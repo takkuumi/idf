@@ -1,0 +1,5 @@
+[toolchain]
+channel = "esp"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["xtensa-esp32s3-espidf"]
+profile = "minimal"

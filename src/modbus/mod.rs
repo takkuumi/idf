@@ -1,0 +1,35 @@
+//! Modbus 协议模块
+//!
+//! 同时支持：
+//! - RTU Master (RS485 #1) - 主站轮询从站设备
+//! - RTU Slave  (RS485 #2) - 本机作为从站响应外部主站
+//! - TCP Server (以太网)   - 监听 502 端口，多连接
+//!
+//! 数据通过 `bus::BUS` 全局共享，Modbus 寄存器映射见 `config::regs`。
+
+use std::sync::Arc;
+
+use crate::error::AppResult;
+use crate::hal::Hal;
+
+#[cfg(feature_modbus_rtu)]
+pub mod rtu_master;
+#[cfg(feature_modbus_rtu)]
+pub mod rtu_slave;
+#[cfg(feature_modbus_tcp)]
+pub mod tcp_server;
+pub mod shared;
+
+/// 启动 RTU Master + Slave 任务
+#[cfg(feature_modbus_rtu)]
+pub fn start_rtu(_hal: Arc<Hal>) -> AppResult<()> {
+    rtu_master::start(_hal.clone())?;
+    rtu_slave::start(_hal.clone())?;
+    Ok(())
+}
+
+/// 启动 TCP Server 任务
+#[cfg(feature_modbus_tcp)]
+pub fn start_tcp() -> AppResult<()> {
+    tcp_server::start()
+}

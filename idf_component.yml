@@ -1,0 +1,5 @@
+## IDF Component Manager 依赖清单
+## W5500 以太网驱动 (ESP-IDF 外部组件)
+## 通过 idf_component_manager 自动下载到 managed_components/
+dependencies:
+  espressif/w5500: "^1.0.0"

@@ -1,0 +1,27 @@
+# Rust / Cargo
+/target
+/Cargo.lock
+**/*.rs.bk
+
+# ESP-IDF 构建产物
+/build
+/sdkconfig
+/sdkconfig.old
+/dependencies.lock
+/managed_components
+
+# IDE
+/.vscode
+/.idea
+/.embuild
+
+# 日志与烧录产物
+*.bin
+*.elf
+*.map
+*.log
+flash_args
+flash_project_args
+
+# Mac
+.DS_Store

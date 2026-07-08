@@ -1,0 +1,26 @@
+# Name,     Type, SubType,  Offset,   Size,    Flags
+# ESP32-S3R8 8MB Flash 分区表
+# Bootloader (0x1000-0xF000) + Partition table (0xF000-0x10000) 由 ESP-IDF 自动管理
+#
+# 分区布局 (符合 ESP-IDF 生产分区惯用做法):
+# - factory 与 ota_0/ota_1 等大 (2.25MB), 保证 factory 固件可 OTA 升级
+# - nvs_keys: NVS 加密密钥分区 (CONFIG_NVS_ENCRYPTION=y 必需)
+# - coredump: 崩溃转储到 Flash, 便于工业现场故障分析
+# - ble_mesh: BLE Mesh 独立 NVS 分区, 与系统 nvs 隔离
+# - storage: FAT 文件系统, 大文件存储 (日志/配置备份)
+#
+# 总计: 0x6000 (nvs) + 0x1000 (phy) + 0x1000 (nvs_keys) + 0x2000 (otadata)
+#     + 0x240000 (factory) + 0x240000 (ota_0) + 0x240000 (ota_1)
+#     + 0x10000 (coredump) + 0x10000 (ble_mesh) + 0x100000 (storage)
+#     = 0x800000 (8MB), 含 0x1A000-0x20000 对齐间隙
+
+nvs,        data, nvs,      0x10000,  0x6000,
+phy_init,   data, phy,      0x16000,  0x1000,
+nvs_keys,   data, nvs_keys, 0x17000,  0x1000, encrypted
+otadata,    data, ota,      0x18000,  0x2000,
+factory,    app,  factory,  0x20000,  0x240000,
+ota_0,      app,  ota_0,    0x260000, 0x240000,
+ota_1,      app,  ota_1,    0x4A0000, 0x240000,
+coredump,   data, coredump, 0x6E0000, 0x10000,
+ble_mesh,   data, nvs,      0x6F0000, 0x10000,
+storage,    data, fat,      0x700000, 0x100000,
