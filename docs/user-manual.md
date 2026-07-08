@@ -59,7 +59,7 @@
 
 - **语言**：Rust（nightly，Xtensa target）
 - **HAL**：`esp-idf-hal` v0.45 + `esp-idf-svc`
-- **系统**：ESP-IDF v5.5.2 + FreeRTOS SMP
+- **系统**：ESP-IDF v5.5.4 + FreeRTOS SMP
 - **并发模型**：`std::thread` + `parking_lot::Mutex` + `once_cell::Lazy`
 - **任务绑定**：双核 SMP 亲和性（Core 0 网络/协议，Core 1 实时 IO）
 

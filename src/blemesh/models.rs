@@ -112,13 +112,13 @@ pub fn composition() -> *const EspBleMeshComp {
 /// 处理 ESP_BLE_MESH_MODEL_OPERATION_EVT
 ///
 /// `param` 实为 `esp_ble_mesh_model_cb_param_t*`, 这里按 `ModelOpParam` 解析。
-/// v5.5.2 字段: opcode / model / ctx (指针) / length / msg (无 errcode 字段)
+/// v5.5.4 字段: opcode / model / ctx (指针) / length / msg (无 errcode 字段)
 pub unsafe fn handle_model_operation(param: *mut c_void) {
     if param.is_null() {
         return;
     }
     let p = unsafe { &*(param as *const ModelOpParam) };
-    // v5.5.2: model_operation 事件参数无 errcode 字段, 直接处理 opcode
+    // v5.5.4: model_operation 事件参数无 errcode 字段, 直接处理 opcode
     // 通过 ctx 指针解引用获取消息上下文 (ctx 是指针, 非 inline)
     let ctx = match unsafe { p.ctx.as_ref() } {
         Some(c) => c,

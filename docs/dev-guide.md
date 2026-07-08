@@ -6,7 +6,7 @@
 
 - 项目路径：`/Users/ling/Workspace/idf`
 - Rust edition：2024
-- ESP-IDF：v5.5.2（通过 `esp_idf_sys` 绑定）
+- ESP-IDF：v5.5.4（通过 `esp_idf_sys` 绑定）
 - esp-idf-hal 0.45 + esp-idf-svc 0.50
 - 目标芯片：ESP32-S3R8（Xtensa LX7 双核 240MHz，512KB SRAM，8MB Octal PSRAM）
 
@@ -41,11 +41,11 @@ brew install ninja cmake libusb
 sudo apt-get install -y gcc g++ ninja-build cmake libssl-dev pkg-config libusb-1.0-0-dev
 ```
 
-### 1.2 安装 ESP-IDF v5.5.2
+### 1.2 安装 ESP-IDF v5.5.4
 
 ```bash
 # 克隆 ESP-IDF（一次性，注意递归子模块）
-git clone -b v5.5.2 --recursive https://github.com/espressif/esp-idf.git
+git clone -b v5.5.4 --recursive https://github.com/espressif/esp-idf.git
 cd esp-idf
 ./install.sh esp32s3     # 注意：esp32s3（不是 esp32c5）
 . ./export.sh            # 每次打开新终端需执行
@@ -97,7 +97,7 @@ espflash --version             # 应可用
 | `build.rs` | embuild 编排 ESP-IDF，设置 `feature_*` cfg，feature 互斥校验 |
 | `idf_component.yml` | 声明 W5500 外部 IDF Component 依赖 `espressif/w5500: ^1.0.0` |
 
-> **首次编译会下载 ESP-IDF v5.5.2 并构建 Xtensa 工具链，耗时 15–40 分钟。**
+> **首次编译会下载 ESP-IDF v5.5.4 并构建 Xtensa 工具链，耗时 15–40 分钟。**
 
 ---
 

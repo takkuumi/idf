@@ -25,7 +25,7 @@ const PROV_OOB_OUTPUT_BEEP: u16 = 0x0002;
 /// ESP_BLE_MESH_PROV_OOB_OTHER = BIT(0) = 0x0001
 const PROV_OOB_INFO_OTHER: u32 = 0x0001;
 
-// mesh 回调事件 (esp_ble_mesh_prov_cb_event_t 子集, 数值取自 ESP-IDF v5.5.2)
+// mesh 回调事件 (esp_ble_mesh_prov_cb_event_t 子集, 数值取自 ESP-IDF v5.5.4)
 const EVT_NODE_PROV_COMPLETE: c_int = 10; // ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT
 const EVT_PROVISIONER_PROV_COMPLETE: c_int = 31; // ESP_BLE_MESH_PROVISIONER_PROV_COMPLETE_EVT
 
@@ -91,7 +91,7 @@ const DEVICE_UUID: [u8; 16] = [
 // ----------------------------------------------------------------------------
 // 配网参数 (static mut: esp_ble_mesh_init 可能写入 dev_key)
 //
-// EspBleMeshProv 字段布局严格对齐 ESP-IDF v5.5.2 esp_ble_mesh_defs.h L841-970
+// EspBleMeshProv 字段布局严格对齐 ESP-IDF v5.5.4 esp_ble_mesh_defs.h L841-970
 // uuid 是指针 (*const u8), 非 [u8; 16] 数组
 // 所有回调字段 (esp_ble_mesh_cb_t = uint32_t) 初始化为 0, 由 stack 回填
 // ----------------------------------------------------------------------------
@@ -158,7 +158,7 @@ pub fn provisioning_info() -> *const EspBleMeshProv {
 // 配网事件处理 (由 bindings::mesh_event_cb 转发)
 // ----------------------------------------------------------------------------
 
-/// `esp_ble_mesh_prov_cb_param_t.node_prov_complete` (ESP-IDF v5.5.2 defs.h L1264-1270)
+/// `esp_ble_mesh_prov_cb_param_t.node_prov_complete` (ESP-IDF v5.5.4 defs.h L1264-1270)
 ///
 /// ```c
 /// struct ble_mesh_provision_complete_evt_param {
@@ -179,7 +179,7 @@ struct NodeProvCompleteParam {
     iv_index: u32,      // offset 24
 }
 
-/// `esp_ble_mesh_prov_cb_param_t.provisioner_prov_complete` (ESP-IDF v5.5.2 defs.h L1419-1425)
+/// `esp_ble_mesh_prov_cb_param_t.provisioner_prov_complete` (ESP-IDF v5.5.4 defs.h L1419-1425)
 ///
 /// ```c
 /// struct ble_mesh_provisioner_prov_comp_param {
@@ -215,7 +215,7 @@ pub unsafe fn handle_provisioning_event(event: c_int, param: *mut c_void) {
                 log::warn!("[mesh-prov] NODE_PROV_COMPLETE: null param");
                 return;
             }
-            // SAFETY: param 类型对齐 NodeProvCompleteParam (esp_ble_mesh_defs.h v5.5.2 L1264-1270)
+            // SAFETY: param 类型对齐 NodeProvCompleteParam (esp_ble_mesh_defs.h v5.5.4 L1264-1270)
             let p = unsafe { &*(param as *const NodeProvCompleteParam) };
             log::info!(
                 "[mesh-prov] NODE_PROV_COMPLETE: net_idx={}, addr=0x{:04x}, flags={}, iv_index={}",

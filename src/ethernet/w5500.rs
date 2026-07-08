@@ -43,7 +43,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let dma_chan = 1; // ESP32-S3 SPI DMA
     check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
 
-    // 2) W5500 SPI 设备配置 (ESP-IDF v5.5.2: MAC 驱动内部调用 spi_bus_add_device, 无需手动添加)
+    // 2) W5500 SPI 设备配置 (ESP-IDF v5.5.4: MAC 驱动内部调用 spi_bus_add_device, 无需手动添加)
     let dev_cfg = spi_device_config_default(pins::ETH_SPI_CS);
 
     // 3) 硬件复位 W5500 (复用 Hal.gpio 的 ETH_RST 引脚, 避免重复 gpio_config)
@@ -72,7 +72,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
           "esp_eth_driver_install")?;
 
     // 7) 默认 eth netif + attach glue
-    // ESP-IDF v5.5.2: esp_netif_create_default_eth_mac 已移除,
+    // ESP-IDF v5.5.4: esp_netif_create_default_eth_mac 已移除,
     // 改用 esp_netif_new + ESP_NETIF_DEFAULT_ETH 模式 (base+stack, driver=NULL)
     let netif_cfg = esp_idf_sys::esp_netif_config {
         base: unsafe { &esp_idf_sys::_g_esp_netif_inherent_eth_config } as *const _,
@@ -149,7 +149,7 @@ fn eth_mac_config_default() -> esp_idf_sys::eth_mac_config_t {
 }
 
 /// W5500 配置: SPI 主机 + 设备配置 + 中断引脚
-/// ESP-IDF v5.5.2: eth_w5500_config_t 不再接受 spi_device_handle_t,
+/// ESP-IDF v5.5.4: eth_w5500_config_t 不再接受 spi_device_handle_t,
 /// 而是接受 spi_host_id + spi_devcfg 指针, MAC 驱动内部调用 spi_bus_add_device
 fn eth_w5500_config_default(spi_host: esp_idf_sys::spi_host_device_t,
                              dev_cfg: &esp_idf_sys::spi_device_interface_config_t,

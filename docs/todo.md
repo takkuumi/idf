@@ -1,10 +1,10 @@
 # 已知 TODO 清单
 
-> 待对照实际硬件、ESP-IDF v5.5.2 头文件、esp-idf-hal 0.45 实际 API 校准
+> 待对照实际硬件、ESP-IDF v5.5.4 头文件、esp-idf-hal 0.45 实际 API 校准
 
 ## ★ 存储区域划分与 ESP32-S3R8 潜力利用修复（2026-07-08）
 
-对照 ESP-IDF v5.5.2 源码核对分区表和 sdkconfig.defaults，修复存储分区与硬件潜力利用问题。
+对照 ESP-IDF v5.5.4 源码核对分区表和 sdkconfig.defaults，修复存储分区与硬件潜力利用问题。
 
 ### 分区表修复 (partitions.csv)
 
@@ -37,7 +37,7 @@
 - 3 路 UART + SPI2 (W5500) + I2C0 (MCP23017) + ADC1 DMA 6 通道 + LEDC 4 通道
 - WiFi/BLE 软件共存 + OTA 回滚 + Task/Int WDT 双层看门狗
 
-## ★ BLE Mesh API 对照 ESP-IDF v5.5.2 源码查漏补缺（2026-07-08）
+## ★ BLE Mesh API 对照 ESP-IDF v5.5.4 源码查漏补缺（2026-07-08）
 
 对照 `/Users/ling/workspace/esp-idf/components/bt/esp_ble_mesh/` 真实源码，逐项核对 BLE Mesh C API 绑定与结构体布局，修复 3 个关键错误：
 

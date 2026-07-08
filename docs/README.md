@@ -17,7 +17,7 @@
 | 模块 | 方案 |
 |------|------|
 | 主控 | ESP32-S3R8 (Xtensa LX7 双核 240MHz, 512KB SRAM, **8MB Octal SPI PSRAM**) |
-| 开发框架 | ESP-IDF v5.5.2 + Rust (esp-idf-sys 0.35 / hal 0.45 / svc 0.50) |
+| 开发框架 | ESP-IDF v5.5.4 + Rust (esp-idf-sys 0.35 / hal 0.45 / svc 0.50) |
 | 以太网 | WIZnet W5500 over SPI2 (硬wired TCP/IP + 10/100 MAC/PHY, 单口 + 应用层简单冗余) |
 | BLE Mesh | Bluedroid + Proxy + Node + Generic OnOff (ESP32-S3R8 内置 BLE 5.0) |
 | IO 点 | 8 路 DI (光耦隔离) + 8 路 DO (开漏) |

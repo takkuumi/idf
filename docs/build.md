@@ -116,7 +116,7 @@ build-std = ["std", "core", "alloc", "panic_abort"]
 build-std-features = ["panic_immediate_abort"]
 
 [env]
-ESP_IDF_VERSION = "v5.5.2"
+ESP_IDF_VERSION = "v5.5.4"
 ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
 MCU = "esp32s3"
 ESP_IDF_TARGET = "esp32s3"
@@ -153,8 +153,8 @@ embuild = { version = "0.33", features = ["espidf"] }  # build-dependencies
 关键配置项（详见文件本身）：
 - Flash: QIO 80MHz 8MB
 - PSRAM: Octal 80MHz 8MB
-- BLE: `CONFIG_BT_BLUEDROID_ENABLED=y`（v5.5.2 重命名，旧名 `CONFIG_BT_BLUEDROID` 已废弃）
-- BLE Mesh: `CONFIG_BLE_MESH=y`（v5.5.2 重命名，旧名 `CONFIG_BT_BLE_MESH` 已废弃）
+- BLE: `CONFIG_BT_BLUEDROID_ENABLED=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLUEDROID` 已废弃）
+- BLE Mesh: `CONFIG_BLE_MESH=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLE_MESH` 已废弃）
 - W5500: `CONFIG_ETH_SPI_ETHERNET_W5500=y`
 - Core Dump: `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`
 - Heap: `CONFIG_HEAP_POISONING_COMPREHENSIVE=y`
@@ -342,7 +342,7 @@ rustflags = ["--cfg", "espidf_time64"]  # 不要加 -C link-arg=--gc-sections �
 
 ### 2. `undefined reference to esp_ble_mesh_*`
 
-**原因**：ESP-IDF v5.5.2 重命名了 BLE Mesh 配置项，旧名 `CONFIG_BT_BLE_MESH_*` 已废弃。
+**原因**：ESP-IDF v5.5.4 重命名了 BLE Mesh 配置项，旧名 `CONFIG_BT_BLE_MESH_*` 已废弃。
 
 **解决**：修改 `sdkconfig.defaults`，把所有 `CONFIG_BT_BLE_MESH_*` 改为 `CONFIG_BLE_MESH_*`：
 ```diff
@@ -455,7 +455,7 @@ esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX \
 
 | 组件 | 版本 |
 |------|------|
-| ESP-IDF | v5.5.2 |
+| ESP-IDF | v5.5.4 |
 | esp-idf-sys | 0.37.2 |
 | esp-idf-hal | 0.46.2 |
 | esp-idf-svc | 0.52 |

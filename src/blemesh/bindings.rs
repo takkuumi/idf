@@ -1,6 +1,6 @@
 //! ESP-IDF BLE Mesh C API 绑定封装
 //!
-//! 字段布局严格对齐 ESP-IDF v5.5.2 源码:
+//! 字段布局严格对齐 ESP-IDF v5.5.4 源码:
 //!   /Users/ling/workspace/esp-idf/components/bt/esp_ble_mesh/api/esp_ble_mesh_defs.h
 //!   /Users/ling/workspace/esp-idf/components/bt/esp_ble_mesh/api/core/include/esp_ble_mesh_networking_api.h
 //!
@@ -36,7 +36,7 @@ unsafe extern "C" {
     fn esp_ble_mesh_init(prov: *mut EspBleMeshProv, comp: *const EspBleMeshComp) -> c_int;
     /// 注册配网事件回调 (NODE_PROV_COMPLETE / PROVISIONER_PROV_COMPLETE 等)
     fn esp_ble_mesh_register_prov_callback(cb: MeshCb) -> c_int;
-    /// 注册模型事件回调 (MODEL_OPERATION 等), v5.5.2 拆分自 register_callback
+    /// 注册模型事件回调 (MODEL_OPERATION 等), v5.5.4 拆分自 register_callback
     fn esp_ble_mesh_register_custom_model_callback(cb: MeshCb) -> c_int;
     /// 注册 Generic Client 回调 (事件空间与 model_cb 不同)
     fn esp_ble_mesh_register_generic_client_callback(cb: MeshCb) -> c_int;
@@ -80,7 +80,7 @@ unsafe extern "C" {
 }
 
 // ============================================================================
-// 关键数据结构 (严格对齐 ESP-IDF v5.5.2 esp_ble_mesh_defs.h)
+// 关键数据结构 (严格对齐 ESP-IDF v5.5.4 esp_ble_mesh_defs.h)
 // ============================================================================
 
 /// esp_ble_mesh_model_op_t (defs.h L552-556)
@@ -440,7 +440,7 @@ pub fn init_bluedroid() -> AppResult<()> {
 
 /// 3. 初始化 mesh 协议栈 (持有 nvs)
 ///
-/// v5.5.2: esp_ble_mesh_init(prov, comp) 双参数
+/// v5.5.4: esp_ble_mesh_init(prov, comp) 双参数
 pub fn init_mesh_stack(nvs: esp_idf_svc::nvs::EspDefaultNvsPartition) -> AppResult<()> {
     let _ = NVS.set(nvs);
 
@@ -449,7 +449,7 @@ pub fn init_mesh_stack(nvs: esp_idf_svc::nvs::EspDefaultNvsPartition) -> AppResu
 
     check(unsafe { esp_ble_mesh_init(prov_mut, comp) }, "esp_ble_mesh_init")?;
 
-    // v5.5.2: 三类回调事件空间互不相同, 必须使用独立回调函数
+    // v5.5.4: 三类回调事件空间互不相同, 必须使用独立回调函数
     // - prov_cb:            NODE_PROV_COMPLETE(10) / PROVISIONER_PROV_COMPLETE(31) 等
     // - custom_model_cb:    MODEL_OPERATION(0) / MODEL_SEND_COMP(1) 等 (esp_ble_mesh_model_cb_event_t)
     // - generic_client_cb:  GET_STATE(0) / SET_STATE(1) / PUBLISH(2) / TIMEOUT(3)
@@ -472,7 +472,7 @@ pub fn init_mesh_stack(nvs: esp_idf_svc::nvs::EspDefaultNvsPartition) -> AppResu
 
 /// 4. 注册模型 (Generic OnOff Server/Client) 与客户端回调
 ///
-/// v5.5.2: 回调已在 init_mesh_stack 中注册, 此函数保留为占位/扩展点
+/// v5.5.4: 回调已在 init_mesh_stack 中注册, 此函数保留为占位/扩展点
 pub fn register_models() -> AppResult<()> {
     log::info!("[blemesh] models registered (callbacks in init_mesh_stack)");
     Ok(())
@@ -480,7 +480,7 @@ pub fn register_models() -> AppResult<()> {
 
 /// 5. 启用 Proxy 服务 (GATT 接入)
 ///
-/// v5.5.2: esp_ble_mesh_proxy_gatt_enable (非 proxy_proxy_enable!)
+/// v5.5.4: esp_ble_mesh_proxy_gatt_enable (非 proxy_proxy_enable!)
 pub fn enable_proxy() -> AppResult<()> {
     check(unsafe { esp_ble_mesh_proxy_identity_enable() }, "proxy_identity_enable")?;
     check(unsafe { esp_ble_mesh_proxy_gatt_enable() }, "proxy_gatt_enable")?;

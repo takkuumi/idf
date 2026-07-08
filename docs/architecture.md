@@ -40,7 +40,7 @@
               └────────┬────────┘
                        │
        ┌───────────────┴────────────────┐
-       │       ESP-IDF v5.5.2            │
+       │       ESP-IDF v5.5.4            │
        │  (esp_idf_sys + esp_idf_hal)    │
        └───────────────┬────────────────┘
                        │
@@ -165,7 +165,7 @@ ESP32-S3 有 3 个 UART：
 
 ESP32-S3R8 内置 BLE 5.0 + Bluetooth Mesh。ESP-IDF 的 BLE Mesh 主要以 C API 暴露，esp-idf-svc 未完整封装，直接通过 esp_idf_sys 调用。
 
-**字段布局严格对齐 ESP-IDF v5.5.2 源码**（`/Users/ling/workspace/esp-idf/components/bt/esp_ble_mesh/api/`）。
+**字段布局严格对齐 ESP-IDF v5.5.4 源码**（`/Users/ling/workspace/esp-idf/components/bt/esp_ble_mesh/api/`）。
 
 | 文件 | 职责 |
 |------|------|
@@ -173,12 +173,12 @@ ESP32-S3R8 内置 BLE 5.0 + Bluetooth Mesh。ESP-IDF 的 BLE Mesh 主要以 C AP
 | `models.rs` | Generic OnOff Server/Client 模型定义, 消息收发 |
 | `provisioning.rs` | 静态 OOB + Provisioner 配网流程, 事件解析 |
 
-**三类回调注册** (v5.5.2 事件值空间不同, 必须独立):
+**三类回调注册** (v5.5.4 事件值空间不同, 必须独立):
 - `esp_ble_mesh_register_prov_callback` → `prov_event_cb` (NODE_PROV_COMPLETE=10 / PROVISIONER_PROV_COMPLETE=31)
 - `esp_ble_mesh_register_custom_model_callback` → `custom_model_event_cb` (MODEL_OPERATION=0 / SEND_COMP=1)
 - `esp_ble_mesh_register_generic_client_callback` → `generic_client_event_cb` (GET_STATE=0 / SET_STATE=1 / PUBLISH=2 / TIMEOUT=3)
 
-**关键 API** (v5.5.2):
+**关键 API** (v5.5.4):
 - `esp_ble_mesh_init(prov, comp)` 双参数
 - `esp_ble_mesh_model_publish(model, opcode, length, data, role)` 5 参数 (无 ctx)
 - `esp_ble_mesh_server_model_send_msg(model, ctx, opcode, length, data)` 5 参数 (含 ctx)
