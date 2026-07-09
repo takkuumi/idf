@@ -1,10 +1,11 @@
 //! DO 数字输出任务
 //!
-//! - 默认版本: 周期 10ms 读取 `BUS.do_.bits`, 更新到 8 路 GPIO 输出
-//! - F3/F4 版本: 周期 10ms 读取 `BUS.do_.bits`, 更新到 16 路 I2C MCP23017 扩展输出
-//! - 仅在状态变化时调用写入，避免抖动
+//! - F16 版本: 周期 ~1ms 检查 `BUS.do_.bits`, 变化时更新 PCA9555 输出
+//! - 支持事件驱动: Modbus 写入后调用 `notify()` 立即触发刷新
+//! - 仅在状态变化时写入硬件, 避免不必要的 I2C 操作
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::bus;
@@ -13,55 +14,71 @@ use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
 
-/// 输出周期 (ms)
-const OUTPUT_PERIOD_MS: u64 = 10;
-/// 心跳节流: 每 10 次循环 (≈100ms) 上报一次
-const HB_DIV: u32 = 10;
+/// 输出刷新间隔 (ms) — 细粒度检查, 配合 notify 实现亚 ms 级响应
+const TICK_MS: u64 = 1;
+/// 最大轮询间隔 (ms) — notify 未触发时也在此时间内刷新
+const MAX_POLL_MS: u64 = 10;
+/// 心跳节流: 每 100ms 上报一次
+const HB_DIV: u32 = 100;
 
-/// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("do-output");
 
-/// 启动 DO 输出任务
+/// Modbus/其他模块写入 DO 后置位, 通知 DO 任务立即刷新
+static DO_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// 通知 DO 任务有新数据需要立即刷新 (事件驱动, 非阻塞)
+pub fn notify() {
+    DO_DIRTY.store(true, Ordering::Release);
+}
+
+#[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
 pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_RT);
+    let result = std::thread::Builder::new()
         .name("do-output".into())
         .spawn(move || {
-            health::pin_current_to_core(health::CORE_RT);
             log::info!(
-                "[do] output task started, period={}ms, channels={} (version {})",
-                OUTPUT_PERIOD_MS, hw_version::DO_COUNT, hw_version::NAME
+                "[do] output task started, tick={}ms, max_poll={}ms, channels={} (version {})",
+                TICK_MS, MAX_POLL_MS, hw_version::DO_COUNT, hw_version::NAME
             );
 
-            // 上一次输出的 DO 状态, 初值 0xFFFF_FFFF_FFFF_FFFF 使首次必然全量刷新
             let mut last: u64 = u64::MAX;
             let mut tick_div: u32 = 0;
+            let mut since_last_write: u64 = 0;
 
             loop {
                 tick_div = tick_div.wrapping_add(1);
                 if tick_div % HB_DIV == 0 {
                     TASK_HB.tick();
                 }
-                let bits = match bus::lock_timeout() {
-                    Some(b) => b.do_.bits,
-                    None => {
-                        log::error!("[do] bus lock timeout, keep last");
-                        last
-                    }
-                };
 
-                // 仅在变化时写硬件 (统一通过 DigitalIo trait 访问)
-                if bits != last {
-                    if let Err(e) = hal.dio().write_do_all(bits) {
-                        log::error!("[do] write_do_all failed: {}", e);
+                // 检查是否需要刷新: notify 触发 或 达到最大轮询间隔
+                let dirty = DO_DIRTY.swap(false, Ordering::Acquire);
+                since_last_write += TICK_MS;
+
+                if dirty || since_last_write >= MAX_POLL_MS {
+                    since_last_write = 0;
+                    let bits = match bus::lock_timeout() {
+                        Some(b) => b.do_.bits,
+                        None => {
+                            log::error!("[do] bus lock timeout, keep last");
+                            last
+                        }
+                    };
+                    if bits != last {
+                        if let Err(e) = hal.dio().write_do_all(bits) {
+                            log::error!("[do] write_do_all failed: {}", e);
+                        }
+                        last = bits;
                     }
-                    last = bits;
                 }
 
-                std::thread::sleep(Duration::from_millis(OUTPUT_PERIOD_MS));
+                std::thread::sleep(Duration::from_millis(TICK_MS));
             }
-        })
-        .map_err(|e| AppError::Io(format!("spawn do-output: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Io(format!("spawn do-output: {e}")))?;
 
     Ok(())
 }

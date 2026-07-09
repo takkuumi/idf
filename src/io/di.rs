@@ -17,13 +17,10 @@ use crate::hal::Hal;
 use crate::health::{self, TaskHb};
 
 /// 扫描周期 (ms)
-/// - 默认版本 (GPIO 直驱): 1ms, 无通信延迟
-/// - F3/F4 版本 (I2C MCP23017): 5ms, 留足 I2C 读取时间
-///   F4 需读 3 片 MCP23017 (48 DI), 400kHz 下每片约 200μs, 共 600μs
-///   5ms 周期既保证响应性, 又避免任务积压
-#[cfg(not(any(feature_f3, feature_f4)))]
-const SCAN_PERIOD_MS: u64 = 1;
-#[cfg(any(feature_f3, feature_f4))]
+/// DI 扫描周期:
+/// - F16 (PCA9555 软件 I2C): 5ms — 留足 I2C 时间, 避免阻塞网络中断
+///   (读 2 端口 + 写 2 LED ≈ 4×100μs @250kHz, < 5% CPU)
+/// - F3/F4 (I2C MCP23017): 5ms 同理
 const SCAN_PERIOD_MS: u64 = 5;
 /// 去抖需要的连续相同采样次数
 const DEBOUNCE_COUNT: u8 = 3;
@@ -39,12 +36,13 @@ const HB_DIV: u32 = 20;
 static TASK_HB: TaskHb = TaskHb::new("di-scan");
 
 /// 启动 DI 扫描任务
+#[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
 pub fn start_scan_task(hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_RT);
+    let result = std::thread::Builder::new()
         .name("di-scan".into())
         .spawn(move || {
-            health::pin_current_to_core(health::CORE_RT);
             log::info!(
                 "[di] scan task started, period={}ms, channels={} (version {})",
                 SCAN_PERIOD_MS, hw_version::DI_COUNT, hw_version::NAME
@@ -102,8 +100,9 @@ pub fn start_scan_task(hal: Arc<Hal>) -> AppResult<()> {
 
                 std::thread::sleep(Duration::from_millis(SCAN_PERIOD_MS));
             }
-        })
-        .map_err(|e| AppError::Io(format!("spawn di-scan: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Io(format!("spawn di-scan: {e}")))?;
 
     Ok(())
 }

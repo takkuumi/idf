@@ -8,6 +8,7 @@
 //! GPIO 物理输出由 `io` 任务根据总线状态刷新 (模块解耦);
 //! 如需在 mesh 回调中直接驱动 GPIO, 见 `bindings` TODO (需将 hal 存入全局 OnceCell)。
 
+use std::cell::UnsafeCell;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -19,6 +20,94 @@ use super::bindings::{
     OP_GEN_ONOFF_GET, OP_GEN_ONOFF_SET, OP_GEN_ONOFF_SET_UNACK, OP_GEN_ONOFF_STATUS,
     ROLE_NODE,
 };
+
+// ============================================================================
+// Publication context (esp_ble_mesh_model_pub_t) — MUST be non-null for
+// Generic OnOff Server, otherwise esp_ble_mesh_init returns -EINVAL.
+//
+// Layout verified against ESP-IDF v5.5.4:
+//   sizeof(net_buf_simple) = 12
+//   sizeof(k_work) = 12 (handler+index+user_data)
+//   sizeof(esp_ble_mesh_model_pub_t) = 40 (no CONFIG_BLE_MESH_DF_SRV)
+// ============================================================================
+
+/// net_buf_simple (mesh/buf.h L95-109): 12 bytes, 4-byte aligned
+#[repr(C)]
+struct NetBufSimple {
+    data: *mut u8,       // offset 0, 4 bytes
+    len: u16,            // offset 4, 2 bytes
+    size: u16,           // offset 6, 2 bytes
+    __buf: *mut u8,      // offset 8, 4 bytes (total=12)
+}
+
+/// esp_ble_mesh_model_pub_t (esp_ble_mesh_defs.h L476-517), 40 bytes
+#[repr(C, align(4))]
+struct MeshModelPub {
+    _pad0: [u8; 16],            // offset 0-15: model + publish_addr + bitfields + ttl/retransmit/period/period_start
+    msg: *mut NetBufSimple,     // offset 16: net_buf_simple *msg
+    update: u32,                // offset 20: esp_ble_mesh_cb_t update
+    _timer: [u8; 12],           // offset 24-35: struct k_delayed_work (k_work {handler,index,user_data})
+    dev_role: u8,               // offset 36
+    _pad1: [u8; 3],             // offset 37-39: tail padding
+}
+
+// ---- Publication buffer for OnOff Status messages (1 byte payload) ----
+// Mesh stack publishes status via this buffer; 16 bytes provides headroom for headers.
+static mut PUB_BUF_DATA: [u8; 16] = [0u8; 16];
+static mut PUB_BUF: NetBufSimple = NetBufSimple {
+    data: std::ptr::null_mut(), // filled in init_model_pub()
+    len: 0,
+    size: 16,
+    __buf: std::ptr::null_mut(), // filled in init_model_pub()
+};
+
+// ---- Publication context (allocated in RAM so mesh stack can write to it) ----
+static mut PUB: MeshModelPub = MeshModelPub {
+    _pad0: [0u8; 16],
+    msg: std::ptr::null_mut(),   // filled in init_model_pub()
+    update: 0,
+    _timer: [0u8; 12],
+    dev_role: ROLE_NODE,
+    _pad1: [0u8; 3],
+};
+
+/// Server context for Generic OnOff (bt_mesh_gen_onoff_srv).
+/// The mesh stack requires `model->user_data` to be non-null for Generic Server models.
+/// Size: 128 bytes is generous for the structure (actual ~64-72 bytes).
+static mut GEN_ONOFF_SRV_DATA: [u8; 128] = [0u8; 128];
+
+/// Client context for Generic OnOff (bt_mesh_client_user_data_t, ~28 bytes).
+/// The mesh stack requires `model->user_data` to be non-null for Generic Client models.
+static mut GEN_ONOFF_CLI_DATA: [u8; 32] = [0u8; 32];
+
+/// Called once before `composition()` to link pub buffer, context pointers,
+/// and server user_data. Must be called before `esp_ble_mesh_init` reads the composition data.
+fn init_model_pub() {
+    // Use raw pointer operations to satisfy Rust 2024 static_mut_refs lint
+    let data_ptr: *mut u8 = core::ptr::addr_of_mut!(PUB_BUF_DATA) as *mut u8;
+    let srv_data_ptr: *mut u8 = core::ptr::addr_of_mut!(GEN_ONOFF_SRV_DATA) as *mut u8;
+    let cli_data_ptr: *mut u8 = core::ptr::addr_of_mut!(GEN_ONOFF_CLI_DATA) as *mut u8;
+    unsafe {
+        PUB_BUF.data = data_ptr;
+        PUB_BUF.__buf = data_ptr;
+        PUB.msg = &raw mut PUB_BUF;
+        // Set server model user_data (required by generic_server_init)
+        let models = SIG_MODELS.get();
+        (*models)[0].user_data = srv_data_ptr as *mut _;
+        // Set client model user_data (required by generic_client_init)
+        (*models)[1].user_data = cli_data_ptr as *mut _;
+    }
+}
+
+/// 包装 UnsafeCell 使其可在 static 中使用 (实现 Sync)
+/// 安全性: ESP-IDF 的 esp_ble_mesh_init 在单线程启动阶段写入,
+/// 之后只读访问。Rust 侧通过 model_ptr() 获取指针, 无数据竞争。
+struct RamCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for RamCell<T> {}
+impl<T> RamCell<T> {
+    const fn new(v: T) -> Self { RamCell(UnsafeCell::new(v)) }
+    fn get(&self) -> *mut T { self.0.get() }
+}
 
 /// OnOff Set 消息的 Transaction Identifier (tid) 全局计数器
 ///
@@ -47,13 +136,15 @@ static CLI_OPS: [EspBleMeshOp; 2] = [
 ];
 
 // ----------------------------------------------------------------------------
-// 模型 / 元素 / 组合数据 (静态, 供 esp_ble_mesh_init 引用)
+// 模型 / 元素 / 组合数据
 // ----------------------------------------------------------------------------
-/// 静态 SIG 模型数组
-///
-/// element_idx/model_idx/flags/element/pub_/keys/groups/cb 等字段在静态初始化时置 0,
-/// 由 esp_ble_mesh_init 在注册时回填。
-pub static SIG_MODELS: [EspBleMeshModel; 2] = [
+// ESP-IDF 的 esp_ble_mesh_init 会写入 model->op, model->cb, model->element,
+// element->element_addr 等字段。static 在 Rust 中放在 flash 只读段,
+// 写入会触发 "Cache error: Dbus write to cache rejected" 崩溃。
+// 使用 UnsafeCell 强制数据放在 RAM (.data 段), 允许 ESP-IDF 写入。
+
+/// SIG 模型数组 (放在 RAM, esp_ble_mesh_init 会回填 op/cb/element 等字段)
+static SIG_MODELS: RamCell<[EspBleMeshModel; 2]> = RamCell::new([
     EspBleMeshModel {
         model_id: cfg::MODEL_ID_ONOFF_SRV,
         company_id: 0, // SIG model
@@ -82,28 +173,55 @@ pub static SIG_MODELS: [EspBleMeshModel; 2] = [
         cb: std::ptr::null_mut(),
         user_data: std::ptr::null_mut(),
     },
-];
+]);
 
-static ELEMENTS: [EspBleMeshElem; 1] = [EspBleMeshElem {
-    element_addr: 0, // 由 esp_ble_mesh_init 回填为主单播地址
-    location: 0, // TODO: primary location
-    sig_model_count: 2,
-    vnd_model_count: 0,
-    sig_models: SIG_MODELS.as_ptr() as *mut EspBleMeshModel,
-    vnd_models: std::ptr::null_mut(),
-}];
+/// 元素数组 (放在 RAM, esp_ble_mesh_init 会回填 element_addr)
+static ELEMENTS: RamCell<[EspBleMeshElem; 1]> = RamCell::new([
+    EspBleMeshElem {
+        element_addr: 0, // 由 esp_ble_mesh_init 回填为主单播地址
+        location: 0,
+        sig_model_count: 2,
+        vnd_model_count: 0,
+        sig_models: std::ptr::null_mut(), // 在 composition() 中设置
+        vnd_models: std::ptr::null_mut(),
+    },
+]);
 
-static COMP: EspBleMeshComp = EspBleMeshComp {
-    cid: 0x0001, // TODO: 公司 ID (测试值)
+/// 组合数据 (放在 RAM, 因为需要运行时设置 elements 指针)
+static COMP: RamCell<EspBleMeshComp> = RamCell::new(EspBleMeshComp {
+    cid: 0x0001,
     pid: 0x0001,
     vid: 0x0001,
     element_count: 1,
-    elements: ELEMENTS.as_ptr() as *mut EspBleMeshElem,
-};
+    elements: std::ptr::null_mut(), // 在 composition() 中设置
+});
 
 /// 返回组合数据指针, 供 `esp_ble_mesh_init`
+///
+/// 每次调用时重新链接指针 (ELEMENTS→SIG_MODELS, COMP→ELEMENTS),
+/// 并初始化 publication context, 确保指针指向 RAM 中的可写数据。
+/// ESP-IDF 会在 init 期间写入这些结构。
 pub fn composition() -> *const EspBleMeshComp {
-    &COMP as *const _
+    unsafe {
+        // Link pub buffer → publication context → server model
+        init_model_pub();
+        let models = SIG_MODELS.get();
+        (*models)[0].pub_ = (&raw const PUB) as *mut _;
+        // Link elements → models, comp → elements
+        let elements = ELEMENTS.get();
+        let comp = COMP.get();
+        (*elements)[0].sig_models = models as *mut EspBleMeshModel;
+        (*comp).elements = elements as *mut EspBleMeshElem;
+        comp as *const EspBleMeshComp
+    }
+}
+
+/// 获取 SIG_MODELS 中指定索引的模型指针 (供 client 发送消息用)
+pub fn model_ptr(idx: usize) -> *mut EspBleMeshModel {
+    unsafe {
+        let arr = SIG_MODELS.get();
+        (*arr).as_mut_ptr().add(idx)
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -223,7 +341,7 @@ pub fn send_onoff_set(value: bool, dst_addr: u16, net_idx: u16, app_idx: u16) {
     let ctx = EspBleMeshMsgCtx::for_send(net_idx, app_idx, dst_addr);
 
     // 使用 client 模型 (SIG_MODELS[1])
-    let client_model = &SIG_MODELS[1] as *const EspBleMeshModel as *mut EspBleMeshModel;
+    let client_model = model_ptr(1);
 
     // esp_ble_mesh_client_model_send_msg: 8 参数
     // (model, ctx, opcode, length, data, msg_timeout, need_rsp, device_role)

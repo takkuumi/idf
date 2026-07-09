@@ -129,11 +129,11 @@ impl SystemConfig {
             fw_version: Self::fw_version_from_cargo(),
             cfg_version: 0,
             eth_mac: [0; 6],
-            dhcp: true,
-            ip: [192, 168, 1, 100],
+            dhcp: false,
+            ip: [192, 168, 51, 221],
             mask: [255, 255, 255, 0],
-            gateway: [192, 168, 1, 1],
-            dns: [192, 168, 1, 1],
+            gateway: [192, 168, 51, 1],
+            dns: [192, 168, 51, 1],
             ble_mac: [0; 6],
             ble_name,
             ble_mesh_enable: true,
@@ -510,6 +510,27 @@ impl SystemConfig {
         )
     }
 
+    pub fn mask_str(&self) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            self.mask[0], self.mask[1], self.mask[2], self.mask[3]
+        )
+    }
+
+    pub fn gw_str(&self) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            self.gateway[0], self.gateway[1], self.gateway[2], self.gateway[3]
+        )
+    }
+
+    pub fn dns_str(&self) -> String {
+        format!(
+            "{}.{}.{}.{}",
+            self.dns[0], self.dns[1], self.dns[2], self.dns[3]
+        )
+    }
+
     pub fn mac_str(&self) -> String {
         format!(
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -539,7 +560,7 @@ impl SystemConfig {
 // 字段编解码辅助
 // ----------------------------------------------------------------------------
 
-/// IPv4: 4 字节 → 2 个 U16 (高字节先, 192.168.1.100 → [0xC0A8, 0x0164])
+/// IPv4: 4 字节 → 2 个 U16 (高字节先, 192.168.51.221 → [0xC0A8, 0x33DD])
 fn read_ipv4(bytes: &[u8; 4], base: u16, addr: u16) -> Option<u16> {
     let off = addr.checked_sub(base)?;
     if off >= 2 {
@@ -583,7 +604,7 @@ fn write_mac(bytes: &mut [u8; 6], base: u16, addr: u16, value: u16) -> Option<()
     Some(())
 }
 
-/// 解析 "192.168.1.100" → [192,168,1,100]
+/// 解析 "192.168.51.221" → [192,168,51,221]
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() != 4 {

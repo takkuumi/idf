@@ -34,10 +34,10 @@ static TASK_HB: TaskHb = TaskHb::new("ai-sample");
 /// TODO: `_timer_svc` 可用于更精确的定时采样，当前用 std::thread::sleep。
 pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppResult<()> {
     health::register(&TASK_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_RT);
+    let result = std::thread::Builder::new()
         .name("ai-sample".into())
         .spawn(move || {
-            health::pin_current_to_core(health::CORE_RT);
             log::info!("[ai] sample task started, period={}ms", SAMPLE_PERIOD_MS);
 
             // 每通道一个环形缓冲区
@@ -89,8 +89,9 @@ pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppR
 
                 std::thread::sleep(Duration::from_millis(SAMPLE_PERIOD_MS));
             }
-        })
-        .map_err(|e| AppError::Channel(format!("spawn ai-sample: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Channel(format!("spawn ai-sample: {e}")))?;
 
     Ok(())
 }

@@ -1,8 +1,8 @@
-//! ESP32-S3R8 嵌入式网关主入口
+//! ESP32-S3R2 嵌入式网关主入口
 //!
 //! 系统组成：
 //! - 以太网 (W5500 over SPI2) + 应用层简单冗余
-//! - BLE Mesh (Proxy + Node + Generic OnOff 模型) — ESP32-S3R8 内置
+//! - BLE Mesh (Proxy + Node + Generic OnOff 模型) — ESP32-S3R2 内置
 //! - 8 路 DI / 8 路 DO
 //! - 6 路 AI (ADC1) / 4 路 AO (LEDC PWM)
 //! - 2 路 RS485 (UART1/UART2)
@@ -57,7 +57,7 @@ fn main() -> AppResult<()> {
 
     log::info!("================================================");
     log::info!("{} v{}", config::APP_NAME, config::APP_VERSION);
-    log::info!("ESP32-S3R8 IoT Gateway starting...");
+    log::info!("ESP32-S3R2 IoT Gateway starting...");
     log::info!("================================================");
 
     // 1.1 OTA 固件确认 (取消回滚)
@@ -73,6 +73,20 @@ fn main() -> AppResult<()> {
         .map_err(|e| crate::error::AppError::Sys(format!("take eventloop: {e:?}")))?;
     let timer_svc = EspTaskTimerService::new()
         .map_err(|e| crate::error::AppError::Sys(format!("timer svc: {e:?}")))?;
+
+    // 2.1 初始化 TCP/IP 协议栈 (LwIP)
+    // 必须在创建任何网络接口 (esp_netif_new) 之前调用, 否则 LwIP 的 tcpip 线程 mailbox
+    // 未初始化, 后续 socket 操作会触发 "Invalid mbox" 断言
+    // (esp_idf_svc 的 wifi/eth 封装内部不会自动调用)
+    unsafe {
+        let ret = esp_idf_sys::esp_netif_init();
+        if ret != esp_idf_sys::ESP_OK {
+            return Err(crate::error::AppError::Sys(format!(
+                "esp_netif_init failed: esp_err=0x{:08X}", ret
+            )));
+        }
+    }
+    log::debug!("[main] esp_netif_init ok (LwIP tcpip thread started)");
 
     // 3. 硬件抽象层初始化
     let hal = hal::Hal::init(peripherals)?;
@@ -181,7 +195,6 @@ fn main() -> AppResult<()> {
 // 主循环：周期性更新系统状态、复位计数、喂狗、健康检查
 // ----------------------------------------------------------------------------
 fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
-    crate::health::pin_current_to_core(crate::health::CORE_NET);
     let mut tick: u32 = 0;
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
     let start = std::time::Instant::now();

@@ -1,7 +1,7 @@
 # =============================================================================
-# ESP32-S3R8 项目默认 sdkconfig
+# ESP32-S3R2 项目默认 sdkconfig
 # 用途：嵌入式网关（以太网 W5500 + BLE Mesh + IO + AI/AO + RS485 + Modbus）
-# 硬件：ESP32-S3R8 (Xtensa LX7 双核 240MHz, 512KB SRAM, 8MB Octal PSRAM)
+# 硬件：ESP32-S3R2 (Xtensa LX7 双核 240MHz, 512KB SRAM, 2MB Quad PSRAM)
 # =============================================================================
 
 # ---- 目标芯片 ----
@@ -9,7 +9,7 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_IDF_TARGET_ESP32S3=y
 
 # ---- 时钟与 Flash/PSRAM ----
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y
 CONFIG_ESP_SYSTEM_PMP_IDE_SPLIT_SIZE=y
 # CPU 频率锁定 240MHz (ESP32-S3 最高频, 工业实时性)
@@ -41,17 +41,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_SPI_FLASH_BROWNOUT_RESET=y
 CONFIG_SPI_FLASH_USE_4BLOCK_ERASE=y
 
-# PSRAM (8MB Octal SPI) - ESP32-S3R8 内置
+# PSRAM (2MB Quad SPI) - ESP32-S3R2 内置
 # 策略: >4KB 自动走 PSRAM, 保留 16KB 内部 SRAM 给 DMA/中断/栈
 # (ProtoStore 3KB 仍走内部 SRAM; NVS 缓冲区/BLE Mesh 配置走 PSRAM)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SIZE=8388608
+CONFIG_SPIRAM_SIZE=2097152
 CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_USE_AHB_DBUS3=y
-CONFIG_SPIRAM_XIP_FROM_DATA=y
+CONFIG_SPIRAM_MODE_QUAD=y
 # <4KB 走内部 SRAM (栈/小型 struct/Mutex 等), >=4KB 走 PSRAM
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 # 保留 16KB 内部 SRAM 不被 PSRAM 分配占用 (给 DMA 描述符/中断栈)
@@ -133,7 +131,7 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 # LWIP DHCP (Wi-Fi 用)
 CONFIG_LWIP_DHCPS=y
 
-# ---- BLE 与 BLE Mesh (ESP32-S3R8 内置) ----
+# ---- BLE 与 BLE Mesh (ESP32-S3R2 内置) ----
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=n
@@ -153,7 +151,9 @@ CONFIG_BLE_MESH_PROXY=y
 CONFIG_BLE_MESH_NODE=y
 CONFIG_BLE_MESH_LOW_POWER=n
 CONFIG_BLE_MESH_FRIEND=y
-# Generic OnOff/Level Server 模型默认编译, 仅需启用 Client 模型
+# Generic Server 模型 (代码注册了 OnOff Server, 必须启用)
+CONFIG_BLE_MESH_GENERIC_SERVER=y
+# Generic OnOff/Level Client 模型
 CONFIG_BLE_MESH_GENERIC_ONOFF_CLI=y
 CONFIG_BLE_MESH_GENERIC_LEVEL_CLI=y
 # 使用独立 NVS 分区 (partitions.csv 中的 "ble_mesh" 分区)

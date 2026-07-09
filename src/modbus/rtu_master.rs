@@ -18,7 +18,7 @@ use crate::modbus::shared::modbus_crc16;
 use crate::rs485::{Rs485Config, Rs485Port};
 
 /// 失败重试次数 (不含首次)
-const MAX_RETRY: u32 = 3;
+const MAX_RETRY: u32 = 0; // 无从站时不重试, 避免长时间阻塞
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("mb-rtu-master");
@@ -51,10 +51,10 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     let port_cfg = Rs485Config::from_rtu_master();
     let mut port = Rs485Port::open(&port_cfg)?;
 
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("mb-rtu-master".into())
         .spawn(move || {
-            crate::health::pin_current_to_core(crate::health::CORE_NET);
             loop {
                 // 心跳: 每轮询周期一次
                 TASK_HB.tick();
@@ -68,8 +68,9 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 }
                 std::thread::sleep(Duration::from_millis(cfg::POLL_INTERVAL_MS));
             }
-        })
-        .map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
 
     log::info!("[mb-rtu-master] started on uart{}", cfg::UART_PORT);
     Ok(())

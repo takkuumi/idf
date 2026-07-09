@@ -403,13 +403,61 @@ fn check(ret: c_int, ctx: &str) -> AppResult<()> {
 // 初始化各阶段
 // ============================================================================
 /// 1. 初始化 BT 控制器 (BLE only)
+///
+/// 使用 BT_CONTROLLER_INIT_CONFIG_DEFAULT() 宏的等价值填充所有字段。
+/// 之前用 Default::default() 导致 magic=0, controller_task_prio=0,
+/// esp_bt_controller_init 返回 ESP_ERR_INVALID_ARG (0x102)。
 pub fn init_ble_controller() -> AppResult<()> {
     let mode_classic = esp_idf_sys::esp_bt_mode_t_ESP_BT_MODE_CLASSIC_BT;
     let _ = unsafe { esp_idf_sys::esp_bt_controller_mem_release(mode_classic) };
 
     let mut bt_cfg = esp_idf_sys::esp_bt_controller_config_t {
-        controller_task_stack_size: 4096,
-        ..Default::default()
+        magic: esp_idf_sys::ESP_BT_CTRL_CONFIG_MAGIC_VAL,
+        version: esp_idf_sys::ESP_BT_CTRL_CONFIG_VERSION,
+        controller_task_stack_size: esp_idf_sys::ESP_TASK_BT_CONTROLLER_STACK as u16,
+        controller_task_prio: esp_idf_sys::ESP_TASK_BT_CONTROLLER_PRIO as u8,
+        controller_task_run_cpu: esp_idf_sys::CONFIG_BT_CTRL_PINNED_TO_CORE as u8,
+        bluetooth_mode: esp_idf_sys::CONFIG_BT_CTRL_MODE_EFF as u8,
+        ble_max_act: esp_idf_sys::CONFIG_BT_CTRL_BLE_MAX_ACT_EFF as u8,
+        sleep_mode: esp_idf_sys::CONFIG_BT_CTRL_SLEEP_MODE_EFF as u8,
+        sleep_clock: esp_idf_sys::CONFIG_BT_CTRL_SLEEP_CLOCK_EFF as u8,
+        ble_st_acl_tx_buf_nb: esp_idf_sys::CONFIG_BT_CTRL_BLE_STATIC_ACL_TX_BUF_NB as u8,
+        ble_hw_cca_check: esp_idf_sys::CONFIG_BT_CTRL_HW_CCA_EFF as u8,
+        ble_adv_dup_filt_max: esp_idf_sys::CONFIG_BT_CTRL_ADV_DUP_FILT_MAX as u16,
+        coex_param_en: false,
+        ce_len_type: esp_idf_sys::CONFIG_BT_CTRL_CE_LENGTH_TYPE_EFF as u8,
+        coex_use_hooks: false,
+        hci_tl_type: esp_idf_sys::CONFIG_BT_CTRL_HCI_TL_EFF as u8,
+        hci_tl_funcs: std::ptr::null_mut(),
+        txant_dft: esp_idf_sys::CONFIG_BT_CTRL_TX_ANTENNA_INDEX_EFF as u8,
+        rxant_dft: esp_idf_sys::CONFIG_BT_CTRL_RX_ANTENNA_INDEX_EFF as u8,
+        txpwr_dft: esp_idf_sys::CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_EFF as u8,
+        cfg_mask: esp_idf_sys::CFG_MASK,
+        scan_duplicate_mode: esp_idf_sys::SCAN_DUPLICATE_MODE as u8,
+        scan_duplicate_type: esp_idf_sys::SCAN_DUPLICATE_TYPE_VALUE as u8,
+        normal_adv_size: esp_idf_sys::NORMAL_SCAN_DUPLICATE_CACHE_SIZE as u16,
+        mesh_adv_size: esp_idf_sys::MESH_DUPLICATE_SCAN_CACHE_SIZE as u16,
+        coex_phy_coded_tx_rx_time_limit: esp_idf_sys::CONFIG_BT_CTRL_COEX_PHY_CODED_TX_RX_TLIM_EFF as u8,
+        hw_target_code: esp_idf_sys::BLE_HW_TARGET_CODE_CHIP_ECO0,
+        slave_ce_len_min: esp_idf_sys::SLAVE_CE_LEN_MIN_DEFAULT as u8,
+        hw_recorrect_en: esp_idf_sys::AGC_RECORRECT_EN as u8,
+        cca_thresh: esp_idf_sys::CONFIG_BT_CTRL_HW_CCA_VAL as u8,
+        scan_backoff_upperlimitmax: esp_idf_sys::BT_CTRL_SCAN_BACKOFF_UPPERLIMITMAX as u16,
+        dup_list_refresh_period: esp_idf_sys::DUPL_SCAN_CACHE_REFRESH_PERIOD as u16,
+        ble_50_feat_supp: esp_idf_sys::BT_CTRL_50_FEATURE_SUPPORT != 0,
+        ble_cca_mode: esp_idf_sys::BT_BLE_CCA_MODE as u8,
+        ble_data_lenth_zero_aux: esp_idf_sys::BT_BLE_ADV_DATA_LENGTH_ZERO_AUX as u8,
+        ble_chan_ass_en: esp_idf_sys::BT_CTRL_CHAN_ASS_EN as u8,
+        ble_ping_en: esp_idf_sys::BT_CTRL_LE_PING_EN as u8,
+        ble_llcp_disc_flag: esp_idf_sys::BT_CTRL_BLE_LLCP_DISC_FLAG as u8,
+        run_in_flash: esp_idf_sys::BT_CTRL_RUN_IN_FLASH_ONLY != 0,
+        dtm_en: esp_idf_sys::BT_CTRL_DTM_ENABLE != 0,
+        enc_en: esp_idf_sys::BLE_SECURITY_ENABLE != 0,
+        qa_test: esp_idf_sys::BT_CTRL_BLE_TEST != 0,
+        connect_en: esp_idf_sys::BT_CTRL_BLE_MASTER != 0,
+        scan_en: esp_idf_sys::BT_CTRL_BLE_SCAN != 0,
+        ble_aa_check: esp_idf_sys::BLE_CTRL_CHECK_CONNECT_IND_ACCESS_ADDRESS_ENABLED != 0,
+        adv_en: esp_idf_sys::BT_CTRL_BLE_ADV != 0,
     };
     check(
         unsafe { esp_idf_sys::esp_bt_controller_init(&mut bt_cfg) },
@@ -488,17 +536,17 @@ pub fn enable_proxy() -> AppResult<()> {
     Ok(())
 }
 
-/// 6. 启动配网广播 (Node + Provisioner 双角色)
+/// 6. 启动配网广播 (Node 角色)
+///
+/// 注意: 同一时间只能启用一种角色 (Node 或 Provisioner),
+/// 不能同时调用 node_prov_enable 和 provisioner_prov_enable。
+/// 当前固件角色为 Node (等待被配网)。
 pub fn start_advertising() -> AppResult<()> {
     check(
         unsafe { esp_ble_mesh_node_prov_enable(PROV_BEARER_ADV | PROV_BEARER_GATT) },
         "node_prov_enable",
     )?;
-    check(
-        unsafe { esp_ble_mesh_provisioner_prov_enable(PROV_BEARER_ADV | PROV_BEARER_GATT) },
-        "provisioner_prov_enable",
-    )?;
-    log::info!("[blemesh] provisioning advertising started");
+    log::info!("[blemesh] provisioning advertising started (node role)");
     Ok(())
 }
 
@@ -519,7 +567,7 @@ pub fn heartbeat_loop() -> AppResult<()> {
 
         // 使用 Server 模型 (SIG_MODELS[0]) 发布
         // esp_ble_mesh_model_publish: 5 参数 (model, opcode, length, data, role)
-        let server_model = models::SIG_MODELS.as_ptr() as *mut EspBleMeshModel;
+        let server_model = models::model_ptr(0);
         let ret = unsafe {
             esp_ble_mesh_model_publish(
                 server_model,

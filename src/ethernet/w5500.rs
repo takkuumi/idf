@@ -7,6 +7,15 @@
 //!   esp_eth_mac_new_w5500 → esp_eth_phy_new_w5500 → esp_eth_driver_install
 //! → esp_netif_new(ESP_NETIF_DEFAULT_ETH) + glue → esp_eth_start → IP 事件 watch → 心跳任务
 //!
+//! 引脚分配 (来源: LILYGO T-ETH-Lite-ESP32-S3 utilities.h):
+//!   MISO=GPIO11, MOSI=GPIO12, SCLK=GPIO10, CS=GPIO9, INT=GPIO13, RST=GPIO14
+//!   SPI host = SPI3_HOST (ESP-IDF v5.x: SPI3_HOST=2)
+//!
+//! W5500 SPI 帧格式 (VDM 模式):
+//!   [addr_hi, addr_lo, ctrl_byte, data...]
+//!   ctrl = (BSB<<3) | (RWB<<2) | OM
+//! ESP-IDF SPI 驱动通过 command_bits=16 (地址段) + address_bits=8 (控制段) 硬件处理帧格式
+//!
 //! 注意: 需在 sdkconfig.defaults 中启用 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
 use core::fmt::Write as _;
@@ -30,25 +39,45 @@ static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 10);
 
 /// 启动 W5500 以太网。
 ///
-/// SPI2_HOST 总线由本模块独占管理 (W5500 是 SPI 总线上唯一外设)。
+/// SPI3_HOST 总线由本模块独占管理 (W5500 是 SPI 总线上唯一外设)。
 /// ETH_RST 引脚复用 `hal.gpio.eth_reset()`，避免与 GPIO 模块重复初始化。
 pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let _ = sys_loop;
 
-    log::info!("[eth] initializing W5500 over SPI{}...", pins::ETH_SPI_HOST);
+    log::info!("[eth] initializing W5500 over SPI{} (MISO={},MOSI={},SCLK={},CS={},INT={},RST={})...",
+               pins::ETH_SPI_HOST, pins::ETH_SPI_MISO, pins::ETH_SPI_MOSI,
+               pins::ETH_SPI_SCLK, pins::ETH_SPI_CS, pins::ETH_INT, pins::ETH_RST);
 
-    // 1) 初始化 SPI 总线 (W5500 独占 SPI2_HOST)
-    let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
-    let bus_cfg = spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
-    let dma_chan = 1; // ESP32-S3 SPI DMA
-    check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
+    // 0) 安装 GPIO ISR 服务 (W5500 驱动内部调用 gpio_isr_handler_add 注册 INT 引脚中断)
+    //    必须在 esp_eth_driver_install 之前调用, 否则 W5500 复位会超时
+    //    若已安装返回 ESP_ERR_INVALID_STATE (0x103), 忽略即可
+    let isr_ret = unsafe { esp_idf_sys::gpio_install_isr_service(0) };
+    if isr_ret != esp_idf_sys::ESP_OK && isr_ret != esp_idf_sys::ESP_ERR_INVALID_STATE {
+        return Err(AppError::Ethernet(format!(
+            "gpio_install_isr_service failed: esp_err=0x{:08X}", isr_ret
+        )));
+    }
+    log::debug!("[eth] GPIO ISR service ready (ret={})", isr_ret);
 
-    // 2) W5500 SPI 设备配置 (ESP-IDF v5.5.4: MAC 驱动内部调用 spi_bus_add_device, 无需手动添加)
-    let dev_cfg = spi_device_config_default(pins::ETH_SPI_CS);
-
-    // 3) 硬件复位 W5500 (复用 Hal.gpio 的 ETH_RST 引脚, 避免重复 gpio_config)
+    // 1) 硬件复位 W5500 (复用 Hal.gpio 的 ETH_RST 引脚, 避免重复 gpio_config)
+    //    序列: HIGH(250ms) → LOW(50ms) → HIGH(350ms), 来自参考固件 ETHClass.cpp
     log::info!("[eth] resetting W5500 via GPIO{}...", pins::ETH_RST);
     hal.gpio.eth_reset();
+
+    // 2) 初始化 SPI 总线 (W5500 独占 SPI3_HOST)
+    //    DMA: SPI_DMA_CH_AUTO (ESP-IDF 自动分配 DMA 通道)
+    let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
+    let bus_cfg = spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
+    let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_CH_AUTO;
+    check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
+    log::info!("[eth] SPI bus initialized (host={}, DMA=auto)", spi_host);
+
+    // 3) W5500 SPI 设备配置
+    //    ESP-IDF v5.5.4: MAC 驱动内部调用 spi_bus_add_device, 无需手动添加
+    //    command_bits=16: W5500 SPI 帧的地址段 (2 字节)
+    //    address_bits=8:  W5500 SPI 帧的控制段 (1 字节)
+    //    这样 ESP-IDF SPI 驱动硬件处理 W5500 帧格式, MAC 驱动只需发送数据
+    let dev_cfg = spi_device_config_default(pins::ETH_SPI_CS);
 
     // 4) 创建 W5500 MAC
     let mac_cfg = eth_mac_config_default();
@@ -59,6 +88,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     }
 
     // 5) 创建 PHY
+    //    reset_gpio_num=-1: RST 由 hal.gpio.eth_reset() 手动管理, 不让 PHY 驱动重复控制
     let phy_cfg = eth_phy_config_default();
     let phy = unsafe { esp_idf_sys::esp_eth_phy_new_w5500(&phy_cfg) };
     if phy.is_null() {
@@ -70,6 +100,30 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let mut eth_handle: esp_idf_sys::esp_eth_handle_t = std::ptr::null_mut();
     check(unsafe { esp_idf_sys::esp_eth_driver_install(&eth_cfg, &mut eth_handle as *mut _) },
           "esp_eth_driver_install")?;
+
+    // 6.5) 设置 MAC 地址 (W5500 无预置 MAC, 需从 ESP32 eFuse 读取后写入)
+    {
+        let mac = crate::bus::lock_timeout()
+            .map(|b| b.cfg.eth_mac);
+        let mac_bytes = mac.unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        if mac_bytes != [0u8; 6] && mac_bytes != [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] {
+            log::info!(
+                "[eth] setting MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac_bytes[0], mac_bytes[1], mac_bytes[2],
+                mac_bytes[3], mac_bytes[4], mac_bytes[5]
+            );
+        }
+        check(
+            unsafe {
+                esp_idf_sys::esp_eth_ioctl(
+                    eth_handle,
+                    esp_idf_sys::esp_eth_io_cmd_t_ETH_CMD_S_MAC_ADDR,
+                    mac_bytes.as_ptr() as *mut _,
+                )
+            },
+            "esp_eth_ioctl(S_MAC_ADDR)",
+        )?;
+    }
 
     // 7) 默认 eth netif + attach glue
     // ESP-IDF v5.5.4: esp_netif_create_default_eth_mac 已移除,
@@ -85,6 +139,9 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     }
     let glue = unsafe { esp_idf_sys::esp_eth_new_netif_glue(eth_handle) };
     check(unsafe { esp_idf_sys::esp_netif_attach(netif, glue as *mut c_void) }, "esp_netif_attach")?;
+
+    // 7.5) 配置网络: 读取 SystemConfig, 禁用 DHCP → 设置静态 IP
+    apply_netif_config(netif)?;
 
     // 8) 启动
     check(unsafe { esp_idf_sys::esp_eth_start(eth_handle) }, "esp_eth_start")?;
@@ -127,14 +184,18 @@ fn spi_bus_config_default(mosi: u8, miso: u8, sclk: u8) -> esp_idf_sys::spi_bus_
 
 fn spi_device_config_default(cs: u8) -> esp_idf_sys::spi_device_interface_config_t {
     esp_idf_sys::spi_device_interface_config_t {
-        // W5500 SPI 帧: 地址段(2B) + 控制段(1B, 可选) + 数据段
-        // ESP-IDF W5500 驱动内部用 spi_device_polling_transmit 处理帧格式
-        command_bits: 0, address_bits: 0, dummy_bits: 0,
+        // W5500 SPI 帧: 地址段(2B) + 控制段(1B) + 数据段
+        // command_bits=16: SPI 硬件处理地址段 (2 字节)
+        // address_bits=8:  SPI 硬件处理控制段 (1 字节)
+        // MAC 驱动只需发送数据段, 帧格式由 SPI 硬件自动组装
+        command_bits: 16,
+        address_bits: 8,
+        dummy_bits: 0,
         mode: 0,
         clock_source: esp_idf_sys::soc_periph_spi_clk_src_t_SPI_CLK_SRC_DEFAULT,
         duty_cycle_pos: 0,
         cs_ena_pretrans: 0, cs_ena_posttrans: 0,  // SPI mode 0
-        clock_speed_hz: 20_000_000,  // 20MHz (W5500 最高 80MHz, 用 20MHz 保证稳定性)
+        clock_speed_hz: 40_000_000,  // 40MHz (W5500 最高 80MHz, 40MHz 兼顾速度与稳定性)
         input_delay_ns: 0,
         sample_point: 0,
         spics_io_num: cs as i32,
@@ -171,7 +232,8 @@ fn eth_w5500_config_default(spi_host: esp_idf_sys::spi_host_device_t,
 
 fn eth_phy_config_default() -> esp_idf_sys::eth_phy_config_t {
     esp_idf_sys::eth_phy_config_t {
-        // W5500 PHY 地址固定为 0 (内部 PHY), -1 表示自动探测
+        // W5500 PHY 地址固定为 0 (内部 PHY)
+        // reset_gpio_num=-1: RST 由 hal.gpio.eth_reset() 手动管理
         phy_addr: 0, reset_timeout_ms: 100, autonego_timeout_ms: 4000, reset_gpio_num: -1,
         hw_reset_assert_time_us: 0, post_hw_reset_delay_ms: 0,
     }
@@ -228,10 +290,10 @@ fn fmt_ip(addr: &u32) -> heapless::String<15> {
 // ---- 心跳任务：每 5s 检测网关连通性；连续失败 >= 3 次触发 esp_restart ----
 fn spawn_heartbeat() -> AppResult<()> {
     health::register(&ETH_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("eth-heartbeat".into())
         .spawn(move || {
-            crate::health::pin_current_to_core(crate::health::CORE_NET);
             let mut fail_count: u32 = 0;
             let period = std::time::Duration::from_secs(HEARTBEAT_PERIOD_S);
             loop {
@@ -252,8 +314,9 @@ fn spawn_heartbeat() -> AppResult<()> {
                 }
                 std::thread::sleep(period);
             }
-        })
-        .map_err(|e| AppError::Ethernet(format!("spawn heartbeat: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Ethernet(format!("spawn heartbeat: {e}")))?;
     log::info!("[eth] heartbeat task started, period={}s", HEARTBEAT_PERIOD_S);
     Ok(())
 }
@@ -261,6 +324,76 @@ fn spawn_heartbeat() -> AppResult<()> {
 fn heartbeat_once() -> bool {
     // TODO: 实现真正的心跳检测
     true
+}
+
+/// 从 SystemConfig 读取网络配置并应用到 netif
+///
+/// - dhcp=false → 停止 DHCP client, 设置静态 IP/掩码/网关/DNS
+/// - dhcp=true  → 保持 DHCP 客户端 (默认行为)
+fn apply_netif_config(netif: *mut esp_idf_sys::esp_netif_obj) -> AppResult<()> {
+    // 读取 SystemConfig
+    let cfg = crate::bus::lock_timeout()
+        .map(|b| b.cfg.clone())
+        .unwrap_or_else(|| {
+            log::warn!("[eth] bus lock failed, using built-in defaults");
+            let mut c = crate::device::SystemConfig::defaults();
+            c.dhcp = false;
+            c
+        });
+
+    log::info!(
+        "[eth] network config: dhcp={} ip={} mask={} gw={} dns={}",
+        cfg.dhcp,
+        cfg.ip_str(),
+        cfg.mask_str(),
+        cfg.gw_str(),
+        cfg.dns_str(),
+    );
+
+    if cfg.dhcp {
+        log::info!("[eth] DHCP mode, waiting for lease...");
+        return Ok(());
+    }
+
+    // 静态 IP 模式: 停止 DHCP client
+    unsafe { esp_idf_sys::esp_netif_dhcpc_stop(netif) };
+
+    // 构造 esp_netif_ip_info_t
+    fn to_ip4(b: [u8; 4]) -> esp_idf_sys::esp_ip4_addr_t {
+        esp_idf_sys::esp_ip4_addr_t {
+            addr: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    }
+    let ip_info = esp_idf_sys::esp_netif_ip_info_t {
+        ip: to_ip4(cfg.ip),
+        netmask: to_ip4(cfg.mask),
+        gw: to_ip4(cfg.gateway),
+    };
+    check(
+        unsafe { esp_idf_sys::esp_netif_set_ip_info(netif, &ip_info) },
+        "esp_netif_set_ip_info",
+    )?;
+
+    // 设置 DNS
+    let mut dns_main: esp_idf_sys::esp_netif_dns_info_t = Default::default();
+    dns_main.ip.u_addr.ip4 = to_ip4(cfg.dns);
+    unsafe {
+        esp_idf_sys::esp_netif_set_dns_info(
+            netif,
+            esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+            &mut dns_main as *mut _,
+        );
+    }
+
+    log::info!(
+        "[eth] static IP configured: {} / {} gw {} dns {}",
+        cfg.ip_str(),
+        cfg.mask_str(),
+        cfg.gw_str(),
+        cfg.dns_str(),
+    );
+
+    Ok(())
 }
 
 fn check(ret: esp_idf_sys::esp_err_t, ctx: &str) -> AppResult<()> {

@@ -3,12 +3,12 @@
 //! 所有引脚分配、外设编号、采样周期统一在此处定义，
 //! 便于硬件改版时一次修改、全局生效。
 //!
-//! 硬件平台：ESP32-S3R8 (Xtensa LX7 双核 240MHz, 512KB SRAM, 8MB Octal PSRAM)
+//! 硬件平台：ESP32-S3R2 (Xtensa LX7 双核 240MHz, 512KB SRAM, 2MB Quad PSRAM)
 //!   - 内置 Wi-Fi 802.11 b/g/n + BLE 5.0 + Bluetooth Mesh
 //!   - 3 个 UART (UART0/1/2), 4 个 SPI (SPI0/1 Flash/PSRAM, SPI2/3 外设)
 //!   - 2 个 ADC (ADC1: 10 通道, ADC2: 10 通道, 12-bit)
 //!   - 8 通道 LEDC PWM
-//!   - 45 个 GPIO (GPIO0~GPIO48), GPIO26~32 被 Octal SPI Flash/PSRAM 占用
+//!   - 45 个 GPIO (GPIO0~GPIO48), GPIO26~31 被 Quad SPI Flash/PSRAM 占用
 //!
 //! 实际硬件改版只需修改本文件。
 
@@ -22,48 +22,79 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAIN_LOOP_PERIOD_MS: u64 = 100;
 
 // ----------------------------------------------------------------------------
-// GPIO 引脚分配 (ESP32-S3R8)
+// GPIO 引脚分配 (ESP32-S3R2)
 // ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)
-// GPIO26~32: 被 Octal SPI Flash/PSRAM 占用 (8MB PSRAM), 不可用
+// GPIO26~31: 被 Quad SPI Flash/PSRAM 占用 (2MB PSRAM), 不可用
 // GPIO0:    strapping (boot mode, 需外部上拉)
 // GPIO3:    strapping (JTAG source)
 // GPIO45/46: strapping (VDD_SPI / system freq)
 // GPIO43/44: UART0 默认 TX/RX (下载/日志)
+//
+// 引脚分配来源: LILYGO T-ETH-Lite-ESP32-S3 原理图 + 参考固件 utilities.h
 // ----------------------------------------------------------------------------
 pub mod pins {
-    // ---- 以太网 W5500 (SPI2_HOST) ----
+    // ---- 以太网 W5500 (SPI3_HOST) ----
     // W5500: 硬件 TCP/IP 以太网控制器, SPI 接口, 内置 32KB 缓冲, 8 socket
     // SPI mode 0, 最高 80MHz (实际用 20MHz 保证稳定性)
-    pub const ETH_SPI_HOST: u8 = 2; // SPI2_HOST (ESP32-S3 有 SPI2/3 可用于外设)
-    pub const ETH_SPI_MOSI: u8 = 11;
-    pub const ETH_SPI_MISO: u8 = 13;
-    pub const ETH_SPI_SCLK: u8 = 12;
-    pub const ETH_SPI_CS: u8 = 10;
-    pub const ETH_INT: u8 = 14;  // W5500 INT 引脚, 低有效
-    pub const ETH_RST: u8 = 15;  // W5500 RST 引脚, 低有效
+    // 引脚来自 LILYGO T-ETH-Lite-ESP32-S3 utilities.h (LILYGO_T_ETH_LITE_ESP32S3)
+    pub const ETH_SPI_HOST: u8 = 2; // SPI3_HOST (ESP-IDF v5.x: SPI2_HOST=1, SPI3_HOST=2)
+    pub const ETH_SPI_MISO: u8 = 11;
+    pub const ETH_SPI_MOSI: u8 = 12;
+    pub const ETH_SPI_SCLK: u8 = 10;
+    pub const ETH_SPI_CS: u8 = 9;
+    pub const ETH_INT: u8 = 13;  // W5500 INT 引脚, 低有效
+    pub const ETH_RST: u8 = 14;  // W5500 RST 引脚, 低有效
 
-    // ---- RS485 #0 (用作 Modbus RTU Master, UART1) ----
-    // UART1 映射到高位 GPIO, 避开 ADC1 引脚 (GPIO1-6 对应 ADC1_CH0-5)
+    // ---- RS485 #0 (Modbus RTU, UART1) ----
+    // 引脚来自参考固件 MCA_F16V2_1_F48_BLE.ino: rs485_1.begin(baud, cfg, 46, 45)
+    // Arduino begin 参数顺序: (baud, config, RX, TX) → RX=46, TX=45
     pub const RS485_0_UART: u8 = 1; // UART1
-    pub const RS485_0_TX: u8 = 40;
-    pub const RS485_0_RX: u8 = 41;
-    pub const RS485_0_DE: u8 = 42; // DE/RE 共控 (高=发送, 低=接收)
+    pub const RS485_0_TX: u8 = 45;
+    pub const RS485_0_RX: u8 = 46;
+    pub const RS485_0_DE: u8 = 7;  // DE/RE 共控 (高=发送, 低=接收)
 
-    // ---- RS485 #1 (用作 Modbus RTU Slave, UART2) ----
-    // ESP32-S3 有 3 个 UART: UART0(下载/日志) + UART1(主站) + UART2(从站)
-    // 不再需要与下载串口复用, 稳定性更好
+    // ---- RS485 #1 (Modbus RTU, UART2) ----
+    // 引脚来自参考固件: rs485_2.begin(baud, cfg, 41, 42) → RX=41, TX=42
     pub const RS485_1_UART: u8 = 2; // UART2
-    pub const RS485_1_TX: u8 = 17;
-    pub const RS485_1_RX: u8 = 18;
-    pub const RS485_1_DE: u8 = 7;
+    pub const RS485_1_TX: u8 = 42;
+    pub const RS485_1_RX: u8 = 41;
+    pub const RS485_1_DE: u8 = 8;
 
-    // ---- 数字输入 DI (8 路, 光耦隔离) ----
-    // 使用 GPIO19-21 + GPIO33-37, 避开 Flash/PSRAM 和 strapping 引脚
-    pub const DI_PINS: [u8; 8] = [19, 20, 21, 33, 34, 35, 36, 37];
+    // ---- 电源使能引脚 (开机时需拉高) ----
+    // GPIO21: 灯板电源使能 (HIGH=上电)
+    // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
+    pub const POWER_LED_EN: u8 = 21;
+    pub const POWER_RELAY_EN: u8 = 33;
 
-    // ---- 数字输出 DO (8 路, OC 输出) ----
-    // 使用 GPIO8/9/16/38/39/45/46/48, 避开 ADC1 和 SPI 引脚
-    pub const DO_PINS: [u8; 8] = [8, 9, 16, 38, 39, 45, 46, 48];
+    // ---- RS485 地址码输入 (拨码开关, 启动时读取) ----
+    // 参考固件: RS485_AD0=digitalRead(19), AD1=20, AD2=48, AD3=47, ESP_STOP=34
+    pub const RS485_ADDR_PINS: [u8; 4] = [19, 20, 48, 47];
+    pub const ESP_STOP_PIN: u8 = 34;
+
+    // ---- NCA9555 (PCA9555) IO 扩展芯片 (软件 I2C) ----
+    // 参考固件 nca9555.h: DI/DO 全部通过 PCA9555 扩展, 不使用 ESP32 GPIO 直驱
+    // IIC_SCL=36, IIC_SDA=35, IIC_LED_SCL=37, IIC_LED_SDA=38, INT=34
+    pub const NCA9555_IIC_SCL: u8 = 36;
+    pub const NCA9555_IIC_SDA: u8 = 35;
+    pub const NCA9555_LED_SCL: u8 = 37;
+    pub const NCA9555_LED_SDA: u8 = 38;
+    pub const NCA9555_INT: u8 = 34;  // 与 ESP_STOP_PIN 共用 GPIO34
+
+    // ---- 光纤检测输入 ----
+    // 参考固件: FIB1=digitalRead(39), FIB2=digitalRead(40)
+    pub const FIB1_PIN: u8 = 39;
+    pub const FIB2_PIN: u8 = 40;
+
+    // ---- 数字输入 DI (8 路) ----
+    // TODO: 实际硬件 DI 通过 PCA9555 (NCA9555) I2C 扩展, 不使用 ESP32 GPIO 直驱
+    // 当前为占位, 避免与 W5500/RS485/电源/NCA9555 引脚冲突
+    // 可用空闲 GPIO: 7(DE0), 8(DE1), 15, 16, 17, 18 (仅 6 个, 不足 8DI)
+    pub const DI_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
+
+    // ---- 数字输出 DO (8 路) ----
+    // TODO: 实际硬件 DO 通过 PCA9555 (NCA9555) I2C 扩展
+    // 当前为占位, 实际不可用 (ESP32-S3 上无足够空闲 GPIO 给 8DO)
+    pub const DO_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
 
     // ---- AI 模拟输入 (ADC1, 6 通道, 12-bit SAR ADC) ----
     // ADC1_CH0-5 = GPIO1-6, 不与 UART1/UART2 冲突
@@ -71,12 +102,12 @@ pub mod pins {
     pub const AI_CHANNELS: [u8; 6] = [0, 1, 2, 3, 4, 5];
 
     // ---- AO 模拟输出 (LEDC PWM, 4 通道) ----
-    // 与 DO 部分复用 (硬件设计上互斥, 同一引脚不可同时使用)
+    // 使用空闲 GPIO: 15, 16, 17, 18 (不与 W5500/RS485/NCA9555 冲突)
     pub const AO_CHANNELS: [(u8, u8); 4] = [
-        (0, 8),  // (ledc_channel, gpio)
-        (1, 9),
-        (2, 16),
-        (3, 38),
+        (0, 15),  // (ledc_channel, gpio)
+        (1, 16),
+        (2, 17),
+        (3, 18),
     ];
     pub const AO_FREQ_HZ: u32 = 5000; // PWM 频率，0-10V 模拟输出经 RC 滤波
     pub const AO_RESOLUTION_BITS: u8 = 12; // 12-bit 与 ADC 对齐
@@ -104,7 +135,7 @@ pub mod hw_version {
     #[cfg(feature_f4)]
     pub const NAME: &str = "F4";
     #[cfg(not(any(feature_f3, feature_f4)))]
-    pub const NAME: &str = "Default";
+    pub const NAME: &str = "F16";
 
     /// DI 通道数
     #[cfg(feature_f3)]
@@ -112,7 +143,7 @@ pub mod hw_version {
     #[cfg(feature_f4)]
     pub const DI_COUNT: usize = 48;
     #[cfg(not(any(feature_f3, feature_f4)))]
-    pub const DI_COUNT: usize = 8;
+    pub const DI_COUNT: usize = 16;
 
     /// DO 通道数
     #[cfg(feature_f3)]
@@ -120,7 +151,7 @@ pub mod hw_version {
     #[cfg(feature_f4)]
     pub const DO_COUNT: usize = 16;
     #[cfg(not(any(feature_f3, feature_f4)))]
-    pub const DO_COUNT: usize = 8;
+    pub const DO_COUNT: usize = 16;
 
     /// 是否使用 I2C IO 扩展 (F3/F4)
     #[cfg(any(feature_f3, feature_f4))]
@@ -203,8 +234,8 @@ pub mod modbus {
         pub const PARITY: char = 'N';
         pub const STOP_BITS: u8 = 1;
         pub const DATA_BITS: u8 = 8;
-        pub const POLL_INTERVAL_MS: u64 = 200;
-        pub const TIMEOUT_MS: u64 = 500;
+        pub const POLL_INTERVAL_MS: u64 = 1000; // 无实际从站时降低轮询频率
+        pub const TIMEOUT_MS: u64 = 100;  // 缩短超时减少等待
     }
 
     /// RTU 从站参数

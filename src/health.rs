@@ -200,32 +200,46 @@ pub fn unsubscribe_wdt() {
 // 任务核间绑定 (ESP32-S3 双核优化)
 // ----------------------------------------------------------------------------
 //
-// ESP32-S3 双核: Core 0 (网络/BLE/协议栈) + Core 1 (实时采集/计算)
-// 默认 Rust `std::thread::spawn` 不绑定核, 任务在核间漂移导致 cache miss 抖动。
-// 在任务函数开头调用 `pin_current_to_core(N)` 可固定到指定核, 减少抖动。
+// ESP32-S3 双核: Core 0 (网络/BLE/协议栈) + Core 1 (实时采集/IO)
+// Rust std::thread::spawn 通过 pthread_create 创建线程。
 //
-// 核分配策略 (按工业实时性 + 协议栈特性):
-//   - Core 0: 网络/协议栈 (eth/mb-tcp/mb-rtu-master/ble-at/proto-store/main_loop)
-//     (LwIP/Bluedroid/FreeRTOS 系统任务默认在 Core 0, 减少 IPC)
-//   - Core 1: 实时采集 (io-di-scan/io-do-output/ai-sample/ao-output)
-//     (避开网络/协议栈抖动, DI 1ms 周期更稳定)
+// 方案: 在 spawn 之前调用 `set_next_thread_core(N)` 配置下一次
+// pthread_create 的目标核心。ESP-IDF 的 esp_pthread_set_cfg 影响
+// 随后创建的线程（非当前线程）。
+//
+// 核分配策略:
+//   Core 0 — 网络/协议栈 (LwIP/W5500/mb-tcp/mb-rtu/ble-mesh/main-loop)
+//   Core 1 — 实时 IO (di-scan/do-output/ai-sample/ao-output)
 
-/// 把当前任务绑定到指定核 (ESP32-S3: 0 或 1)
+/// 设置**下一次** `std::thread::spawn` 创建线程的目标核心。
 ///
-/// 在任务函数开头调用一次即可。基于 ESP-IDF FreeRTOS v10.5+ 的
-/// `vTaskCoreAffinitySet` API (SMP 版本)。
-///
-/// 注意: 必须在任务上下文内调用 (会获取当前 task handle)。
-/// 如果 binding 不可用 (esp_idf_sys < 0.34), 编译会报错, 移除调用即可。
+/// 调用后立即 spawn 的线程会被固定到指定核心。
+/// 注意: 这是全局状态, 影响所有后续线程创建, 直到再次调用。
+/// 建议在 spawn 前调用, spawn 后恢复为默认值 (tskNO_AFFINITY = -1)。
 #[inline]
-pub fn pin_current_to_core(core: u32) {
-    // ESP-IDF FreeRTOS SMP: mask bit0=core0, bit1=core1, 0x3=both
-    // vTaskCoreAffinitySet not available in this esp_idf_sys version;
-    // tasks are pinned via xTaskCreatePinnedToCore at creation time.
-    let _ = core;
+pub fn set_next_thread_core(core: u32) {
+    let mut cfg = unsafe { esp_idf_sys::esp_pthread_get_default_config() };
+    cfg.pin_to_core = core as i32;
+    cfg.inherit_cfg = false; // 不让子线程继承此配置
+    unsafe { esp_idf_sys::esp_pthread_set_cfg(&cfg) };
 }
 
-/// Core 0 (网络/协议栈核)
+/// 恢复线程创建到默认行为 (不绑定核心)
+#[inline]
+pub fn reset_thread_core() {
+    let mut cfg = unsafe { esp_idf_sys::esp_pthread_get_default_config() };
+    cfg.pin_to_core = -1; // tskNO_AFFINITY
+    cfg.inherit_cfg = false;
+    unsafe { esp_idf_sys::esp_pthread_set_cfg(&cfg) };
+}
+
+/// Core 0 — 网络/协议栈
 pub const CORE_NET: u32 = 0;
-/// Core 1 (实时采集/计算核)
+/// Core 1 — 实时采集
 pub const CORE_RT: u32 = 1;
+
+/// 已废弃: ESP-IDF 不支持在任务内动态修改核心绑定。
+/// 请改用 `set_next_thread_core()` 在 spawn 之前调用。
+#[deprecated(since = "0.2.0", note = "use set_next_thread_core() before thread::spawn instead")]
+#[inline]
+pub fn pin_current_to_core(_core: u32) {}

@@ -29,14 +29,16 @@ pub fn start(_hal: Arc<Hal>, _nvs: esp_idf_svc::nvs::EspDefaultNvsPartition) -> 
     bindings::start_advertising()?;
 
     // 启动心跳任务
-    std::thread::Builder::new()
+    crate::health::set_next_thread_core(crate::health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("mesh-heartbeat".into())
         .spawn(|| {
             if let Err(e) = bindings::heartbeat_loop() {
                 log::error!("[blemesh] heartbeat task error: {e}");
             }
-        })
-        .map_err(|e| crate::error::AppError::BleMesh(format!("spawn heartbeat: {e}")))?;
+        });
+    crate::health::reset_thread_core();
+    result.map_err(|e| crate::error::AppError::BleMesh(format!("spawn heartbeat: {e}")))?;
 
     log::info!("[blemesh] started (Proxy+Node, OnOff models)");
     Ok(())

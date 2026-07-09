@@ -64,7 +64,10 @@ impl ModbusBackend for BusBackend {
 
     fn write_single_coil(&self, addr: u16, value: bool) -> bool {
         if let Some(mut b) = bus::lock_timeout() {
-            b.write_coil(addr, value)
+            let ok = b.write_coil(addr, value);
+            #[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+            if ok { crate::io::do_::notify(); }
+            ok
         } else {
             false
         }
@@ -80,12 +83,15 @@ impl ModbusBackend for BusBackend {
 
     fn write_multiple_coils(&self, addr: u16, values: &[bool]) -> bool {
         if let Some(mut b) = bus::lock_timeout() {
+            let mut ok = true;
             for (i, &v) in values.iter().enumerate() {
                 if !b.write_coil(addr + i as u16, v) {
-                    return false;
+                    ok = false;
                 }
             }
-            true
+            #[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+            if ok { crate::io::do_::notify(); }
+            ok
         } else {
             false
         }

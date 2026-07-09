@@ -30,6 +30,10 @@ fn main() {
     if std::env::var("CARGO_FEATURE_WIFI").is_ok() {
         println!("cargo:rustc-cfg=feature_wifi");
     }
+    // GPIO 直驱 DI/DO (默认版本). 实际硬件 DI/DO 走 PCA9555, 需禁用此 feature
+    if std::env::var("CARGO_FEATURE_IO_DI_DO").is_ok() {
+        println!("cargo:rustc-cfg=feature_io_di_do");
+    }
     // 硬件版本 F3/F4 (I2C MCP23017 扩展)
     if std::env::var("CARGO_FEATURE_F3").is_ok() {
         println!("cargo:rustc-cfg=feature_f3");

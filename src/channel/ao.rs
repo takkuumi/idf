@@ -32,10 +32,10 @@ static TASK_HB: TaskHb = TaskHb::new("ao-output");
 /// TODO: 假设 `hal.ledc.set_duty(idx: usize, duty: u32) -> ()`，由 hal/ledc 模块实现后接入。
 pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_RT);
+    let result = std::thread::Builder::new()
         .name("ao-output".into())
         .spawn(move || {
-            health::pin_current_to_core(health::CORE_RT);
             log::info!("[ao] output task started, period={}ms", OUTPUT_PERIOD_MS);
 
             // 上一次输出的 duty，初值全 1 使首次必然全量刷新
@@ -73,8 +73,9 @@ pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
 
                 std::thread::sleep(Duration::from_millis(OUTPUT_PERIOD_MS));
             }
-        })
-        .map_err(|e| AppError::Channel(format!("spawn ao-output: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Channel(format!("spawn ao-output: {e}")))?;
 
     Ok(())
 }

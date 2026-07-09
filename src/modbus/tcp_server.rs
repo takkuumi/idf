@@ -25,10 +25,10 @@ pub fn start() -> AppResult<()> {
     let listener = TcpListener::bind(("0.0.0.0", cfg::PORT))
         .map_err(|e| AppError::Modbus(format!("bind {}: {}", cfg::PORT, e)))?;
 
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("mb-tcp-listen".into())
         .spawn(move || {
-            crate::health::pin_current_to_core(crate::health::CORE_NET);
             log::info!("[mb-tcp] listening on :{}", cfg::PORT);
             for stream in listener.incoming() {
                 // 心跳: 每次 accept 返回 (有连接或错误)
@@ -44,22 +44,24 @@ pub fn start() -> AppResult<()> {
                         CONN_COUNT.fetch_add(1, Ordering::SeqCst);
 
                         let id = CONN_COUNT.load(Ordering::SeqCst);
+                        health::set_next_thread_core(health::CORE_NET);
                         std::thread::Builder::new()
                             .name(format!("mb-tcp-conn-{id}"))
                             .spawn(move || {
-                                crate::health::pin_current_to_core(crate::health::CORE_NET);
                                 if let Err(e) = handle_conn(s) {
                                     log::debug!("[mb-tcp-conn-{id}] closed: {}", e);
                                 }
                                 CONN_COUNT.fetch_sub(1, Ordering::SeqCst);
                             })
                             .ok();
+                        health::reset_thread_core();
                     }
                     Err(e) => log::warn!("[mb-tcp] accept: {}", e),
                 }
             }
-        })
-        .map_err(|e| AppError::Modbus(format!("spawn: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Modbus(format!("spawn: {e}")))?;
 
     Ok(())
 }

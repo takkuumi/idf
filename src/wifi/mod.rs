@@ -1,6 +1,6 @@
 //! Wi-Fi 模块 (ESP32-S3 内置, 作为以太网冗余或 AP 配置入口)
 //!
-//! ESP32-S3R8 内置 Wi-Fi 802.11 b/g/n, 与 BLE 共用 2.4GHz 射频 (硬件分时复用)。
+//! ESP32-S3R2 内置 Wi-Fi 802.11 b/g/n, 与 BLE 共用 2.4GHz 射频 (硬件分时复用)。
 //! 本模块作为**以太网冗余链路**或**AP 配置入口**:
 //!
 //! - **Station 模式** (默认): 连接到上游 AP, 作为以太网故障时的备份链路
@@ -102,10 +102,10 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 /// 不触发系统复位 (与 eth 不同, Wi-Fi 作为备份链路, 失败可接受)。
 fn spawn_heartbeat() -> AppResult<()> {
     health::register(&WIFI_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("wifi-heartbeat".into())
         .spawn(move || {
-            crate::health::pin_current_to_core(crate::health::CORE_NET);
             let period = std::time::Duration::from_secs(cfg::HEARTBEAT_PERIOD_S);
             loop {
                 WIFI_HB.tick();
@@ -113,8 +113,9 @@ fn spawn_heartbeat() -> AppResult<()> {
                 // 当前仅周期上报心跳, 实际链路检测待实现
                 std::thread::sleep(period);
             }
-        })
-        .map_err(|e| AppError::Sys(format!("spawn wifi-heartbeat: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Sys(format!("spawn wifi-heartbeat: {e}")))?;
     log::info!("[wifi] heartbeat task started, period={}s", cfg::HEARTBEAT_PERIOD_S);
     Ok(())
 }

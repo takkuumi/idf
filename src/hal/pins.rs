@@ -5,7 +5,7 @@
 //!
 //! # ESP32-S3 说明
 //!
-//! ESP32-S3 有 45 个 GPIO (GPIO0~GPIO48), GPIO26~32 被 Octal SPI Flash/PSRAM 占用。
+//! ESP32-S3 有 45 个 GPIO (GPIO0~GPIO48), GPIO26~31 被 Quad SPI Flash/PSRAM 占用。
 //! 本模块不依赖 `Pins` 的具体字段，而是直接使用 GPIO 编号 (u8)。
 //! 各子模块通过 `esp_idf_hal::gpio::AnyInputPin::new(num)` /
 //! `AnyOutputPin::new(num)` 等 unsafe 构造器创建类型擦除引脚。
@@ -69,10 +69,10 @@ pub struct HalPins {
     /// RS485 #0 / #1 的 DE 引脚
     pub rs485_de: [u8; 2],
 
-    // ---- DI / DO 引脚号 (仅默认版本, F3/F4 用 I2C MCP23017 扩展) ----
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    // ---- DI / DO 引脚号 (仅 io-di-do 版本, F3/F4 用 I2C 扩展) ----
+    #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
     pub di: [u8; 8],
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
     pub do_: [u8; 8],
 }
 
@@ -110,9 +110,9 @@ impl HalPins {
             },
             ledc_channels: cfg::AO_CHANNELS,
 
-            #[cfg(not(any(feature_f3, feature_f4)))]
+            #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
             di: cfg::DI_PINS,
-            #[cfg(not(any(feature_f3, feature_f4)))]
+            #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
             do_: cfg::DO_PINS,
             eth_int: cfg::ETH_INT,
             eth_rst: cfg::ETH_RST,

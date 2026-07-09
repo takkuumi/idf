@@ -161,11 +161,13 @@ pub fn init() -> AppResult<()> {
 
     // 4. 启动监听线程
     health::register(&WATCH_HB);
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("device-store".into())
         .stack_size(6144)
-        .spawn(watch_loop)
-        .map_err(|e| AppError::Config(format!("spawn device-store: {e}")))?;
+        .spawn(watch_loop);
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Config(format!("spawn device-store: {e}")))?;
 
     Ok(())
 }
@@ -230,7 +232,6 @@ pub fn save_mesh_keys(net_idx: u16, app_idx: u16) -> AppResult<()> {
 // ----------------------------------------------------------------------------
 
 fn watch_loop() {
-    crate::health::pin_current_to_core(crate::health::CORE_NET);
     loop {
         // 心跳: 每次 50ms 循环
         WATCH_HB.tick();
@@ -442,13 +443,15 @@ fn apply_config() -> AppResult<()> {
 
     // 3. 软重启让新配置生效 (500ms 后重启, 给 AT 响应/日志/NVS 留时间)
     log::warn!("[device] scheduling soft restart in 500ms for full effect");
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("cfg-apply-restart".into())
         .spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(500));
             unsafe { esp_idf_sys::esp_restart(); }
-        })
-        .map_err(|e| AppError::Config(format!("spawn restart: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| AppError::Config(format!("spawn restart: {e}")))?;
 
     Ok(())
 }

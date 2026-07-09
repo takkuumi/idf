@@ -11,8 +11,9 @@ build-std = ["std", "core", "alloc", "panic_abort"]
 build-std-features = ["panic_immediate_abort"]
 
 [env]
-# ESP-IDF v5.5.4
+# ESP-IDF v5.5.4 (使用本地已初始化的仓库, 避免克隆时相对子模块 URL 解析失败)
 ESP_IDF_VERSION = "v5.5.4"
+IDF_PATH = { value = "/Users/takumi/Workspace/esp-idf", force = true }
 ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
 MCU = "esp32s3"
 ESP_IDF_TARGET = "esp32s3"

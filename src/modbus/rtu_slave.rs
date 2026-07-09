@@ -25,10 +25,10 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     let mut port = Rs485Port::open(&port_cfg)?;
     let backend = BusBackend;
 
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("mb-rtu-slave".into())
         .spawn(move || {
-            crate::health::pin_current_to_core(crate::health::CORE_NET);
             let mut buf = [0u8; 256];
             loop {
                 // 心跳: 每次循环 (即使无请求也 1s 返回一次)
@@ -46,8 +46,9 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                     }
                 }
             }
-        })
-        .map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
+        });
+    health::reset_thread_core();
+    result.map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
 
     log::info!("[mb-rtu-slave] started on uart{} addr={}", cfg::UART_PORT, cfg::ADDR);
     Ok(())

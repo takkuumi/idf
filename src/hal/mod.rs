@@ -17,7 +17,7 @@
 
 use esp_idf_hal::peripherals::Peripherals;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 pub mod pins;
 pub mod uart;
@@ -31,6 +31,11 @@ pub mod i2c_bus;
 pub mod mcp23017;
 #[cfg(any(feature_f3, feature_f4))]
 pub mod io_ext;
+/// Software I2C + PCA9555 (default version: 8 DI + 8 DO via NCA9555)
+#[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+pub mod sw_i2c;
+#[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+pub mod pca9555;
 
 pub use pins::HalPins;
 pub use uart::UartPort;
@@ -40,6 +45,8 @@ pub use gpio::GpioBank;
 pub use digital_io::DigitalIo;
 #[cfg(any(feature_f3, feature_f4))]
 pub use io_ext::IoExtender;
+#[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+pub use pca9555::Pca9555Duo;
 
 /// 硬件抽象总句柄
 pub struct Hal {
@@ -51,6 +58,9 @@ pub struct Hal {
     /// I2C IO 扩展 (仅 F3/F4 版本)
     #[cfg(any(feature_f3, feature_f4))]
     pub io_ext: IoExtender,
+    /// PCA9555 IO + LED 双芯片 (默认版本, 通过软件 I2C)
+    #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+    pub pca9555: Pca9555Duo,
 }
 
 impl Hal {
@@ -64,10 +74,8 @@ impl Hal {
         let adc = AdcHandle::init(pins.adc1)?;
         let ledc = LedcHandle::init(pins.ledc_timer, pins.ledc_channels)?;
 
-        // GpioBank 初始化 (默认版本含 DI/DO, F3/F4 不含)
-        #[cfg(not(any(feature_f3, feature_f4)))]
-        let gpio = GpioBank::init(pins.di, pins.do_, pins.eth_int, pins.eth_rst, pins.rs485_de)?;
-        #[cfg(any(feature_f3, feature_f4))]
+        // GpioBank 初始化: DI/DO 由 PCA9555 (default) 或 MCP23017 (F3/F4) 管理
+        // GPIO 仅管理辅助引脚 (ETH_INT, ETH_RST, RS485_DE)
         let gpio = GpioBank::init(pins.eth_int, pins.eth_rst, pins.rs485_de)?;
 
         // F3/F4 版本: 初始化 I2C IO 扩展 (MCP23017)
@@ -83,6 +91,42 @@ impl Hal {
             IoExtender::init(i2c_bus)?
         };
 
+        // 默认版本 (8 DI + 8 DO): 先给 IO 扩展板供电, 再初始化 PCA9555
+        // GPIO21: 灯板电源使能 (HIGH=上电)
+        // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
+        #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+        {
+            use esp_idf_sys::{gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_OUTPUT, gpio_set_level};
+            for &pwr_pin in &[crate::config::pins::POWER_LED_EN, crate::config::pins::POWER_RELAY_EN] {
+                let cfg = gpio_config_t {
+                    pin_bit_mask: 1u64 << (pwr_pin as u64),
+                    mode: gpio_mode_t_GPIO_MODE_OUTPUT,
+                    pull_up_en: 0u32,
+                    pull_down_en: 0u32,
+                    intr_type: 0,
+                };
+                let ret = unsafe { gpio_config(&cfg) };
+                if ret != 0 {
+                    return Err(AppError::Io(format!("power_en gpio{pwr_pin} config: esp_err=0x{ret:08X}")));
+                }
+                unsafe { gpio_set_level(pwr_pin as i32, 1) }; // HIGH = 上电
+            }
+            log::info!("[hal] IO/LED board power enabled (gpio21 + gpio33 HIGH)");
+        }
+
+        // 默认版本 (8 DI + 8 DO): 初始化双 PCA9555 (IO + LED)
+        // IO 总线:   SDA=GPIO35, SCL=GPIO36 (DI@0x40, DO@0x42)
+        // LED 总线:  SDA=GPIO38, SCL=GPIO37 (DI_LED@0x40, DO_LED@0x48)
+        #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+        let pca9555 = {
+            Pca9555Duo::init(
+                crate::config::pins::NCA9555_IIC_SDA as i32,
+                crate::config::pins::NCA9555_IIC_SCL as i32,
+                crate::config::pins::NCA9555_LED_SDA as i32,
+                crate::config::pins::NCA9555_LED_SCL as i32,
+            )?
+        };
+
         Ok(Self {
             pins,
             uart,
@@ -91,6 +135,8 @@ impl Hal {
             gpio,
             #[cfg(any(feature_f3, feature_f4))]
             io_ext,
+            #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+            pca9555,
         })
     }
 
@@ -108,11 +154,16 @@ impl Hal {
     /// let bits = hal.dio().read_di_all()?;
     /// hal.dio().write_do_all(0xFFFF)?;
     /// ```
+    /// 获取数字 IO 抽象接口 (DI/DO 统一访问)
+    ///
+    /// 仅在 io-di-do 或 F3/F4 feature 启用时可用。
+    /// 实际硬件 DI/DO 走 PCA9555 I2C 扩展, 待实现后此处返回 PCA9555 实例。
+    #[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
     pub fn dio(&self) -> &dyn DigitalIo {
-        // 默认版本: GpioBank 实现 DigitalIo (GPIO 直驱)
-        #[cfg(not(any(feature_f3, feature_f4)))]
+        // 默认版本: PCA9555 通过软件 I2C (NCA9555 on GPIO 35/36)
+        #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
         {
-            &self.gpio
+            &self.pca9555
         }
         // F3/F4 版本: IoExtender 实现 DigitalIo (I2C MCP23017 扩展)
         #[cfg(any(feature_f3, feature_f4))]

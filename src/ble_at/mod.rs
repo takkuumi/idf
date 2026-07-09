@@ -505,11 +505,13 @@ pub fn start() -> AppResult<()> {
     }
 
     // 3. 启动 AT 命令处理线程
-    std::thread::Builder::new()
+    health::set_next_thread_core(health::CORE_NET);
+    let result = std::thread::Builder::new()
         .name("ble-at".into())
         .stack_size(4096)
-        .spawn(process_loop)
-        .map_err(|e| crate::error::AppError::BleMesh(format!("spawn ble-at: {e}")))?;
+        .spawn(process_loop);
+    health::reset_thread_core();
+    result.map_err(|e| crate::error::AppError::BleMesh(format!("spawn ble-at: {e}")))?;
 
     log::info!("[ble_at] service started (GATT callback registered, AT parser ready)");
     Ok(())
@@ -520,7 +522,6 @@ pub fn start() -> AppResult<()> {
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
 /// 有则调用 parser::process 处理, 响应写入 TX_BUFFER 等待 notify。
 fn process_loop() {
-    crate::health::pin_current_to_core(crate::health::CORE_NET);
     loop {
         // 心跳: 每次 10ms 循环
         TASK_HB.tick();

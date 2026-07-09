@@ -3,7 +3,7 @@ name = "esp32s3-iot-gateway"
 version = "0.1.0"
 edition = "2024"
 authors = ["idf"]
-description = "ESP32-S3R8 嵌入式网关：以太网 W5500 + BLE Mesh + IO + AI/AO + RS485 + Modbus"
+description = "ESP32-S3R2 嵌入式网关：以太网 W5500 + BLE Mesh + IO + AI/AO + RS485 + Modbus"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -29,6 +29,7 @@ panic = "unwind"
 # 默认启用 ADC Continuous/DMA (ESP32-S3 硬件潜力)
 # 如需回退到 OneShot: --no-default-features --features "ble-mesh,ethernet-w5500,..."
 default = ["adc-continuous", "ble-mesh", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do"]
+# io-di-do 默认禁用: 实际硬件 DI/DO 通过 PCA9555 I2C 扩展, 非 GPIO 直驱
 adc-continuous = []
 # Wi-Fi 支持 (ESP32-S3 内置, 作为以太网冗余或 AP 配置入口)
 wifi = []

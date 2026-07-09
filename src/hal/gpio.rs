@@ -35,23 +35,18 @@ pub struct GpioBank {
     /// RS485 #0 / #1 的 DE 引脚
     rs485_de: [Mutex<PinDriver<'static, Output>>; 2],
 
-    /// 8 路 DI 输入 (仅默认版本, F3/F4 用 IoExtender)
-    #[cfg(not(any(feature_f3, feature_f4)))]
-    di: [PinDriver<'static, Input>; 8],
-    /// 8 路 DO 输出 (仅默认版本, F3/F4 用 IoExtender)
-    #[cfg(not(any(feature_f3, feature_f4)))]
-    do_: [Mutex<PinDriver<'static, Output>>; 8],
-    /// DO 输出状态缓存 (仅默认版本)
-    ///
-    /// PinDriver<Output> 不支持 is_high() 读回, 用缓存记录已写入的电平。
-    /// 初始值 0 (所有 DO 低电平)。
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    /// 8 路 DI 输入 (仅 io-di-do 版本使用 GPIO 直驱, 否则由 PCA9555/MCP23017 管理)
+    di: Option<[PinDriver<'static, Input>; 8]>,
+    /// 8 路 DO 输出
+    do_: Option<[Mutex<PinDriver<'static, Output>>; 8]>,
+    /// DO 输出状态缓存
     do_cache: Mutex<u64>,
 }
 
 impl GpioBank {
-    /// 初始化 GPIO 集合 (默认版本: GPIO 直驱 DI/DO)
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    /// 初始化 GPIO 集合 (GPIO 直驱 DI/DO — 保留, 需 feature_gpio_di_do)
+    #[cfg(feature_gpio_di_do)]
+    #[allow(dead_code)]
     pub fn init(
         di_pins: [u8; 8],
         do_pins: [u8; 8],
@@ -100,14 +95,13 @@ impl GpioBank {
             eth_int: eth_int_pin,
             eth_rst: eth_rst_pin,
             rs485_de: rs485_de_pins,
-            di,
-            do_,
+            di: Some(di),
+            do_: Some(do_),
             do_cache: Mutex::new(0),
         })
     }
 
-    /// 初始化 GPIO 集合 (F3/F4 版本: 不含 DI/DO, 由 IoExtender 管理)
-    #[cfg(any(feature_f3, feature_f4))]
+    /// 初始化 GPIO 集合 (无 DI/DO: DI/DO 由 IoExtender/PCA9555 管理)
     pub fn init(
         eth_int: u8,
         eth_rst: u8,
@@ -118,11 +112,14 @@ impl GpioBank {
             eth_int: eth_int_pin,
             eth_rst: eth_rst_pin,
             rs485_de: rs485_de_pins,
+            di: None,
+            do_: None,
+            do_cache: Mutex::new(0),
         })
     }
 
-    /// 读 DI idx (0..8)。仅默认版本可用, F3/F4 用 IoExtender。
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    /// 读 DI idx (0..8)。仅 gpio_di_do 版本可用
+    #[cfg(feature_gpio_di_do)]
     pub fn di_read(&self, idx: u8) -> bool {
         if idx >= 8 {
             log::warn!("[gpio] di_read idx out of range: {idx}");
@@ -131,8 +128,8 @@ impl GpioBank {
         self.di[idx as usize].is_high()
     }
 
-    /// 写 DO idx (0..8)。仅默认版本可用, F3/F4 用 IoExtender。
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    /// 写 DO idx (0..8)。仅 gpio_di_do 版本可用
+    #[cfg(feature_gpio_di_do)]
     pub fn do_write(&self, idx: u8, on: bool) {
         if idx >= 8 {
             log::warn!("[gpio] do_write idx out of range: {idx}");
@@ -152,20 +149,29 @@ impl GpioBank {
         }
     }
 
-    /// 复位 W5500: 拉低 ETH_RST 50ms 后释放。
+    /// 复位 W5500: HIGH(250ms) → LOW(50ms) → HIGH(350ms)
+    /// 序列来自参考固件 ETHClass.cpp beginSPI()
     pub fn eth_reset(&self) {
         let mut pin = self.eth_rst.lock();
+        // 1. 先拉高确保不在复位状态
+        if let Err(e) = pin.set_high() {
+            log::warn!("[gpio] eth_reset set_high(initial) failed: {e:?}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        // 2. 拉低触发复位
         if let Err(e) = pin.set_low() {
             log::warn!("[gpio] eth_reset set_low failed: {e:?}");
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+        // 3. 释放复位 (拉高)
         if let Err(e) = pin.set_high() {
-            log::warn!("[gpio] eth_reset set_high failed: {e:?}");
+            log::warn!("[gpio] eth_reset set_high(release) failed: {e:?}");
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
-        log::info!("[gpio] W5500 reset pulse applied");
+        std::thread::sleep(Duration::from_millis(350));
+        log::info!("[gpio] W5500 reset pulse applied (250ms H → 50ms L → 350ms H)");
     }
 
     /// 读 ETH_INT 电平。true = 高 (无中断)，false = 低 (中断触发)。
@@ -220,7 +226,7 @@ fn make_output(gpio: u8) -> AppResult<PinDriver<'static, Output>> {
 // 上层通过 `hal.dio() -> &dyn DigitalIo` 统一访问 DI/DO, 屏蔽 GPIO/I2C 差异。
 // 仅默认版本 (8 DI + 8 DO) 为 GpioBank 实现此 trait;
 // F3/F4 版本由 IoExtender 实现, GpioBank 不含 DI/DO 字段。
-#[cfg(not(any(feature_f3, feature_f4)))]
+#[cfg(feature_gpio_di_do)]
 impl crate::hal::digital_io::DigitalIo for GpioBank {
     fn di_count(&self) -> usize {
         8
