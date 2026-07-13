@@ -248,9 +248,9 @@ pub mod modbus {
         pub const DATA_BITS: u8 = 8;
     }
 
-    /// TCP Server 参数
+    /// TCP Server 参数 - 匹配参考固件 MCA_F16V2_1_F48_BLE (4端口)
     pub mod tcp {
-        pub const PORT: u16 = 502;
+        pub const PORTS: &[u16] = &[502, 503, 504, 5002];
         pub const MAX_CONNECTIONS: usize = 4;
         pub const RX_TIMEOUT_MS: u64 = 2000;
         pub const TX_TIMEOUT_MS: u64 = 2000;
@@ -292,102 +292,125 @@ pub mod ble_mesh {
 }
 
 // ----------------------------------------------------------------------------
-// 应用层寄存器布局
-// ----------------------------------------------------------------------------
+// ============================================================================
+// Modbus 寄存器布局 — 与参考固件 MCA_F16V2_1_F48_BLE 兼容
+// ============================================================================
+//
+// 线圈 (Coils, 0x):     地址 512+ (0x200+), 对应 DO 点, 1-based 编号
+// 离散输入 (DIs, 1x):   地址 0+, 对应 DI 点
+// 输入寄存器 (IRs, 3x): 地址 128+ (0x80+), 对应 AI 模拟量
+// 保持寄存器 (HRs, 4x): 地址 2176+ (0x880+), 配置/参数区
+//
 pub mod regs {
-    // 线圈 (Coil, 1-bit, 可读写) - DO 输出
-    // 通道数随硬件版本变化: Default=8, F3=16, F4=16
-    pub const COIL_DO_BASE: u16 = 0x0000;
-    pub const COIL_DO_COUNT: u16 = crate::config::hw_version::DO_COUNT as u16;
+    use crate::config::hw_version;
 
-    // 离散输入 (Discrete Input, 1-bit, 只读) - DI 输入
-    // 通道数随硬件版本变化: Default=8, F3=16, F4=48
+    // ---- 线圈 (Coil, FC=01/05/15) - DO 输出 ----
+    // 参考固件: REG_D01 = 0x200, 编号 1-16 (F16) 或 1-48 (F48)
+    pub const COIL_DO_BASE: u16 = 0x0200;
+    pub const COIL_DO_COUNT: u16 = hw_version::DO_COUNT as u16;
+    pub const COIL_DO_END: u16 = COIL_DO_BASE + COIL_DO_COUNT;
+
+    // ---- 离散输入 (Discrete Input, FC=02) - DI 输入 ----
+    // 参考固件: REG_T01 = 0x0000, 编号 1-16 (F16)
     pub const DISC_DI_BASE: u16 = 0x0000;
-    pub const DISC_DI_COUNT: u16 = crate::config::hw_version::DI_COUNT as u16;
+    pub const DISC_DI_COUNT: u16 = hw_version::DI_COUNT as u16;
 
-    // 输入寄存器 (Input Register, 16-bit, 只读) - AI 输入
-    pub const INREG_AI_BASE: u16 = 0x0000; // 6 路 AI, 原始 ADC 值
-    pub const INREG_AI_COUNT: u16 = 6;
-    pub const INREG_AI_SCALED_BASE: u16 = 0x0010; // 6 路 AI, 工程量 (放大 1000 倍)
+    // ---- 输入寄存器 (Input Register, FC=04, RO) ----
+    // 参考固件: REG_A01 = 0x0080 (AI), REG_STATU_A01 = 0x0088 (AI状态)
+    pub const INREG_AI_BASE: u16 = 0x0080;
+    pub const INREG_AI_COUNT: u16 = 4; // F16: 4路AI
+    pub const INREG_AI_STATUS_BASE: u16 = 0x0088;
+    // 系统信息 (RO)
+    pub const INREG_QI_COUNT: u16 = 0x087C;   // Q和I点数 (高字节=Q, 低字节=I)
+    pub const INREG_ADC485: u16 = 0x087D;     // 模拟量+485通道数
+    pub const INREG_FW_VER: u16 = 0x087E;     // 固件版本号
+    pub const INREG_FW_DATE: u16 = 0x087F;    // 固件版本日期
 
-    // 保持寄存器 (Holding Register, 16-bit, 可读写) - AO 输出 + 系统参数
-    pub const HOLD_AO_BASE: u16 = 0x0000; // 4 路 AO, 工程量 (放大 1000 倍)
-    pub const HOLD_AO_COUNT: u16 = 4;
-    pub const HOLD_SYS_BASE: u16 = 0x0100; // 系统寄存器
-    pub const HOLD_SYS_FW_VER: u16 = 0x0100; // 固件版本 (BCD: 0x0102 = v1.02)
-    pub const HOLD_SYS_UPTIME_S: u16 = 0x0101; // 运行时长 (秒)
-    pub const HOLD_SYS_RESET_CNT: u16 = 0x0102; // 复位计数
-    pub const HOLD_SYS_RESET: u16 = 0x0103; // 写 0xA5A5 触发复位
-    pub const HOLD_SYS_RESET_REASON: u16 = 0x0104; // 复位原因 (RO, esp_reset_reason_t)
-    pub const HOLD_SYS_TASK_HEALTH: u16 = 0x0105; // 任务健康位图 (RO, bit=1 表示该任务停滞)
-    pub const HOLD_SYS_LOG_LEVEL: u16 = 0x0106;    // 日志级别 (0=Err 1=Warn 2=Info 3=Debug 4=Trace, RW)
+    // ---- 保持寄存器 (Holding Register, FC=03/06/16, RW) ----
+    // 参考固件: SLAVE_REG_P01 = 0x0880 (2176)
+    pub const HOLD_CFG_BASE: u16 = 0x0880;
+    // 485 通信状态 (2176-2179, RO)
+    pub const HOLD_485_1_COMERR: u16 = 0x0880;
+    pub const HOLD_485_1_APPERR: u16 = 0x0881;
+    pub const HOLD_485_2_COMERR: u16 = 0x0882;
+    pub const HOLD_485_2_APPERR: u16 = 0x0883;
+    // SN 序列号 (2196-2204 = 9 words = 18 ASCII chars)
+    pub const HOLD_SN_BASE: u16 = 2196;
+    pub const HOLD_SN_COUNT: u16 = 9;
+    // 位置/桩号 (2205-2212 = 8 words = 16 ASCII chars)
+    pub const HOLD_PLACE_BASE: u16 = 2205;
+    pub const HOLD_PLACE_COUNT: u16 = 8;
+    // 硬件版本 (2213)
+    pub const HOLD_HW_VER: u16 = 2213;
+    // RS485 配置 (2214-2238, 5 ports × 5 words)
+    pub const HOLD_RS485_BASE: u16 = 2214;
+    pub const HOLD_RS485_STRIDE: u16 = 5;
+    // 保留/未知 (2239-2242, 参考固件默认 5500-5503)
+    pub const HOLD_UNKNOWN_BASE: u16 = 2239;
+    pub const HOLD_UNKNOWN_COUNT: u16 = 4;
+    // TCP COM 端口 (2243-2246, 参考固件 SLAVE_REG_TCP_COM1..4)
+    pub const HOLD_TCP_COM_BASE: u16 = 2243;
+    pub const HOLD_TCP_COM_COUNT: u16 = 4;
+    // IP 地址 (2247-2250 = 2 words)
+    pub const HOLD_IP_BASE: u16 = 2247;
+    // 子网掩码 (2251-2254)
+    pub const HOLD_MASK_BASE: u16 = 2251;
+    // 网关 (2255-2258)
+    pub const HOLD_GW_BASE: u16 = 2255;
+    // DNS (2259-2262)
+    pub const HOLD_DNS_BASE: u16 = 2259;
+    // MAC 地址 (2263-2268 = 6 bytes in 3 words)
+    pub const HOLD_MAC_BASE: u16 = 2263;
+    // 主站 COM 数量 + IP (2269-2273)
+    pub const HOLD_MASTER_COM: u16 = 2269;
+    pub const HOLD_MASTER_IP_BASE: u16 = 2270;
+    // 蓝牙地址 (2274-2277)
+    pub const HOLD_BT_ADDR_BASE: u16 = 2274;
+    // 传感器标定 (2280-2295, 8 sensors × 2 values)
+    pub const HOLD_SENSOR_MIN_BASE: u16 = 2280;
+    pub const HOLD_SENSOR_MAX_BASE: u16 = 2288;
+    // 设备功能配置 (2300+)
+    pub const HOLD_DEVICE_CONFIG: u16 = 2300;
+    // 用户自定义区 (4000-4223 = 224 words)
+    pub const HOLD_USER_BASE: u16 = 4000;
+    pub const HOLD_USER_COUNT: u16 = 224;
+    // P区结束地址
+    pub const HOLD_CFG_END: u16 = 4223;
 
-    // ============ OTA 升级区 (OTA UPGRADE) ============
-    // 通过 BLE AT 命令 +OTA 触发升级, Modbus 只读状态 + 触发重启
-    pub const HOLD_OTA_STATUS: u16 = 0x0107;        // (RO) 0=空闲 1=接收中 2=完成待重启 3=校验失败 4=空间不足 5=已中止
-    pub const HOLD_OTA_TOTAL_LO: u16 = 0x0108;     // (RW) 升级包总大小 低 16 位 (字节数)
-    pub const HOLD_OTA_TOTAL_HI: u16 = 0x0109;      // (RW) 升级包总大小 高 16 位
-    pub const HOLD_OTA_WRITTEN_LO: u16 = 0x010A;   // (RO) 已写入字节数 低 16 位
-    pub const HOLD_OTA_WRITTEN_HI: u16 = 0x010B;   // (RO) 已写入字节数 高 16 位
-    pub const HOLD_OTA_BEGIN: u16 = 0x010C;         // (WO) 写 0x0B0A → 开始升级 (使用 TOTAL_* 字段值)
-    pub const HOLD_OTA_END: u16 = 0x010D;           // (WO) 写 0x0E0D → 结束升级 + 设置启动分区
-    pub const HOLD_OTA_ABORT: u16 = 0x010E;         // (WO) 写 0x0AB0 → 中止升级
-    pub const HOLD_OTA_REBOOT: u16 = 0x010F;        // (WO) 写 0x0F0E → 重启应用新固件
+    // ---- 设备文本区 (5000-6999, 2000 字) ----
+    pub const DEVICE_TEXT_BASE: u16 = 5000;
+    pub const DEVICE_TEXT_COUNT: u16 = 2000;
+    pub const DEVICE_TEXT_END: u16 = 6999;
 
-    // ============ 系统配置区 (SYSTEM CONFIG) ============
-    // 用户可读写, 通过 Modbus 或 BLE AT 修改
-    // 修改后写 CFG_APPLY=0xB5B5 触发应用 (持久化 + 运行时生效)
-    // 写 CFG_RESET=0xD5D5 恢复默认配置
-    pub const CFG_BASE: u16 = 0x0200;
-    pub const CFG_END: u16 = 0x0260; // 不含
+    // ---- 协议存储区 (与用户区连续, 兼容原有 PROTO 区) ----
+    pub const PROTO_BASE: u16 = 0x4000;
+    pub const PROTO_COUNT: u16 = 1500;
+    pub const PROTO_END: u16 = PROTO_BASE + PROTO_COUNT;
+    pub const PROTO_COMMIT: u16 = PROTO_END;
+    pub const PROTO_RELOAD: u16 = PROTO_END + 1;
+    pub const PROTO_VERSION: u16 = PROTO_END + 2;
+    pub const PROTO_LENGTH: u16 = PROTO_END + 3;
+    pub const PROTO_STATUS: u16 = PROTO_END + 4;
+    pub const PROTO_MAGIC: u16 = PROTO_END + 5;
 
-    // 设备信息区 (0x0200-0x021F)
-    pub const CFG_SN_BASE: u16 = 0x0200;        // SN 号 (16 字, ASCII 32 字符)
-    pub const CFG_SN_COUNT: u16 = 16;
-    pub const CFG_NAME_BASE: u16 = 0x0210;      // 设备名称 (8 字, ASCII 16 字符)
-    pub const CFG_NAME_COUNT: u16 = 8;
-    pub const CFG_HW_VER: u16 = 0x0218;         // 硬件版本 (BCD)
-    pub const CFG_FW_VER: u16 = 0x0219;         // 固件版本 (BCD)
-    pub const CFG_CFG_VER: u16 = 0x021A;        // 配置版本 (每次修改自增)
-    pub const CFG_APPLY: u16 = 0x021B;           // 写 0xB5B5 → 应用配置 (持久化+生效)
-    pub const CFG_RESET_DEFAULT: u16 = 0x021C;  // 写 0xD5D5 → 恢复默认
-
-    // 网络配置 (0x0220-0x022F)
-    pub const CFG_ETH_MAC_BASE: u16 = 0x0220;   // 以太网 MAC (3 字 = 6 字节)
-    pub const CFG_DHCP: u16 = 0x0223;            // 0=静态, 1=DHCP
-    pub const CFG_IP_BASE: u16 = 0x0224;         // IP 地址 (2 字 = 4 字节)
-    pub const CFG_MASK_BASE: u16 = 0x0226;       // 子网掩码 (2 字)
-    pub const CFG_GW_BASE: u16 = 0x0228;         // 网关 (2 字)
-    pub const CFG_DNS_BASE: u16 = 0x022A;        // DNS (2 字)
-
-    // 蓝牙配置 (0x0230-0x023F)
-    pub const CFG_BLE_MAC_BASE: u16 = 0x0230;    // BLE MAC (3 字 = 6 字节)
-    pub const CFG_BLE_NAME_BASE: u16 = 0x0233;   // BLE 名称 (4 字 = 8 字符)
-    pub const CFG_BLE_MESH_EN: u16 = 0x0237;     // 0=禁用, 1=启用
-
-    // RS485 配置 (0x0240-0x025F), 每通道 16 字
-    pub const CFG_RS485_BASE: u16 = 0x0240;
-    pub const CFG_RS485_STRIDE: u16 = 16;
-    pub const CFG_RS485_COUNT: u16 = 2;
-    // 通道内偏移:
-    //   +0  波特率 (÷100, 9600 → 96, 115200 → 1152)
-    //   +1  数据位 (7/8)
-    //   +2  停止位 (1/2)
-    //   +3  校验 (0=None, 1=Odd, 2=Even)
-    //   +4  从站地址 (0=主站模式)
-    //   +5  模式 (0=Master, 1=Slave, 2=Gateway)
-    //   +6..+15  保留
-
-    // ============ 协议存储区 (PROTOCOL STORE) ============
-    // 用户自定义协议存储区，单段连续 1500 个 U16 (3000 字节)
-    // 通过 Modbus FC=03/06/10 或 BLE AT 命令访问
-    pub const PROTO_BASE: u16 = 0x4000;       // 协议数据区起始
-    pub const PROTO_COUNT: u16 = 1500;        // 协议数据长度 (U16 单位)
-    pub const PROTO_END: u16 = 0x4000 + 1500; // = 0x45DC (exclusive)
-    pub const PROTO_COMMIT: u16 = 0x45DC;    // 写 0xC5C5 → 触发持久化到 NVS
-    pub const PROTO_RELOAD: u16 = 0x45DD;    // 写 0xA5A5 → 从 NVS 重载到 RAM
-    pub const PROTO_VERSION: u16 = 0x45DE;   // 用户自定义协议版本 (RW)
-    pub const PROTO_LENGTH: u16 = 0x45DF;    // 用户写入的有效协议长度 (U16 数)
-    pub const PROTO_STATUS: u16 = 0x45E0;    // 状态 (RO): 0=空闲, 1=写入中, 2=加载中, 3=校验失败
-    pub const PROTO_MAGIC: u16 = 0x45E1;     // NVS 存储魔数 (RO): 0x4757 ("GW")
+    // ---- Internal-only registers (not exposed via Modbus, for backward compat) ----
+    pub const CFG_BASE: u16 = HOLD_CFG_BASE;
+    pub const CFG_FW_VER: u16 = INREG_FW_VER;
+    pub const CFG_CFG_VER: u16 = 0xFF00;
+    pub const CFG_APPLY: u16 = 0xFF01;
+    pub const CFG_RESET_DEFAULT: u16 = 0xFF02;
+    pub const CFG_DHCP: u16 = 0xFF03;
+    pub const CFG_BLE_MESH_EN: u16 = 0xFF11;
+    pub const CFG_BLE_MAC_BASE: u16 = 0;
+    pub const CFG_END: u16 = HOLD_CFG_END + 1;
+    // Backward compat aliases
+    pub const CFG_BLE_NAME_BASE: u16 = HOLD_BT_ADDR_BASE;
+    pub const CFG_NAME_BASE: u16 = HOLD_PLACE_BASE;
+    pub const CFG_NAME_COUNT: u16 = HOLD_PLACE_COUNT;
+    pub const CFG_RS485_BASE: u16 = HOLD_RS485_BASE;
+    pub const CFG_RS485_STRIDE: u16 = HOLD_RS485_STRIDE;
+    pub const CFG_RS485_COUNT: u16 = 5;
+    // Master config defaults
+    pub const TCP_PORTS_DEFAULT: [u16; 4] = [502, 503, 504, 5002];
+    pub const UNKNOWN_DEFAULTS: [u16; 4] = [5500, 5501, 5502, 5503];
 }

@@ -22,16 +22,23 @@ static LISTEN_HB: TaskHb = TaskHb::new_with_stall("mb-tcp-listen", 60);
 
 pub fn start() -> AppResult<()> {
     health::register(&LISTEN_HB);
-    let listener = TcpListener::bind(("0.0.0.0", cfg::PORT))
-        .map_err(|e| AppError::Modbus(format!("bind {}: {}", cfg::PORT, e)))?;
+    for &port in cfg::PORTS {
+        spawn_listener(port)?;
+    }
+    log::info!("[mb-tcp] listening on {} ports: {:?}", cfg::PORTS.len(), cfg::PORTS);
+    Ok(())
+}
+
+fn spawn_listener(port: u16) -> AppResult<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .map_err(|e| AppError::Modbus(format!("bind {}: {}", port, e)))?;
 
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
-        .name("mb-tcp-listen".into())
+        .name(format!("mb-tcp-{}", port))
         .spawn(move || {
-            log::info!("[mb-tcp] listening on :{}", cfg::PORT);
+            log::info!("[mb-tcp] listening on :{}", port);
             for stream in listener.incoming() {
-                // 心跳: 每次 accept 返回 (有连接或错误)
                 LISTEN_HB.tick();
                 match stream {
                     Ok(s) => {
@@ -42,7 +49,6 @@ pub fn start() -> AppResult<()> {
                             continue;
                         }
                         CONN_COUNT.fetch_add(1, Ordering::SeqCst);
-
                         let id = CONN_COUNT.load(Ordering::SeqCst);
                         health::set_next_thread_core(health::CORE_NET);
                         std::thread::Builder::new()
@@ -62,7 +68,6 @@ pub fn start() -> AppResult<()> {
         });
     health::reset_thread_core();
     result.map_err(|e| AppError::Modbus(format!("spawn: {e}")))?;
-
     Ok(())
 }
 
@@ -102,13 +107,14 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         }
 
         let length = u16::from_be_bytes([header[4], header[5]]) as usize;
-        if length < 2 || length > 253 + 1 {
+        if length < 2 || length > 254 {
             log::warn!("[mb-tcp] bad length {}", length);
             return Ok(());
         }
 
-        // 读 PDU
-        let pdu_len = length - 1;
+        // 读 PDU: 标准 Modbus TCP — MBAP length = unit_id + PDU
+        // PDU 不含 unit_id, 首字节即为功能码
+        let pdu_len = length - 1;  // 减去 MBAP 中的 unit_id
         match stream.read_exact(&mut pdu[..pdu_len]) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -122,7 +128,8 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         }
 
         let unit_id = header[6];
-        let func = pdu[0];
+        if pdu_len < 1 { return Ok(()); }
+        let func = pdu[0];  // PDU 首字节 = 功能码
         let resp_pdu = build_pdu(&backend, func, &pdu[1..pdu_len]);
         let resp_len = 1 + resp_pdu.len();
         let mut mbap = [0u8; 7];
@@ -131,8 +138,11 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         mbap[4..6].copy_from_slice(&(resp_len as u16).to_be_bytes());
         mbap[6] = unit_id;
 
-        stream.write_all(&mbap)?;
-        stream.write_all(&resp_pdu)?;
+        // 合并 MBAP + PDU 为单次写入, 避免 W5500 分批发送导致对端收到不完整帧
+        let mut response = Vec::with_capacity(7 + resp_pdu.len());
+        response.extend_from_slice(&mbap);
+        response.extend_from_slice(&resp_pdu);
+        stream.write_all(&response)?;
         stream.flush()?;
     }
 }

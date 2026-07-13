@@ -26,6 +26,7 @@ mod error;
 mod config;
 mod bus;
 mod device;
+mod device_config;
 mod ble_at;
 mod hal;
 mod ethernet;

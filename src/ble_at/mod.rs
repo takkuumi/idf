@@ -424,10 +424,11 @@ extern "C" fn gatts_event_cb(event: c_int, gatts_if: c_int, param: *mut c_void) 
                     if enabled { "enabled" } else { "disabled" }
                 );
             } else if p.handle == handles[IDX_CHAR_RX_VAL] && !p.value.is_null() && p.len > 0 {
-                // RX characteristic 写入 (AT 命令)
-                // SAFETY: p.value 指向主机写入数据, 长度 p.len
+                // RX characteristic 写入 — 优先尝试二进制协议, 否则按文本 AT 处理
                 let data = unsafe { std::slice::from_raw_parts(p.value, p.len as usize) };
-                feed_data(data);
+                if !try_handle_binary_protocol(data, p.conn_id, p.trans_id) {
+                    feed_data(data);
+                }
                 log::debug!("[ble_at] GATT write RX: {} bytes", data.len());
             }
             drop(handles);
@@ -629,6 +630,129 @@ pub fn feed_data(data: &[u8]) {
     for &b in data {
         let _ = rx.push(b as char);
     }
+}
+
+// ============================================================================
+// 二进制协议处理 — 兼容参考固件 MCA_F16V2_1_F48_BLE
+// ============================================================================
+// 帧格式: [len(1)] [chipID(6)] [cmd(1)] [data(N)] [CRC16(2)]
+
+fn chip_id_bytes() -> [u8; 6] {
+    crate::bus::lock_timeout()
+        .map(|b| b.cfg.eth_mac)
+        .unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+}
+
+fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
+    if data.len() < 10 { return false; }
+    let frame_len = data[0] as usize;
+    if frame_len != data.len() { return false; }
+    let crc_pos = frame_len - 2;
+    let calc_crc = crate::modbus::shared::modbus_crc16(&data[..crc_pos]);
+    let rx_crc = u16::from_le_bytes([data[crc_pos], data[crc_pos + 1]]);
+    if calc_crc != rx_crc { return true; }
+    let chip_id = chip_id_bytes();
+    if data[1..7] != chip_id { return true; }
+    let cmd = data[7];
+    let payload = &data[8..crc_pos];
+    let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let _ = rsp.push(cmd);
+    match cmd {
+        0x03 => {
+            let _ = rsp.push(0x00);
+            if let Some(b) = crate::bus::lock_timeout() {
+                for i in 0..4u16 { let v = b.ai.raw[i as usize]; let _ = rsp.push((v>>8) as u8); let _ = rsp.push(v as u8); }
+            }
+        }
+        0xC0 => {
+            let _ = rsp.push(0x00);
+            if !payload.is_empty() {
+                let n = ((payload.len()-1)/2).min(payload[0] as usize);
+                for i in 0..n {
+                    let addr = payload[1+i*2] as u16;
+                    let on = payload[1+i*2+1] != 0;
+                    if let Some(mut b) = crate::bus::lock_timeout() {
+                        b.write_coil((addr).wrapping_add(crate::config::regs::COIL_DO_BASE).wrapping_sub(1), on);
+                    }
+                }
+                #[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+                crate::io::do_::notify();
+            }
+        }
+        0xC1 => {
+            let _ = rsp.push(0x00);
+            let count = payload.first().copied().unwrap_or(16) as usize;
+            let _ = rsp.push(count as u8);
+            if let Some(b) = crate::bus::lock_timeout() {
+                let di = b.di.bits;
+                let mut bits: u8 = 0;
+                for i in 0..count {
+                    bits = (bits << 1) | ((di >> (count - 1 - i)) & 1) as u8;
+                    if (i+1)%8==0 || i+1==count { let _ = rsp.push(bits); bits = 0; }
+                }
+            }
+        }
+        0xCE => {
+            let _ = rsp.push(0x00);
+            if let Some(b) = crate::bus::lock_timeout() {
+                let _ = rsp.extend_from_slice(&b.cfg.ip);
+                let _ = rsp.extend_from_slice(&b.cfg.mask);
+                let _ = rsp.extend_from_slice(&b.cfg.gateway);
+            }
+        }
+        0xCD => {
+            let _ = rsp.push(0x00);
+            if payload.len() >= 12 {
+                if let Some(mut b) = crate::bus::lock_timeout() {
+                    b.cfg.ip.copy_from_slice(&payload[0..4]);
+                    b.cfg.mask.copy_from_slice(&payload[4..8]);
+                    b.cfg.gateway.copy_from_slice(&payload[8..12]);
+                }
+                std::thread::spawn(|| { std::thread::sleep(std::time::Duration::from_millis(500)); unsafe { esp_idf_sys::esp_restart() }; });
+            }
+        }
+        0xCF => {
+            let _ = rsp.push(0x00);
+            let fw = crate::bus::lock_timeout().map(|b| b.cfg.fw_version).unwrap_or(0x0221);
+            let _ = rsp.push(((fw/100)&0xFF) as u8); let _ = rsp.push((((fw%100)/10)&0xFF) as u8);
+            let _ = rsp.push(((fw%10)&0xFF) as u8); let _ = rsp.push(0x06); let _ = rsp.push(0x15);
+        }
+        0xCC => {
+            let _ = rsp.push(0x00);
+            let hw = crate::bus::lock_timeout().map(|b| b.cfg.hw_version).unwrap_or(0xF300);
+            let _ = rsp.push((hw&0xFF) as u8); let _ = rsp.push(((hw>>8)&0xFF) as u8);
+        }
+        0xC2 => {
+            let _ = rsp.push(0x00);
+            let sn = crate::bus::lock_timeout().map(|b| b.cfg.sn).unwrap_or([0u8;32]);
+            for i in 0..9u8 { let _ = rsp.push(sn[i as usize*2]); let _ = rsp.push(sn[i as usize*2+1]); }
+        }
+        0xC3 => {
+            let _ = rsp.push(0x00);
+            if payload.len() >= 18 {
+                if let Some(mut b) = crate::bus::lock_timeout() { b.cfg.sn[..18].copy_from_slice(&payload[..18]); }
+            }
+        }
+        _ => { let _ = rsp.push(0x81); }
+    }
+    // 构建应答帧
+    let chip_id = chip_id_bytes();
+    let mut frame: heapless::Vec<u8, 300> = heapless::Vec::new();
+    let _ = frame.push(0);
+    let _ = frame.extend_from_slice(&chip_id);
+    let _ = frame.extend_from_slice(&rsp);
+    let crc = crate::modbus::shared::modbus_crc16(&frame[..frame.len()]);
+    let _ = frame.extend_from_slice(&crc.to_le_bytes());
+    frame[0] = frame.len() as u8;
+    // 发送 notify
+    let gatts_if = *GATTS_IF.lock() as u8;
+    if let Some(cid) = *CONN_ID.lock() {
+        if cid == conn_id {
+            let handle = HANDLE_TABLE.lock()[IDX_CHAR_TX_VAL];
+            unsafe { esp_idf_sys::esp_ble_gatts_send_indicate(gatts_if, conn_id, handle, frame.len() as u16, frame.as_ptr() as *mut _, false); };
+        }
+    }
+    true
 }
 
 /// 取出待发送的响应数据 (供 GATT notify 调用)

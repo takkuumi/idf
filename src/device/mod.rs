@@ -177,6 +177,22 @@ pub fn nvs_partition() -> EspDefaultNvsPartition {
     NVS_PARTITION.clone()
 }
 
+/// 从 NVS 读取 blob 到 buffer, 返回实际读取的字节数
+pub fn nvs_read_to_buf(key: &str, buf: &mut [u8]) -> Option<usize> {
+    let nvs = NVS.lock();
+    match nvs.get_blob(key, buf) {
+        Ok(Some(data)) => Some(data.len()),
+        _ => None,
+    }
+}
+
+/// 写入 blob 到 NVS
+pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
+    let nvs = NVS.lock();
+    nvs.set_blob(key, data)
+        .map_err(|e| AppError::Config(format!("nvs set_blob {key}: {e:?}")))
+}
+
 // ----------------------------------------------------------------------------
 // 复位计数持久化 (工业可靠性: 记录复位历史)
 // ----------------------------------------------------------------------------

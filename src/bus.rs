@@ -12,8 +12,9 @@
 use parking_lot::Mutex;
 use once_cell::sync::Lazy;
 
-use crate::config::regs;
+use crate::config::{hw_version, regs};
 use crate::device::system_config::{SystemConfig, WriteResult};
+use crate::device_config::DeviceConfigTable;
 
 // ----------------------------------------------------------------------------
 // 数据结构
@@ -119,7 +120,6 @@ impl Default for ProtoStore {
 }
 
 /// 总线总状态
-#[derive(Default)]
 pub struct Bus {
     pub di: DiState,
     pub do_: DoState,
@@ -128,22 +128,42 @@ pub struct Bus {
     pub sys: SysState,
     pub proto: ProtoStore,
     pub cfg: SystemConfig,
+    pub device_config: DeviceConfigTable,
+    /// 设备文本区 (5000-6999 = 2000 字)
+    pub device_text: [u16; 2000],
+}
+
+impl Default for Bus {
+    fn default() -> Self {
+        Self {
+            di: Default::default(),
+            do_: Default::default(),
+            ai: Default::default(),
+            ao: Default::default(),
+            sys: Default::default(),
+            proto: Default::default(),
+            cfg: SystemConfig::defaults(),
+            device_config: DeviceConfigTable::default(),
+            device_text: [0u16; 2000],
+        }
+    }
 }
 
 impl Bus {
     fn new() -> Self {
         let mut s = Self::default();
-        s.sys.firmware_version = 0x0100; // v1.00
+        s.sys.firmware_version = 0x0100;
         s.cfg = SystemConfig::defaults();
         s
     }
 
     // ---- Modbus 寄存器映射 (供 Modbus 模块使用) ----
 
-    /// 读取线圈 (FC=0x01)
+    /// 读取线圈 (FC=0x01). 地址范围: COIL_DO_BASE .. COIL_DO_END
     pub fn read_coil(&self, addr: u16) -> Option<bool> {
-        if addr < regs::COIL_DO_COUNT {
-            Some(self.do_.bits & (1u64 << addr) != 0)
+        if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
+            let ch = (addr - regs::COIL_DO_BASE) as usize;
+            Some(self.do_.bits & (1u64 << ch) != 0)
         } else {
             None
         }
@@ -151,11 +171,12 @@ impl Bus {
 
     /// 写入线圈 (FC=0x05/0x0F)
     pub fn write_coil(&mut self, addr: u16, value: bool) -> bool {
-        if addr < regs::COIL_DO_COUNT {
+        if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
+            let ch = (addr - regs::COIL_DO_BASE) as usize;
             if value {
-                self.do_.bits |= 1u64 << addr;
+                self.do_.bits |= 1u64 << ch;
             } else {
-                self.do_.bits &= !(1u64 << addr);
+                self.do_.bits &= !(1u64 << ch);
             }
             true
         } else {
@@ -172,67 +193,77 @@ impl Bus {
         }
     }
 
-    /// 读取输入寄存器 (FC=0x04)
+    /// 读取输入寄存器 (FC=0x04). 参考固件: AI raw @ 0x80, AI status @ 0x88, sys info @ 0x87C
     pub fn read_input_reg(&self, addr: u16) -> Option<u16> {
-        if addr < regs::INREG_AI_COUNT {
-            Some(self.ai.raw[addr as usize])
-        } else {
-            let scaled_addr = addr.wrapping_sub(regs::INREG_AI_SCALED_BASE);
-            if scaled_addr < 6 {
-                Some(self.ai.scaled[scaled_addr as usize])
-            } else {
-                None
-            }
-        }
-    }
-
-    /// 读取保持寄存器 (FC=0x03)
-    pub fn read_hold_reg(&self, addr: u16) -> Option<u16> {
-        if addr < regs::HOLD_AO_COUNT {
-            Some(self.ao.scaled[addr as usize])
-        } else if addr >= regs::CFG_BASE && addr < regs::CFG_END {
-            // 系统配置区
-            self.cfg.read_reg(addr)
-        } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
-            // 协议存储区数据
-            let idx = (addr - regs::PROTO_BASE) as usize;
-            Some(self.proto.data[idx])
+        if addr >= regs::INREG_AI_BASE && addr < regs::INREG_AI_BASE + regs::INREG_AI_COUNT {
+            let idx = (addr - regs::INREG_AI_BASE) as usize;
+            Some(self.ai.raw.get(idx).copied().unwrap_or(0))
+        } else if addr >= regs::INREG_AI_STATUS_BASE && addr < regs::INREG_AI_STATUS_BASE + regs::INREG_AI_COUNT {
+            let idx = (addr - regs::INREG_AI_STATUS_BASE) as usize;
+            Some(self.ai.scaled.get(idx).copied().unwrap_or(0))
         } else {
             match addr {
-                regs::HOLD_SYS_FW_VER => Some(self.sys.firmware_version),
-                regs::HOLD_SYS_UPTIME_S => Some((self.sys.uptime_s & 0xFFFF) as u16),
-                regs::HOLD_SYS_RESET_CNT => Some(self.sys.reset_count),
-                regs::HOLD_SYS_RESET => Some(if self.sys.reset_request { 0xA5A5 } else { 0 }),
-                regs::HOLD_SYS_RESET_REASON => Some(self.sys.reset_reason as u16),
-                regs::HOLD_SYS_TASK_HEALTH => Some(0), // TODO: 接入 health 模块位图
-                regs::HOLD_SYS_LOG_LEVEL => Some(self.sys.log_level as u16),
-                // OTA 升级区 (RO)
-                regs::HOLD_OTA_STATUS => Some(crate::ota::status().as_u16()),
-                regs::HOLD_OTA_WRITTEN_LO => {
-                    Some((crate::ota::written_bytes() & 0xFFFF) as u16)
-                }
-                regs::HOLD_OTA_WRITTEN_HI => {
-                    Some((crate::ota::written_bytes() >> 16) as u16)
-                }
-                // 协议元数据
-                regs::PROTO_COMMIT => Some(0),
-                regs::PROTO_RELOAD => Some(0),
-                regs::PROTO_VERSION => Some(self.proto.version),
-                regs::PROTO_LENGTH => Some(self.proto.length),
-                regs::PROTO_STATUS => Some(self.proto.status as u16),
-                regs::PROTO_MAGIC => Some(crate::device::PROTO_MAGIC),
+                regs::INREG_QI_COUNT => Some(((hw_version::DO_COUNT as u16) << 8) | (hw_version::DI_COUNT as u16)),
+                regs::INREG_ADC485 => Some((regs::INREG_AI_COUNT << 8) | 2), // 4 ADC + 2 RS485
+                regs::INREG_FW_VER => Some(self.sys.firmware_version),
+                regs::INREG_FW_DATE => Some(0x0615), // MMDD format
                 _ => None,
             }
         }
     }
 
+    /// 读取保持寄存器 (FC=0x03). 匹配参考固件 PRegBuf 全范围返回.
+    pub fn read_hold_reg(&self, addr: u16) -> Option<u16> {
+        // 设备文本区 (5000-6999)
+        if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
+            let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
+            return Some(self.device_text[idx]);
+        }
+        // 设备功能配置区 (2300+)
+        if addr >= regs::HOLD_DEVICE_CONFIG && addr <= regs::HOLD_CFG_END {
+            if addr >= 2300 && addr < 2400 {
+                // Try device_config first
+                if let Some(v) = self.device_config.read_reg(addr) {
+                    return Some(v);
+                }
+            }
+            // 其余走 SystemConfig
+            return Some(self.cfg.read_reg(addr).unwrap_or(0));
+        }
+        // 配置区 (2176-4223): 优先走 SystemConfig, 未映射的返回 0
+        if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
+            return Some(self.cfg.read_reg(addr).unwrap_or(0));
+        }
+        // 协议存储区
+        if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
+            let idx = (addr - regs::PROTO_BASE) as usize;
+            return Some(self.proto.data[idx]);
+        }
+        match addr {
+            regs::PROTO_COMMIT => Some(0),
+            regs::PROTO_RELOAD => Some(0),
+            regs::PROTO_VERSION => Some(self.proto.version),
+            regs::PROTO_LENGTH => Some(self.proto.length),
+            regs::PROTO_STATUS => Some(self.proto.status as u16),
+            regs::PROTO_MAGIC => Some(crate::device::PROTO_MAGIC),
+            _ => None,
+        }
+    }
+
     /// 写入保持寄存器 (FC=0x06/0x10)
     pub fn write_hold_reg(&mut self, addr: u16, value: u16) -> bool {
-        if addr < regs::HOLD_AO_COUNT {
-            self.ao.scaled[addr as usize] = value;
-            true
-        } else if addr >= regs::CFG_BASE && addr < regs::CFG_END {
-            // 系统配置区
+        // 设备文本区 (5000-6999)
+        if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
+            let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
+            self.device_text[idx] = value;
+            return true;
+        }
+        // 设备功能配置区 (2300+)
+        if addr >= 2300 && addr < 2400 {
+            return self.device_config.write_reg(addr, value);
+        }
+        if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
+            // 总是尝试写入 — write_reg 返回 NotFound 时也允许(存到 NVS 原始区)
             match self.cfg.write_reg(addr, value) {
                 WriteResult::Ok => true,
                 WriteResult::Apply => {
@@ -245,113 +276,25 @@ impl Bus {
                     crate::device::request_apply_config();
                     true
                 }
-                WriteResult::NotFound => false,
+                WriteResult::NotFound => true, // 允许写入未映射地址(参考固件 PRegBuf 全范围可写)
             }
         } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
-            // 协议存储区数据
             let idx = (addr - regs::PROTO_BASE) as usize;
             self.proto.data[idx] = value;
             self.proto.dirty = true;
             true
         } else {
             match addr {
-                regs::HOLD_SYS_RESET => {
-                    if value == 0xA5A5 {
-                        self.sys.reset_request = true;
-                    }
-                    true
-                }
-                regs::HOLD_SYS_LOG_LEVEL => {
-                    // 运行时日志级别调节 (0=Err 1=Warn 2=Info 3=Debug 4=Trace)
-                    if value <= 4 {
-                        self.sys.log_level = value as u8;
-                        // 立即应用日志级别
-                        let level = match value {
-                            0 => log::LevelFilter::Error,
-                            1 => log::LevelFilter::Warn,
-                            2 => log::LevelFilter::Info,
-                            3 => log::LevelFilter::Debug,
-                            4 => log::LevelFilter::Trace,
-                            _ => log::LevelFilter::Info,
-                        };
-                        log::set_max_level(level);
-                        log::info!("[bus] log level set to {}", value);
-                    }
-                    true
-                }
-                // OTA 升级区
-                regs::HOLD_OTA_TOTAL_LO => {
-                    let total = crate::ota::pending_total();
-                    crate::ota::set_pending_total((total & 0xFFFF_0000) | value as u32);
-                    true
-                }
-                regs::HOLD_OTA_TOTAL_HI => {
-                    let total = crate::ota::pending_total();
-                    crate::ota::set_pending_total((total & 0x0000_FFFF) | ((value as u32) << 16));
-                    true
-                }
-                regs::HOLD_OTA_BEGIN => {
-                    if value == 0x0B0A {
-                        let total = crate::ota::pending_total();
-                        log::info!("[bus] OTA begin triggered, total={} bytes", total);
-                        if let Err(e) = crate::ota::begin(total) {
-                            log::error!("[bus] OTA begin failed: {}", e);
-                        }
-                    }
-                    true
-                }
-                regs::HOLD_OTA_END => {
-                    if value == 0x0E0D {
-                        log::info!("[bus] OTA end triggered");
-                        match crate::ota::end() {
-                            Ok(()) => log::info!("[bus] OTA end ok, ready to reboot"),
-                            Err(e) => log::error!("[bus] OTA end failed: {}", e),
-                        }
-                    }
-                    true
-                }
-                regs::HOLD_OTA_ABORT => {
-                    if value == 0x0AB0 {
-                        log::info!("[bus] OTA abort triggered");
-                        let _ = crate::ota::abort();
-                    }
-                    true
-                }
-                regs::HOLD_OTA_REBOOT => {
-                    if value == 0x0F0E {
-                        log::info!("[bus] OTA reboot triggered");
-                        // 在新线程中延时重启, 给 Modbus 响应发送留时间
-                        std::thread::spawn(|| {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            unsafe { esp_idf_sys::esp_restart() };
-                        });
-                    }
-                    true
-                }
                 regs::PROTO_COMMIT => {
-                    if value == 0xC5C5 {
-                        self.proto.status = 1; // 写入中
-                        crate::device::request_commit();
-                    }
+                    if value == 0xC5C5 { self.proto.status = 1; crate::device::request_commit(); }
                     true
                 }
                 regs::PROTO_RELOAD => {
-                    if value == 0xA5A5 {
-                        self.proto.status = 2; // 加载中
-                        crate::device::request_reload();
-                    }
+                    if value == 0xA5A5 { self.proto.status = 2; crate::device::request_reload(); }
                     true
                 }
-                regs::PROTO_VERSION => {
-                    self.proto.version = value;
-                    self.proto.dirty = true;
-                    true
-                }
-                regs::PROTO_LENGTH => {
-                    self.proto.length = value;
-                    self.proto.dirty = true;
-                    true
-                }
+                regs::PROTO_VERSION => { self.proto.version = value; self.proto.dirty = true; true }
+                regs::PROTO_LENGTH => { self.proto.length = value; self.proto.dirty = true; true }
                 _ => false,
             }
         }
