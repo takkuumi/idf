@@ -40,7 +40,7 @@ static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 10);
 /// 启动 W5500 以太网。
 ///
 /// SPI3_HOST 总线由本模块独占管理 (W5500 是 SPI 总线上唯一外设)。
-/// ETH_RST 引脚复用 `hal.gpio.eth_reset()`，避免与 GPIO 模块重复初始化。
+/// ETH_RST 引脚复用 `hal.gpio.eth_reset_pulse()`，避免与 GPIO 模块重复初始化。
 pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let _ = sys_loop;
 
@@ -62,7 +62,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 1) 硬件复位 W5500 (复用 Hal.gpio 的 ETH_RST 引脚, 避免重复 gpio_config)
     //    序列: HIGH(250ms) → LOW(50ms) → HIGH(350ms), 来自参考固件 ETHClass.cpp
     log::info!("[eth] resetting W5500 via GPIO{}...", pins::ETH_RST);
-    hal.gpio.eth_reset();
+    hal.gpio.eth_reset_pulse();
 
     // 2) 初始化 SPI 总线 (W5500 独占 SPI3_HOST)
     //    DMA: SPI_DMA_CH_AUTO (ESP-IDF 自动分配 DMA 通道)
@@ -88,7 +88,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     }
 
     // 5) 创建 PHY
-    //    reset_gpio_num=-1: RST 由 hal.gpio.eth_reset() 手动管理, 不让 PHY 驱动重复控制
+    //    reset_gpio_num=-1: RST 由 hal.gpio.eth_reset_pulse() 手动管理, 不让 PHY 驱动重复控制
     let phy_cfg = eth_phy_config_default();
     let phy = unsafe { esp_idf_sys::esp_eth_phy_new_w5500(&phy_cfg) };
     if phy.is_null() {
@@ -233,7 +233,7 @@ fn eth_w5500_config_default(spi_host: esp_idf_sys::spi_host_device_t,
 fn eth_phy_config_default() -> esp_idf_sys::eth_phy_config_t {
     esp_idf_sys::eth_phy_config_t {
         // W5500 PHY 地址固定为 0 (内部 PHY)
-        // reset_gpio_num=-1: RST 由 hal.gpio.eth_reset() 手动管理
+        // reset_gpio_num=-1: RST 由 hal.gpio.eth_reset_pulse() 手动管理
         phy_addr: 0, reset_timeout_ms: 100, autonego_timeout_ms: 4000, reset_gpio_num: -1,
         hw_reset_assert_time_us: 0, post_hw_reset_delay_ms: 0,
     }

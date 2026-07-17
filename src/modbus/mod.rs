@@ -12,16 +12,16 @@ use std::sync::Arc;
 use crate::error::AppResult;
 use crate::hal::Hal;
 
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 pub mod rtu_master;
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 pub mod rtu_slave;
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 pub mod tcp_server;
 pub mod shared;
 
 /// 启动 RTU Master + Slave 任务
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 pub fn start_rtu(_hal: Arc<Hal>) -> AppResult<()> {
     rtu_master::start(_hal.clone())?;
     rtu_slave::start(_hal.clone())?;
@@ -29,7 +29,7 @@ pub fn start_rtu(_hal: Arc<Hal>) -> AppResult<()> {
 }
 
 /// 启动 TCP Server 任务
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 pub fn start_tcp() -> AppResult<()> {
     tcp_server::start()
 }

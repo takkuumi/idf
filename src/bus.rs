@@ -327,3 +327,146 @@ macro_rules! with_bus {
         $body
     }};
 }
+
+// ============================================================================
+// 单元测试 — DI/DO/AI/AO 状态 + 寄存器映射
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::regs;
+
+    #[test]
+    fn test_di_state_bits() {
+        let mut di = DiState::default();
+        di.bits = 0xFFFF;
+        // bit 0..bit 15 都应该是 1
+        for i in 0..16 {
+            assert!(di.bits & (1u64 << i) != 0, "DI {} should be set", i);
+        }
+        // bit 16..bit 47 都是 0
+        for i in 16..48 {
+            assert!(di.bits & (1u64 << i) == 0, "DI {} should be clear", i);
+        }
+    }
+
+    #[test]
+    fn test_do_state_bits() {
+        let mut do_ = DoState::default();
+        do_.bits = 0xAAAA; // 0b10101010...
+        // bit 0 = 0, bit 1 = 1, bit 2 = 0, bit 3 = 1...
+        assert_eq!(do_.bits & 1, 0); // bit 0 = 0
+        assert_eq!(do_.bits & 2, 2); // bit 1 = 1
+        assert_eq!(do_.bits & 4, 0); // bit 2 = 0
+    }
+
+    #[test]
+    fn test_ai_state_array() {
+        let mut ai = AiState::default();
+        ai.raw[0] = 2048; // ~50% of 12-bit range
+        ai.scaled[0] = 5000; // 5.000 mA (for 4-20mA)
+        assert_eq!(ai.raw[0], 2048);
+        assert_eq!(ai.scaled[0], 5000);
+    }
+
+    #[test]
+    fn test_ao_state_array() {
+        let mut ao = AoState::default();
+        ao.scaled[0] = 10000; // 10.000 V
+        ao.duty[0] = 4095; // 100% of 12-bit PWM
+        assert_eq!(ao.scaled[0], 10000);
+        assert_eq!(ao.duty[0], 4095);
+    }
+
+    #[test]
+    fn test_sys_state_default() {
+        let sys = SysState::default();
+        assert_eq!(sys.log_level, SysState::DEFAULT_LOG_LEVEL);
+        assert_eq!(sys.log_level, 2); // Info
+        assert_eq!(sys.uptime_s, 0);
+    }
+
+    #[test]
+    fn test_proto_store_default() {
+        let proto = ProtoStore::default();
+        assert_eq!(proto.data.len(), 1500);
+        assert_eq!(proto.dirty, false);
+        assert_eq!(proto.status, 0);
+    }
+
+    #[test]
+    fn test_bus_read_coil() {
+        let bus = Bus::default();
+        // 默认 DO 全 0, 读线圈应返回 false
+        assert_eq!(bus.read_coil(regs::COIL_DO_BASE), Some(false));
+        // 越界地址返回 None
+        assert_eq!(bus.read_coil(0xFFFF), None);
+    }
+
+    #[test]
+    fn test_bus_write_coil() {
+        let mut bus = Bus::default();
+        // 写线圈 0 (DO0) = true
+        let ok = bus.write_coil(regs::COIL_DO_BASE, true);
+        assert_eq!(ok, true);
+        assert_eq!(bus.read_coil(regs::COIL_DO_BASE), Some(true));
+        // 越界地址写入返回 false
+        assert_eq!(bus.write_coil(0xFFFF, true), false);
+    }
+
+    #[test]
+    fn test_bus_read_disc() {
+        let bus = Bus::default();
+        // 默认 DI 全 0, 读离散输入应返回 false
+        assert_eq!(bus.read_disc(regs::DISC_DI_BASE), Some(false));
+    }
+
+    #[test]
+    fn test_bus_read_input_reg() {
+        let bus = Bus::default();
+        // FW_VER 寄存器应该返回 firmware_version
+        let v = bus.read_input_reg(regs::INREG_FW_VER);
+        // 默认 firmware_version = 0x0100
+        assert_eq!(v, Some(0x0100));
+        // FW_DATE = 0x0615
+        assert_eq!(bus.read_input_reg(regs::INREG_FW_DATE), Some(0x0615));
+    }
+
+    #[test]
+    fn test_bus_read_hold_reg_cfg_endpoints() {
+        let bus = Bus::default();
+        // 验证配置区基本寄存器可读
+        assert!(bus.read_hold_reg(regs::HOLD_CFG_BASE).is_some());
+        assert!(bus.read_hold_reg(regs::HOLD_IP_BASE).is_some());
+        assert!(bus.read_hold_reg(regs::HOLD_MASK_BASE).is_some());
+        assert!(bus.read_hold_reg(regs::HOLD_GW_BASE).is_some());
+    }
+
+    #[test]
+    fn test_bus_write_hold_reg_commit() {
+        let mut bus = Bus::default();
+        // 写 PROTO_COMMIT=0xC5C5 触发 commit
+        let ok = bus.write_hold_reg(regs::PROTO_COMMIT, 0xC5C5);
+        assert_eq!(ok, true);
+    }
+
+    #[test]
+    fn test_bus_write_hold_reg_reload() {
+        let mut bus = Bus::default();
+        // 写 PROTO_RELOAD=0xA5A5 触发 reload
+        let ok = bus.write_hold_reg(regs::PROTO_RELOAD, 0xA5A5);
+        assert_eq!(ok, true);
+    }
+
+    #[test]
+    fn test_bus_device_text_area() {
+        let mut bus = Bus::default();
+        // 写设备文本区 5000-6999
+        let ok = bus.write_hold_reg(5000, 0xABCD);
+        assert_eq!(ok, true);
+        assert_eq!(bus.read_hold_reg(5000), Some(0xABCD));
+        // 越界
+        assert_eq!(bus.write_hold_reg(4999, 0x1234), false);
+        assert_eq!(bus.write_hold_reg(7000, 0x1234), false);
+    }
+}

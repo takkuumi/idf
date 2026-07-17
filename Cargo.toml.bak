@@ -27,8 +27,8 @@ panic = "unwind"
 
 [features]
 # 默认启用 ADC Continuous/DMA (ESP32-S3 硬件潜力)
-# 如需回退到 OneShot: --no-default-features --features "ble-at,ethernet-w5500,..."
-default = ["ble-at", "adc-continuous", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do"]
+# 如需回退到 OneShot: --no-default-features --features "ble-mesh,ethernet-w5500,..."
+default = ["adc-continuous", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do"]
 # io-di-do 默认禁用: 实际硬件 DI/DO 通过 PCA9555 I2C 扩展, 非 GPIO 直驱
 adc-continuous = []
 # Wi-Fi 支持 (ESP32-S3 内置, 作为以太网冗余或 AP 配置入口)

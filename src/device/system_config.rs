@@ -55,7 +55,7 @@ pub struct Rs485Config {
     pub baudrate: u32,
     pub data_bits: u8,
     pub stop_bits: u8,
-    pub parity: u8,    // 0=None 1=Odd 2=Even
+    pub parity: u8,     // 0=None 1=Odd 2=Even
     pub slave_addr: u8, // 0=主站
     pub mode: u8,       // 0=Master 1=Slave 2=Gateway
 }
@@ -65,7 +65,7 @@ impl Default for Rs485Config {
     /// Word1=0x0000 (1200bps/N/8/1/Master), Word2=1, Word3=0, Word4=1000, Word5=20
     fn default() -> Self {
         Self {
-            baudrate: 1200,  // BAUD_RATE[0] = 1200
+            baudrate: 1200, // BAUD_RATE[0] = 1200
             data_bits: 8,
             stop_bits: 1,
             parity: 0,
@@ -121,8 +121,13 @@ impl SystemConfig {
         name[..name_str.len()].copy_from_slice(name_str);
 
         let mut ble_name = [0u8; 8];
-        let ble_str = b"GW-C5";
-        ble_name[..ble_str.len()].copy_from_slice(ble_str);
+        // BLE 广播名称 (≤ 8 字节, 含 0 结尾)
+        // 默认 "Mesh", 与原 C++ 固件 spp_adv_data 一致, 兼容手持机/手机扫描
+        // 用户可通过 AT+CFGBTNAME=<name> 修改
+        let ble_str_static = "Mesh".to_owned();
+        let ble_bytes = ble_str_static.as_bytes();
+        let copy_len = ble_bytes.len().min(ble_name.len());
+        ble_name[..copy_len].copy_from_slice(&ble_bytes[..copy_len]);
 
         Self {
             sn,
@@ -169,14 +174,8 @@ impl SystemConfig {
     pub fn fw_version_from_cargo() -> u16 {
         let v = env!("CARGO_PKG_VERSION");
         let mut parts = v.split('.');
-        let major: u16 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let minor: u16 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let major: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         (major << 8) | minor
     }
 
@@ -248,7 +247,8 @@ impl SystemConfig {
         s.dns.copy_from_slice(&b[OFF_DNS..OFF_DNS + 4]);
 
         s.ble_mac.copy_from_slice(&b[OFF_BLE_MAC..OFF_BLE_MAC + 6]);
-        s.ble_name.copy_from_slice(&b[OFF_BLE_NAME..OFF_BLE_NAME + 8]);
+        s.ble_name
+            .copy_from_slice(&b[OFF_BLE_NAME..OFF_BLE_NAME + 8]);
         s.ble_mesh_enable = b[OFF_BLE_MESH] != 0;
 
         for i in 0..2 {
@@ -358,7 +358,10 @@ impl SystemConfig {
         // BLE 名称 — 2字节/字 (参考固件: BT_ARRD1..BT_ARRD4)
         if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
             let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
-            return Some(u16::from_be_bytes([self.ble_name[idx], self.ble_name[idx + 1]]));
+            return Some(u16::from_be_bytes([
+                self.ble_name[idx],
+                self.ble_name[idx + 1],
+            ]));
         }
         if addr == regs::CFG_BLE_MESH_EN {
             return Some(self.ble_mesh_enable as u16);
@@ -368,34 +371,52 @@ impl SystemConfig {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
             if (base..base + 5).contains(&addr) {
                 let off = (addr - base) as usize;
-                let r = if i < self.rs485.len() { &self.rs485[i] } else { &self.rs485[0] };
+                let r = if i < self.rs485.len() {
+                    &self.rs485[i]
+                } else {
+                    &self.rs485[0]
+                };
                 return Some(match off {
                     // Word 1: (baud_idx<<12)|(parity<<10)|(stop<<9)|(data<<8)|mode
                     0 => {
                         let baud_idx = match r.baudrate {
-                            1200 => 0, 2400 => 1, 4800 => 2, 9600 => 3,
-                            19200 => 4, 38400 => 5, 57600 => 6, 115200 => 7,
-                            230400 => 8, 460800 => 9, 921600 => 10, _ => 3,
+                            1200 => 0,
+                            2400 => 1,
+                            4800 => 2,
+                            9600 => 3,
+                            19200 => 4,
+                            38400 => 5,
+                            57600 => 6,
+                            115200 => 7,
+                            230400 => 8,
+                            460800 => 9,
+                            921600 => 10,
+                            _ => 3,
                         };
-                        (baud_idx << 12) | ((r.parity as u16 & 0x3) << 10)
+                        (baud_idx << 12)
+                            | ((r.parity as u16 & 0x3) << 10)
                             | ((r.stop_bits.saturating_sub(1) as u16 & 0x1) << 9)
                             | ((if r.data_bits == 7 { 1u16 } else { 0u16 }) << 8)
                             | (r.mode as u16 & 0xFF)
                     }
-                    1 => r.slave_addr as u16,     // Word 2: Slave ID
-                    2 => 0u16,                      // Word 3: Retry count (default 0)
-                    3 => 1000u16,                   // Word 4: Response timeout (default 1000ms)
-                    4 => 20u16,                     // Word 5: Delay between polls (default 20ms)
+                    1 => r.slave_addr as u16, // Word 2: Slave ID
+                    2 => 0u16,                // Word 3: Retry count (default 0)
+                    3 => 1000u16,             // Word 4: Response timeout (default 1000ms)
+                    4 => 20u16,               // Word 5: Delay between polls (default 20ms)
                     _ => 0,
                 });
             }
         }
         // 未知保留区 (2239-2242, 参考固件默认 5500-5503)
-        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT).contains(&addr) {
+        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT)
+            .contains(&addr)
+        {
             return Some(5500 + (addr - regs::HOLD_UNKNOWN_BASE) as u16);
         }
         // TCP COM 端口 (2243-2246)
-        if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT).contains(&addr) {
+        if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
+            .contains(&addr)
+        {
             let idx = (addr - regs::HOLD_TCP_COM_BASE) as usize;
             return Some(regs::TCP_PORTS_DEFAULT.get(idx).copied().unwrap_or(0));
         }
@@ -483,11 +504,18 @@ impl SystemConfig {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
             if (base..base + 5).contains(&addr) {
                 let off = (addr - base) as usize;
-                let r = if i < self.rs485.len() { &mut self.rs485[i] } else { &mut self.rs485[0] };
+                let r = if i < self.rs485.len() {
+                    &mut self.rs485[i]
+                } else {
+                    &mut self.rs485[0]
+                };
                 match off {
                     0 => {
                         let baud_idx = ((value >> 12) & 0xF) as u32;
-                        let baud_table: [u32; 11] = [1200,2400,4800,9600,19200,38400,57600,115200,230400,460800,921600];
+                        let baud_table: [u32; 11] = [
+                            1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800,
+                            921600,
+                        ];
                         r.baudrate = *baud_table.get(baud_idx as usize).unwrap_or(&9600);
                         r.parity = ((value >> 10) & 0x3) as u8;
                         r.stop_bits = (((value >> 9) & 0x1) + 1) as u8;
@@ -502,11 +530,15 @@ impl SystemConfig {
             }
         }
         // 未知保留区 (2239-2242, 可写)
-        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT).contains(&addr) {
+        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT)
+            .contains(&addr)
+        {
             return WriteResult::Ok;
         }
         // TCP COM 端口 (2243-2246, 可写)
-        if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT).contains(&addr) {
+        if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
+            .contains(&addr)
+        {
             return WriteResult::Ok;
         }
         WriteResult::NotFound
@@ -591,13 +623,17 @@ impl SystemConfig {
 /// IPv4: 4 字节 → 4 个 U16, 每字 1 字节 (参考固件: SLAVE_REG_PIP1..PIP4)
 fn read_ipv4(bytes: &[u8; 4], base: u16, addr: u16) -> Option<u16> {
     let off = addr.checked_sub(base)?;
-    if off >= 4 { return None; }
+    if off >= 4 {
+        return None;
+    }
     Some(bytes[off as usize] as u16)
 }
 
 fn write_ipv4(bytes: &mut [u8; 4], base: u16, addr: u16, value: u16) -> Option<()> {
     let off = addr.checked_sub(base)?;
-    if off >= 4 { return None; }
+    if off >= 4 {
+        return None;
+    }
     bytes[off as usize] = (value & 0xFF) as u8;
     Some(())
 }
@@ -605,13 +641,17 @@ fn write_ipv4(bytes: &mut [u8; 4], base: u16, addr: u16, value: u16) -> Option<(
 /// MAC: 6 字节 → 6 个 U16, 每字 1 字节 (参考固件: SLAVE_REG_MAC1..MAC6)
 fn read_mac(bytes: &[u8; 6], base: u16, addr: u16) -> Option<u16> {
     let off = addr.checked_sub(base)?;
-    if off >= 6 { return None; }
+    if off >= 6 {
+        return None;
+    }
     Some(bytes[off as usize] as u16)
 }
 
 fn write_mac(bytes: &mut [u8; 6], base: u16, addr: u16, value: u16) -> Option<()> {
     let off = addr.checked_sub(base)?;
-    if off >= 6 { return None; }
+    if off >= 6 {
+        return None;
+    }
     bytes[off as usize] = (value & 0xFF) as u8;
     Some(())
 }
@@ -640,4 +680,98 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
         out[i] = u8::from_str_radix(p, 16).ok()?;
     }
     Some(out)
+}
+
+// ============================================================================
+// 单元测试 — SystemConfig 字段读写
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = SystemConfig::defaults();
+        assert_eq!(cfg.dhcp, true);
+        assert_eq!(cfg.ip, [192, 168, 1, 200]);
+        assert_eq!(cfg.mac, [0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]);
+        assert_eq!(cfg.rs485.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_ipv4() {
+        assert_eq!(parse_ipv4("192.168.1.1"), Some([192, 168, 1, 1]));
+        assert_eq!(parse_ipv4("0.0.0.0"), Some([0, 0, 0, 0]));
+        assert_eq!(parse_ipv4("255.255.255.255"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_ipv4(""), None);
+        assert_eq!(parse_ipv4("256.0.0.0"), None);
+        assert_eq!(parse_ipv4("192.168.1"), None);
+    }
+
+    #[test]
+    fn test_parse_mac() {
+        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF"), Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        assert_eq!(parse_mac("00:08:DC:11:22:33"), Some([0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]));
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(parse_mac("invalid"), None);
+        assert_eq!(parse_mac("AA:BB:CC"), None);
+    }
+
+    #[test]
+    fn test_ip_str_format() {
+        let cfg = SystemConfig::defaults();
+        let s = cfg.ip_str();
+        assert!(s.contains("192.168.1.200"));
+    }
+
+    #[test]
+    fn test_read_reg_unmapped_returns_none() {
+        let cfg = SystemConfig::defaults();
+        // 不在已知映射中的地址返回 None
+        assert_eq!(cfg.read_reg(0xFFFF), None);
+    }
+
+    #[test]
+    fn test_read_reg_fw_ver() {
+        let cfg = SystemConfig::defaults();
+        // FW_VER 在输入寄存器区
+        assert!(cfg.read_reg(0x087E).is_some());
+    }
+
+    #[test]
+    fn test_write_reg_apply_request() {
+        let mut cfg = SystemConfig::defaults();
+        // CFG_APPLY = 0xFF01, 写任意值触发 Apply
+        let result = cfg.write_reg(0xFF01, 0x0000);
+        assert_eq!(result, WriteResult::Apply);
+    }
+
+    #[test]
+    fn test_write_reg_reset_request() {
+        let mut cfg = SystemConfig::defaults();
+        // CFG_RESET_DEFAULT = 0xFF02, 写 0xD5D5 触发 Reset
+        let result = cfg.write_reg(0xFF02, 0xD5D5);
+        assert_eq!(result, WriteResult::Reset);
+    }
+
+    #[test]
+    fn test_write_reg_dhcp() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(0xFF03, 1);
+        assert_eq!(result, WriteResult::Ok);
+        // cfg.dhcp is private; assert via behavior
+        let result2 = cfg.write_reg(0xFF03, 0);
+        assert_eq!(result2, WriteResult::Ok);
+    }
+
+    #[test]
+    fn test_str_format_helpers() {
+        let cfg = SystemConfig::defaults();
+        // 默认 SN 应该是 32 字节零填充
+        let sn = cfg.sn_str();
+        assert!(sn.len() <= 32);
+        // 默认 BLE 名称
+        let name = cfg.ble_name_str();
+        assert!(name.len() <= 16);
+    }
 }

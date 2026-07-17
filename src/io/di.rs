@@ -27,16 +27,16 @@ const DEBOUNCE_COUNT: u8 = 3;
 /// 心跳节流: 每 100ms 上报一次, 避免原子操作过载
 /// 默认版本 (1ms 周期): HB_DIV=100 → 100ms
 /// F3/F4 版本 (5ms 周期): HB_DIV=20 → 100ms
-#[cfg(not(any(feature_f3, feature_f4)))]
+#[cfg(not(any(feature = "f3", feature = "f4")))]
 const HB_DIV: u32 = 100;
-#[cfg(any(feature_f3, feature_f4))]
+#[cfg(any(feature = "f3", feature = "f4"))]
 const HB_DIV: u32 = 20;
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("di-scan");
 
 /// 启动 DI 扫描任务
-#[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_scan_task(hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
     health::set_next_thread_core(health::CORE_RT);

@@ -25,8 +25,10 @@ pub fn process(line: &str) -> String {
         return ok_none();
     }
 
-    // AT+XXX[=ARGS]
+    // AT+XXX[=ARGS]；兼容不带加号的 ATXXX，但分派前必须剥离可选的 '+'。
+    // 旧实现直接使用 line[2..]，导致标准命令 AT+VERSION 被解析成 "+VERSION"。
     let rest = &line[2..];
+    let rest = rest.strip_prefix('+').unwrap_or(rest);
     let (cmd, args) = match rest.find(['=', '?']) {
         Some(pos) => {
             let sep = rest.as_bytes()[pos] as char;
@@ -164,5 +166,78 @@ fn handle_ota(args: &str) -> String {
         ota_handlers::handle_ota_reboot(rest)
     } else {
         err(2, "usage: AT+OTA=BEGIN/WRITE/END/ABORT/STATUS/REBOOT")
+    }
+}
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_u16_decimal() {
+        assert_eq!(parse_u16("1234"), Some(1234));
+        assert_eq!(parse_u16("0"), Some(0));
+        assert_eq!(parse_u16("65535"), Some(65535));
+    }
+
+    #[test]
+    fn test_parse_u16_hex() {
+        assert_eq!(parse_u16("0x100"), Some(256));
+        assert_eq!(parse_u16("0XFF"), Some(255));
+        assert_eq!(parse_u16("0xABCD"), Some(0xABCD));
+    }
+
+    #[test]
+    fn test_parse_u16_invalid() {
+        assert_eq!(parse_u16(""), None);
+        assert_eq!(parse_u16("abc"), None);
+        assert_eq!(parse_u16("99999999"), None); // overflow
+    }
+
+    #[test]
+    fn test_parse_u16_list() {
+        let v = parse_u16_list("1,2,3,0xFF");
+        assert_eq!(v, heapless::Vec::from_slice(&[1, 2, 3, 255]).unwrap());
+    }
+
+    #[test]
+    fn test_response_formats() {
+        assert_eq!(ok_none(), "OK\r\n");
+        assert_eq!(ok_data("hello"), "OK hello\r\n");
+        assert_eq!(err(10, "bad"), "ERROR 10: bad\r\n");
+    }
+
+    /// AT 命令分发测试 — 通过调用 process() 验证命令分发正确
+    #[test]
+    fn test_at_basic() {
+        assert_eq!(process("AT"), "OK\r\n");
+        assert_eq!(process("at"), "OK\r\n");
+        assert_eq!(process("AT+VERSION"), "OK ");
+        // AT+VERSION 实际值由 handlers::handle_version 返回, 这里仅验证前缀
+        let resp = process("AT+VERSION");
+        assert!(resp.starts_with("OK "));
+    }
+
+    #[test]
+    fn test_at_unknown() {
+        let resp = process("AT+BOGUS_CMD");
+        assert!(resp.starts_with("ERROR 2:"));
+    }
+
+    #[test]
+    fn test_at_invalid() {
+        // 不以 AT 开头
+        let resp = process("HELLO");
+        assert!(resp.starts_with("ERROR 1:"));
+    }
+
+    #[test]
+    fn test_at_without_plus() {
+        // 兼容不带 + 的旧命令
+        let resp = process("ATVERSION");
+        assert!(resp.starts_with("OK "));
     }
 }

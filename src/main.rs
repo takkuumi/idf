@@ -27,6 +27,7 @@ mod config;
 mod bus;
 mod device;
 mod device_config;
+#[cfg(feature = "ble-at")]
 mod ble_at;
 mod hal;
 mod ethernet;
@@ -34,11 +35,10 @@ mod rs485;
 mod modbus;
 mod io;
 mod channel;
-mod blemesh;
 mod health;
 mod ota;
 mod protocol;
-#[cfg(feature_wifi)]
+#[cfg(feature = "wifi")]
 mod wifi;
 
 use std::sync::Arc;
@@ -91,6 +91,15 @@ fn main() -> AppResult<()> {
 
     // 3. 硬件抽象层初始化
     let hal = hal::Hal::init(peripherals)?;
+    // 4. 设备协议存储初始化 (含 NVS 加载 + 监听线程)
+    // 显式初始化 NVS 分区 (解决 LoadProhibited: BLE 代码加入后启动顺序改变)
+    log::info!("[main] initializing NVS flash...");
+    unsafe {
+        let ret = esp_idf_sys::nvs_flash_init();
+        if ret != esp_idf_sys::ESP_OK && ret != esp_idf_sys::ESP_ERR_NVS_NO_FREE_PAGES {
+            log::warn!("[main] nvs_flash_init: 0x{:x}", ret);
+        }
+    }
     let hal = Arc::new(hal);
 
     // 4. 设备协议存储初始化 (含 NVS 加载 + 监听线程)
@@ -122,7 +131,7 @@ fn main() -> AppResult<()> {
     );
 
     // 5. 启动以太网 (W5500)
-    #[cfg(feature_ethernet)]
+    #[cfg(feature = "ethernet-w5500")]
     {
         log::info!("[main] starting ethernet (W5500)...");
         ethernet::start(hal.clone(), sys_loop.clone())?;
@@ -130,7 +139,7 @@ fn main() -> AppResult<()> {
 
     // 5.1 启动 Wi-Fi (ESP32-S3 内置, 作为以太网冗余链路, 默认不启用)
     // 用 `--features wifi` 启用, 与 BLE 共存 (sdkconfig 已配 COEX)
-    #[cfg(feature_wifi)]
+    #[cfg(feature = "wifi")]
     {
         log::info!("[main] starting Wi-Fi (Station mode)...");
         // Wi-Fi 启动失败仅记日志, 不阻断主流程 (作为备份链路)
@@ -142,21 +151,12 @@ fn main() -> AppResult<()> {
     // 6. 通信协议注册表 (插件化管理 Modbus RTU/TCP + BLE Mesh)
     let mut protocols = protocol::ProtocolRegistry::new();
 
-    // 6.1 启动 BLE Mesh (需在 ble_at 之前, ble_at 依赖 BLE 协议栈已初始化)
-    #[cfg(feature_ble_mesh)]
+    // 6. 启动 BLE GATT Server (标准 BLE)
+    #[cfg(feature = "ble-at")]
     {
-        log::info!("[main] starting ble mesh...");
-        protocols.register(Box::new(protocol::BleMeshProtocol::new(hal.clone())));
-        if let Some(p) = protocols.find("ble-mesh") {
-            p.start()?;
-        }
+        log::info!("[main] starting ble gatt server...");
+        ble_at::start()?;
     }
-
-    // 6.2 BLE AT 命令通道 (依赖 BLE 协议栈, 独立于协议注册表)
-    log::info!("[main] starting ble at command channel...");
-    ble_at::start()?;
-
-    // 7. 启动 IO 扫描 (DI/DO)
     #[cfg(feature = "io-di-do")]
     {
         log::info!("[main] starting io scan task...");
@@ -171,12 +171,12 @@ fn main() -> AppResult<()> {
     }
 
     // 9. 注册 + 启动 Modbus 通信协议 (通过 ProtocolRegistry 插件化管理)
-    #[cfg(feature_modbus_rtu)]
+    #[cfg(feature = "modbus-rtu")]
     {
         log::info!("[main] registering modbus rtu...");
         protocols.register(Box::new(protocol::ModbusRtuProtocol::new(hal.clone())));
     }
-    #[cfg(feature_modbus_tcp)]
+    #[cfg(feature = "modbus-tcp")]
     {
         log::info!("[main] registering modbus tcp...");
         protocols.register(Box::new(protocol::ModbusTcpProtocol::new()));

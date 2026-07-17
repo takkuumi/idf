@@ -130,3 +130,68 @@ print('uptime:', r.registers[0], 's')
 - [ ] DO 写到 GPIO 输出延迟 < 20ms (10ms 周期)
 - [ ] AI 采样到总线更新延迟 < 100ms
 - [ ] BLE Mesh OnOff Set 到 DO 输出延迟 < 200ms (心跳周期)
+
+## BLE 验证 (新)
+
+### 启动日志检查
+- [ ] `[ble_at] service starting (uuid=4fafc201-...)` 应在初始化时打印
+- [ ] `[ble_at] controller config magic=0x...` 显示 magic 正确
+- [ ] `[ble_at] Classic BT memory release returned 0x...` (S3 上是 NOT_FOUND, 正常)
+- [ ] `[ble_at] BLE device name set to 'GW-XXXXXX'` 显示 BLE 名称
+- [ ] `[ble_at] BLE MAC = XX:XX:XX:XX:XX:XX` 显示蓝牙 MAC
+- [ ] `[ble_at] ETH MAC = XX:XX:XX:XX:XX:XX` 显示以太网 MAC
+- [ ] `[ble_at] local MTU set to 247` MTU 设置成功
+- [ ] `[ble_at] GATT app registered` GATT 应用注册
+- [ ] `[ble_at] GOT CREAT_ATTR_TAB_EVT` 属性表创建事件
+- [ ] `[ble_at] GATT service started` 服务启动
+- [ ] `[ble_at] ADV_DATA configured` 广播数据配置
+- [ ] `[ble_at] SCAN_RSP configured` 扫描响应配置 (含 name + txpower)
+- [ ] `[ble_at] SCAN_RSP configured; starting advertising...` 启动广播
+- [ ] `[ble_at] BLE advertising active (svc=4fafc201-...)` 广播已激活
+
+### 移动端扫描测试
+- [ ] 打开 nRF Connect 或 手持机 APP
+- [ ] 扫描 BLE 设备, 应该看到 "GW-XXXXXX" (后 3 字节是 MAC 地址)
+- [ ] 点击连接, 应能成功连接
+- [ ] MTU 协商 = 247 (查看 nRF Connect 详情)
+- [ ] 服务列表中应显示 4fafc201-1fb5-459e-8fcc-c5c9c331914b
+- [ ] 特征 b/eb5483e-36e1-4688-b7f5-ea07361b26a8 应显示 Read/Write/Notify 属性
+- [ ] Subscribe Notify 应能成功
+- [ ] 写入 "AT\r\n" 到 characteristic, 设备应通过 Notify 返回 "OK\r\n"
+
+## 单元测试运行
+
+```bash
+# 这些测试是 #[cfg(test)] mod tests, 嵌入在源码中
+# 由于项目链接 esp-idf-sys, 标准的 cargo test 无法运行
+# 但可通过文档测试或 device 上运行的集成测试验证
+
+# 验证代码结构正确:
+cargo check              # 默认 features
+cargo check --features f3 # F3 版本 (16 DI + 16 DO)
+cargo check --features f4 # F4 版本 (48 DI, 无 DO)
+```
+
+## F3/F4 版本特定测试
+
+### F3 (16 DI + 16 DO)
+- [ ] 编译时启用: `cargo build --features f3`
+- [ ] `cfg::hw_version::NAME` == "F3"
+- [ ] `cfg::hw_version::DI_COUNT` == 16
+- [ ] `cfg::hw_version::DO_COUNT` == 16
+- [ ] 3 片 MCP23017 在 I2C 总线 (DI@0x20, DO@0x21)
+- [ ] 读 DI 0..15 正确
+- [ ] 写 DO 0..15 正确
+
+### F4 (48 DI + 48 DO)
+- [ ] 编译时启用: `cargo build --features f4`
+- [ ] `cfg::hw_version::NAME` == "F4"
+- [ ] `cfg::hw_version::DI_COUNT` == 48
+- [ ] `cfg::hw_version::DO_COUNT` == 48
+- [ ] `cfg::hw_version::DO_EXT_CHIPS` == 3
+- [ ] 6 片 MCP23017 在 I2C 总线
+  - DI: 0x20 / 0x21 / 0x22 (各 16 路)
+  - DO: 0x23 / 0x24 / 0x25 (各 16 路)
+- [ ] 读 DI 0..47 正确
+- [ ] 写 DO 0..47 正确 (一次 I2C 写 3 片, 约 600μs)
+- [ ] 读 DO 缓存正确

@@ -25,6 +25,8 @@ pub use types::{DeviceType, DeviceFunction, DeviceFunctionMeta};
 pub struct DeviceConfigTable {
     /// 已配置设备列表
     devices: heapless::Vec<DeviceEntry, 32>,
+    /// 写入 2300 的计数值 (独立于 devices.len(), 参考项目 PRegBuf 语义)
+    stored_count: u16,
     /// NVS key 前缀
     nvs_key: &'static str,
 }
@@ -56,6 +58,7 @@ impl DeviceConfigTable {
     pub fn new() -> Self {
         Self {
             devices: heapless::Vec::new(),
+            stored_count: 0,
             nvs_key: "dev_cfg",
         }
     }
@@ -78,7 +81,7 @@ impl DeviceConfigTable {
     pub fn read_reg(&self, addr: u16) -> Option<u16> {
         let base = 2300u16;
         if addr == base {
-            return Some(self.devices.len() as u16);
+            return Some(self.stored_count);
         }
         let off = (addr - base - 1) as usize;
         let mut pos = 0usize;
@@ -107,6 +110,7 @@ impl DeviceConfigTable {
         let base = 2300u16;
         if addr == base {
             let count = value as usize;
+            self.stored_count = value;
             self.devices.truncate(count.min(32));
             return true;
         }

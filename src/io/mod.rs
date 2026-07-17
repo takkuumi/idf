@@ -17,7 +17,7 @@ pub mod do_;
 ///
 /// 仅在 io-di-do 或 F3/F4 启用时编译。
 /// 实际硬件 DI/DO 走 PCA9555 I2C 扩展, 待实现后此处恢复。
-#[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     di::start_scan_task(_hal.clone())?;
     do_::start_output_task(_hal)?;

@@ -49,6 +49,7 @@ pub fn load(table: &mut DeviceConfigTable) -> AppResult<()> {
         }
     }
     log::info!("[dev_cfg] loaded {} devices from NVS", table.devices.len());
+    table.stored_count = table.devices.len() as u16;
     Ok(())
 }
 

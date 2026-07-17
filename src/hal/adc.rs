@@ -2,7 +2,7 @@
 //!
 //! 支持两种模式 (通过 feature flag 切换):
 //!
-//! - **Continuous + DMA 模式** (`feature_adc_continuous`, 默认):
+//! - **Continuous + DMA 模式** (`feature = "adc-continuous"`, 默认):
 //!   ADC1 6 通道在后台 DMA 连续采样, CPU 仅读环形缓冲区, 零 CPU 占用。
 //!   用 `esp_idf_sys` 直接调用 `adc_continuous_*` API。
 //!   每 100ms 调用 `sample_all()` 时, 从 DMA 缓冲区读取 N 帧并取平均。
@@ -29,14 +29,14 @@ use crate::hal::pins::Adc1Cfg;
 // 统一对外句柄 (根据 feature 切换内部实现)
 // ============================================================================
 
-/// ADC1 句柄 (统一 API, 内部实现根据 feature_adc_continuous 切换)
+/// ADC1 句柄 (统一 API, 内部实现根据 feature = "adc-continuous" 切换)
 ///
-/// - `feature_adc_continuous` (默认): Continuous + DMA 模式
+/// - `feature = "adc-continuous"` (默认): Continuous + DMA 模式
 /// - 否则: OneShot + Mutex 模式
 pub struct AdcHandle {
-    #[cfg(feature_adc_continuous)]
+    #[cfg(feature = "adc-continuous")]
     inner: AdcContinuous,
-    #[cfg(not(feature_adc_continuous))]
+    #[cfg(not(feature = "adc-continuous"))]
     inner: AdcOneShot,
 }
 
@@ -44,9 +44,9 @@ impl AdcHandle {
     /// 初始化 ADC1 + 6 个通道
     pub fn init(cfg: Adc1Cfg) -> AppResult<Self> {
         Ok(Self {
-            #[cfg(feature_adc_continuous)]
+            #[cfg(feature = "adc-continuous")]
             inner: AdcContinuous::init(cfg)?,
-            #[cfg(not(feature_adc_continuous))]
+            #[cfg(not(feature = "adc-continuous"))]
             inner: AdcOneShot::init(cfg)?,
         })
     }
@@ -71,7 +71,7 @@ impl AdcHandle {
 // Continuous + DMA 模式 (ESP32-S3 硬件加速)
 // ============================================================================
 
-#[cfg(feature_adc_continuous)]
+#[cfg(feature = "adc-continuous")]
 mod adc_continuous {
     use super::*;
 
@@ -235,14 +235,14 @@ mod adc_continuous {
     }
 }
 
-#[cfg(feature_adc_continuous)]
+#[cfg(feature = "adc-continuous")]
 use adc_continuous::AdcContinuous;
 
 // ============================================================================
 // OneShot + Mutex 模式 (兼容性 fallback)
 // ============================================================================
 
-#[cfg(not(feature_adc_continuous))]
+#[cfg(not(feature = "adc-continuous"))]
 mod adc_oneshot {
     use super::*;
     use parking_lot::Mutex;
@@ -251,7 +251,7 @@ mod adc_oneshot {
     use esp_idf_hal::gpio::AnyInputPin;
     use esp_idf_hal::peripherals::ADC1;
 
-    /// ADC OneShot 句柄 (fallback, 不启用 feature_adc_continuous 时使用)
+    /// ADC OneShot 句柄 (fallback, 不启用 feature = "adc-continuous" 时使用)
     pub struct AdcOneShot {
         driver: Mutex<AdcDriver<'static>>,
         channels: [AdcChannelDriver<'static, AnyInputPin>; 6],
@@ -317,5 +317,5 @@ mod adc_oneshot {
     }
 }
 
-#[cfg(not(feature_adc_continuous))]
+#[cfg(not(feature = "adc-continuous"))]
 use adc_oneshot::AdcOneShot;

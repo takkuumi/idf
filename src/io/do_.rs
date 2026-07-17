@@ -31,7 +31,7 @@ pub fn notify() {
     DO_DIRTY.store(true, Ordering::Release);
 }
 
-#[cfg(any(feature_io_di_do, feature_f3, feature_f4))]
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
     health::set_next_thread_core(health::CORE_RT);

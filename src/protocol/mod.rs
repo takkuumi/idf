@@ -27,10 +27,10 @@ use parking_lot::Mutex;
 
 use crate::error::AppResult;
 
-// Arc + Hal 仅被需要 Arc<Hal> 的适配器使用 (ModbusRtuProtocol / BleMeshProtocol)
-#[cfg(any(feature_modbus_rtu, feature_ble_mesh))]
+// Arc + Hal 仅被需要 Arc<Hal> 的适配器使用 (ModbusRtuProtocol)
+#[cfg(feature = "modbus-rtu")]
 use std::sync::Arc;
-#[cfg(any(feature_modbus_rtu, feature_ble_mesh))]
+#[cfg(feature = "modbus-rtu")]
 use crate::hal::Hal;
 
 // ============================================================================
@@ -240,13 +240,13 @@ impl Default for ProtocolRegistry {
 ///
 /// 封装 `modbus::start_rtu()`, 通过 Protocol trait 统一管理。
 /// 持有 `Arc<Hal>` 供 RS485 + Modbus RTU Master/Slave 任务使用。
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 pub struct ModbusRtuProtocol {
     hal: Arc<Hal>,
     state: ProtocolState,
 }
 
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 impl ModbusRtuProtocol {
     pub fn new(hal: Arc<Hal>) -> Self {
         Self {
@@ -256,7 +256,7 @@ impl ModbusRtuProtocol {
     }
 }
 
-#[cfg(feature_modbus_rtu)]
+#[cfg(feature = "modbus-rtu")]
 impl Protocol for ModbusRtuProtocol {
     fn name(&self) -> &str {
         "modbus-rtu"
@@ -285,12 +285,12 @@ impl Protocol for ModbusRtuProtocol {
 /// Modbus TCP 协议适配器
 ///
 /// 封装 `modbus::start_tcp()`, 监听 502 端口。
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 pub struct ModbusTcpProtocol {
     state: ProtocolState,
 }
 
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 impl ModbusTcpProtocol {
     pub fn new() -> Self {
         Self {
@@ -299,14 +299,14 @@ impl ModbusTcpProtocol {
     }
 }
 
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 impl Default for ModbusTcpProtocol {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature_modbus_tcp)]
+#[cfg(feature = "modbus-tcp")]
 impl Protocol for ModbusTcpProtocol {
     fn name(&self) -> &str {
         "modbus-tcp"
@@ -332,49 +332,3 @@ impl Protocol for ModbusTcpProtocol {
     }
 }
 
-/// BLE Mesh 协议适配器
-///
-/// 封装 `blemesh::start()`, 初始化 BLE 控制器 + Bluedroid + Mesh 协议栈。
-/// 持有 `Arc<Hal>` 供心跳任务使用, NVS 分区从 `device::nvs_partition()` 获取。
-#[cfg(feature_ble_mesh)]
-pub struct BleMeshProtocol {
-    hal: Arc<Hal>,
-    state: ProtocolState,
-}
-
-#[cfg(feature_ble_mesh)]
-impl BleMeshProtocol {
-    pub fn new(hal: Arc<Hal>) -> Self {
-        Self {
-            hal,
-            state: ProtocolState::new(),
-        }
-    }
-}
-
-#[cfg(feature_ble_mesh)]
-impl Protocol for BleMeshProtocol {
-    fn name(&self) -> &str {
-        "ble-mesh"
-    }
-
-    fn start(&self) -> AppResult<()> {
-        let nvs = crate::device::nvs_partition();
-        crate::blemesh::start(self.hal.clone(), nvs)?;
-        self.state.mark_started();
-        Ok(())
-    }
-
-    fn stop(&self) -> AppResult<()> {
-        self.state.mark_stopped();
-        Ok(())
-    }
-
-    fn is_running(&self) -> bool {
-        self.state.is_running()
-    }
-
-    fn stats(&self) -> ProtocolStats {
-        self.state.stats(self.name())
-    }
-}

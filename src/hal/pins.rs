@@ -70,9 +70,9 @@ pub struct HalPins {
     pub rs485_de: [u8; 2],
 
     // ---- DI / DO 引脚号 (仅 io-di-do 版本, F3/F4 用 I2C 扩展) ----
-    #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+    #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
     pub di: [u8; 8],
-    #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+    #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
     pub do_: [u8; 8],
 }
 
@@ -110,9 +110,9 @@ impl HalPins {
             },
             ledc_channels: cfg::AO_CHANNELS,
 
-            #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+            #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
             di: cfg::DI_PINS,
-            #[cfg(all(feature_io_di_do, not(any(feature_f3, feature_f4))))]
+            #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
             do_: cfg::DO_PINS,
             eth_int: cfg::ETH_INT,
             eth_rst: cfg::ETH_RST,

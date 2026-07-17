@@ -130,47 +130,52 @@ pub mod pins {
 // ----------------------------------------------------------------------------
 pub mod hw_version {
     /// 版本名 (用于日志和 AT+VERSION 响应)
-    #[cfg(feature_f3)]
+    #[cfg(feature = "f3")]
     pub const NAME: &str = "F3";
-    #[cfg(feature_f4)]
+    #[cfg(feature = "f4")]
     pub const NAME: &str = "F4";
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const NAME: &str = "F16";
 
     /// DI 通道数
-    #[cfg(feature_f3)]
+    #[cfg(feature = "f3")]
     pub const DI_COUNT: usize = 16;
-    #[cfg(feature_f4)]
+    #[cfg(feature = "f4")]
     pub const DI_COUNT: usize = 48;
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DI_COUNT: usize = 16;
 
     /// DO 通道数
-    #[cfg(feature_f3)]
+    /// - F3: 16 DO (1 片 MCP23017)
+    /// - F4: 48 DO (3 片 MCP23017, 每片 16 DO)
+    /// - 默认: 16 DO (GPIO 直驱或 1 片 PCA9555)
+    #[cfg(feature = "f3")]
     pub const DO_COUNT: usize = 16;
-    #[cfg(feature_f4)]
-    pub const DO_COUNT: usize = 16;
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(feature = "f4")]
+    pub const DO_COUNT: usize = 48;
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DO_COUNT: usize = 16;
 
     /// 是否使用 I2C IO 扩展 (F3/F4)
-    #[cfg(any(feature_f3, feature_f4))]
+    #[cfg(any(feature = "f3", feature = "f4"))]
     pub const USE_IO_EXT: bool = true;
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const USE_IO_EXT: bool = false;
 
     /// DI 扩展芯片数量 (MCP23017, 每片 16 通道)
-    #[cfg(feature_f3)]
+    #[cfg(feature = "f3")]
     pub const DI_EXT_CHIPS: usize = 1; // 16 DI / 16 per chip = 1
-    #[cfg(feature_f4)]
+    #[cfg(feature = "f4")]
     pub const DI_EXT_CHIPS: usize = 3; // 48 DI / 16 per chip = 3
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DI_EXT_CHIPS: usize = 0;
 
-    /// DO 扩展芯片数量 (F3/F4 都是 16 DO = 1 片)
-    #[cfg(any(feature_f3, feature_f4))]
+    /// DO 扩展芯片数量 (F3: 1 片 16 DO; F4: 3 片 48 DO)
+    #[cfg(feature = "f3")]
     pub const DO_EXT_CHIPS: usize = 1;
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(feature = "f4")]
+    pub const DO_EXT_CHIPS: usize = 3;
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DO_EXT_CHIPS: usize = 0;
 }
 
@@ -182,19 +187,28 @@ pub mod hw_version {
 // ----------------------------------------------------------------------------
 pub mod io_ext {
     /// MCP23017 DI 芯片 I2C 地址列表 (7-bit, 不含 R/W 位)
-    #[cfg(feature_f3)]
+    #[cfg(feature = "f3")]
     pub const DI_ADDRS: &[u8] = &[0x20]; // 1 片, 16 DI
-    #[cfg(feature_f4)]
+    #[cfg(feature = "f4")]
     pub const DI_ADDRS: &[u8] = &[0x20, 0x21, 0x22]; // 3 片, 48 DI
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DI_ADDRS: &[u8] = &[];
 
-    /// MCP23017 DO 芯片 I2C 地址
-    #[cfg(feature_f3)]
-    pub const DO_ADDR: u8 = 0x21; // F3: 1 片 DO
-    #[cfg(feature_f4)]
-    pub const DO_ADDR: u8 = 0x23; // F4: 1 片 DO
-    #[cfg(not(any(feature_f3, feature_f4)))]
+    /// MCP23017 DO 芯片 I2C 地址列表 (F3: 1 片; F4: 3 片)
+    /// F4: DI 已占用 0x20/0x21/0x22, DO 用 0x23/0x24/0x25
+    #[cfg(feature = "f3")]
+    pub const DO_ADDRS: &[u8] = &[0x21]; // F3: 1 片 DO @ 0x21
+    #[cfg(feature = "f4")]
+    pub const DO_ADDRS: &[u8] = &[0x23, 0x24, 0x25]; // F4: 3 片 DO @ 0x23/0x24/0x25
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    pub const DO_ADDRS: &[u8] = &[];
+
+    /// 单 DO 芯片地址 (向后兼容, 取第一个地址)
+    #[cfg(feature = "f3")]
+    pub const DO_ADDR: u8 = 0x21;
+    #[cfg(feature = "f4")]
+    pub const DO_ADDR: u8 = 0x23;
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DO_ADDR: u8 = 0;
 
     // ---- MCP23017 寄存器地址 (Byte mode, IOCON.BANK=0) ----
@@ -413,4 +427,111 @@ pub mod regs {
     // Master config defaults
     pub const TCP_PORTS_DEFAULT: [u16; 4] = [502, 503, 504, 5002];
     pub const UNKNOWN_DEFAULTS: [u16; 4] = [5500, 5501, 5502, 5503];
+}
+
+// ============================================================================
+// 单元测试 — 验证寄存器布局与参考固件对齐
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mca_register_layout_aligned() {
+        // 验证关键寄存器地址与 MCA_F16V2_1_F48_BLE.ino 一致
+        // REG_D01 = 0x0200
+        assert_eq!(regs::COIL_DO_BASE, 0x0200);
+        // REG_T01 = 0x0000 (离散输入起点)
+        assert_eq!(regs::DISC_DI_BASE, 0x0000);
+        // REG_A01 = 0x0080 (AI 起点)
+        assert_eq!(regs::INREG_AI_BASE, 0x0080);
+        // SLAVE_REG_P01 = 0x0880 (保持寄存器起点)
+        assert_eq!(regs::HOLD_CFG_BASE, 0x0880);
+        // SLAVE_REG_SN1 = 2196
+        assert_eq!(regs::HOLD_SN_BASE, 2196);
+        // SLAVE_REG_PLACE1 = 2205
+        assert_eq!(regs::HOLD_PLACE_BASE, 2205);
+        // SLAVE_REG_HW_VER = 2213
+        assert_eq!(regs::HOLD_HW_VER, 2213);
+        // SLAVE_REG_485_1_1 = 2214
+        assert_eq!(regs::HOLD_RS485_BASE, 2214);
+        // SLAVE_REG_TCP_COM1 = 2243
+        assert_eq!(regs::HOLD_TCP_COM_BASE, 2243);
+        // SLAVE_REG_PIP1 = 2247
+        assert_eq!(regs::HOLD_IP_BASE, 2247);
+        // SLAVE_REG_PNTEMASK1 = 2251
+        assert_eq!(regs::HOLD_MASK_BASE, 2251);
+        // SLAVE_REG_PGW1 = 2255
+        assert_eq!(regs::HOLD_GW_BASE, 2255);
+        // SLAVE_REG_DNS1 = 2259
+        assert_eq!(regs::HOLD_DNS_BASE, 2259);
+        // SLAVE_REG_MAC1 = 2263
+        assert_eq!(regs::HOLD_MAC_BASE, 2263);
+        // SLAVE_REG_MASTER_COM = 2269
+        assert_eq!(regs::HOLD_MASTER_COM, 2269);
+        // SLAVE_REG_BT_ARRD1 = 2274
+        assert_eq!(regs::HOLD_BT_ADDR_BASE, 2274);
+        // SLAVE_SERSOR_MIN = 2280
+        assert_eq!(regs::HOLD_SENSOR_MIN_BASE, 2280);
+        // SLAVE_SERSOR_MAX = 2288
+        assert_eq!(regs::HOLD_SENSOR_MAX_BASE, 2288);
+        // SLAVE_DEVICE_CONFIG = 2300
+        assert_eq!(regs::HOLD_DEVICE_CONFIG, 2300);
+        // SLAVE_USER_START = 4000
+        assert_eq!(regs::HOLD_USER_BASE, 4000);
+    }
+
+    #[test]
+    fn test_register_address_invariants() {
+        // P 区连续
+        assert!(regs::HOLD_RS485_BASE < regs::HOLD_TCP_COM_BASE);
+        assert!(regs::HOLD_TCP_COM_BASE < regs::HOLD_IP_BASE);
+        assert!(regs::HOLD_IP_BASE < regs::HOLD_MASK_BASE);
+        assert!(regs::HOLD_MASK_BASE < regs::HOLD_GW_BASE);
+        assert!(regs::HOLD_GW_BASE < regs::HOLD_DNS_BASE);
+        assert!(regs::HOLD_DNS_BASE < regs::HOLD_MAC_BASE);
+        assert!(regs::HOLD_MAC_BASE < regs::HOLD_MASTER_COM);
+        assert!(regs::HOLD_MASTER_COM < regs::HOLD_BT_ADDR_BASE);
+    }
+
+    #[test]
+    #[cfg(feature = "f3")]
+    fn test_f3_di_count() {
+        assert_eq!(hw_version::DI_COUNT, 16);
+        assert_eq!(hw_version::DO_COUNT, 16);
+        assert_eq!(hw_version::NAME, "F3");
+    }
+
+    #[test]
+    #[cfg(feature = "f4")]
+    fn test_f4_di_do_count() {
+        // F4: 48 DI + 48 DO
+        assert_eq!(hw_version::DI_COUNT, 48);
+        assert_eq!(hw_version::DO_COUNT, 48);
+        assert_eq!(hw_version::NAME, "F4");
+        assert_eq!(hw_version::DO_EXT_CHIPS, 3);
+        assert_eq!(crate::config::io_ext::DO_ADDRS.len(), 3);
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    fn test_default_di_do_count() {
+        assert_eq!(hw_version::NAME, "F16");
+        assert_eq!(hw_version::DI_COUNT, 16);
+        assert_eq!(hw_version::DO_COUNT, 16);
+    }
+
+    #[test]
+    fn test_protocol_area() {
+        // 协议区 (与用户区连续)
+        assert_eq!(regs::PROTO_BASE, 0x4000);
+        assert_eq!(regs::PROTO_COUNT, 1500);
+        assert_eq!(regs::PROTO_END, 0x4000 + 1500);
+    }
+
+    #[test]
+    fn test_app_metadata() {
+        assert_eq!(APP_NAME, "esp32s3-iot-gateway");
+        assert_eq!(MAIN_LOOP_PERIOD_MS, 100);
+    }
 }
