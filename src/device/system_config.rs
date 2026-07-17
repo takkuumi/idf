@@ -61,16 +61,16 @@ pub struct Rs485Config {
 }
 
 impl Default for Rs485Config {
-    /// 匹配参考固件 MODS_Init 中的 PRegBuf 默认值:
-    /// Word1=0x0000 (1200bps/N/8/1/Master), Word2=1, Word3=0, Word4=1000, Word5=20
+    /// 与实际 UART 配置一致 (rs485::port 打开 9600 baud).
+    /// Word1=0x3000 (9600bps/N/8/1/Master), Word2=1, Word3=0, Word4=1000, Word5=20
     fn default() -> Self {
         Self {
-            baudrate: 1200, // BAUD_RATE[0] = 1200
+            baudrate: 9600,
             data_bits: 8,
             stop_bits: 1,
             parity: 0,
             slave_addr: 1,
-            mode: 0, // Master (匹配参考固件 0x0000 低字节=0)
+            mode: 0, // Master
         }
     }
 }
@@ -133,7 +133,9 @@ impl SystemConfig {
             sn,
             name,
             hw_version: 0x0100,
-            fw_version: Self::fw_version_from_cargo(),
+            // 匹配 MCA F16 + NCA9555F16: MCA_FIRMWARE_VERSION=221, Date=0x0615
+            // Android 端 fwVersionBytesToStr 解析: fw=221 → "2.2.1", dt=0x0615 → "1557"
+            fw_version: 221,
             cfg_version: 0,
             eth_mac: [0; 6],
             dhcp: false,

@@ -137,7 +137,7 @@ pub fn init() -> AppResult<()> {
     {
         let mut bus = bus::lock_timeout()
             .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.data.copy_from_slice(&data);
+        bus.proto.data.copy_from_slice(&data[..PROTO_WORDS]);
         bus.proto.version = version;
         bus.proto.length = length;
         bus.proto.dirty = false;
@@ -164,7 +164,7 @@ pub fn init() -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("device-store".into())
-        .stack_size(6144)
+        .stack_size(16384)
         .spawn(watch_loop);
     health::reset_thread_core();
     result.map_err(|e| AppError::Config(format!("spawn device-store: {e}")))?;
@@ -413,7 +413,7 @@ fn reload() -> AppResult<()> {
     {
         let mut bus = bus::lock_timeout()
             .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.data.copy_from_slice(&data);
+        bus.proto.data.copy_from_slice(&data[..PROTO_WORDS]);
         bus.proto.version = version;
         bus.proto.length = length;
         bus.proto.dirty = false;
@@ -424,27 +424,27 @@ fn reload() -> AppResult<()> {
     Ok(())
 }
 
-/// 应用系统配置:
+/// 应用系统配置 (不重启):
 /// 1. 持久化当前 SystemConfig 到 NVS
-/// 2. 触发软重启 (500ms 后 esp_restart), 让新配置在启动时完整生效
+/// 2. **不重启** - 避免每次 Modbus 写入配置都断开 BLE 连接
 ///
-/// 设计说明: 网络配置变更需重新初始化 esp_eth/esp_netif, RS485/BLE 配置变更
-/// 需重开外设, 这些操作运行时切换风险高 (资源句柄所有权问题), 故采用软重启方案。
-/// 用户通过 AT+CFGAPPLY 或写 CFG_APPLY=0xB5B5 触发, AT 响应已先返回再重启。
+/// 设计变更: 之前的实现每次 Apply 都触发 esp_restart(), 导致 Android 端
+/// "参数导入" 批量写入后立即断开 BLE, 用户体验极差。
+/// 现在的策略: 仅写 NVS, 不重启, 让 BLE 和其他外设保持运行。
 ///
-/// 重启延时 500ms: 确保 AT 响应 (BLE notify) + 日志 flush + NVS 提交完成
-/// (200ms 在 BLE 高负载时可能截断响应, 500ms 提供安全余量)
+/// 注: 网络/RS485/BLE 配置的运行时切换不在此函数中处理, 由各模块自行监听 cfg 变化。
+/// 如果用户希望完全重新初始化外设, 可以显式调用 esp_restart()。
 fn apply_config() -> AppResult<()> {
-    log::info!("[device] applying system config...");
+    log::info!("[device] applying system config (no restart)...");
 
-    // 1. 从 bus 拷贝当前 cfg
+    // 1. 从 bus 拷贝当前 cfg (持锁时间短)
     let cfg = {
         let bus = bus::lock_timeout()
             .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
         bus.cfg.clone()
     };
 
-    // 2. 持久化到 NVS
+    // 2. 持久化到 NVS (同步, 因为 NVS 写入很快, 通常 < 50ms)
     let mut nvs = NVS.lock();
     cfg.save_to_nvs(&mut nvs)?;
     drop(nvs);
@@ -456,19 +456,7 @@ fn apply_config() -> AppResult<()> {
         cfg.cfg_version,
         cfg.mac_str()
     );
-
-    // 3. 软重启让新配置生效 (500ms 后重启, 给 AT 响应/日志/NVS 留时间)
-    log::warn!("[device] scheduling soft restart in 500ms for full effect");
-    health::set_next_thread_core(health::CORE_NET);
-    let result = std::thread::Builder::new()
-        .name("cfg-apply-restart".into())
-        .spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            unsafe { esp_idf_sys::esp_restart(); }
-        });
-    health::reset_thread_core();
-    result.map_err(|e| AppError::Config(format!("spawn restart: {e}")))?;
-
+    log::info!("[device] BLE and other peripherals continue running (no restart)");
     Ok(())
 }
 

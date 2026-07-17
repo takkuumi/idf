@@ -90,9 +90,15 @@ static TASK_HB: TaskHb = TaskHb::new("ble-at");
 static RX_BUFFER: Lazy<Mutex<heapless::String<512>>> =
     Lazy::new(|| Mutex::new(heapless::String::new()));
 
-/// 输出缓冲区 (notify 给主机)
+/// 输出缓冲区 (notify 给主机, AT 命令文本响应)
 static TX_BUFFER: Lazy<Mutex<heapless::String<512>>> =
     Lazy::new(|| Mutex::new(heapless::String::new()));
+/// 二进制响应队列 (由 GATT 写回调填充, main loop 发送)
+static BINARY_TX: Lazy<Mutex<heapless::Vec<u8, 512>>> =
+    Lazy::new(|| Mutex::new(heapless::Vec::new()));
+/// 有待发送的 BLE 通知 (由 CONNECT_EVT 或 Modbus 响应设置, main loop 消费)
+static PENDING_NOTIFY: std::sync::atomic::AtomicBool = 
+    std::sync::atomic::AtomicBool::new(false);
 
 // ============================================================================
 // Bluedroid GATT C API 绑定
@@ -397,36 +403,59 @@ unsafe extern "C" fn gatts_event_cb(
                 let enabled = cccd & 0x0001 != 0;
                 TX_NOTIFY_ENABLED.store(enabled, Ordering::SeqCst);
                 log::info!(
-                    "[ble_at] TX notify {}",
-                    if enabled { "enabled" } else { "disabled" }
+                    "[ble_at] TX notify {}, gatts_if={:?}, conn_id={}",
+                    if enabled { "enabled" } else { "disabled" },
+                    *GATTS_IF.lock(),
+                    p.conn_id
                 );
             } else if p.handle == handles[IDX_CHAR_VALUE] && !p.value.is_null() && p.len > 0 {
                 // RX characteristic 写入 — 优先尝试二进制协议, 否则按文本 AT 处理
+                // 关键修复: 必须先发送写响应, 然后再处理数据发送通知
+                // 否则 Android BLE 栈可能在收到通知前就进入下一状态
                 let data = unsafe { std::slice::from_raw_parts(p.value, p.len as usize) };
-                if !try_handle_binary_protocol(data, p.conn_id, p.trans_id) {
-                    feed_data(data);
-                }
-                log::debug!("[ble_at] GATT write RX: {} bytes", data.len());
-            }
-            drop(handles);
+                let data_vec: Vec<u8> = data.to_vec();
+                // handles already dropped implicitly
 
-            // 发送写入响应 (need_rsp=true 时, AUTO_RSP 的 CCCD 由协议栈自动响应)
-            // 仅 RSP_BY_APP 的 RX char 需应用响应
-            if p.need_rsp {
-                let Some(gatts_if) = *GATTS_IF.lock() else {
-                    log::error!("[ble_at] cannot respond: GATT interface is unavailable");
-                    return;
-                };
-                // SAFETY: gatts_if / conn_id / trans_id 来源可靠
-                let _ = unsafe {
-                    esp_idf_sys::esp_ble_gatts_send_response(
-                        gatts_if,
-                        p.conn_id,
-                        p.trans_id,
-                        esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
-                        std::ptr::null_mut(),
-                    )
-                };
+                // 1. 先发送写响应 (GATT 协议要求先响应 write request)
+                if p.need_rsp {
+                    let Some(gatts_if) = *GATTS_IF.lock() else {
+                        log::error!("[ble_at] cannot respond: GATT interface is unavailable");
+                        return;
+                    };
+                    let _ = unsafe {
+                        esp_idf_sys::esp_ble_gatts_send_response(
+                            gatts_if,
+                            p.conn_id,
+                            p.trans_id,
+                            esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
+
+                // 2. 写响应后, 处理数据并发送通知
+                log::info!("[ble_at] GATT write RX: {} bytes, hex={}", data_vec.len(),
+                    data_vec.iter().take(20).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "));
+                if !try_handle_binary_protocol(&data_vec, p.conn_id, p.trans_id) {
+                    feed_data(&data_vec);
+                }
+            } else {
+                // handles already dropped implicitly
+                // 其他情况 (例如 CCCD 写入) 仍需发送响应
+                if p.need_rsp {
+                    let Some(gatts_if) = *GATTS_IF.lock() else {
+                        return;
+                    };
+                    let _ = unsafe {
+                        esp_idf_sys::esp_ble_gatts_send_response(
+                            gatts_if,
+                            p.conn_id,
+                            p.trans_id,
+                            esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
             }
         }
         ESP_GATTS_CONNECT_EVT => {
@@ -437,6 +466,32 @@ unsafe extern "C" fn gatts_event_cb(
             *CONN_ID.lock() = Some(p.conn_id);
             *GATTS_IF.lock() = Some(gatts_if);
             log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
+            
+            // MCA 兼容: 连接后立即产一个心跳通知到 BINARY_TX 队列
+            // Android BLEDataSyncManager.onStateConnected 会发心跳命令,
+            // 但有时 Service 未发现, 写入失败, 导致数据流卡死。
+            // 我们主动发心跳, 触发 Android 的 onHeartbeatChanged → readHardwareInfo
+            // 这个通知由 process_loop 的 try_send_notify 在 CCCD 使能后发送
+            let hb = {
+                use std::sync::atomic::{AtomicU16, Ordering};
+                static HB: AtomicU16 = AtomicU16::new(0);
+                HB.fetch_add(1, Ordering::Relaxed)
+            };
+            // 用 BLE 帧格式: tx_id=0, proto_id=0, pdu_data=[unit=1, func=0x11, hb_hi, hb_lo]
+            let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = frame.extend_from_slice(&[0u8, 0]);  // tx_id=0
+            let _ = frame.extend_from_slice(&[0u8, 0]);  // proto_id=0
+            let _ = frame.extend_from_slice(&4u16.to_be_bytes()); // length=4
+            let _ = frame.push(1);   // unit
+            let _ = frame.push(0x11); // func=heartbeat
+            let _ = frame.push((hb >> 8) as u8);
+            let _ = frame.push((hb & 0xFF) as u8);
+            let crc = modbus_crc16(&frame[..frame.len()]);
+            let _ = frame.push(crc as u8);
+            let _ = frame.push((crc >> 8) as u8);
+            // 标记有待发送的通知 (main loop 通过 process_tick 发送)
+            PENDING_NOTIFY.store(true, std::sync::atomic::Ordering::Release);
+            log::info!("[ble_at] connect heartbeat pending");
         }
         ESP_GATTS_DISCONNECT_EVT => {
             if param.is_null() {
@@ -641,16 +696,8 @@ pub fn start() -> AppResult<()> {
         )));
     }
 
-    health::register(&TASK_HB);
-    health::set_next_thread_core(health::CORE_NET);
-    let result = std::thread::Builder::new()
-        .name("ble-at".into())
-        .stack_size(4096)
-        .spawn(process_loop);
-    health::reset_thread_core();
-    result.map_err(|e| crate::error::AppError::BleMesh(format!("spawn ble-at: {e}")))?;
-
     log::info!("[ble_at] service startup queued (GATT callback registered, AT parser ready)");
+    log::info!("[ble_at] notification sender runs in main loop (no dedicated thread)");
     Ok(())
 }
 
@@ -658,43 +705,64 @@ pub fn start() -> AppResult<()> {
 ///
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
 /// 有则调用 parser::process 处理, 响应写入 TX_BUFFER 等待 notify。
-fn process_loop() {
-    loop {
-        // 心跳: 每次 10ms 循环
-        TASK_HB.tick();
-
-        // 从 RX_BUFFER 取一行
-        let cmd = {
-            let mut rx = RX_BUFFER.lock();
-            match rx.find('\n') {
-                Some(pos) => {
-                    let line: String = rx[..pos].trim_end_matches('\r').to_string();
-                    // heapless::String has no replace_range; save rest then rebuild
-                    let rest: String = rx[pos + 1..].to_string();
-                    rx.clear();
-                    let _ = rx.push_str(&rest);
-                    Some(line)
-                }
-                None => None,
+pub fn process_tick() {
+    if !TX_NOTIFY_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
+    let Some(conn_id) = *CONN_ID.lock() else { return; };
+    let Some(gatts_if) = *GATTS_IF.lock() else { return; };
+    let h = HANDLE_TABLE.lock();
+    let tx_handle = h[IDX_CHAR_VALUE];
+    drop(h);
+    if tx_handle == 0 { return; }
+    
+    // 1. 优先发送 BINARY_TX 队列中的响应 (Android 请求的 Modbus 响应)
+    if let Some(mut btx) = BINARY_TX.try_lock() {
+        if !btx.is_empty() {
+            let data: Vec<u8> = btx[..].to_vec();
+            let data_len = data.len();
+            btx.clear();
+            drop(btx);
+            let ret = unsafe {
+                esp_idf_sys::esp_ble_gatts_send_indicate(
+                    gatts_if, conn_id, tx_handle,
+                    data.len() as u16, data.as_ptr() as *mut u8, false,
+                )
+            };
+            if ret == 0 {
+                log::info!("[ble_at] BINARY_TX sent: {} bytes OK", data_len);
+            } else {
+                log::warn!("[ble_at] BINARY_TX send failed rc=0x{:x}", ret);
             }
-        };
-
-        if let Some(line) = cmd {
-            log::debug!("[ble_at] recv: {}", line);
-            let resp = parser::process(&line);
-            log::debug!("[ble_at] resp: {}", resp.trim_end());
-
-            // 写入 TX_BUFFER, 等待 notify 发送
-            {
-                let mut tx = TX_BUFFER.lock();
-                let _ = tx.push_str(&resp);
-            }
-
-            // 尝试通过 GATT notify 发送响应
-            try_send_notify();
+            return;
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    
+    // 2. 每 100 次主循环 (~10s) 发一次心跳
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static HB_DIV: AtomicU16 = AtomicU16::new(0);
+    static HB_SEQ: AtomicU16 = AtomicU16::new(0);
+    let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
+    if n % 100 != 0 { return; }
+    let seq = HB_SEQ.fetch_add(1, Ordering::Relaxed);
+    
+    let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
+    let _ = frame.extend_from_slice(&[0u8, 0, 0, 0, 0, 4]);
+    let _ = frame.push(1);
+    let _ = frame.push(0x11);
+    let _ = frame.push((seq >> 8) as u8);
+    let _ = frame.push((seq & 0xFF) as u8);
+    let crc = crate::modbus::shared::modbus_crc16(&frame[..frame.len()]);
+    let _ = frame.push(crc as u8);
+    let _ = frame.push((crc >> 8) as u8);
+    
+    log::info!("[ble_at] heartbeat #{} ({} bytes)", seq, frame.len());
+    let ret = unsafe {
+        esp_idf_sys::esp_ble_gatts_send_indicate(
+            gatts_if, conn_id, tx_handle,
+            frame.len() as u16, frame.as_ptr() as *mut u8, false,
+        )
+    };
+    if ret != 0 {
+        log::warn!("[ble_at] heartbeat failed rc=0x{:x}", ret);
     }
 }
 
@@ -707,6 +775,12 @@ fn process_loop() {
 ///
 /// 任一条件不满足时静默回退 (数据保留在 TX_BUFFER, 等下次重试)。
 fn try_send_notify() {
+    // 入口日志: 确认此函数被调用
+    log::info!("[ble_at] try_send_notify called, enabled={}, conn={:?}, gatts_if={:?}",
+        TX_NOTIFY_ENABLED.load(Ordering::SeqCst),
+        *CONN_ID.lock(),
+        *GATTS_IF.lock()
+    );
     // 检查 CCCD 是否使能
     if !TX_NOTIFY_ENABLED.load(Ordering::SeqCst) {
         return;
@@ -730,7 +804,7 @@ fn try_send_notify() {
     // 检查 GATT 服务是否已注册
     let handles = HANDLE_TABLE.lock();
     let tx_handle = handles[IDX_CHAR_VALUE];
-    drop(handles);
+    // handles already dropped implicitly
     if tx_handle == 0 {
         // GATT 服务尚未注册, 数据放回 TX_BUFFER 等下次重试
         let mut tx = TX_BUFFER.lock();
@@ -841,8 +915,7 @@ fn heartbeat_counter() -> u16 {
 }
 
 fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
-    log::debug!(
-        "[ble_at] binary rx: {} bytes, hex={}",
+    log::info!("[ble_at] binary rx: {} bytes, hex={}",
         data.len(),
         data.iter().take(20).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
     );
@@ -883,13 +956,24 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     let unit = data[6];
     let func = data[7];
     if func == 0x11 {
-        // 心跳应答: [unit][0x11][hb_hi][hb_lo] + CRC
-        let mut rsp: heapless::Vec<u8, 8> = heapless::Vec::new();
-        let _ = rsp.push(unit);
-        let _ = rsp.push(func);
+        // 心跳应答 - 最小化以适应默认 BLE MTU 23
+        // BLE 帧格式: [tx_id(2)][proto_id(2)][length(2)][unit(1)][func(1)][data(N)][crc(2)]
+        // Android parseCMDModel: data_len=length-2, data=data[8..8+data_len]
+        // Android parseHeartbeat: slave=data[0], runStatus=data[1], terminal=data[2..]
+        // 
+        // pdu_data 必须包含 [unit, func, data_bytes] 长度 >= 2
+        // 最小情况: 2 字节 (slave + runStatus, 但 Android 需要 unit 和 func 来自 BLE 帧)
+        // 
+        // 实际: pdu_data = [unit, func=0x11, slave, runStatus] 4 字节
+        // BLE 帧: 2+2+2+4+2 = 12 字节
         let hb = heartbeat_counter();
+        let mut rsp: heapless::Vec<u8, 4> = heapless::Vec::new();
+        let _ = rsp.push(unit);          // pdu[0] = slave (unit_id)
+        let _ = rsp.push(func);          // pdu[1] = runStatus = 0x11 (心跳标志)
+        // pdu[2..3] 作为 terminal (Android 存入 BLEDataSyncModel)
         let _ = rsp.push((hb >> 8) as u8);
         let _ = rsp.push((hb & 0xFF) as u8);
+        log::debug!("[ble_at] heartbeat: hb_seq={}", hb);
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
@@ -907,41 +991,40 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
     let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
     let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
-    // length 字段 = pdu_data.len() (Android 端定义)
     let length = pdu_data.len() as u16;
     let _ = frame.extend_from_slice(&length.to_be_bytes());
-    // pdu_data (含 slave + func + body + CRC)
     let _ = frame.extend_from_slice(pdu_data);
-    // CRC 覆盖前 6+length 字节 (tx_id + proto_id + length + pdu_data)
     let crc = modbus_crc16(&frame[..frame.len()]);
     let _ = frame.push(crc as u8);
     let _ = frame.push((crc >> 8) as u8);
-    log::debug!(
-        "[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
+    log::info!("[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
         tx_id, proto_id, length, pdu_data.len()
     );
-    send_ble_rsp(&frame, conn_id);
+    // 放入二进制响应队列, 由 process_loop 的 try_send_notify 发送
+    // 关键: 不在 GATT 回调中直接 send_indicate!
+    if let Some(mut btx) = BINARY_TX.try_lock() {
+        if btx.len() + frame.len() <= 512 {
+            let _ = btx.extend_from_slice(&frame);
+        } else {
+            log::warn!("[ble_at] binary TX full, dropping frame ({} bytes)", frame.len());
+        }
+    }
 }
 
-/// 通过 BLE TX Characteristic 发送响应 (notify)
-fn send_ble_rsp(data: &[u8], conn_id: u16) {
+/// 发送 BLE notification (只由 process_loop 线程调用)
+/// 不在 GATT 回调中直接调用!
+fn send_notify(data: &[u8]) {
     let Some(gatts_if) = *GATTS_IF.lock() else { return; };
-    if let Some(cid) = *CONN_ID.lock() {
-        if cid == conn_id {
-            let handle = HANDLE_TABLE.lock()[IDX_CHAR_VALUE];
-            // macOS USB BLE dongle 存在已知时序问题: 写入后立即 notify 可能不送达
-            // 加 10ms 延迟让协议栈稳定后再发送
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            unsafe {
-                let rc = esp_idf_sys::esp_ble_gatts_send_indicate(
-                    gatts_if, conn_id, handle,
-                    data.len() as u16, data.as_ptr() as *mut u8,
-                    false, // notify
-                );
-                if rc != 0 {
-                    log::warn!("[ble_at] notify failed rc=0x{:x}", rc);
-                }
-            }
+    let Some(conn_id) = *CONN_ID.lock() else { return; };
+    let handle = HANDLE_TABLE.lock()[IDX_CHAR_VALUE];
+    unsafe {
+        let rc = esp_idf_sys::esp_ble_gatts_send_indicate(
+            gatts_if, conn_id, handle,
+            data.len() as u16, data.as_ptr() as *mut u8,
+            false,
+        );
+        if rc != 0 {
+            log::warn!("[ble_at] notify failed rc=0x{:x}", rc);
         }
     }
 }

@@ -152,21 +152,34 @@ impl Default for Bus {
 impl Bus {
     fn new() -> Self {
         let mut s = Self::default();
-        s.sys.firmware_version = 0x0100;
+        // FW 版本从 cfg 读取 (cfg 在 device::init 中从 Cargo.toml 同步)
         s.cfg = SystemConfig::defaults();
+        s.sys.firmware_version = s.cfg.fw_version;
         s
     }
 
     // ---- Modbus 寄存器映射 (供 Modbus 模块使用) ----
 
-    /// 读取线圈 (FC=0x01). 地址范围: COIL_DO_BASE .. COIL_DO_END
+    /// 读取线圈 (FC=0x01).
+    ///
+    /// 地址分配 (与 MCA 一致, 兼容 Android 手持机):
+    /// - 0x0000-0x001F: 别名读取 DI (DI 离散输入)
+    /// - 0x0200-0x02FF: 读取 DO (线圈)
+    ///
+    /// Android 端 readComInputIOStatusCMD 使用 FC=01 读取 DI,
+    /// 我们需要把 0x0000-0x001F 范围的 coil 读请求别名到 DI 读取。
     pub fn read_coil(&self, addr: u16) -> Option<bool> {
+        // DO 范围 (0x0200+)
         if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
             let ch = (addr - regs::COIL_DO_BASE) as usize;
-            Some(self.do_.bits & (1u64 << ch) != 0)
-        } else {
-            None
+            return Some(self.do_.bits & (1u64 << ch) != 0);
         }
+        // 别名: FC=01 读取 0x0000-0x001F 范围时, 实际读取 DI
+        // (Android 手持机的 readComInputIOStatusCMD 用 FC=01 读 DI)
+        if addr < regs::DISC_DI_COUNT as u16 {
+            return Some(self.di.bits & (1u64 << addr) != 0);
+        }
+        None
     }
 
     /// 写入线圈 (FC=0x05/0x0F)

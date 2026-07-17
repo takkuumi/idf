@@ -102,8 +102,11 @@ fn main() -> AppResult<()> {
     }
     let hal = Arc::new(hal);
 
-    // 4. 设备协议存储初始化 (含 NVS 加载 + 监听线程)
-    // 失败时回退到空 ProtoStore (bus 已有默认值), 避免设备无法启动
+    // 4. 复位原因记录 (在 device::init 之前, 避免线程竞争)
+    let reset_reason = unsafe { esp_idf_sys::esp_reset_reason() as u32 as u8 };
+    log::info!("[main] reset reason={}", reset_reason);
+
+    // 5. 设备协议存储初始化 (含 NVS 加载 + 监听线程)
     log::info!("[main] starting device protocol store...");
     match device::init() {
         Ok(()) => log::info!("[main] device init ok"),
@@ -113,22 +116,17 @@ fn main() -> AppResult<()> {
         ),
     }
 
-    // 4.1 复位原因记录 + 复位计数持久化 (工业可靠性)
-    // esp_reset_reason_t: 1=POWERON 2=EXT 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT 15=BROWNOUT
-    let reset_reason = unsafe { esp_idf_sys::esp_reset_reason() } as u8;
+    // 6. 复位计数持久化 (NVS 已就绪, 直接读写, 不用 catch_unwind)
     let mut reset_count = device::load_reset_count();
     reset_count = reset_count.wrapping_add(1);
-    if let Err(e) = device::save_reset_count(reset_count) {
-        log::warn!("[main] save reset count failed: {}", e);
+    match device::save_reset_count(reset_count) {
+        Ok(()) => log::info!("[main] reset count={}", reset_count),
+        Err(e) => log::warn!("[main] save reset count failed: {}", e),
     }
     if let Some(mut b) = bus::lock_timeout() {
         b.sys.reset_count = reset_count;
         b.sys.reset_reason = reset_reason;
     }
-    log::info!(
-        "[main] reset reason={}, count={}",
-        reset_reason, reset_count
-    );
 
     // 5. 启动以太网 (W5500)
     #[cfg(feature = "ethernet-w5500")]
@@ -208,6 +206,10 @@ fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
 
         // 每个周期喂狗 (100ms), 远小于 WDT 超时 10s
         health::feed_wdt();
+
+        // BLE 通知发送 (每 100ms, 替代独立线程)
+        #[cfg(feature = "ble-at")]
+        ble_at::process_tick();
 
         // 每 1s 更新 uptime + 检查任务心跳
         if tick % (1000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
