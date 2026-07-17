@@ -277,6 +277,33 @@ extern "C" fn ip_event_cb(
         let mask = data.ip_info.netmask;
         log::info!("[eth] got IP: {} / {} gw {}",
                    fmt_ip(&ip.addr), fmt_ip(&mask.addr), fmt_ip(&gw.addr));
+
+        // Write back DHCP-assigned IP/mask/gw to bus.cfg so Modbus/BLE reads the real IP
+        if let Some(mut b) = crate::bus::lock_timeout() {
+            b.cfg.ip = [
+                ip.addr as u8,
+                (ip.addr >> 8) as u8,
+                (ip.addr >> 16) as u8,
+                (ip.addr >> 24) as u8,
+            ];
+            b.cfg.mask = [
+                mask.addr as u8,
+                (mask.addr >> 8) as u8,
+                (mask.addr >> 16) as u8,
+                (mask.addr >> 24) as u8,
+            ];
+            b.cfg.gateway = [
+                gw.addr as u8,
+                (gw.addr >> 8) as u8,
+                (gw.addr >> 16) as u8,
+                (gw.addr >> 24) as u8,
+            ];
+            b.cfg.dhcp = true;
+            log::info!("[eth] bus.cfg updated: ip={} mask={} gw={}",
+                b.cfg.ip_str(), b.cfg.mask_str(), b.cfg.gw_str());
+        } else {
+            log::warn!("[eth] bus lock timeout, cfg not updated from DHCP");
+        }
     }
 }
 

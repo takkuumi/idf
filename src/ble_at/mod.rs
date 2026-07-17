@@ -396,6 +396,8 @@ unsafe extern "C" fn gatts_event_cb(
             let handles = HANDLE_TABLE.lock();
 
             // CCCD 写入 (TX notify enable/disable)
+            // 注意: CCCD 分支必须先发送 write response，再处理 CCCD，
+            // 否则 Android BLE 栈收不到响应会进入异常状态。
             if p.handle == handles[IDX_CHAR_CCCD] && p.len == 2 && !p.value.is_null() {
                 // SAFETY: p.value 指向主机写入的 2 字节数据
                 let v = unsafe { std::slice::from_raw_parts(p.value, 2) };
@@ -408,6 +410,20 @@ unsafe extern "C" fn gatts_event_cb(
                     *GATTS_IF.lock(),
                     p.conn_id
                 );
+                // 发写响应 — Android 端需要收到 CCCD write response 才能继续通信
+                if p.need_rsp {
+                    if let Some(gatts_if) = *GATTS_IF.lock() {
+                        let _ = unsafe {
+                            esp_idf_sys::esp_ble_gatts_send_response(
+                                gatts_if,
+                                p.conn_id,
+                                p.trans_id,
+                                esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                    }
+                }
             } else if p.handle == handles[IDX_CHAR_VALUE] && !p.value.is_null() && p.len > 0 {
                 // RX characteristic 写入 — 优先尝试二进制协议, 否则按文本 AT 处理
                 // 关键修复: 必须先发送写响应, 然后再处理数据发送通知
@@ -500,6 +516,17 @@ unsafe extern "C" fn gatts_event_cb(
             let p = unsafe { &(*param).disconnect };
             *CONN_ID.lock() = None;
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
+            // 清空 BINARY_TX 残留数据，防止旧帧在新连接时被发送
+            if let Some(mut btx) = BINARY_TX.try_lock() {
+                btx.clear();
+            }
+            // 清空 RX_BUFFER 和 TX_BUFFER
+            if let Some(mut rx) = RX_BUFFER.try_lock() {
+                rx.clear();
+            }
+            if let Some(mut tx) = TX_BUFFER.try_lock() {
+                tx.clear();
+            }
             log::info!(
                 "[ble_at] GATT client disconnected (conn_id={}, reason={})",
                 p.conn_id,
@@ -977,6 +1004,11 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
+    // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
+    // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
+    if func >= 0xC0 && func <= 0xCF {
+        return handle_mca_custom_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit);
+    }
     // 其它 PDU: unit_id 字节作为 Modbus slave 地址, func+data 作为 Modbus PDU
     let pdu = &data[6..crc_begin]; // [unit][func][data...]
     handle_modbus_rtu(pdu, tx_id, proto_id, conn_id)
@@ -987,6 +1019,109 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
 /// 帧格式: tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | pdu_data(N) | crc(2 LE)
 /// 其中 length 字段 = pdu_data.len() (含 slave/func/data/CRC, 不含 BLE 帧头尾)
 /// CRC 计算范围 = 整个帧除最后 2 字节
+
+/// 处理 MCA 自定义协议命令 (0xC0-0xCF)
+///
+/// 当 Android 端通过新版 BLE 协议格式 (tx_id/proto_id/length/unit/func/data/crc)
+/// 发送原 MCA 自定义命令时，通过 func 值识别并分发。
+///
+/// 命令对照 (原 MCA 固件 vBleMessageDistribution):
+///   0xC2 = GET_SN_CODE
+///   0xC3 = SET_SN_CODE
+///   0xC4 = GET_LOCATION_INFO
+///   0xC6 = GET_ETH_MAC
+///   0xCA = GET_BLUETOOTH_NO
+///   0xCC = GET_DEVICE_TYPE
+///   0xCD = SET_NET_INFO
+///   0xCE = GET_NET_INFO (IP/子网/网关)
+///   0xCF = GET_FIRMWARE_VER
+fn handle_mca_custom_command(
+    func: u8,
+    data: &[u8],
+    tx_id: u16,
+    proto_id: u16,
+    conn_id: u16,
+    unit: u8,
+) -> bool {
+    log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={}", 
+        data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "));
+    match func {
+        0xCE => {
+            // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
+            let (ip, mask, gw) = match crate::bus::lock_timeout() {
+                Some(b) => (b.cfg.ip, b.cfg.mask, b.cfg.gateway),
+                None => ([0; 4], [0; 4], [0; 4]),
+            };
+            let mut rsp: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = rsp.push(0xCE); // cmd
+            let _ = rsp.push(0);    // status = 成功
+            let _ = rsp.extend_from_slice(&ip);   // IP 4 字节
+            let _ = rsp.extend_from_slice(&mask); // 掩码 4 字节
+            let _ = rsp.extend_from_slice(&gw);   // 网关 4 字节
+            log::info!("[ble_at] GET_NET_INFO: ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3],
+                mask[0], mask[1], mask[2], mask[3],
+                gw[0], gw[1], gw[2], gw[3]);
+            // 用 BLE 协议帧格式包装响应
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+            true
+        }
+        0xC2 => {
+            // GET_SN_CODE
+            let sn = match crate::bus::lock_timeout() {
+                Some(b) => b.cfg.sn,
+                None => [0u8; 32],
+            };
+            let mut rsp: heapless::Vec<u8, 20> = heapless::Vec::new();
+            let _ = rsp.push(0xC2);
+            let _ = rsp.push(0);
+            // SN 9 个 U16 (大端) → 18 字节 ASCII
+            for i in 0..9usize {
+                let w = u16::from_be_bytes([sn[i * 2], sn[i * 2 + 1]]);
+                let _ = rsp.push(w as u8);
+                let _ = rsp.push((w >> 8) as u8);
+            }
+            log::info!("[ble_at] GET_SN_CODE: {} bytes", rsp.len());
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+            true
+        }
+        0xCF => {
+            // GET_FIRMWARE_VER
+            let fw = crate::config::APP_VERSION;
+            let mut rsp: heapless::Vec<u8, 8> = heapless::Vec::new();
+            let _ = rsp.push(0xCF);
+            let _ = rsp.push(0);
+            // 格式: major, minor, patch, date_hi, date_lo
+            let _ = rsp.push(2); // major
+            let _ = rsp.push(2); // minor
+            let _ = rsp.push(1); // patch
+            let _ = rsp.push(0x06); // date hi (June)
+            let _ = rsp.push(0x15); // date lo (15)
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+            true
+        }
+        0xC6 => {
+            // GET_ETH_MAC
+            let mac = match crate::bus::lock_timeout() {
+                Some(b) => b.cfg.eth_mac,
+                None => [0; 6],
+            };
+            let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
+            let _ = rsp.push(0xC6);
+            let _ = rsp.push(0);
+            let _ = rsp.extend_from_slice(&mac);
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+            true
+        }
+        _ => {
+            // 未实现的自定义命令 → 返回 unknown error
+            log::warn!("[ble_at] MCA custom cmd 0x{func:02X} not implemented");
+            false
+        }
+    }
+}
+
+
 fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
     let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
