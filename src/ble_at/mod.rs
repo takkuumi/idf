@@ -1293,7 +1293,7 @@ mod tests {
 // 3. length 字段值 = pdu_data 长度
 //
 #[cfg(test)]
-mod tests {
+mod tests_ble_cmd {
     use super::*;
 
     /// 构建 Android 兼容的 BLE 请求帧 (与 CommandBuilderUtil.buildCMD 一致)

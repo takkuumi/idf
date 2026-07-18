@@ -3,8 +3,20 @@
 ## 项目背景
 此系统是开发一款基于ESP-IDF的 工业控制系统。
 原有一套C++开发的系统，但运行不稳定，一些功能实现有缺失，现基于rust + esp-idf 进行重构。
-ESP-IDF 源码存放于本机 /Users/takumi/Workspace/esp-idf 目录
-原C++系统存放于/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE
+ESP-IDF 源码存放于本机目录 /Users/takumi/Workspace/esp-idf 
+原C++系统存放于本机目录/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE
+手持机源码存放于本机目录 /Users/takumi/Workspace/metuory-wireless-management-app-1.0.78
+
+给我往死里对MCA_F16V2_1_F48_BLE 和 metuory-wireless-management-app-1.0.78，要求主把功能、细节完完全全实现完，你需要自己烧录，烧录后自己重置，然后验证
+如果遇到阻塞任务，继续推进其它任务
+
+烧录用 espflash， 串口是 /dev/cu.usbserial-1430
+
+禁止修改esp-idf 、MCA_F16V2_1_F48_BLE和metuory-wireless-management-app-1.0.78源码
+
+不许偷懒，我去睡觉了，遇到需要我审批的，你自己处理，我睡觉了，我醒了会检查
+
+
 
 ## 完成情况 (2026-07-17)
 

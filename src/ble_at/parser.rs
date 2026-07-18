@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_parse_u16_list() {
         let v = parse_u16_list("1,2,3,0xFF");
-        assert_eq!(v, heapless::Vec::from_slice(&[1, 2, 3, 255]).unwrap());
+        assert_eq!(v, heapless::Vec::<u16, 128>::from_slice(&[1, 2, 3, 255]).unwrap());
     }
 
     #[test]

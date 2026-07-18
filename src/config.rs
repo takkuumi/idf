@@ -380,6 +380,9 @@ pub mod regs {
     pub const HOLD_MASTER_IP_BASE: u16 = 2270;
     // 蓝牙地址 (2274-2277)
     pub const HOLD_BT_ADDR_BASE: u16 = 2274;
+    // BLE 名称 — 自定义 (4000-4003 = 4 words = 8 bytes)
+    pub const HOLD_BLE_NAME_BASE: u16 = HOLD_USER_BASE;
+    pub const HOLD_BLE_NAME_COUNT: u16 = 4;
     // 传感器标定 (2280-2295, 8 sensors × 2 values)
     pub const HOLD_SENSOR_MIN_BASE: u16 = 2280;
     pub const HOLD_SENSOR_MAX_BASE: u16 = 2288;
@@ -390,6 +393,10 @@ pub mod regs {
     pub const HOLD_USER_COUNT: u16 = 224;
     // P区结束地址
     pub const HOLD_CFG_END: u16 = 4223;
+    // 通用 P区缓冲 (0x0880..0x107F = 2048 字) — 用于未映射字段的通用读写
+    pub const HOLD_PXX_BASE: u16 = HOLD_CFG_BASE;  // = 0x0880
+    pub const HOLD_PXX_END: u16 = HOLD_CFG_END;    // = 0x107F
+    pub const HOLD_PXX_COUNT: usize = (HOLD_PXX_END - HOLD_PXX_BASE + 1) as usize;
 
     // ---- 设备文本区 (5000-6999, 2000 字) ----
     pub const DEVICE_TEXT_BASE: u16 = 5000;
@@ -418,7 +425,7 @@ pub mod regs {
     pub const CFG_BLE_MAC_BASE: u16 = 0;
     pub const CFG_END: u16 = HOLD_CFG_END + 1;
     // Backward compat aliases
-    pub const CFG_BLE_NAME_BASE: u16 = HOLD_BT_ADDR_BASE;
+    pub const CFG_BLE_NAME_BASE: u16 = HOLD_BLE_NAME_BASE;
     pub const CFG_NAME_BASE: u16 = HOLD_PLACE_BASE;
     pub const CFG_NAME_COUNT: u16 = HOLD_PLACE_COUNT;
     pub const CFG_RS485_BASE: u16 = HOLD_RS485_BASE;

@@ -1,3 +1,50 @@
+
+## 2. 2026-07-18 最新修复 (自动完成)
+
+### 关键 Bug 修复
+- **mb-tcp-listen 停滞**: TCP 监听 accept 阻塞导致心跳无法 tick, 任务被误判为停滞。改为非阻塞 accept + 200ms sleep, 监听任务心跳正常上报。
+- **P区通用存储不生效**: `read_hold_reg` 中设备配置区 (2300-4223) 的检查分支使用了 `HOLD_DEVICE_CONFIG=2300` 作为起点, 误捕获了 0x1000 等通用 P区地址。统一从 `HOLD_CFG_BASE=0x0880` (2176) 开始, 增加通用 holding_buf[2048] 缓冲, 未映射地址可正常读写。
+- **FW date 显示错乱**: `INREG_FW_DATE` 寄存器值原为 `0x0615` (1557), 应为 `MCA_FIRMWARE_DATE=615` → `0x0267`。Android 端 `fwVersionBytesToStr` 解析后显示 "2.2.1.615" 才正确。
+- **BLE MAC / BLE NAME 存储错位**: 原代码将 BLE 名称存放在 `HOLD_BT_ADDR_BASE` (2274-2277), 与 Android `READ_BLUETOOTH_ID` 期望的 BLE MAC 位置冲突。修正为: BLE MAC 在 `HOLD_BT_ADDR_BASE` (4 寄存器, 6 字节 MAC + 2 字节填充), BLE 名称存放在 `HOLD_BLE_NAME_BASE` (`HOLD_USER_BASE` = 4000-4003)。
+- **P区 generic holding_buf**: 新增 2048 字通用 P区缓冲 (堆分配避免栈溢出), 0x0880-0x107F 范围内任何地址可读写, 符合 MCA `PRegBuf` 全范围可读写的设计。
+
+### 验证通过的 Modbus TCP 命令 (与 metuory-wireless-management-app 协议对齐)
+
+| Android 命令 | Modbus 映射 | 状态 |
+|-------------|------------|------|
+| READ_ADC_VALUE | FC=04, addr=0x0080, count=8 | ✓ |
+| READ_SN | FC=03, addr=0x0894, count=9 | ✓ |
+| READ_LOCATION | FC=03, addr=0x089D, count=8 | ✓ |
+| READ_MAC | FC=03, addr=0x08D7, count=6 | ✓ |
+| READ_BLUETOOTH_ID | FC=03, addr=0x08E2, count=4 | ✓ |
+| READ_DEVICE_PRODUCT | FC=03, addr=0x08A5, count=1 | ✓ |
+| READ_IP | FC=03, addr=0x08C7, count=12 | ✓ |
+| READ_FW_VERSION | FC=04, addr=0x087E, count=2 | ✓ |
+| READ_HARDWARE_INFO | FC=04, addr=0x087C, count=4 | ✓ |
+| READ_COM_INPUT_IO_STATUS | FC=01, addr=0x0000 | ✓ |
+| READ_COM_OUTPUT_IO_STATUS | FC=01, addr=0x0200 | ✓ |
+| WRITE_COM_OUTPUT_IO_STATUS | FC=05 | ✓ |
+| WRITE_COM_OUTPUT_MULTI_IO_STATUS | FC=0F | ✓ |
+| WRITE_CONTROL_ADDRESS | FC=06 | ✓ |
+| WRITE_SN | FC=10 | ✓ |
+| READ_RS485_CONFIG | FC=03, addr=0x08A6 | ✓ |
+
+### 验证通过的 Modbus TCP 多端口
+
+| 端口 | 用途 | 状态 |
+|------|------|------|
+| 502 | Modbus TCP 主端口 | ✓ |
+| 503 | 备用端口 | ✓ |
+| 504 | 备用端口 | ✓ |
+| 5002 | 备用端口 | ✓ |
+
+### 异常响应
+
+| 场景 | 异常码 | 状态 |
+|------|--------|------|
+| FC=07 (非法功能码) | 0x8701 | ✓ |
+| FC=03 非法地址 (0xFFFF) | 0x8302 | ✓ |
+
 # 改动总结 (2026-07-17 夜间自动完成)
 
 ## 1. 蓝牙完全修复 ✓

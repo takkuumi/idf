@@ -98,6 +98,7 @@ pub struct SystemConfig {
 }
 
 /// 写入结果
+#[derive(Debug, PartialEq)]
 pub enum WriteResult {
     /// 普通字段写入成功
     Ok,
@@ -357,9 +358,17 @@ impl SystemConfig {
         if let Some(v) = read_mac(&self.eth_mac, regs::HOLD_MAC_BASE, addr) {
             return Some(v);
         }
-        // BLE 名称 — 2字节/字 (参考固件: BT_ARRD1..BT_ARRD4)
+        // BLE MAC 地址 — 6 字节 → 4 个 U16 (高字节在前, 不足 8 字节用 0 填充)
+        // Android 端 READ_BLUETOOTH_ID 期望读 4 寄存器 (8 bytes)
         if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
             let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
+            let b0 = if idx < 6 { self.ble_mac[idx] } else { 0 };
+            let b1 = if idx + 1 < 6 { self.ble_mac[idx + 1] } else { 0 };
+            return Some(u16::from_be_bytes([b0, b1]));
+        }
+        // BLE 名称 — 2字节/字 (自定义位置 HOLD_BLE_NAME_BASE)
+        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
+            let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             return Some(u16::from_be_bytes([
                 self.ble_name[idx],
                 self.ble_name[idx + 1],
@@ -489,9 +498,17 @@ impl SystemConfig {
         if let Some(()) = write_mac(&mut self.eth_mac, regs::HOLD_MAC_BASE, addr, value) {
             return WriteResult::Apply;
         }
-        // BLE 名称 — 2字节/字
+        // BLE MAC — 高字节在前, 写入 4 寄存器 (前 3 个寄存器 = 6 bytes MAC)
         if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
             let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
+            let [hi, lo] = value.to_be_bytes();
+            if idx < 6 { self.ble_mac[idx] = hi; }
+            if idx + 1 < 6 { self.ble_mac[idx + 1] = lo; }
+            return WriteResult::Apply;
+        }
+        // BLE 名称 — 2字节/字 (自定义位置)
+        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
+            let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
@@ -696,7 +713,7 @@ mod tests {
         let cfg = SystemConfig::defaults();
         assert_eq!(cfg.dhcp, true);
         assert_eq!(cfg.ip, [192, 168, 1, 200]);
-        assert_eq!(cfg.mac, [0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]);
+        assert_eq!(cfg.eth_mac, [0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]);
         assert_eq!(cfg.rs485.len(), 2);
     }
 

@@ -38,32 +38,42 @@ fn spawn_listener(port: u16) -> AppResult<()> {
         .name(format!("mb-tcp-{}", port))
         .spawn(move || {
             log::info!("[mb-tcp] listening on :{}", port);
-            for stream in listener.incoming() {
+            // 设置非阻塞以确保心跳可以定期 tick (避免任务被误判为停滞)
+            listener.set_nonblocking(true).ok();
+            loop {
                 LISTEN_HB.tick();
-                match stream {
-                    Ok(s) => {
-                        let cur = CONN_COUNT.load(Ordering::SeqCst);
-                        if cur >= cfg::MAX_CONNECTIONS as u32 {
-                            log::warn!("[mb-tcp] rejected, max={} reached", cfg::MAX_CONNECTIONS);
-                            drop(s);
-                            continue;
-                        }
-                        CONN_COUNT.fetch_add(1, Ordering::SeqCst);
-                        let id = CONN_COUNT.load(Ordering::SeqCst);
-                        health::set_next_thread_core(health::CORE_NET);
-                        std::thread::Builder::new()
-                            .name(format!("mb-tcp-conn-{id}"))
-                            .spawn(move || {
-                                if let Err(e) = handle_conn(s) {
-                                    log::debug!("[mb-tcp-conn-{id}] closed: {}", e);
-                                }
-                                CONN_COUNT.fetch_sub(1, Ordering::SeqCst);
-                            })
-                            .ok();
-                        health::reset_thread_core();
+                let stream = match listener.accept() {
+                    Ok((s, _addr)) => s,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // 200ms 后再尝试, 期间心跳已 tick
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
                     }
-                    Err(e) => log::warn!("[mb-tcp] accept: {}", e),
+                    Err(e) => {
+                        log::warn!("[mb-tcp] accept: {}", e);
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                };
+                let cur = CONN_COUNT.load(Ordering::SeqCst);
+                if cur >= cfg::MAX_CONNECTIONS as u32 {
+                    log::warn!("[mb-tcp] rejected, max={} reached", cfg::MAX_CONNECTIONS);
+                    drop(stream);
+                    continue;
                 }
+                CONN_COUNT.fetch_add(1, Ordering::SeqCst);
+                let id = CONN_COUNT.load(Ordering::SeqCst);
+                health::set_next_thread_core(health::CORE_NET);
+                std::thread::Builder::new()
+                    .name(format!("mb-tcp-conn-{id}"))
+                    .spawn(move || {
+                        if let Err(e) = handle_conn(stream) {
+                            log::debug!("[mb-tcp-conn-{id}] closed: {}", e);
+                        }
+                        CONN_COUNT.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .ok();
+                health::reset_thread_core();
             }
         });
     health::reset_thread_core();

@@ -131,6 +131,10 @@ pub struct Bus {
     pub device_config: DeviceConfigTable,
     /// 设备文本区 (5000-6999 = 2000 字)
     pub device_text: [u16; 2000],
+    /// 通用 P区保持寄存器缓冲 (0x0880..0x107F = 2176..4223 = 2048 字)
+    /// 参考固件 PRegBuf 全范围可读写, 未映射字段也允许读写
+    /// Box<[u16; 2048]> 用堆分配避免 Bus 结构体过大导致栈溢出
+    pub holding_buf: Box<[u16; 2048]>,
 }
 
 impl Default for Bus {
@@ -145,6 +149,7 @@ impl Default for Bus {
             cfg: SystemConfig::defaults(),
             device_config: DeviceConfigTable::default(),
             device_text: [0u16; 2000],
+            holding_buf: Box::new([0u16; 2048]),
         }
     }
 }
@@ -219,7 +224,7 @@ impl Bus {
                 regs::INREG_QI_COUNT => Some(((hw_version::DO_COUNT as u16) << 8) | (hw_version::DI_COUNT as u16)),
                 regs::INREG_ADC485 => Some((regs::INREG_AI_COUNT << 8) | 2), // 4 ADC + 2 RS485
                 regs::INREG_FW_VER => Some(self.sys.firmware_version),
-                regs::INREG_FW_DATE => Some(0x0615), // MMDD format
+                regs::INREG_FW_DATE => Some(0x0267), // MCA_FIRMWARE_DATE=615
                 _ => None,
             }
         }
@@ -232,20 +237,26 @@ impl Bus {
             let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
             return Some(self.device_text[idx]);
         }
-        // 设备功能配置区 (2300+)
-        if addr >= regs::HOLD_DEVICE_CONFIG && addr <= regs::HOLD_CFG_END {
+        // 配置区 (2176-4223 = HOLD_CFG_BASE..HOLD_CFG_END):
+        // 1. 先尝试 SystemConfig 映射 (SN/PLACE/IP/MAC/BLE NAME 等)
+        // 2. 未映射的走通用 P区缓冲 (PRegBuf 全范围可读写)
+        if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
+            // 设备功能配置区 (2300-2399) 优先走 device_config
             if addr >= 2300 && addr < 2400 {
-                // Try device_config first
                 if let Some(v) = self.device_config.read_reg(addr) {
                     return Some(v);
                 }
             }
-            // 其余走 SystemConfig
-            return Some(self.cfg.read_reg(addr).unwrap_or(0));
-        }
-        // 配置区 (2176-4223): 优先走 SystemConfig, 未映射的返回 0
-        if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
-            return Some(self.cfg.read_reg(addr).unwrap_or(0));
+            // 尝试 SystemConfig 映射
+            if let Some(v) = self.cfg.read_reg(addr) {
+                return Some(v);
+            }
+            // 未映射的走通用 P区缓冲
+            let idx = (addr - regs::HOLD_PXX_BASE) as usize;
+            if idx < regs::HOLD_PXX_COUNT {
+                return Some(self.holding_buf[idx]);
+            }
+            return Some(0);
         }
         // 协议存储区
         if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
@@ -276,20 +287,28 @@ impl Bus {
             return self.device_config.write_reg(addr, value);
         }
         if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
-            // 总是尝试写入 — write_reg 返回 NotFound 时也允许(存到 NVS 原始区)
+            // 1. 尝试 SystemConfig 映射
             match self.cfg.write_reg(addr, value) {
-                WriteResult::Ok => true,
+                WriteResult::Ok => return true,
                 WriteResult::Apply => {
                     self.cfg.cfg_version = self.cfg.cfg_version.wrapping_add(1);
                     crate::device::request_apply_config();
-                    true
+                    return true;
                 }
                 WriteResult::Reset => {
                     self.cfg = SystemConfig::defaults();
                     crate::device::request_apply_config();
-                    true
+                    return true;
                 }
-                WriteResult::NotFound => true, // 允许写入未映射地址(参考固件 PRegBuf 全范围可写)
+                WriteResult::NotFound => {
+                    // 2. 未映射的写入通用 P区缓冲 (PRegBuf 全范围可写)
+                    let idx = (addr - regs::HOLD_PXX_BASE) as usize;
+                    if idx < regs::HOLD_PXX_COUNT {
+                        self.holding_buf[idx] = value;
+                        return true;
+                    }
+                    return false;
+                }
             }
         } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
             let idx = (addr - regs::PROTO_BASE) as usize;
@@ -441,8 +460,8 @@ mod tests {
         let v = bus.read_input_reg(regs::INREG_FW_VER);
         // 默认 firmware_version = 0x0100
         assert_eq!(v, Some(0x0100));
-        // FW_DATE = 0x0615
-        assert_eq!(bus.read_input_reg(regs::INREG_FW_DATE), Some(0x0615));
+        // FW_DATE = 0x0267
+        assert_eq!(bus.read_input_reg(regs::INREG_FW_DATE), Some(0x0267));
     }
 
     #[test]
