@@ -1,10 +1,9 @@
 //! Modbus 共享工具与总线后端
 //!
 //! - `ModbusBackend` trait: 抽象所有 Modbus 寄存器访问
-//! - `BusBackend`: 实现 `ModbusBackend`, 全部代理到 `crate::bus::BUS`
+//! - `BusBackend`: 实现 `ModbusBackend`, 全部代理到 `crate::bus::backends::*`
+//!   (无锁自由函数: 读 RCU / 写 RCU RMW + atomic, legacy `Spin<Bus>` 已退役)
 //! - `modbus_crc16`: 标准 Modbus CRC-16 (0xA001 polynomial)
-
-use crate::bus;
 
 /// Modbus 寄存器访问后端
 pub trait ModbusBackend {
@@ -18,96 +17,82 @@ pub trait ModbusBackend {
     fn write_multiple_registers(&self, addr: u16, values: &[u16]) -> bool;
 }
 
-/// 总线后端, 全部代理到 `bus::BUS`
+/// 总线后端, 全部代理到 `bus::backends::*` (无锁 RCU + atomic)
 pub struct BusBackend;
 
 impl ModbusBackend for BusBackend {
     fn read_coils(&self, addr: u16, count: u16) -> Vec<bool> {
         let mut v = Vec::with_capacity(count as usize);
-        if let Some(b) = bus::lock_timeout() {
-            for i in 0..count {
-                v.push(b.read_coil(addr + i).unwrap_or(false));
-            }
+        for i in 0..count {
+            v.push(crate::bus::backends::read_coil(addr + i).unwrap_or(false));
         }
         v
     }
 
     fn read_discrete_inputs(&self, addr: u16, count: u16) -> Vec<bool> {
         let mut v = Vec::with_capacity(count as usize);
-        if let Some(b) = bus::lock_timeout() {
-            for i in 0..count {
-                v.push(b.read_disc(addr + i).unwrap_or(false));
-            }
+        for i in 0..count {
+            v.push(crate::bus::backends::read_disc(addr + i).unwrap_or(false));
         }
         v
     }
 
     fn read_holding_registers(&self, addr: u16, count: u16) -> Vec<u16> {
         let mut v = Vec::with_capacity(count as usize);
-        if let Some(b) = bus::lock_timeout() {
-            for i in 0..count {
-                v.push(b.read_hold_reg(addr + i).unwrap_or(0));
-            }
+        for i in 0..count {
+            v.push(crate::bus::backends::read_hold_reg(addr + i).unwrap_or(0));
         }
         v
     }
 
     fn read_input_registers(&self, addr: u16, count: u16) -> Vec<u16> {
         let mut v = Vec::with_capacity(count as usize);
-        if let Some(b) = bus::lock_timeout() {
-            for i in 0..count {
-                v.push(b.read_input_reg(addr + i).unwrap_or(0));
-            }
+        for i in 0..count {
+            v.push(crate::bus::backends::read_input_reg(addr + i).unwrap_or(0));
         }
         v
     }
 
     fn write_single_coil(&self, addr: u16, value: bool) -> bool {
-        if let Some(mut b) = bus::lock_timeout() {
-            let ok = b.write_coil(addr, value);
-            #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
-            if ok { crate::io::do_::notify(); }
-            ok
-        } else {
-            false
+        // 阶段 B: 写 DO 走无锁 bus::backends::write_coil
+        let ok = crate::bus::backends::write_coil(addr, value);
+        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+        if ok {
+            crate::io::do_::notify();
         }
+        ok
     }
 
     fn write_single_register(&self, addr: u16, value: u16) -> bool {
-        if let Some(mut b) = bus::lock_timeout() {
-            b.write_hold_reg(addr, value)
-        } else {
-            false
-        }
+        // 阶段 B: 写 holding 走无锁 backends::write_hold_reg (RCU RMW)
+        crate::bus::backends::write_hold_reg(addr, value)
     }
 
     fn write_multiple_coils(&self, addr: u16, values: &[bool]) -> bool {
-        if let Some(mut b) = bus::lock_timeout() {
-            let mut ok = true;
-            for (i, &v) in values.iter().enumerate() {
-                if !b.write_coil(addr + i as u16, v) {
-                    ok = false;
-                }
+        // 阶段 B: 循环 backends::write_coil; DI 段不可写
+        let mut ok = true;
+        for (i, &v) in values.iter().enumerate() {
+            if !crate::bus::backends::write_coil(addr + i as u16, v) {
+                ok = false;
             }
-            #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
-            if ok { crate::io::do_::notify(); }
-            ok
-        } else {
-            false
         }
+        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+        if ok {
+            crate::io::do_::notify();
+        }
+        ok
     }
 
     fn write_multiple_registers(&self, addr: u16, values: &[u16]) -> bool {
-        if let Some(mut b) = bus::lock_timeout() {
-            for (i, &v) in values.iter().enumerate() {
-                if !b.write_hold_reg(addr + i as u16, v) {
-                    return false;
-                }
+        // 阶段 B: 循环 backends::write_hold_reg (RCU RMW)
+        let mut ok = true;
+        for (i, &v) in values.iter().enumerate() {
+            if !crate::bus::backends::write_hold_reg(addr + i as u16, v) {
+                ok = false;
+                break;
             }
-            true
-        } else {
-            false
         }
+        ok
     }
 }
 
@@ -171,7 +156,10 @@ pub fn handle_pdu<B: ModbusBackend>(
         0x06 => write_single_reg_pdu(backend, pdu),
         0x0F => write_multi_coils_pdu(backend, pdu),
         0x10 => write_multi_regs_pdu(backend, pdu),
-        _ => return exception_pdu(func, exc::ILLEGAL_FUNCTION),
+        _ => {
+            crate::error::log_warn(crate::error::module_id::MODBUS, 200, func as u32);
+            return exception_pdu(func, exc::ILLEGAL_FUNCTION);
+        }
     };
     // 异常检测: 仅当 body 长度为 1 且是合法异常码 (1-4) 时才视为异常
     // 正常响应的 body 至少 2 字节: [byte_count, ...data]

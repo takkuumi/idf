@@ -21,7 +21,7 @@
 //!
 //! MCP23017 内部: bit0-7 = PORTA, bit8-15 = PORTB
 
-use parking_lot::Mutex;
+use crate::sync::{AtomicBits64, Spin};
 
 use crate::config::hw_version;
 use crate::config::io_ext as cfg;
@@ -39,14 +39,14 @@ const MAX_DO_CHIPS: usize = 3;
 /// 持有 I2C 总线 + 所有 MCP23017 芯片句柄。
 /// 用 Mutex 保护, 多任务访问安全 (DI 扫描 / DO 输出 / Modbus 读状态)。
 pub struct IoExtender {
-    bus: Mutex<I2cBus>,
+    bus: Spin<I2cBus>,
     di_chips: [Mcp23017; MAX_DI_CHIPS],
     di_chip_count: usize,
     /// DO 扩展芯片数组 (F3: 1 片; F4: 3 片)
     do_chips: [Mcp23017; MAX_DO_CHIPS],
     do_chip_count: usize,
-    /// DO 输出缓存 (避免每次读取 MCP23017)
-    do_cache: Mutex<u64>,
+    /// DO 输出缓存 (避免每次读取 MCP23017); 真无锁 (AtomicBits64)
+    do_cache: AtomicBits64,
 }
 
 impl IoExtender {
@@ -100,12 +100,12 @@ impl IoExtender {
         }
 
         Ok(Self {
-            bus: Mutex::new(bus_guard),
+            bus: Spin::new(bus_guard),
             di_chips,
             di_chip_count: di_addrs.len(),
             do_chips,
             do_chip_count: do_addrs.len(),
-            do_cache: Mutex::new(0),
+            do_cache: AtomicBits64::new(0),
         })
     }
 
@@ -139,8 +139,8 @@ impl IoExtender {
     /// F4: 48 bit (3 片 MCP23017, 每片写 16 bit)
     #[inline]
     pub fn write_do(&self, value: u64) -> AppResult<()> {
-        // 缓存更新
-        *self.do_cache.lock() = value;
+        // 缓存更新 (无锁位图)
+        self.do_cache.store_bits(value);
         // 限制为 DO_COUNT 位 (超出 bit 忽略)
         let mask = if hw_version::DO_COUNT >= 64 {
             u64::MAX
@@ -169,19 +169,19 @@ impl IoExtender {
                 hw_version::DO_COUNT
             )));
         }
-        let mut current = *self.do_cache.lock();
-        if on {
-            current |= 1u64 << idx;
+        let current = self.do_cache.load_bits();
+        let new_val = if on {
+            current | (1u64 << idx)
         } else {
-            current &= !(1u64 << idx);
-        }
-        self.write_do(current)
+            current & !(1u64 << idx)
+        };
+        self.write_do(new_val)
     }
 
     /// 读取当前 DO 输出状态 (从缓存, 不读 I2C)
     #[inline]
     pub fn read_do_cached(&self) -> u64 {
-        *self.do_cache.lock()
+        self.do_cache.load_bits()
     }
 
     /// 读取当前 DO 输出状态 (从所有 MCP23017 读取, F4 需 3 次 I2C 读)
@@ -196,7 +196,7 @@ impl IoExtender {
     }
 
     /// 获取 I2C 总线互斥锁 (供高级用例, 如扫描其它 I2C 设备)
-    pub fn bus(&self) -> &Mutex<I2cBus> {
+    pub fn bus(&self) -> &Spin<I2cBus> {
         &self.bus
     }
 }

@@ -32,10 +32,10 @@ use crate::health::{self, TaskHb};
 /// 心跳周期 (s)
 const HEARTBEAT_PERIOD_S: u64 = 5;
 /// 心跳失败上限 (>= 即触发复位)
-const HEARTBEAT_MAX_FAIL: u32 = 3;
+const HEARTBEAT_MAX_FAIL: u32 = 3; // 旧值, 实际由 recovery 模块分级处理
 
 /// 以太网心跳任务记录 (静态分配, main_loop 监控)
-static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 10);
+static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 2);
 
 /// 启动 W5500 以太网。
 ///
@@ -103,9 +103,11 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 
     // 6.5) 设置 MAC 地址 (W5500 无预置 MAC, 需从 ESP32 eFuse 读取后写入)
     {
-        let mac = crate::bus::lock_timeout()
-            .map(|b| b.cfg.eth_mac);
-        let mac_bytes = mac.unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        // 阶段 A: 从 CONFIG RCU 无锁读 eth_mac; 缺省 DHCP fallback
+        let mac: [u8; 6] = crate::bus::config_read()
+            .map(|cs| cs.cfg.eth_mac)
+            .unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let mac_bytes = mac;
         if mac_bytes != [0u8; 6] && mac_bytes != [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] {
             log::info!(
                 "[eth] setting MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -278,32 +280,36 @@ extern "C" fn ip_event_cb(
         log::info!("[eth] got IP: {} / {} gw {}",
                    fmt_ip(&ip.addr), fmt_ip(&mask.addr), fmt_ip(&gw.addr));
 
-        // Write back DHCP-assigned IP/mask/gw to bus.cfg so Modbus/BLE reads the real IP
-        if let Some(mut b) = crate::bus::lock_timeout() {
-            b.cfg.ip = [
-                ip.addr as u8,
-                (ip.addr >> 8) as u8,
-                (ip.addr >> 16) as u8,
-                (ip.addr >> 24) as u8,
-            ];
-            b.cfg.mask = [
-                mask.addr as u8,
-                (mask.addr >> 8) as u8,
-                (mask.addr >> 16) as u8,
-                (mask.addr >> 24) as u8,
-            ];
-            b.cfg.gateway = [
-                gw.addr as u8,
-                (gw.addr >> 8) as u8,
-                (gw.addr >> 16) as u8,
-                (gw.addr >> 24) as u8,
-            ];
-            b.cfg.dhcp = true;
-            log::info!("[eth] bus.cfg updated: ip={} mask={} gw={}",
-                b.cfg.ip_str(), b.cfg.mask_str(), b.cfg.gw_str());
-        } else {
-            log::warn!("[eth] bus lock timeout, cfg not updated from DHCP");
-        }
+        // Write back DHCP-assigned IP/mask/gw to CONFIG RCU; Modbus/BLE 读即 RCU
+        let ip_b = [
+            ip.addr as u8,
+            (ip.addr >> 8) as u8,
+            (ip.addr >> 16) as u8,
+            (ip.addr >> 24) as u8,
+        ];
+        let mask_b = [
+            mask.addr as u8,
+            (mask.addr >> 8) as u8,
+            (mask.addr >> 16) as u8,
+            (mask.addr >> 24) as u8,
+        ];
+        let gw_b = [
+            gw.addr as u8,
+            (gw.addr >> 8) as u8,
+            (gw.addr >> 16) as u8,
+            (gw.addr >> 24) as u8,
+        ];
+        crate::bus::backends::config_modify(|c| {
+            c.ip = ip_b;
+            c.mask = mask_b;
+            c.gateway = gw_b;
+            c.dhcp = true;
+        });
+        log::info!(
+            "[eth] cfg updated (RCU): ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
+            ip_b[0], ip_b[1], ip_b[2], ip_b[3],
+            mask_b[0], mask_b[1], mask_b[2], mask_b[3],
+            gw_b[0], gw_b[1], gw_b[2], gw_b[3]);
     }
 }
 
@@ -329,15 +335,32 @@ fn spawn_heartbeat() -> AppResult<()> {
                 if heartbeat_once() {
                     if fail_count > 0 {
                         log::info!("[eth-heartbeat] link restored");
+                        // 网络恢复, 退出降级模式
+                        crate::error::recovery::enter_mode(
+                            crate::error::recovery::DegradedMode::Normal
+                        );
                     }
                     fail_count = 0;
                 } else {
                     fail_count = fail_count.saturating_add(1);
                     log::warn!("[eth-heartbeat] gateway unreachable (count={})", fail_count);
-                    if fail_count >= HEARTBEAT_MAX_FAIL {
-                        log::error!("[eth-heartbeat] max fail reached, restarting");
-                        unsafe { esp_idf_sys::esp_restart(); }
+                    // 分级恢复: 永远不立刻重启, 先尝试降级
+                    if fail_count >= 2 {
+                        let action = crate::error::recovery::decide_action(
+                            crate::error::recovery::Severity::Degradable,
+                            fail_count,
+                        );
+                        crate::error::recovery::apply_action(action, "eth-heartbeat");
+                    } else {
+                        // 短暂失败: 仅记录
+                        crate::error::recovery::record_failure(
+                            crate::error::recovery::Severity::Recoverable,
+                            "eth-heartbeat",
+                            "gateway ping failed",
+                        );
                     }
+                    // 注: 旧逻辑是 fail_count >= HEARTBEAT_MAX_FAIL (3) 时重启
+                    // 新逻辑: 永远不重启, 降级运行, 网络恢复后自动恢复
                 }
                 std::thread::sleep(period);
             }
@@ -359,10 +382,10 @@ fn heartbeat_once() -> bool {
 /// - dhcp=true  → 保持 DHCP 客户端 (默认行为)
 fn apply_netif_config(netif: *mut esp_idf_sys::esp_netif_obj) -> AppResult<()> {
     // 读取 SystemConfig
-    let cfg = crate::bus::lock_timeout()
-        .map(|b| b.cfg.clone())
+    let cfg = crate::bus::config_state::config_read()
+        .map(|cs| cs.cfg.clone())
         .unwrap_or_else(|| {
-            log::warn!("[eth] bus lock failed, using built-in defaults");
+            log::warn!("[eth] CONFIG RCU unavailable, using built-in defaults");
             let mut c = crate::device::SystemConfig::defaults();
             c.dhcp = false;
             c

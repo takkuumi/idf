@@ -22,6 +22,8 @@
 // edition 2024 配套: 显式要求 unsafe fn 内的 unsafe 操作需 unsafe block
 #![warn(unsafe_op_in_unsafe_fn)]
 
+mod actor;
+mod sync;
 mod error;
 mod config;
 mod bus;
@@ -123,10 +125,9 @@ fn main() -> AppResult<()> {
         Ok(()) => log::info!("[main] reset count={}", reset_count),
         Err(e) => log::warn!("[main] save reset count failed: {}", e),
     }
-    if let Some(mut b) = bus::lock_timeout() {
-        b.sys.reset_count = reset_count;
-        b.sys.reset_reason = reset_reason;
-    }
+    // 复位计数/原因直接写 IO.sys 原子, 不再经 legacy Bus (阶段 D)
+    bus::IO.sys.set_reset_count(reset_count);
+    bus::IO.sys.set_reset_reason(reset_reason);
 
     // 5. 启动以太网 (W5500)
     #[cfg(feature = "ethernet-w5500")]
@@ -183,10 +184,27 @@ fn main() -> AppResult<()> {
 
     // 10. 主循环
     log::info!("[main] entering main loop (period={}ms)", MAIN_LOOP_PERIOD_MS);
-    main_loop(timer_svc)?;
-
-    log::warn!("[main] main loop exited, rebooting");
-    unsafe { esp_idf_sys::esp_restart() };
+    // 打印任务-核心分配 (便于验证双核优化)
+    health::print_core_assignment();
+    if let Err(e) = main_loop(timer_svc) {
+        log::error!("[main] main loop returned error: {e}");
+        // 不再立即重启, 尝试降级运行
+        crate::error::recovery::record_failure(
+            crate::error::recovery::Severity::Severe,
+            "main",
+            &format!("main loop exited: {e}"),
+        );
+        // 进入降级模式
+        crate::error::recovery::enter_mode(
+            crate::error::recovery::DegradedMode::Minimal
+        );
+        // 短暂等待, 给系统机会继续响应
+        std::thread::sleep(Duration::from_secs(1));
+        // 注: 不直接重启, 让系统尝试在降级模式下继续
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     Ok(())
 }
 
@@ -211,17 +229,24 @@ fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
         #[cfg(feature = "ble-at")]
         ble_at::process_tick();
 
+        // 消费 IO 事件 (避免事件队列满, 触发重置丢失关键状态变化)
+        // 实际生产环境中可在此根据事件类型触发即时响应 (如 DI 变化后通知 Modbus TCP 主站)
+        while crate::bus::event_bus::recv_event().is_some() {}
+
         // 每 1s 更新 uptime + 检查任务心跳
         if tick % (1000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             let uptime = start.elapsed().as_secs() as u32;
-            if let Some(mut b) = bus::lock_timeout() {
-                b.sys.uptime_s = uptime;
-                // 复位请求
-                if b.sys.reset_request {
-                    log::warn!("[main] reset requested via modbus");
-                    std::thread::sleep(Duration::from_millis(100));
-                    unsafe { esp_idf_sys::esp_restart() };
-                }
+            // 阶段 A: uptime 写 + reset-request 读 全过 bus::IO.sys (原子), 无锁
+            crate::bus::IO.sys.set_uptime(uptime);
+            if crate::bus::IO.sys.is_reset_requested() {
+                log::warn!("[main] reset requested via modbus (user-initiated)");
+                crate::error::recovery::record_failure(
+                    crate::error::recovery::Severity::Fatal,
+                    "main",
+                    "user-requested reset via modbus",
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                unsafe { esp_idf_sys::esp_restart() };
             }
 
             // 任务健康检查: 检查所有注册任务的心跳

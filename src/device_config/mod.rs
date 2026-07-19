@@ -22,6 +22,7 @@ mod store;
 pub use types::{DeviceType, DeviceFunction, DeviceFunctionMeta};
 
 /// 设备配置表 (对齐参考固件 2300+ 寄存器区域)
+#[derive(Clone)]
 pub struct DeviceConfigTable {
     /// 已配置设备列表
     devices: heapless::Vec<DeviceEntry, 32>,
@@ -31,6 +32,7 @@ pub struct DeviceConfigTable {
     nvs_key: &'static str,
 }
 
+#[derive(Clone)]
 struct DeviceEntry {
     /// 设备类型
     dev_type: DeviceType,

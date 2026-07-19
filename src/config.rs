@@ -340,6 +340,22 @@ pub mod regs {
     pub const INREG_FW_VER: u16 = 0x087E;     // 固件版本号
     pub const INREG_FW_DATE: u16 = 0x087F;    // 固件版本日期
 
+    // ---- 故障恢复状态 (RO, FC=04) ----
+    // 暴露给 Modbus Master 用于远程监控设备健康
+    pub const INREG_RECOV_RECOVERABLE: u16 = 0x0880; // 可恢复故障计数
+    pub const INREG_RECOV_DEGRADABLE: u16 = 0x0881;  // 降级故障计数
+    pub const INREG_RECOV_SEVERE: u16 = 0x0882;       // 严重故障计数
+    pub const INREG_RECOV_MODE: u16 = 0x0883;         // 当前降级模式 (0=Normal, 1=BleOnly, 2=LocalOnly, 3=Minimal)
+    pub const INREG_RECOV_BLE_DROPS: u16 = 0x0884;    // BLE notify 丢弃帧计数
+
+    // ---- 错误环日志 (RO, FC=04) ----
+    // 用于远程诊断: 拉取最近 8 条错误记录
+    // 每条 4 个 U16: timestamp_low, timestamp_high+level+module, code, context_low, context_high
+    pub const INREG_RINGLOG_COUNT: u16 = 0x0885;      // 当前环日志条目数 (0-100)
+    pub const INREG_RINGLOG_WRITES: u16 = 0x0886;     // 总写入次数 (mod 2^32)
+    pub const INREG_RINGLOG_BASE: u16 = 0x0887;       // 8 条最近日志基地址
+    // 0x0887-0x08A6: 8 条 × 4 U16 = 32 个寄存器
+
     // ---- 保持寄存器 (Holding Register, FC=03/06/16, RW) ----
     // 参考固件: SLAVE_REG_P01 = 0x0880 (2176)
     pub const HOLD_CFG_BASE: u16 = 0x0880;

@@ -21,9 +21,10 @@
 //! - DI read: `!raw` — inverted (active-low input)
 //! - DI LED: `raw` — direct (low-active LED, 0=input-active=LED-ON)
 
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::error::{AppError, AppResult};
+use crate::sync::Spin;
 
 use super::digital_io::DigitalIo;
 use super::sw_i2c::SwI2c;
@@ -58,12 +59,12 @@ fn bit_reverse(b: u8) -> u8 {
 // Bus-level I2C access (shared between chips on the same physical bus)
 // ============================================================================
 struct BusI2c {
-    i2c: Mutex<SwI2c>,
+    i2c: Spin<SwI2c>,
 }
 
 impl BusI2c {
     fn new(i2c: SwI2c) -> Self {
-        Self { i2c: Mutex::new(i2c) }
+        Self { i2c: Spin::new(i2c) }
     }
 
     fn write_reg(&self, addr: u8, reg: u8, data: u8) -> AppResult<()> {
@@ -113,12 +114,12 @@ impl BusI2c {
 pub struct Pca9555Duo {
     io_bus: BusI2c,
     led_bus: BusI2c,
-    do_cache: Mutex<u16>,
+    do_cache: AtomicU16,
     /// Last written IO port values (bit-reversed), for incremental write
-    last_io: Mutex<(u8, u8)>,
+    last_io: Spin<(u8, u8)>,
     /// Last written LED port values (inverted), for incremental write
-    last_led: Mutex<(u8, u8)>,
-    status_led: Mutex<u8>,
+    last_led: Spin<(u8, u8)>,
+    status_led: Spin<u8>,
 }
 
 impl Pca9555Duo {
@@ -170,10 +171,10 @@ impl Pca9555Duo {
         Ok(Self {
             io_bus,
             led_bus,
-            do_cache: Mutex::new(0x0000),
-            last_io: Mutex::new((0x00, 0x00)),
-            last_led: Mutex::new((0xFF, 0xFF)), // init=off matches LED init above
-            status_led: Mutex::new(other_led),
+            do_cache: AtomicU16::new(0x0000),
+            last_io: Spin::new((0x00, 0x00)),
+            last_led: Spin::new((0xFF, 0xFF)), // init=off matches LED init above
+            status_led: Spin::new(other_led),
         })
     }
 
@@ -253,12 +254,21 @@ impl DigitalIo for Pca9555Duo {
 
     fn write_do_all(&self, value: u64) -> AppResult<()> {
         let bits = (value & 0xFFFF) as u16;
-        {
-            let mut cache = self.do_cache.lock();
-            if *cache == bits {
+        // 无锁 CAS: 仅当 cache 从旧值换成 bits 时才写入硬件
+        loop {
+            let cur = self.do_cache.load(Ordering::Acquire);
+            if cur == bits {
                 return Ok(());
             }
-            *cache = bits;
+            match self.do_cache.compare_exchange_weak(
+                cur,
+                bits,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => std::hint::spin_loop(),
+            }
         }
         self.apply_do(bits)
     }
@@ -267,18 +277,29 @@ impl DigitalIo for Pca9555Duo {
         if idx >= 16 {
             return Err(AppError::Io(format!("do idx {idx} out of range")));
         }
-        let bits: u16;
-        {
-            let mut cache = self.do_cache.lock();
-            bits = if on { *cache | (1 << idx) } else { *cache & !(1 << idx) };
-            if *cache == bits { return Ok(()); }
-            *cache = bits;
+        let mask = 1u16 << idx;
+        let mut bits: u16;
+        loop {
+            let cur = self.do_cache.load(Ordering::Acquire);
+            bits = if on { cur | mask } else { cur & !mask };
+            if cur == bits {
+                return Ok(());
+            }
+            match self.do_cache.compare_exchange_weak(
+                cur,
+                bits,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => std::hint::spin_loop(),
+            }
         }
         self.apply_do(bits)
     }
 
     fn read_do_cached(&self) -> u64 {
-        *self.do_cache.lock() as u64
+        self.do_cache.load(Ordering::Acquire) as u64
     }
 
     fn read_do_actual(&self) -> AppResult<u64> {

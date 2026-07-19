@@ -16,11 +16,11 @@
 //! # 线程安全
 //!
 //! 输入引脚 `is_high` 仅需 `&self`。
-//! 输出引脚 `set_level` 需 `&mut self`，通过 `parking_lot::Mutex` 串行化。
+//! 输出引脚 `set_level` 需 `&mut self`，通过 `Spin` 短临界区串行化 (不阻塞内核).
 
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use crate::sync::Spin;
 
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Level, Output, PinDriver};
 
@@ -31,11 +31,11 @@ pub struct GpioBank {
     /// W5500 中断输入 (低有效)
     pub eth_int: PinDriver<'static, Input>,
     /// W5500 复位输出 (低脉冲)
-    pub eth_rst: Mutex<PinDriver<'static, Output>>,
+    pub eth_rst: Spin<PinDriver<'static, Output>>,
     /// RS485 #0 / #1 的 DE 引脚
-    pub rs485_de: [Mutex<PinDriver<'static, Output>>; 2],
+    pub rs485_de: [Spin<PinDriver<'static, Output>>; 2],
     /// 板载运行状态 LED (蓝灯, 用于 heartbeat)
-    pub run_led: Mutex<Option<PinDriver<'static, Output>>>,
+    pub run_led: Spin<Option<PinDriver<'static, Output>>>,
 }
 
 impl GpioBank {
@@ -65,7 +65,7 @@ impl GpioBank {
 
         // RS485 #0/#1 DE (输出, 默认低 = 接收模式)
         let rs485_de = [
-            Mutex::new(
+            Spin::new(
                 PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[0]) }).map_err(|e| {
                     AppError::Hal(format!(
                         "rs485_de[0] gpio{}: {e:?}",
@@ -73,7 +73,7 @@ impl GpioBank {
                     ))
                 })?,
             ),
-            Mutex::new(
+            Spin::new(
                 PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[1]) }).map_err(|e| {
                     AppError::Hal(format!(
                         "rs485_de[1] gpio{}: {e:?}",
@@ -87,7 +87,7 @@ impl GpioBank {
         }
 
         // 板载运行 LED (无引脚时为 None, heartbeat 跳过)
-        let run_led = Mutex::new(match run_led_pin {
+        let run_led = Spin::new(match run_led_pin {
             Some(p) => Some(
                 PinDriver::output(unsafe { AnyOutputPin::steal(p) })
                     .map_err(|e| AppError::Hal(format!("run_led gpio{p}: {e:?}")))?,
@@ -97,7 +97,7 @@ impl GpioBank {
 
         Ok(Self {
             eth_int,
-            eth_rst: Mutex::new(PinDriver::output(unsafe { AnyOutputPin::steal(eth_rst_pin) })
+            eth_rst: Spin::new(PinDriver::output(unsafe { AnyOutputPin::steal(eth_rst_pin) })
                 .map_err(|e| AppError::Hal(format!("eth_rst reinit: {e:?}")))?),
             rs485_de,
             run_led,

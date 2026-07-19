@@ -29,8 +29,9 @@
 //!                  └─ABORT→ Idle (回滚)
 //! ```
 
-use parking_lot::Mutex;
-use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::LazyLock;
+use crate::sync::Spin;
 
 use crate::error::{AppError, AppResult};
 
@@ -72,20 +73,20 @@ struct OtaSession {
     last_status: OtaStatus,
 }
 
-/// 全局 OTA 会话 (同时只允许一个升级)
-static SESSION: Lazy<Mutex<Option<OtaSession>>> = Lazy::new(|| Mutex::new(None));
+/// 全局 OTA 会话 (同时只允许一个升级; Spin 短临界区, 不阻塞内核)
+static SESSION: LazyLock<Spin<Option<OtaSession>>> = LazyLock::new(|| Spin::new(None));
 
-/// 待升级包总大小 (通过 Modbus TOTAL_LO/HI 写入, BEGIN 触发时使用)
-static PENDING_TOTAL: parking_lot::Mutex<u32> = parking_lot::Mutex::new(0);
+/// 待升级包总大小 (通过 Modbus TOTAL_LO/HI 写入, BEGIN 触发时使用; 无锁原子)
+static PENDING_TOTAL: AtomicU32 = AtomicU32::new(0);
 
 /// 设置待升级包总大小 (供 Modbus 写 TOTAL_LO/HI 调用)
 pub fn set_pending_total(size: u32) {
-    *PENDING_TOTAL.lock() = size;
+    PENDING_TOTAL.store(size, Ordering::Release);
 }
 
 /// 读取待升级包总大小
 pub fn pending_total() -> u32 {
-    *PENDING_TOTAL.lock()
+    PENDING_TOTAL.load(Ordering::Acquire)
 }
 
 /// 查询当前 OTA 状态

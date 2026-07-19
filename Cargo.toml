@@ -64,11 +64,13 @@ anyhow = { version = "1", default-features = false, features = ["std"] }
 
 # 工具
 heapless = "0.8"
-parking_lot = "0.12"
-once_cell = { version = "1", default-features = false, features = ["std"] }
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
 
+# Local patch for esp-idf-hal to add unaligned_multi_block_rw_max_chunk_size field
+# This field was added in ESP-IDF 5.5.5 but esp-idf-hal 0.46.2 was built for 5.5.4
+# We can't upgrade (network blocked) and can't modify esp-idf source
+# So we patch esp-idf-hal directly
 [patch.crates-io]
-# 如需用本地或 git 版本可在此 patch
+# esp-idf-hal = { path = "patches/esp-idf-hal" }

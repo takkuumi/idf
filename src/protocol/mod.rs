@@ -23,9 +23,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use parking_lot::Mutex;
-
 use crate::error::AppResult;
+use crate::sync::Spin;
 
 // Arc + Hal 仅被需要 Arc<Hal> 的适配器使用 (ModbusRtuProtocol)
 #[cfg(feature = "modbus-rtu")]
@@ -44,8 +43,8 @@ use crate::hal::Hal;
 ///
 /// # 线程安全
 ///
-/// 实现需满足 `Send + Sync`, 内部状态使用原子操作或 Mutex 保护,
-/// 因为 `start(&self)` 接受不可变引用 (适配器模式, 无需 `&mut self`)。
+/// 实现需满足 `Send + Sync`, 内部状态使用原子操作或 Spin 保护,
+/// 因为 `start(&self)` 接受不可变引用 (适配器模式, 无需 `&mut self`).
 pub trait Protocol: Send + Sync {
     /// 协议名称 (如 "modbus-rtu", "modbus-tcp", "ble-mesh")
     fn name(&self) -> &str;
@@ -91,10 +90,10 @@ pub struct ProtocolStats {
 
 /// 协议运行状态管理 (适配器嵌入此结构共享状态管理逻辑)
 ///
-/// 使用原子操作, 支持 `&self` 修改 (Protocol::start(&self) 不需要 &mut self)。
+/// 使用原子操作 + Spin, 支持 `&self` 修改 (Protocol::start(&self) 不需要 &mut self)。
 struct ProtocolState {
     running: AtomicBool,
-    started_at: Mutex<Option<Instant>>,
+    started_at: Spin<Option<Instant>>,
     error_count: AtomicU32,
 }
 
@@ -102,7 +101,7 @@ impl ProtocolState {
     fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
-            started_at: Mutex::new(None),
+            started_at: Spin::new(None),
             error_count: AtomicU32::new(0),
         }
     }
@@ -126,10 +125,8 @@ impl ProtocolState {
     }
 
     fn uptime_s(&self) -> u64 {
-        self.started_at
-            .lock()
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0)
+        let g = self.started_at.lock();
+        g.as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 
     fn error_count(&self) -> u32 {

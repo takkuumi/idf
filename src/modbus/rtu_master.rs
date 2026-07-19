@@ -140,21 +140,26 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
 
         // 写回 bus 协议存储区 (如果指定了 dest_reg)
         if let Some(dest_start) = item.dest_reg {
-            if let Some(mut bus) = crate::bus::lock_timeout() {
-                for (i, &v) in regs.iter().enumerate() {
-                    let addr = dest_start.wrapping_add(i as u16);
-                    // 仅写入协议存储区范围
-                    if (addr >= crate::config::regs::PROTO_BASE)
-                        && (addr < crate::config::regs::PROTO_END)
-                    {
-                        let idx = (addr - crate::config::regs::PROTO_BASE) as usize;
-                        bus.proto.data[idx] = v;
-                        bus.proto.dirty = true;
-                    }
+            let mut written = 0u16;
+            for (i, &v) in regs.iter().enumerate() {
+                let addr = dest_start.wrapping_add(i as u16);
+                if (addr >= crate::config::regs::PROTO_BASE)
+                    && (addr < crate::config::regs::PROTO_END)
+                {
+                    let idx = (addr - crate::config::regs::PROTO_BASE) as usize;
+                    // 阶段 B: 无锁 RMW — clone snap → 修改 proto.data[idx] → Rcu::write
+                    crate::bus::backends::storage_modify(|snap| {
+                        snap.proto.data[idx] = v;
+                        snap.proto.dirty = true;
+                        snap.proto.status = crate::bus::proto_status();
+                    });
+                    written += 1;
                 }
+            }
+            if written > 0 {
                 log::debug!(
-                    "[mb-rtu-master] wrote {} regs to bus at {:#06X}",
-                    regs.len(), dest_start
+                    "[mb-rtu-master] wrote {} regs to RCU storage at {:#06X}",
+                    written, dest_start
                 );
             }
         }

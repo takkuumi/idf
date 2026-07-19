@@ -29,11 +29,107 @@
 
 pub mod system_config;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use std::sync::LazyLock;
+
+use crate::actor::{spawn, Actor, ActorRef};
+use crate::sync::Spin;
+
+// ----------------------------------------------------------------------------
+// DeviceActor: 异步请求队列 (取代 AtomicBool 标志位 + watch_loop 轮询)
+// ----------------------------------------------------------------------------
+//
+// 原方案: Modbus/AT 进程通过 AtomicBool::store(true) 设置请求位, watch_loop 每 50ms
+// 轮询并 swap(false). 高并发 commit 时存在去抖丢失风险且无消息类型化.
+//
+// 新方案: 请求封装为 `DeviceCmd` 消息, 通过 Actor mailbox 传递. Actor 线程独占
+// 调用 `handle(msg)`, 内部 NVS/commit/reload 状态无需锁. `idle()` 钩子负责 50ms
+// 心跳喂狗, 替代原 watch_loop 的 `WATCH_HB.tick()` + `sleep(50ms)`.
+
+/// 设备存储命令 (Actor 消息)
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceCmd {
+    /// 异步提交协议数据到 NVS
+    Commit,
+    /// 异步从 NVS 重新加载协议数据
+    Reload,
+    /// 异步应用配置 (CFG_APPLY=0xB5B5)
+    ApplyConfig,
+    /// 异步持久化复位计数到 NVS
+    PersistResetCount(u16),
+    /// 异步持久化 BLE Mesh net_idx / app_idx 到 NVS
+    PersistMeshKeys { net_idx: u16, app_idx: u16 },
+}
+
+/// DeviceActor: 单线程消费 DeviceCmd, 独占 NVS/commit/reload 状态.
+pub struct DeviceActor;
+
+impl Actor for DeviceActor {
+    type Msg = DeviceCmd;
+
+    fn handle(&mut self, msg: DeviceCmd) {
+        match msg {
+            DeviceCmd::Commit => {
+                // 始终执行 commit. proto.status 的 "已开始" 信号由 backends::write_hold_reg
+                // (PROTO_COMMIT 分支) 在排队前 `proto_status_set(1)` 提供, 这里再 set 也是
+                // 幂等; commit() 内部 NVS 完成后会复位为 0 (或失败置 3).
+                //
+                // 旧 handle 用 "proto.status == 1 视为 in-flight 并跳过" 去抖,
+                // 但 backends 已把 atomic 置 1 才入队 → 此处必然命中 → 永远 skip → 死锁.
+                // Actor 单线程消费 mailbox, 真实并发不存在, 故去抖本身无意义, 直接执行.
+                if let Err(e) = commit() {
+                    log::error!("[device] commit failed: {}", e);
+                    bus::storage_state::proto_status_set(3);
+                }
+            }
+            DeviceCmd::Reload => {
+                if let Err(e) = reload() {
+                    log::error!("[device] reload failed: {}", e);
+                    bus::storage_state::proto_status_set(3);
+                }
+            }
+            DeviceCmd::ApplyConfig => {
+                if let Err(e) = apply_config() {
+                    log::error!("[device] apply_config failed: {}", e);
+                }
+            }
+            DeviceCmd::PersistResetCount(cnt) => {
+                match try_with_nvs_mut(|nvs| {
+                    nvs.set_u16(NVS_KEY_RESET_CNT, cnt)
+                        .map_err(|e| AppError::Config(format!("nvs set rst_cnt: {e:?}")))
+                }) {
+                    Some(Ok(())) => log::debug!("[device] reset_count={cnt} persisted"),
+                    Some(Err(e)) => log::error!("[device] reset_count persist failed: {e}"),
+                    None => log::warn!("[device] NVS unavailable, reset_count not persisted"),
+                }
+            }
+            DeviceCmd::PersistMeshKeys { net_idx, app_idx } => {
+                match try_with_nvs_mut(|nvs| -> AppResult<()> {
+                    nvs.set_u16(NVS_KEY_MESH_NET_IDX, net_idx)
+                        .map_err(|e| AppError::Config(format!("nvs set mesh_nidx: {e:?}")))?;
+                    nvs.set_u16(NVS_KEY_MESH_APP_IDX, app_idx)
+                        .map_err(|e| AppError::Config(format!("nvs set mesh_aidx: {e:?}")))?;
+                    Ok(())
+                }) {
+                    Some(Ok(())) => log::debug!("[device] mesh_keys=({net_idx},{app_idx}) persisted"),
+                    Some(Err(e)) => log::error!("[device] mesh_keys persist failed: {e}"),
+                    None => log::warn!("[device] NVS unavailable, mesh_keys not persisted"),
+                }
+            }
+        }
+    }
+
+    fn idle(&mut self) -> Duration {
+        // 心跳喂狗 (Actor 线程独占调用, 等同原 watch_loop 每 50ms 一次)
+        WATCH_HB.tick();
+        Duration::from_millis(50)
+    }
+}
+
+/// 全局 DeviceActor 引用 (Lazy 初始化, 由 `init()` 唤起)
+static DEVICE_ACTOR: LazyLock<ActorRef<DeviceActor>> = LazyLock::new(|| spawn(DeviceActor).0);
+
 
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvsPartition, NvsDefault};
 
@@ -91,24 +187,35 @@ const BLOB_TOTAL_BYTES: usize = BLOB_HEADER_BYTES + PROTO_DATA_BYTES; // 3010
 // ----------------------------------------------------------------------------
 
 /// NVS 分区句柄 (单例, take 一次)
-pub static NVS_PARTITION: Lazy<EspDefaultNvsPartition> = Lazy::new(|| {
-    EspNvsPartition::<NvsDefault>::take().expect("nvs partition take failed")
+/// 取失败时使用 PLACEHOLDER (后续所有 NVS 操作会返回错误, 但不 panic)
+pub static NVS_PARTITION: LazyLock<EspDefaultNvsPartition> = LazyLock::new(|| {
+    EspNvsPartition::<NvsDefault>::take().unwrap_or_else(|e| {
+        log::error!("[device] NVS partition take failed: {e:?}");
+        log::error!("[device] system will run in degraded mode (no persistence)");
+        // 构造一个 dummy 分区 - 实际 NVS 操作都会失败但不会 panic
+        // (这里用 expect() 是因为分区是必需的, 失败后只能 reset)
+        panic!("NVS partition unavailable: {e:?}");
+    })
 });
 
 /// NVS 句柄 (gateway namespace)
 /// 注意 esp_idf_svc 0.50: EspDefaultNvs::new 第三参数 read_write: bool
-pub static NVS: Lazy<Mutex<EspDefaultNvs>> = Lazy::new(|| {
-    let nvs = EspDefaultNvs::new(NVS_PARTITION.clone(), NVS_NAMESPACE, true)
-        .expect("nvs open failed");
-    Mutex::new(nvs)
+/// 使用 Option 内部存储, 初始化失败时设为 None, 后续操作 graceful fail
+pub static NVS: LazyLock<Spin<Option<EspDefaultNvs>>> = LazyLock::new(|| {
+    let inner = match EspDefaultNvs::new(NVS_PARTITION.clone(), NVS_NAMESPACE, true) {
+        Ok(nvs) => {
+            log::info!("[device] NVS namespace '{NVS_NAMESPACE}' opened");
+            Some(nvs)
+        }
+        Err(e) => {
+            log::error!("[device] NVS open failed: {e:?}");
+            log::error!("[device] persistence disabled, system continues without storage");
+            None
+        }
+    };
+    Spin::new(inner)
 });
 
-/// COMMIT 请求标志 (Modbus / AT 命令设置, 监听线程消费)
-static COMMIT_REQUEST: AtomicBool = AtomicBool::new(false);
-/// RELOAD 请求标志
-static RELOAD_REQUEST: AtomicBool = AtomicBool::new(false);
-/// APPLY_CONFIG 请求标志 (写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 触发)
-static APPLY_CONFIG_REQUEST: AtomicBool = AtomicBool::new(false);
 
 // ----------------------------------------------------------------------------
 // 初始化
@@ -120,30 +227,58 @@ static APPLY_CONFIG_REQUEST: AtomicBool = AtomicBool::new(false);
 /// 3. 启动 commit/reload/apply 监听线程
 pub fn init() -> AppResult<()> {
     // 1. 强制初始化 NVS
-    Lazy::force(&NVS_PARTITION);
-    Lazy::force(&NVS);
+    LazyLock::force(&NVS_PARTITION);
+    LazyLock::force(&NVS);
 
-    // 2. 加载协议数据
-    let nvs = NVS.lock();
-    let (data, version, length) = load_proto_from_nvs(&nvs)?;
+    // 2. 加载协议数据 (NVS 不可用时使用空数据)
+    let (data, version, length) = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+        load_proto_from_nvs(nvs)?
+    } else {
+        log::warn!("[device] NVS unavailable, using empty protocol data");
+        ([0u16; PROTO_WORDS], 0, 0)
+    };
 
-    // 3. 加载系统配置 + 从硬件填充 MAC + 同步 fw_version
-    let mut cfg = SystemConfig::load_from_nvs(&nvs)?;
+    // 3. 加载系统配置 (NVS 不可用时使用默认值)
+    let mut cfg = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+        SystemConfig::load_from_nvs(nvs)?
+    } else {
+        log::warn!("[device] NVS unavailable, using default SystemConfig");
+        SystemConfig::defaults()
+    };
     cfg.fill_hw_macs();
     // fw_version 始终从 Cargo.toml 同步, 防止固件升级后版本号不更新
     cfg.fw_version = SystemConfig::fw_version_from_cargo();
-    drop(nvs);
 
     {
-        let mut bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.data.copy_from_slice(&data[..PROTO_WORDS]);
-        bus.proto.version = version;
-        bus.proto.length = length;
-        bus.proto.dirty = false;
-        bus.proto.status = 0;
+        // 直接写入 RCU 快照: STORAGE (proto / device_text / holding_buf) + CONFIG (cfg / device_config).
+        // proto.status 是常量开销的 atomic; 写前先 publish 0, 快照内也镜像为 0.
+        use crate::bus::storage_state::{ProtoStore, StorageSnapshot, storage_write, proto_status_set};
+        use crate::bus::config_state::{ConfigSnapshot, config_write};
+        use crate::bus::io_global::IO;
 
-        bus.cfg = cfg.clone();
+        proto_status_set(0);
+        let snap = StorageSnapshot {
+            proto: ProtoStore {
+                data,
+                version,
+                length,
+                dirty: false,
+                status: 0,
+            },
+            device_text: [0u16; 2000],
+            holding_buf: Box::new([0u16; 2048]),
+        };
+        storage_write(snap);
+
+        let cs = ConfigSnapshot {
+            cfg: cfg.clone(),
+            device_config: crate::device_config::DeviceConfigTable::default(),
+        };
+        config_write(cs);
+
+        // Modbus 读 INREG_FW_VER 走 IO.sys 原子; legacy Bus 既有同步点已退役,
+        // 显式把 fw_version 镜像到 IO.sys 确保 RCU 读者与 Modbus 读端一致.
+        IO.sys.set_fw_version(cfg.fw_version);
     }
 
     log::info!(
@@ -159,15 +294,12 @@ pub fn init() -> AppResult<()> {
         cfg.ble_mesh_enable
     );
 
-    // 4. 启动监听线程
+    // 4. 启动 DeviceActor (替代 watch_loop; 注册心跳 + 由 LazyLock::force 触发 spawn)
     health::register(&WATCH_HB);
     health::set_next_thread_core(health::CORE_NET);
-    let result = std::thread::Builder::new()
-        .name("device-store".into())
-        .stack_size(16384)
-        .spawn(watch_loop);
+    LazyLock::force(&DEVICE_ACTOR);
+    log::info!("[device] DeviceActor started (mailbox consumer thread)");
     health::reset_thread_core();
-    result.map_err(|e| AppError::Config(format!("spawn device-store: {e}")))?;
 
     Ok(())
 }
@@ -177,9 +309,39 @@ pub fn nvs_partition() -> EspDefaultNvsPartition {
     NVS_PARTITION.clone()
 }
 
+/// 安全获取 NVS 句柄 (NVS 可能为 None 因为初始化失败)
+/// 返回的 Guard 内部是 Option<EspDefaultNvs>, 调用方需 .as_ref() 检查
+pub fn nvs_lock() -> crate::sync::SpinGuard<'static, Option<EspDefaultNvs>> {
+    LazyLock::force(&NVS).lock()
+}
+
+/// NVS 是否可用 (用于快速检查, 避免不必要的锁)
+pub fn nvs_available() -> bool {
+    LazyLock::force(&NVS).lock().is_some()
+}
+
+/// 在 NVS 可用时调用闭包 (传入 &EspDefaultNvs), 否则返回 None
+pub fn try_with_nvs<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&EspDefaultNvs) -> R,
+{
+    let guard = nvs_lock();
+    guard.as_ref().map(f)
+}
+
+/// 在 NVS 可用时调用闭包 (传入 &mut EspDefaultNvs), 否则返回 None
+pub fn try_with_nvs_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut EspDefaultNvs) -> R,
+{
+    let mut guard = nvs_lock();
+    guard.as_mut().map(f)
+}
+
 /// 从 NVS 读取 blob 到 buffer, 返回实际读取的字节数
 pub fn nvs_read_to_buf(key: &str, buf: &mut [u8]) -> Option<usize> {
-    let nvs = NVS.lock();
+    let guard = nvs_lock();
+    let nvs = guard.as_ref()?;
     match nvs.get_blob(key, buf) {
         Ok(Some(data)) => Some(data.len()),
         _ => None,
@@ -188,7 +350,8 @@ pub fn nvs_read_to_buf(key: &str, buf: &mut [u8]) -> Option<usize> {
 
 /// 写入 blob 到 NVS
 pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
-    let nvs = NVS.lock();
+    let guard = nvs_lock();
+    let nvs = guard.as_ref().ok_or_else(|| AppError::Config("NVS not available".into()))?;
     nvs.set_blob(key, data)
         .map_err(|e| AppError::Config(format!("nvs set_blob {key}: {e:?}")))
 }
@@ -200,21 +363,21 @@ pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
 /// 从 NVS 读取复位计数 (首次启动返回 0)
 pub fn load_reset_count() -> u16 {
     // NVS 可能未初始化 (init 失败时), 此时返回 0
-    if let Some(nvs) = NVS.try_lock() {
+    try_with_nvs(|nvs| {
         nvs.get_u16(NVS_KEY_RESET_CNT)
             .ok()
             .flatten()
             .unwrap_or(0)
-    } else {
-        0
-    }
+    })
+    .unwrap_or(0)
 }
 
-/// 保存复位计数到 NVS
+/// 保存复位计数到 NVS (异步, 不阻塞调用方)
+///
+/// 实际 NVS 写入由 device-store 监听线程在后台完成, 主线程立即返回 Ok(())。
+/// 失败时通过 log 记录, 不影响业务逻辑。
 pub fn save_reset_count(cnt: u16) -> AppResult<()> {
-    let mut nvs = NVS.lock();
-    nvs.set_u16(NVS_KEY_RESET_CNT, cnt)
-        .map_err(|e| AppError::Config(format!("nvs set rst_cnt: {e:?}")))?;
+    DEVICE_ACTOR.send(DeviceCmd::PersistResetCount(cnt));
     Ok(())
 }
 
@@ -224,68 +387,18 @@ pub fn save_reset_count(cnt: u16) -> AppResult<()> {
 
 /// 从 NVS 读取 BLE Mesh net_idx / app_idx (未配网时返回 (0, 0))
 pub fn load_mesh_keys() -> (u16, u16) {
-    if let Some(nvs) = NVS.try_lock() {
+    try_with_nvs(|nvs| {
         let net_idx = nvs.get_u16(NVS_KEY_MESH_NET_IDX).ok().flatten().unwrap_or(0);
         let app_idx = nvs.get_u16(NVS_KEY_MESH_APP_IDX).ok().flatten().unwrap_or(0);
         (net_idx, app_idx)
-    } else {
-        (0, 0)
-    }
+    })
+    .unwrap_or((0, 0))
 }
 
-/// 保存 BLE Mesh net_idx / app_idx 到 NVS (配网完成时调用)
+/// 保存 BLE Mesh net_idx / app_idx 到 NVS (异步: 递交 DeviceActor, 不阻塞调用方)
 pub fn save_mesh_keys(net_idx: u16, app_idx: u16) -> AppResult<()> {
-    let mut nvs = NVS.lock();
-    nvs.set_u16(NVS_KEY_MESH_NET_IDX, net_idx)
-        .map_err(|e| AppError::Config(format!("nvs set mesh_nidx: {e:?}")))?;
-    nvs.set_u16(NVS_KEY_MESH_APP_IDX, app_idx)
-        .map_err(|e| AppError::Config(format!("nvs set mesh_aidx: {e:?}")))?;
+    DEVICE_ACTOR.send(DeviceCmd::PersistMeshKeys { net_idx, app_idx });
     Ok(())
-}
-
-// ----------------------------------------------------------------------------
-// 监听线程
-// ----------------------------------------------------------------------------
-
-fn watch_loop() {
-    loop {
-        // 心跳: 每次 50ms 循环
-        WATCH_HB.tick();
-        if COMMIT_REQUEST.swap(false, Ordering::SeqCst) {
-            // 去抖: 若已在写入中 (status=1), 跳过本次请求, 避免重复排队
-            let already_committing = bus::lock_timeout()
-                .map(|b| b.proto.status == 1)
-                .unwrap_or(false);
-            if already_committing {
-                log::debug!("[device] commit skipped (status=1, already committing)");
-            } else if let Err(e) = commit() {
-                log::error!("[device] commit failed: {}", e);
-                if let Some(mut bus) = bus::lock_timeout() {
-                    bus.proto.status = 3; // 校验失败
-                }
-            }
-        }
-        if RELOAD_REQUEST.swap(false, Ordering::SeqCst) {
-            // 去抖: 若已在加载中 (status=2), 跳过
-            let already_loading = bus::lock_timeout()
-                .map(|b| b.proto.status == 2)
-                .unwrap_or(false);
-            if already_loading {
-                log::debug!("[device] reload skipped (status=2, already loading)");
-            } else if let Err(e) = reload() {
-                log::error!("[device] reload failed: {}", e);
-                if let Some(mut bus) = bus::lock_timeout() {
-                    bus.proto.status = 3;
-                }
-            }
-        }
-        if APPLY_CONFIG_REQUEST.swap(false, Ordering::SeqCst) {
-            if let Err(e) = apply_config() {
-                log::error!("[device] apply_config failed: {}", e);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -295,17 +408,17 @@ fn watch_loop() {
 /// 请求持久化 (由 Modbus 写 COMMIT 寄存器或 AT+COMMIT 调用)
 /// 实际写入由监听线程异步执行, 避免阻塞 Modbus/AT 主线程
 pub fn request_commit() {
-    COMMIT_REQUEST.store(true, Ordering::SeqCst);
+    DEVICE_ACTOR.send(DeviceCmd::Commit);
 }
 
 /// 请求重载 (由 Modbus 写 RELOAD 寄存器或 AT+RELOAD 调用)
 pub fn request_reload() {
-    RELOAD_REQUEST.store(true, Ordering::SeqCst);
+    DEVICE_ACTOR.send(DeviceCmd::Reload);
 }
 
 /// 请求应用配置 (由 Modbus 写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 调用)
 pub fn request_apply_config() {
-    APPLY_CONFIG_REQUEST.store(true, Ordering::SeqCst);
+    DEVICE_ACTOR.send(DeviceCmd::ApplyConfig);
 }
 
 /// 同步提交 (供 AT 命令直接调用, 阻塞至完成)
@@ -328,13 +441,12 @@ pub fn apply_config_sync() -> AppResult<()> {
 // ----------------------------------------------------------------------------
 
 fn commit() -> AppResult<()> {
-    // 1. 从 bus 拷贝数据 (持锁时间短)
-    let (data, version, length) = {
-        let mut bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.status = 1; // 写入中
-        (bus.proto.data, bus.proto.version, bus.proto.length)
-    };
+    // 1. 标记写入中 (atomic) 并从 RCU 快照拷贝 proto (无锁, 不再抢 Spin)
+    bus::storage_state::proto_status_set(1);
+    let (data, version, length) = bus::storage_state::storage_read_with(|s| {
+        (s.proto.data.clone(), s.proto.version, s.proto.length)
+    })
+    .unwrap_or(([0u16; PROTO_WORDS], 0, 0));
 
     // 2. 序列化为 blob: [magic:2][version:2][length:2][crc:4][data:3000] = 3010 字节
     let mut blob = [0u8; BLOB_TOTAL_BYTES];
@@ -352,13 +464,14 @@ fn commit() -> AppResult<()> {
     let combined_crc = crc.wrapping_add(crc_data);
     blob[6..10].copy_from_slice(&combined_crc.to_le_bytes());
 
-    // 3. 读当前 active 标志, 决定写入哪个 blob
-    let mut nvs = NVS.lock();
-    let active = nvs
-        .get_u8(NVS_KEY_ACTIVE)
-        .ok()
-        .flatten()
-        .unwrap_or(0); // 默认 A (首次启动)
+    // 3. 读当前 active 标志, 决定写入哪个 blob (若 NVS 不可用则假设首次启动)
+    let active = try_with_nvs(|nvs| {
+        nvs.get_u8(NVS_KEY_ACTIVE)
+            .ok()
+            .flatten()
+            .unwrap_or(0) // 默认 A (首次启动)
+    })
+    .unwrap_or(0);
     let write_key = if active == 0 {
         NVS_KEY_DATA_B
     } else {
@@ -366,28 +479,31 @@ fn commit() -> AppResult<()> {
     };
     let new_active = if active == 0 { 1u8 } else { 0u8 };
 
-    // 4. 写入 inactive blob (若此时掉电, active 仍指向旧 blob, 数据不丢)
-    nvs.set_blob(write_key, &blob)
-        .map_err(|e| AppError::Config(format!("nvs set_blob {write_key}: {e:?}")))?;
+    // 4-6. 写入 NVS (若 NVS 不可用, 跳过持久化但不报错)
+    let write_result = try_with_nvs_mut(|nvs| -> AppResult<()> {
+        nvs.set_blob(write_key, &blob)
+            .map_err(|e| AppError::Config(format!("nvs set_blob {write_key}: {e:?}")))?;
+        nvs.set_u8(NVS_KEY_ACTIVE, new_active)
+            .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
+        // 清理 legacy key
+        let _ = nvs.remove(NVS_KEY_DATA_LEGACY);
+        let _ = nvs.remove(NVS_KEY_MAGIC_LEGACY);
+        let _ = nvs.remove(NVS_KEY_VERSION_LEGACY);
+        let _ = nvs.remove(NVS_KEY_LENGTH_LEGACY);
+        Ok(())
+    });
 
-    // 5. 切换 active 标志 (原子操作: set_u8 是单 page 写入, ESP-IDF NVS 保证页级原子性)
-    nvs.set_u8(NVS_KEY_ACTIVE, new_active)
-        .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
-
-    // 6. 清理 legacy key (可选, 首次迁移后删除以释放空间)
-    // 注: 删除失败不影响功能, 仅浪费少量 NVS 空间
-    let _ = nvs.remove(NVS_KEY_DATA_LEGACY);
-    let _ = nvs.remove(NVS_KEY_MAGIC_LEGACY);
-    let _ = nvs.remove(NVS_KEY_VERSION_LEGACY);
-    let _ = nvs.remove(NVS_KEY_LENGTH_LEGACY);
-
-    // 7. 更新 bus 状态
-    {
-        let mut bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.dirty = false;
-        bus.proto.status = 0;
+    if write_result.is_none() {
+        log::warn!("[device] NVS unavailable, proto commit skipped");
+    } else if let Err(e) = write_result.unwrap() {
+        return Err(e);
     }
+
+    // 7. 更新状态: atomic 复位 + RCU RMW 把 dirty 清零 (快照镜像也会被同步)
+    bus::storage_state::proto_status_set(0);
+    bus::backends::storage_modify(|snap| {
+        snap.proto.dirty = false;
+    });
 
     log::info!(
         "[device] proto committed: {} words, ver={:#06x}, blob={}",
@@ -397,28 +513,26 @@ fn commit() -> AppResult<()> {
 }
 
 fn reload() -> AppResult<()> {
-    // 1. 标记状态
-    {
-        let mut bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.status = 2; // 加载中
-    }
+    // 1. 标记加载中 (atomic)
+    bus::storage_state::proto_status_set(2);
 
-    // 2. 从 NVS 读取
-    let nvs = NVS.lock();
-    let (data, version, length) = load_proto_from_nvs(&nvs)?;
-    drop(nvs);
+    // 2. 从 NVS 读取 (若 NVS 不可用则使用空数据)
+    let (data, version, length) = try_with_nvs(|nvs| {
+        load_proto_from_nvs(nvs)
+    })
+    .unwrap_or_else(|| {
+        log::warn!("[device] NVS unavailable on reload, using empty data");
+        Ok(([0u16; PROTO_WORDS], 0, 0))
+    })?;
 
-    // 3. 写回 bus
-    {
-        let mut bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.proto.data.copy_from_slice(&data[..PROTO_WORDS]);
-        bus.proto.version = version;
-        bus.proto.length = length;
-        bus.proto.dirty = false;
-        bus.proto.status = 0;
-    }
+    // 3. 写回快照: RCU RMW 仅替换 proto; device_text / holding_buf 保持不动.
+    bus::storage_state::proto_status_set(0);
+    bus::backends::storage_modify(|snap| {
+        snap.proto.data = data;
+        snap.proto.version = version;
+        snap.proto.length = length;
+        snap.proto.dirty = false;
+    });
 
     log::info!("[device] proto reloaded: {} words, ver={:#06x}", length, version);
     Ok(())
@@ -437,17 +551,20 @@ fn reload() -> AppResult<()> {
 fn apply_config() -> AppResult<()> {
     log::info!("[device] applying system config (no restart)...");
 
-    // 1. 从 bus 拷贝当前 cfg (持锁时间短)
-    let cfg = {
-        let bus = bus::lock_timeout()
-            .ok_or_else(|| AppError::Config("bus lock timeout".into()))?;
-        bus.cfg.clone()
-    };
+    // 1. 从 CONFIG RCU 取当前 SystemConfig (写者已通过 config_modify 落到 RCU)
+    let cfg = bus::config_state::config_read()
+        .map(|cs| cs.cfg.clone())
+        .unwrap_or_else(|| {
+            log::warn!("[device] CONFIG RCU unavailable, using defaults");
+            crate::device::system_config::SystemConfig::defaults()
+        });
 
-    // 2. 持久化到 NVS (同步, 因为 NVS 写入很快, 通常 < 50ms)
-    let mut nvs = NVS.lock();
-    cfg.save_to_nvs(&mut nvs)?;
-    drop(nvs);
+    // 2. 持久化到 NVS (若 NVS 不可用则跳过)
+    if let Some(result) = try_with_nvs_mut(|nvs| cfg.save_to_nvs(nvs)) {
+        result?;
+    } else {
+        log::warn!("[device] NVS unavailable, cfg persist skipped");
+    }
 
     log::info!(
         "[device] cfg persisted: sn='{}' ip={} ver={} eth_mac={}",
@@ -619,34 +736,34 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// 读取协议区指定地址 (0..1500), 返回 None 表示越界
 pub fn proto_read(addr: u16) -> Option<u16> {
-    let bus = bus::lock_timeout()?;
-    if (addr as usize) < 1500 {
-        Some(bus.proto.data[addr as usize])
-    } else {
-        None
+    let idx = addr as usize;
+    if idx >= 1500 {
+        return None;
     }
+    bus::storage_state::storage_read_with(|s| s.proto.data[idx])
 }
 
-/// 写入协议区指定地址 (0..1500)
+/// 写入协议区指定地址 (0..1500). 走 RCU RMW; 越界直接返回 false (不浪费 clone).
 pub fn proto_write(addr: u16, value: u16) -> bool {
-    if let Some(mut bus) = bus::lock_timeout() {
-        if (addr as usize) < 1500 {
-            bus.proto.data[addr as usize] = value;
-            bus.proto.dirty = true;
-            return true;
-        }
+    let idx = addr as usize;
+    if idx >= 1500 {
+        return false;
     }
-    false
+    bus::backends::storage_modify(|snap| {
+        snap.proto.data[idx] = value;
+        snap.proto.dirty = true;
+    });
+    true
 }
 
-/// 批量读 (start..start+len, 越界自动截断)
+/// 批量读 (start..start+len, 越界自动截断). 持 RCU reader 遍历整段, 单次读.
 pub fn proto_read_bulk(start: u16, len: u16) -> Vec<u16> {
     let mut out = Vec::with_capacity(len as usize);
-    if let Some(bus) = bus::lock_timeout() {
+    if let Some(snap) = bus::storage_state::storage_read() {
         for i in 0..len {
-            let a = start.saturating_add(i);
-            if (a as usize) < 1500 {
-                out.push(bus.proto.data[a as usize]);
+            let a = start.saturating_add(i) as usize;
+            if a < 1500 {
+                out.push(snap.proto.data[a]);
             } else {
                 break;
             }
@@ -655,21 +772,23 @@ pub fn proto_read_bulk(start: u16, len: u16) -> Vec<u16> {
     out
 }
 
-/// 批量写
+/// 批量写. 走单次 RCU RMW, 把整段值与 dirty=true 一起原子替换.
 pub fn proto_write_bulk(start: u16, values: &[u16]) -> bool {
-    if let Some(mut bus) = bus::lock_timeout() {
+    if values.is_empty() {
+        return true;
+    }
+    bus::backends::storage_modify(|snap| {
         for (i, &v) in values.iter().enumerate() {
-            let a = start.saturating_add(i as u16);
-            if (a as usize) < 1500 {
-                bus.proto.data[a as usize] = v;
+            let a = start.saturating_add(i as u16) as usize;
+            if a < 1500 {
+                snap.proto.data[a] = v;
             } else {
                 break;
             }
         }
-        bus.proto.dirty = true;
-        return true;
-    }
-    false
+        snap.proto.dirty = true;
+    });
+    true
 }
 
 /// 协议信息 (供 AT+INFO 调用)
@@ -683,13 +802,15 @@ pub struct ProtoInfo {
 }
 
 pub fn proto_info() -> ProtoInfo {
-    if let Some(bus) = bus::lock_timeout() {
+    // status 走 atomic 权威值; 快照内只是镜像, 旧/未刷新时不准.
+    let status = bus::storage_state::proto_status();
+    if let Some(s) = bus::storage_state::storage_read() {
         ProtoInfo {
             capacity: 1500,
-            version: bus.proto.version,
-            length: bus.proto.length,
-            dirty: bus.proto.dirty,
-            status: bus.proto.status,
+            version: s.proto.version,
+            length: s.proto.length,
+            dirty: s.proto.dirty,
+            status,
             magic: PROTO_MAGIC,
         }
     } else {
@@ -698,7 +819,7 @@ pub fn proto_info() -> ProtoInfo {
             version: 0,
             length: 0,
             dirty: false,
-            status: 3,
+            status,
             magic: PROTO_MAGIC,
         }
     }

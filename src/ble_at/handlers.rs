@@ -88,8 +88,11 @@ pub fn handle_bulkw(args: &str) -> String {
     if values.len() < 2 {
         return err(10, "usage: AT+BULKW=<start>,<v1>,<v2>,...");
     }
-    // 安全拆分: values.len() >= 2 已保证
-    let (start, rest) = values.split_first().unwrap();
+    // 安全拆分: 用 match 替代 unwrap, 任何分支都不 panic
+    let (start, rest) = match values.split_first() {
+        Some((s, r)) => (s, r),
+        None => return err(10, "usage: AT+BULKW=<start>,<v1>,<v2>,..."),
+    };
     if device::proto_write_bulk(*start, rest) {
         ok_data(&format!("{} words", rest.len()))
     } else {
@@ -143,18 +146,17 @@ pub fn handle_info(_args: &str) -> String {
 // DI/DO 位宽根据硬件版本变化 (默认 8 bit / F3-F4 16-48 bit)
 // ----------------------------------------------------------------------------
 pub fn handle_status(_args: &str) -> String {
-    let (uptime, fw, rst, di, do_, ai, ao) = match crate::bus::lock_timeout() {
-        Some(b) => (
-            b.sys.uptime_s,
-            b.sys.firmware_version,
-            b.sys.reset_count,
-            b.di.bits,
-            b.do_.bits,
-            b.ai.raw,
-            b.ao.scaled,
-        ),
-        None => return err(30, "bus lock"),
-    };
+    // 全部从 IO 原子读 (无锁), 不再过 legacy Bus (阶段 D)
+    let io = &crate::bus::IO;
+    let (uptime, fw, rst, di, do_, ai, ao) = (
+        io.sys.get_uptime(),
+        io.sys.get_fw_version(),
+        io.sys.get_reset_count(),
+        io.di.load_bits(),
+        io.do_.load_bits(),
+        [io.ai.get_raw(0), io.ai.get_raw(1), io.ai.get_raw(2), io.ai.get_raw(3), io.ai.get_raw(4), io.ai.get_raw(5)],
+        [io.ao.get_scaled(0), io.ao.get_scaled(1), io.ao.get_scaled(2), io.ao.get_scaled(3)],
+    );
     ok_data(&format!(
         "uptime={}s,fw=0x{:04X},rst={},ver={},di=0x{:X},do=0x{:X},ai=0x{:04X},0x{:04X},0x{:04X},0x{:04X},0x{:04X},0x{:04X},ao=0x{:04X},0x{:04X},0x{:04X},0x{:04X}",
         uptime, fw, rst, crate::config::hw_version::NAME, di, do_,
@@ -168,9 +170,8 @@ pub fn handle_status(_args: &str) -> String {
 // 触发设备复位 (响应立即返回, 200ms 后异步复位, 给 AT 响应发送留时间)
 // ----------------------------------------------------------------------------
 pub fn handle_reset(_args: &str) -> String {
-    if let Some(mut b) = crate::bus::lock_timeout() {
-        b.sys.reset_request = true;
-    }
+    // 直接置位 IO.sys 请求复位 (无锁)
+    crate::bus::IO.sys.request_reset();
     // 异步复位, 避免阻塞 AT 响应
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(200));

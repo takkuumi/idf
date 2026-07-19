@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::bus;
 use crate::config::hw_version;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
@@ -59,13 +58,8 @@ pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
 
                 if dirty || since_last_write >= MAX_POLL_MS {
                     since_last_write = 0;
-                    let bits = match bus::lock_timeout() {
-                        Some(b) => b.do_.bits,
-                        None => {
-                            log::error!("[do] bus lock timeout, keep last");
-                            last
-                        }
-                    };
+                    // 阶段 A: 读 DO 位无锁走 bus::IO.do_ (AtomicBits64)
+                    let bits = crate::bus::IO.do_.load_bits();
                     if bits != last {
                         if let Err(e) = hal.dio().write_do_all(bits) {
                             log::error!("[do] write_do_all failed: {}", e);

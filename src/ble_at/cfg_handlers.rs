@@ -203,15 +203,15 @@ pub fn handle_cfg485(args: &str) -> String {
             None => return err(11, "invalid baud"),
         };
         let data = match parse_u16(parts[2]) {
-            Some(7) | Some(8) => parse_u16(parts[2]).unwrap() as u8,
+            Some(v @ 7) | Some(v @ 8) => v as u8,
             _ => return err(11, "data_bits must be 7 or 8"),
         };
         let stop = match parse_u16(parts[3]) {
-            Some(1) | Some(2) => parse_u16(parts[3]).unwrap() as u8,
+            Some(v @ 1) | Some(v @ 2) => v as u8,
             _ => return err(11, "stop_bits must be 1 or 2"),
         };
         let parity = match parse_u16(parts[4]) {
-            Some(0) | Some(1) | Some(2) => parse_u16(parts[4]).unwrap() as u8,
+            Some(v @ 0) | Some(v @ 1) | Some(v @ 2) => v as u8,
             _ => return err(11, "parity must be 0/1/2"),
         };
         let slave = match parse_u16(parts[5]) {
@@ -219,7 +219,7 @@ pub fn handle_cfg485(args: &str) -> String {
             None => return err(11, "invalid slave"),
         };
         let mode = match parse_u16(parts[6]) {
-            Some(0) | Some(1) | Some(2) => parse_u16(parts[6]).unwrap() as u8,
+            Some(v @ 0) | Some(v @ 1) | Some(v @ 2) => v as u8,
             _ => return err(11, "mode must be 0/1/2"),
         };
         with_cfg_mut(|c| {
@@ -348,20 +348,18 @@ fn ipv4_str(b: &[u8; 4]) -> String {
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
+/// 读取 SystemConfig (RCU). RCU 永不空 (LazyLock 配置 init 后非 null),
+/// `.unwrap_or_else(defaults)` 仅为防御性回退 (单元测试或非生产路径).
 fn with_cfg<R>(f: impl FnOnce(&SystemConfig) -> R) -> R {
-    if let Some(bus) = crate::bus::lock_timeout() {
-        f(&bus.cfg)
-    } else {
-        let c = SystemConfig::defaults();
-        f(&c)
+    // match 两臂各自按值取 f; rustc 推断只有命中臂会 move f, 故编译通过.
+    match crate::bus::config_state::config_read() {
+        Some(cs) => f(&cs.cfg),
+        None => f(&SystemConfig::defaults()),
     }
 }
 
+/// 修改 SystemConfig 后回写 CONFIG RCU (RMW: clone → mutate → 原子替换).
+/// 旧 `with_cfg_mut` 不触发 apply, 此处保持一致 (apply 由调用方/Modbus 写 CFG_APPLY 触发).
 fn with_cfg_mut<R>(f: impl FnOnce(&mut SystemConfig) -> R) -> R {
-    if let Some(mut bus) = crate::bus::lock_timeout() {
-        f(&mut bus.cfg)
-    } else {
-        let mut c = SystemConfig::defaults();
-        f(&mut c)
-    }
+    crate::bus::backends::config_modify_with_result(|cfg| f(cfg))
 }

@@ -43,8 +43,9 @@ pub mod parser;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use std::sync::LazyLock;
+
+use crate::sync::Spin;
 
 use crate::config::modbus::rtu_slave::ADDR as MODBUS_ADDR;
 use crate::error::AppResult;
@@ -71,13 +72,13 @@ const ATTR_TABLE_LEN: usize = 4;
 
 /// 运行时分配的 GATT handle 表 (CREAT_ATTR_TAB_EVT 中填充)
 /// 0 = 尚未分配
-static HANDLE_TABLE: Mutex<[u16; ATTR_TABLE_LEN]> = Mutex::new([0u16; ATTR_TABLE_LEN]);
+static HANDLE_TABLE: Spin<[u16; ATTR_TABLE_LEN]> = Spin::new([0u16; ATTR_TABLE_LEN]);
 
 /// Bluedord 分配的 GATT 接口号 (REG_EVT 中填充, -1 = 未注册)
-static GATTS_IF: Mutex<Option<esp_idf_sys::esp_gatt_if_t>> = Mutex::new(None);
+static GATTS_IF: Spin<Option<esp_idf_sys::esp_gatt_if_t>> = Spin::new(None);
 
 /// 当前 GATT 连接 ID (None = 无客户端连接)
-static CONN_ID: Mutex<Option<u16>> = Mutex::new(None);
+static CONN_ID: Spin<Option<u16>> = Spin::new(None);
 
 /// TX Characteristic CCCD 使能标志 (主机写 0x0001 启用 notify)
 static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -87,15 +88,17 @@ static TASK_HB: TaskHb = TaskHb::new("ble-at");
 
 /// 输入缓冲区 (累计 GATT 写入, 直到遇到 \n)
 /// 单条 AT 命令最长约 200 字节 (BULKW 50 个 U16), 256 字节够用
-static RX_BUFFER: Lazy<Mutex<heapless::String<512>>> =
-    Lazy::new(|| Mutex::new(heapless::String::new()));
+static RX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
+    LazyLock::new(|| Spin::new(heapless::String::new()));
 
 /// 输出缓冲区 (notify 给主机, AT 命令文本响应)
-static TX_BUFFER: Lazy<Mutex<heapless::String<512>>> =
-    Lazy::new(|| Mutex::new(heapless::String::new()));
+static TX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
+    LazyLock::new(|| Spin::new(heapless::String::new()));
 /// 二进制响应队列 (由 GATT 写回调填充, main loop 发送)
-static BINARY_TX: Lazy<Mutex<heapless::Vec<u8, 512>>> =
-    Lazy::new(|| Mutex::new(heapless::Vec::new()));
+static BINARY_TX: LazyLock<Spin<heapless::Vec<u8, 2048>>> =
+    LazyLock::new(|| Spin::new(heapless::Vec::new()));
+/// BLE notify 丢弃帧计数器 (Modbus 寄存器 0x0108 暴露)
+static BINARY_TX_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// 有待发送的 BLE 通知 (由 CONNECT_EVT 或 Modbus 响应设置, main loop 消费)
 static PENDING_NOTIFY: std::sync::atomic::AtomicBool = 
     std::sync::atomic::AtomicBool::new(false);
@@ -660,8 +663,8 @@ pub fn start() -> AppResult<()> {
     }
 
     // device::init() 已在本函数之前加载配置；广播使用可配置的短名称（最多 8 字节）
-    let configured_name = crate::bus::lock_timeout()
-        .map(|bus| bus.cfg.ble_name_str())
+    let configured_name = crate::bus::config_state::config_read()
+        .map(|cs| cs.cfg.ble_name_str())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "GW-S3".to_owned());
     let name = CString::new(configured_name.as_str())
@@ -1048,10 +1051,9 @@ fn handle_mca_custom_command(
     match func {
         0xCE => {
             // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
-            let (ip, mask, gw) = match crate::bus::lock_timeout() {
-                Some(b) => (b.cfg.ip, b.cfg.mask, b.cfg.gateway),
-                None => ([0; 4], [0; 4], [0; 4]),
-            };
+            let (ip, mask, gw) = crate::bus::config_state::config_read()
+                .map(|cs| (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway))
+                .unwrap_or(([0u8; 4], [0u8; 4], [0u8; 4]));
             let mut rsp: heapless::Vec<u8, 16> = heapless::Vec::new();
             let _ = rsp.push(0xCE); // cmd
             let _ = rsp.push(0);    // status = 成功
@@ -1068,10 +1070,9 @@ fn handle_mca_custom_command(
         }
         0xC2 => {
             // GET_SN_CODE
-            let sn = match crate::bus::lock_timeout() {
-                Some(b) => b.cfg.sn,
-                None => [0u8; 32],
-            };
+            let sn = crate::bus::config_state::config_read()
+                .map(|cs| cs.cfg.sn)
+                .unwrap_or([0u8; 32]);
             let mut rsp: heapless::Vec<u8, 20> = heapless::Vec::new();
             let _ = rsp.push(0xC2);
             let _ = rsp.push(0);
@@ -1102,10 +1103,9 @@ fn handle_mca_custom_command(
         }
         0xC6 => {
             // GET_ETH_MAC
-            let mac = match crate::bus::lock_timeout() {
-                Some(b) => b.cfg.eth_mac,
-                None => [0; 6],
-            };
+            let mac = crate::bus::config_state::config_read()
+                .map(|cs| cs.cfg.eth_mac)
+                .unwrap_or([0u8; 6]);
             let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
             let _ = rsp.push(0xC6);
             let _ = rsp.push(0);
@@ -1138,12 +1138,33 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
     // 放入二进制响应队列, 由 process_loop 的 try_send_notify 发送
     // 关键: 不在 GATT 回调中直接 send_indicate!
     if let Some(mut btx) = BINARY_TX.try_lock() {
-        if btx.len() + frame.len() <= 512 {
+        // queue size 2048 bytes, 容纳约 30+ 帧 (每帧 ~60 bytes)
+        if btx.len() + frame.len() <= 2048 {
             let _ = btx.extend_from_slice(&frame);
         } else {
-            log::warn!("[ble_at] binary TX full, dropping frame ({} bytes)", frame.len());
+            // 队列满: 丢弃并计数 (Modbus 可查询)
+            let drops = BINARY_TX_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // 每 10 次丢弃才记日志, 避免日志洪水
+            if drops % 10 == 1 {
+                log::warn!("[ble_at] binary TX full, dropped frame #{} ({} bytes, queue={} bytes)",
+                    drops, frame.len(), btx.len());
+                // 记录为可恢复故障
+                crate::error::recovery::record_failure(
+                    crate::error::recovery::Severity::Recoverable,
+                    "ble_at",
+                    &format!("BLE notify dropped (count={})", drops),
+                );
+            }
         }
+    } else {
+        // 锁失败: 记录但不丢弃
+        log::warn!("[ble_at] BINARY_TX lock failed, frame skipped");
     }
+}
+
+/// 获取 BLE notify 丢弃帧计数 (供 Modbus 状态查询)
+pub fn binary_tx_drops() -> u32 {
+    BINARY_TX_DROPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 发送 BLE notification (只由 process_loop 线程调用)

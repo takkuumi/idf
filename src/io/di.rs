@@ -10,7 +10,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bus;
 use crate::config::hw_version;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
@@ -91,11 +90,9 @@ pub fn start_scan_task(hal: Arc<Hal>) -> AppResult<()> {
                         log::debug!("[di] falling : 0x{:016X}", falling);
                     }
                     stable = candidate;
-                    if let Some(mut b) = bus::lock_timeout() {
-                        b.di.bits = stable;
-                    } else {
-                        log::error!("[di] bus lock timeout");
-                    }
+                    // 阶段 A: 无锁写入 bus::IO.di (AtomicBits64)
+                    crate::bus::IO.di.store_bits(stable);
+                    crate::bus::send_event(crate::bus::IoEvent::DiChanged);
                 }
 
                 std::thread::sleep(Duration::from_millis(SCAN_PERIOD_MS));

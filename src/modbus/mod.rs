@@ -5,7 +5,7 @@
 //! - RTU Slave  (RS485 #2) - 本机作为从站响应外部主站
 //! - TCP Server (以太网)   - 监听 502 端口，多连接
 //!
-//! 数据通过 `bus::BUS` 全局共享，Modbus 寄存器映射见 `config::regs`。
+//! 数据通过 `bus::backends` 无锁全局函数访问，Modbus 寄存器映射见 `config::regs`。
 
 use std::sync::Arc;
 

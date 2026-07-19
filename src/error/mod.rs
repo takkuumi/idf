@@ -1,6 +1,14 @@
 //! 全局错误类型
 //!
 //! 统一所有模块的错误返回，便于 `?` 传播。
+//!
+//! 子模块:
+//! - [`recovery`]: 分级故障恢复 (替代直接 esp_restart)
+
+pub mod recovery;
+pub mod ringlog;
+
+pub use ringlog::{log_error, log_warn, log_critical, module_id, LogEntry, RING_LOG};
 
 use core::fmt;
 use std::io;

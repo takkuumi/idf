@@ -149,10 +149,13 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         mbap[6] = unit_id;
 
         // 合并 MBAP + PDU 为单次写入, 避免 W5500 分批发送导致对端收到不完整帧
-        let mut response = Vec::with_capacity(7 + resp_pdu.len());
-        response.extend_from_slice(&mbap);
-        response.extend_from_slice(&resp_pdu);
-        stream.write_all(&response)?;
+        // 优化: 使用栈缓冲区避免每次响应 1 次堆分配 (高频 Modbus TCP 关键)
+        const MAX_RESP: usize = 280;
+        let mut response = [0u8; MAX_RESP];
+        let resp_len = 7 + resp_pdu.len();
+        response[..7].copy_from_slice(&mbap);
+        response[7..resp_len].copy_from_slice(&resp_pdu);
+        stream.write_all(&response[..resp_len])?;
         stream.flush()?;
     }
 }

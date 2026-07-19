@@ -19,10 +19,7 @@
 //! - 任务表用固定数组 (最多 16 个任务)
 //! - 不依赖 panic=unwind, 不用 catch_unwind
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// 最大监控任务数
 const MAX_TASKS: usize = 16;
@@ -74,49 +71,41 @@ impl TaskHb {
     }
 }
 
-/// 全局任务表 (静态分配, 最多 MAX_TASKS 个)
-struct TaskRegistry {
-    tasks: [&'static TaskHb; MAX_TASKS],
-    count: usize,
+/// 全局任务表 (无锁原子指针表)
+///
+/// 单写者 (启动期 register) + 多读者 (main_loop check_all);
+/// 用 [`AtomicPtr`] 持有 `&'static TaskHb`, [`AtomicUsize`] 计数,
+/// 完全无锁, 无自旋, 无中毒.
+struct Registry {
+    /// 任务指针表 (空槽 = null)
+    tasks: [AtomicPtr<TaskHb>; MAX_TASKS],
+    /// 已注册任务数 (单写者启动期 fetch_add)
+    count: AtomicUsize,
 }
 
-impl TaskRegistry {
-    const fn empty() -> Self {
-        Self {
-            tasks: [
-                &SENTINEL, &SENTINEL, &SENTINEL, &SENTINEL,
-                &SENTINEL, &SENTINEL, &SENTINEL, &SENTINEL,
-                &SENTINEL, &SENTINEL, &SENTINEL, &SENTINEL,
-                &SENTINEL, &SENTINEL, &SENTINEL, &SENTINEL,
-            ],
-            count: 0,
-        }
-    }
-}
-
-/// 哨兵 TaskHb (占位, 不参与监控)
-static SENTINEL: TaskHb = TaskHb::new("__sentinel__");
-
-static REGISTRY: Lazy<Mutex<TaskRegistry>> =
-    Lazy::new(|| Mutex::new(TaskRegistry::empty()));
+static REGISTRY: Registry = Registry {
+    tasks: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_TASKS],
+    count: AtomicUsize::new(0),
+};
 
 /// 默认停滞阈值 (main_loop 检查周期数)
 const DEFAULT_STALL_THRESHOLD: u32 = 3;
 
-/// 注册任务到全局心跳表
+/// 注册任务到全局心跳表 (无锁)
 ///
-/// 应在任务启动时 (init 函数中) 调用一次。
-/// 超过 MAX_TASKS 时记日志并忽略。
+/// 应在任务启动时 (init 函数中) 调用一次.
+/// 超过 MAX_TASKS 时回退计数并记日志忽略.
 pub fn register(task: &'static TaskHb) {
-    let mut reg = REGISTRY.lock();
-    if reg.count >= MAX_TASKS {
+    let idx = REGISTRY.count.fetch_add(1, Ordering::AcqRel);
+    if idx >= MAX_TASKS {
+        // 越界: 回退计数, 拒绝注册
+        REGISTRY.count.fetch_sub(1, Ordering::AcqRel);
         log::error!("[health] task table full, cannot register '{}'", task.name);
         return;
     }
-    let count = reg.count;
-    reg.tasks[count] = task;
-    reg.count += 1;
-    log::debug!("[health] registered task '{}'", task.name);
+    // SAFETY: task 为 &'static TaskHb, 存为 AtomicPtr 长期有效.
+    REGISTRY.tasks[idx].store(task as *const TaskHb as *mut TaskHb, Ordering::Release);
+    log::debug!("[health] registered task '{}' (slot {})", task.name, idx);
 }
 
 /// 检查所有已注册任务的心跳
@@ -125,9 +114,14 @@ pub fn register(task: &'static TaskHb) {
 /// main_loop 每 1s 调用一次。
 pub fn check_all() -> heapless::Vec<&'static str, MAX_TASKS> {
     let mut stalled = heapless::Vec::new();
-    let reg = REGISTRY.lock();
-    for i in 0..reg.count {
-        let t = reg.tasks[i];
+    let n = REGISTRY.count.load(Ordering::Acquire);
+    for i in 0..n {
+        let ptr = REGISTRY.tasks[i].load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        // SAFETY: 指针由 register() 的 &'static TaskHb 存入, 生命周期 = 程序.
+        let t: &'static TaskHb = unsafe { &*ptr };
         let cur = t.counter.load(Ordering::Relaxed);
         let last = t.last_check.load(Ordering::Relaxed);
         let threshold = t.max_stall.load(Ordering::Relaxed);
@@ -150,14 +144,19 @@ pub fn check_all() -> heapless::Vec<&'static str, MAX_TASKS> {
     stalled
 }
 
-/// 更新所有任务的 last_check 快照
+/// 更新所有任务的 last_check 快照 (无锁)
 ///
-/// 在 check_all 之后调用, 用于下次比较。
+/// 在 check_all 之后调用, 用于下次比较.
 /// (check_all 内部已用 store 更新, 此函数供外部重置用)
 pub fn snapshot() {
-    let reg = REGISTRY.lock();
-    for i in 0..reg.count {
-        let t = reg.tasks[i];
+    let n = REGISTRY.count.load(Ordering::Acquire);
+    for i in 0..n {
+        let ptr = REGISTRY.tasks[i].load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        // SAFETY: register 存入的 &'static TaskHb, 生命周期 = 程序.
+        let t: &'static TaskHb = unsafe { &*ptr };
         let cur = t.counter.load(Ordering::Relaxed);
         t.last_check.store(cur, Ordering::Relaxed);
     }
@@ -243,3 +242,33 @@ pub const CORE_RT: u32 = 1;
 #[deprecated(since = "0.2.0", note = "use set_next_thread_core() before thread::spawn instead")]
 #[inline]
 pub fn pin_current_to_core(_core: u32) {}
+
+// ----------------------------------------------------------------------------
+// 启动时打印任务-核心分配表 (便于调试)
+// ----------------------------------------------------------------------------
+
+/// 任务-核心分配信息
+pub struct TaskCoreInfo {
+    pub name: &'static str,
+    pub core: u32,
+}
+
+/// 启动时调用, 打印所有已注册任务的核分配 (无锁读注册表)
+/// 建议在 main loop 启动后调用, 此时所有任务已注册
+pub fn print_core_assignment() {
+    use core::sync::atomic::Ordering;
+    let n = REGISTRY.count.load(Ordering::Acquire);
+    log::info!("=== Task-Core Assignment ({n} tasks) ===");
+    for i in 0..n {
+        let ptr = REGISTRY.tasks[i].load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        // SAFETY: register 存入的 &'static TaskHb
+        let t: &'static TaskHb = unsafe { &*ptr };
+        log::info!(
+            "  [{:2}] {} (max_stall={})",
+            i, t.name, t.max_stall.load(Ordering::Relaxed)
+        );
+    }
+}

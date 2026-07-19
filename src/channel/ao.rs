@@ -9,7 +9,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bus;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
@@ -44,24 +43,15 @@ pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
             loop {
                 // 心跳: 每次循环 (100ms) 上报一次
                 TASK_HB.tick();
-                // 1. 读取 scaled，计算 duty，写回 duty 到总线
-                let duties: [u32; CHANNEL_COUNT] = match bus::lock_timeout() {
-                    Some(mut b) => {
-                        let scaled = b.ao.scaled; // [u16; 4] is Copy
-                        let mut d = [0u32; CHANNEL_COUNT];
-                        for ch in 0..CHANNEL_COUNT {
-                            // 0-10000 → 0-4095
-                            d[ch] = (scaled[ch] as u32) * DUTY_MAX / SCALED_MAX;
-                        }
-                        b.ao.duty = d;
-                        d
-                    }
-                    None => {
-                        log::error!("[ao] bus lock timeout, skip cycle");
-                        std::thread::sleep(Duration::from_millis(OUTPUT_PERIOD_MS));
-                        continue;
-                    }
-                };
+                // 1. 读取 scaled, 计算 duty, 写回 duty 到总线
+                //    阶段 A: 读 scaled + 写 duty 全过 bus::IO.ao (原子), 无锁
+                let mut duties = [0u32; CHANNEL_COUNT];
+                for ch in 0..CHANNEL_COUNT {
+                    let scaled = crate::bus::IO.ao.get_scaled(ch);
+                    duties[ch] = (scaled as u32) * DUTY_MAX / SCALED_MAX;
+                    crate::bus::IO.ao.set_duty(ch, duties[ch]);
+                }
+                crate::bus::send_event(crate::bus::IoEvent::AoUpdated);
 
                 // 2. 仅在 duty 变化时调用 LEDC (硬件 IO 在总线锁外执行)
                 for ch in 0..CHANNEL_COUNT {

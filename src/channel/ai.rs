@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use esp_idf_svc::timer::EspTaskTimerService;
 
-use crate::bus;
 use crate::config::ai_calib;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
@@ -76,12 +75,10 @@ pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppR
                     let scaled = ai_calib::MA_MIN
                         + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX;
 
-                    if let Some(mut b) = bus::lock_timeout() {
-                        b.ai.raw[ch] = avg;
-                        b.ai.scaled[ch] = scaled as u16;
-                    } else {
-                        log::error!("[ai] bus lock timeout (ch={})", ch);
-                    }
+                    // 阶段 A: 无锁写 bus::IO.ai (原子数组)
+                    crate::bus::IO.ai.set_raw(ch, avg);
+                    crate::bus::IO.ai.set_scaled(ch, scaled as u16);
+                    crate::bus::send_event(crate::bus::IoEvent::AiSampled);
                 }
 
                 pos = (pos + 1) % AVG_WINDOW;

@@ -9,7 +9,7 @@
 //!
 //! - **OneShot + Mutex 模式** (兼容性 fallback):
 //!   用 `esp_idf_hal::adc` 的 OneShot API, 每次采样需 CPU 触发 ADC 转换。
-//!   多线程并发采样需 `parking_lot::Mutex` 串行化。
+//!   多线程并发采样需 `Spin` 短临界区串行化.
 //!
 //! # ESP32-S3 ADC1 通道映射
 //!
@@ -245,7 +245,7 @@ use adc_continuous::AdcContinuous;
 #[cfg(not(feature = "adc-continuous"))]
 mod adc_oneshot {
     use super::*;
-    use parking_lot::Mutex;
+    use crate::sync::Spin;
 
     use esp_idf_hal::adc::{config::Config, AdcChannelDriver, AdcDriver};
     use esp_idf_hal::gpio::AnyInputPin;
@@ -253,7 +253,7 @@ mod adc_oneshot {
 
     /// ADC OneShot 句柄 (fallback, 不启用 feature = "adc-continuous" 时使用)
     pub struct AdcOneShot {
-        driver: Mutex<AdcDriver<'static>>,
+        driver: Spin<AdcDriver<'static>>,
         channels: [AdcChannelDriver<'static, AnyInputPin>; 6],
     }
 
@@ -278,10 +278,10 @@ mod adc_oneshot {
                     .map_err(|e| AppError::Hal(format!("adc chan 5: {e:?}")))?,
             ];
 
-            log::info!("[adc] OneShot+Mutex mode (fallback)");
+            log::info!("[adc] OneShot+Spin mode (fallback)");
 
             Ok(Self {
-                driver: Mutex::new(driver),
+                driver: Spin::new(driver),
                 channels,
             })
         }

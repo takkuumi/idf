@@ -7,15 +7,15 @@
 //!
 //! `LedcDriver` 借用 `LedcTimerDriver`。为在同一结构体中持有二者，
 //! 将 `LedcTimerDriver` 通过 `Box::leak` 固定在堆上获取 `&'static` 引用，
-//! 通道以 `'static` 生命周期存入 `Mutex` 数组。
+//! 通道以 `'static` 生命周期存入 `Spin` 数组.
 //! 由于 `Hal` 在程序生命周期内只创建一次且永不清除，此内存泄漏可接受。
 //!
 //! # 线程安全
 //!
 //! `LedcDriver::set_duty` 要求 `&mut self`，多线程 AO 输出任务
-//! 并发写入时通过 `parking_lot::Mutex` 串行化。
+//! 并发写入时通过 `Spin` 短临界区串行化 (不阻塞内核).
 
-use parking_lot::Mutex;
+use crate::sync::Spin;
 
 use esp_idf_hal::gpio::AnyOutputPin;
 use esp_idf_hal::ledc::{
@@ -32,10 +32,10 @@ const AO_CHANNEL_COUNT: usize = 4;
 
 /// LEDC 句柄
 ///
-/// 持有 4 路 PWM 输出通道，每路独立 Mutex。
+/// 持有 4 路 PWM 输出通道，每路独立 Spin.
 /// timer 已 leak 到堆上为 `'static`，被各 channel 借用。
 pub struct LedcHandle {
-    channels: [Mutex<LedcDriver<'static>>; AO_CHANNEL_COUNT],
+    channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT],
 }
 
 /// 根据 u8 编号解析 Resolution 枚举
@@ -98,7 +98,7 @@ impl LedcHandle {
         // 2. 创建 4 个 LedcDriver
         //    每个 LedcDriver 借用 timer_driver (通过 &* reborrow, 不移动所有权)
         //    SAFETY: GPIO 编号来自 config，确保未被其它驱动占用
-        let mut chs: Vec<Mutex<LedcDriver<'static>>> = Vec::with_capacity(AO_CHANNEL_COUNT);
+        let mut chs: Vec<Spin<LedcDriver<'static>>> = Vec::with_capacity(AO_CHANNEL_COUNT);
         for (i, (ch_num, gpio)) in channels.iter().enumerate() {
             let pin = unsafe { AnyOutputPin::steal(*gpio) };
             let driver = match *ch_num {
@@ -113,11 +113,11 @@ impl LedcHandle {
                 }
             }
             .map_err(|e| AppError::Hal(format!("ledc chan {i}: {e:?}")))?;
-            chs.push(Mutex::new(driver));
+            chs.push(Spin::new(driver));
         }
 
         // Vec -> array (长度已知为 4)
-        let channels: [Mutex<LedcDriver<'static>>; AO_CHANNEL_COUNT] = [
+        let channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT] = [
             chs.remove(0),
             chs.remove(0),
             chs.remove(0),
