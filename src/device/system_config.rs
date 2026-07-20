@@ -320,6 +320,15 @@ impl SystemConfig {
     // --------------------------------------------------------------------
 
     pub fn read_reg(&self, addr: u16) -> Option<u16> {
+        // 485 通信错误计数 (0x0880-0x0883, RO) — MCA cold boot 初值 0; 一旦
+        // Modbus master 写入会落入 `holding_buf` 兜底, 再读则照实返回 (与 MCA 等价)。
+        if addr == regs::HOLD_485_1_COMERR
+            || addr == regs::HOLD_485_1_APPERR
+            || addr == regs::HOLD_485_2_COMERR
+            || addr == regs::HOLD_485_2_APPERR
+        {
+            return Some(0);
+        }
         // SN 0x0200-0x020F
         if (regs::HOLD_SN_BASE..regs::HOLD_SN_BASE + regs::HOLD_SN_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_SN_BASE) as usize * 2;

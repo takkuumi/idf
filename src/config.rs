@@ -177,6 +177,16 @@ pub mod hw_version {
     pub const DO_EXT_CHIPS: usize = 3;
     #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DO_EXT_CHIPS: usize = 0;
+
+    /// AI 通道数 (Modbus 报告值, 与 MCA F16/F48 一致).
+    /// 物理仍由 hal::adc 提供 6 路 (ADC1_CH0..5); 越界寄存器返回 0 对齐 MCA 无硬件时的 0 行为.
+    /// - F16 (默认): 4 路 (MCA `REG_AMAX = REG_A04`)
+    /// - F4 (MCA F48): 8 路 (MCA `MCA_F48_HARDWARE_RESOURCE` 时 `REG_AMAX = REG_A08`)
+    /// - F3: 4 路 (无 8 路 AI 子型号)
+    #[cfg(feature = "f4")]
+    pub const AI_COUNT: u16 = 8;
+    #[cfg(not(feature = "f4"))]
+    pub const AI_COUNT: u16 = 4;
 }
 
 // ----------------------------------------------------------------------------
@@ -332,7 +342,7 @@ pub mod regs {
     // ---- 输入寄存器 (Input Register, FC=04, RO) ----
     // 参考固件: REG_A01 = 0x0080 (AI), REG_STATU_A01 = 0x0088 (AI状态)
     pub const INREG_AI_BASE: u16 = 0x0080;
-    pub const INREG_AI_COUNT: u16 = 4; // F16: 4路AI
+    pub const INREG_AI_COUNT: u16 = hw_version::AI_COUNT; // F16=4 / F48=8, 与 MCA 对齐
     pub const INREG_AI_STATUS_BASE: u16 = 0x0088;
     // 系统信息 (RO)
     pub const INREG_QI_COUNT: u16 = 0x087C;   // Q和I点数 (高字节=Q, 低字节=I)

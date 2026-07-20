@@ -259,14 +259,14 @@ pub fn init() -> AppResult<()> {
         proto_status_set(0);
         let snap = StorageSnapshot {
             proto: ProtoStore {
-                data,
+                data: data.to_vec().into_boxed_slice(),
                 version,
                 length,
                 dirty: false,
                 status: 0,
             },
-            device_text: [0u16; 2000],
-            holding_buf: Box::new([0u16; 2048]),
+            device_text: vec![0u16; 2000].into_boxed_slice(),
+            holding_buf: vec![0u16; 2048].into_boxed_slice(),
         };
         storage_write(snap);
 
@@ -446,7 +446,7 @@ fn commit() -> AppResult<()> {
     let (data, version, length) = bus::storage_state::storage_read_with(|s| {
         (s.proto.data.clone(), s.proto.version, s.proto.length)
     })
-    .unwrap_or(([0u16; PROTO_WORDS], 0, 0));
+    .unwrap_or((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0));
 
     // 2. 序列化为 blob: [magic:2][version:2][length:2][crc:4][data:3000] = 3010 字节
     let mut blob = [0u8; BLOB_TOTAL_BYTES];
@@ -528,7 +528,7 @@ fn reload() -> AppResult<()> {
     // 3. 写回快照: RCU RMW 仅替换 proto; device_text / holding_buf 保持不动.
     bus::storage_state::proto_status_set(0);
     bus::backends::storage_modify(|snap| {
-        snap.proto.data = data;
+        snap.proto.data = data.to_vec().into_boxed_slice();
         snap.proto.version = version;
         snap.proto.length = length;
         snap.proto.dirty = false;

@@ -21,9 +21,14 @@ use std::sync::LazyLock;
 use super::rcu::Rcu;
 
 /// 协议存储区
+///
+/// `data` 用 `Box<[u16]>` 而非 `Box<[u16; 1500]>`: std 对 `Box<[T]>::clone` 是
+/// alloc+memcpy heap→heap, **无栈中转**. `Box<[T; N]>::clone` 则是
+/// `Box::new((**self).clone())`, 解引用 `[T; N]` 走栈 → 11KB snapshot 在 main 栈
+/// 上会撑爆 ESP-IDF 默认 8KB main 栈 (本轮烧录实测 stack canary watchpoint命中).
 #[derive(Clone)]
 pub struct ProtoStore {
-    pub data: [u16; 1500],
+    pub data: Box<[u16]>,
     pub version: u16,
     pub length: u16,
     pub dirty: bool,
@@ -33,7 +38,7 @@ pub struct ProtoStore {
 impl Default for ProtoStore {
     fn default() -> Self {
         Self {
-            data: [0u16; 1500],
+            data: vec![0u16; 1500].into_boxed_slice(),
             version: 0,
             length: 0,
             dirty: false,
@@ -43,21 +48,24 @@ impl Default for ProtoStore {
 }
 
 /// 存储快照 (不可变)
+///
+/// 三个大数组字段均 `Box<[u16]>` — 见 [`ProtoStore`] 头注释. 整 struct 大小
+/// 缩到 ~60 字节 (3 个 Box slice 头 + 元数据), clone 全走 heap, 不再撑栈.
 #[derive(Clone)]
 pub struct StorageSnapshot {
     pub proto: ProtoStore,
     /// 设备文本区 (5000-6999 = 2000 字)
-    pub device_text: [u16; 2000],
+    pub device_text: Box<[u16]>,
     /// 通用 P区保持寄存器缓冲 (0x0880..0x107F = 2048 字)
-    pub holding_buf: Box<[u16; 2048]>,
+    pub holding_buf: Box<[u16]>,
 }
 
 impl StorageSnapshot {
     pub fn new() -> Self {
         Self {
             proto: ProtoStore::default(),
-            device_text: [0u16; 2000],
-            holding_buf: Box::new([0u16; 2048]),
+            device_text: vec![0u16; 2000].into_boxed_slice(),
+            holding_buf: vec![0u16; 2048].into_boxed_slice(),
         }
     }
 }
