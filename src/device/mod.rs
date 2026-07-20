@@ -136,6 +136,7 @@ use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvsPartition, N
 use crate::bus;
 use crate::error::{AppError, AppResult};
 use crate::health::{self, TaskHb};
+use crate::config::regs;
 
 pub use system_config::{SystemConfig, parse_ipv4, parse_mac};
 
@@ -162,6 +163,13 @@ const NVS_KEY_DATA_LEGACY: &str = "proto_data";
 const NVS_KEY_MAGIC_LEGACY: &str = "proto_magic";
 const NVS_KEY_VERSION_LEGACY: &str = "proto_ver";
 const NVS_KEY_LENGTH_LEGACY: &str = "proto_len";
+
+/// 设备文本区 NVS key (Android 1.0.78 0x1388-0x1B77, 4000 字节 UTF-16LE)
+const NVS_KEY_DEV_TEXT: &str = "dev_text";
+/// 设备文本区 NVS magic (用于校验 blob 完整性)
+const NVS_KEY_DEV_TEXT_MAGIC: &str = "dev_text_mag";
+/// 设备文本区 magic 字 (0xDEAD = "DT")
+const DEV_TEXT_MAGIC: u16 = 0xDE54;
 
 /// 魔数标识, 用于校验 NVS 是否已初始化
 pub const PROTO_MAGIC: u16 = 0x4757; // 'G'<<8 | 'W'
@@ -238,7 +246,15 @@ pub fn init() -> AppResult<()> {
         ([0u16; PROTO_WORDS], 0, 0)
     };
 
-    // 3. 加载系统配置 (NVS 不可用时使用默认值)
+    // 3. 加载设备文本区 (Android 1.0.78 0x1388-0x1B77)
+    let device_text = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+        load_device_text_from_nvs(nvs)?
+    } else {
+        log::warn!("[device] NVS unavailable, using empty device_text");
+        vec![0u16; regs::DEVICE_TEXT_COUNT as usize]
+    };
+
+    // 4. 加载系统配置 (NVS 不可用时使用默认值)
     let mut cfg = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
         SystemConfig::load_from_nvs(nvs)?
     } else {
@@ -265,7 +281,7 @@ pub fn init() -> AppResult<()> {
                 dirty: false,
                 status: 0,
             },
-            device_text: vec![0u16; 2000].into_boxed_slice(),
+            device_text: device_text.into_boxed_slice(),
             holding_buf: vec![0u16; 2048].into_boxed_slice(),
         };
         storage_write(snap);
@@ -584,6 +600,92 @@ fn apply_config() -> AppResult<()> {
 /// 2. 失败则读另一个 blob → 校验
 /// 3. 都失败则尝试 legacy 单 blob 格式 (兼容旧固件)
 /// 4. 都失败则返回空默认值
+/// 加载设备文本区 (2000 字 = 4000 字节, NVS blob "dev_text")
+///
+/// 成功加载条件:
+/// 1. NVS 存在 magic == DEV_TEXT_MAGIC
+/// 2. blob 长度 == 4000 字节
+///
+/// 失败 → 返回默认空 2000 字
+fn load_device_text_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
+    let expected_bytes = regs::DEVICE_TEXT_COUNT as usize * 2; // 4000
+    // 1. 校验 magic
+    let magic = nvs
+        .get_u16(NVS_KEY_DEV_TEXT_MAGIC)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if magic != DEV_TEXT_MAGIC {
+        log::info!("[device] dev_text magic not found (got {:#06X}), using empty", magic);
+        return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
+    }
+    // 2. 读 blob
+    let mut buf = vec![0u8; expected_bytes];
+    let blob = match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut buf) {
+        Ok(Some(b)) if b.len() == expected_bytes => b,
+        Ok(Some(b)) => {
+            log::warn!("[device] dev_text blob truncated: {}/{}", b.len(), expected_bytes);
+            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
+        }
+        Ok(None) => {
+            log::info!("[device] dev_text blob not present, using empty");
+            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
+        }
+        Err(e) => {
+            log::warn!("[device] dev_text blob read err: {e:?}, using empty");
+            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
+        }
+    };
+    // 3. u16 LE 解码
+    let mut data = vec![0u16; regs::DEVICE_TEXT_COUNT as usize];
+    for (i, chunk) in blob.chunks_exact(2).enumerate() {
+        data[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+    }
+    log::info!("[device] dev_text loaded: {} bytes", blob.len());
+    Ok(data)
+}
+
+/// 持久化设备文本区 (整个 2000 字 = 4000 字节)
+pub fn save_device_text_to_nvs(text: &[u16]) -> AppResult<()> {
+    let expected_bytes = regs::DEVICE_TEXT_COUNT as usize * 2;
+    if text.len() != regs::DEVICE_TEXT_COUNT as usize {
+        return Err(AppError::Config(format!(
+            "dev_text len mismatch: {} != {}",
+            text.len(),
+            regs::DEVICE_TEXT_COUNT as usize
+        )));
+    }
+    let mut blob = [0u8; 4000]; // DEVICE_TEXT_COUNT(2000) * 2
+    for (i, &v) in text.iter().enumerate() {
+        blob[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    if let Some(result) = try_with_nvs_mut(|nvs| -> AppResult<()> {
+        nvs.set_blob(NVS_KEY_DEV_TEXT, &blob[..expected_bytes])
+            .map_err(|e| AppError::Config(format!("nvs set dev_text: {e:?}")))?;
+        nvs.set_u16(NVS_KEY_DEV_TEXT_MAGIC, DEV_TEXT_MAGIC)
+            .map_err(|e| AppError::Config(format!("nvs set dev_text magic: {e:?}")))?;
+        Ok(())
+    }) {
+        result?;
+    } else {
+        log::warn!("[device] NVS unavailable, dev_text persist skipped");
+    }
+    Ok(())
+}
+
+/// 请求持久化设备文本区 (走 Actor mailbox, 异步执行)
+/// 由 backends::write_hold_reg 在 DEVICE_TEXT_BASE 写后调用
+pub fn request_save_device_text() {
+    use crate::bus::storage_state::storage_read;
+    let snapshot = storage_read();
+    if let Some(snap) = snapshot {
+        // 同步写入, 不走 Actor (device_text 写频率低, 同步可接受)
+        if let Err(e) = save_device_text_to_nvs(&snap.device_text) {
+            log::warn!("[device] dev_text persist failed: {e}");
+        }
+    }
+}
+
 fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<([u16; PROTO_WORDS], u16, u16)> {
     let mut data = [0u16; PROTO_WORDS];
 

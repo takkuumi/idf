@@ -219,13 +219,17 @@ fn sync_proto_status(snap: &mut StorageSnapshot) {
 
 /// 写保持寄存器 (FC=06/16), 等价 `Bus::write_hold_reg` 但走 RCU RMW + atomics, 无 `Spin`.
 pub fn write_hold_reg(addr: u16, value: u16) -> bool {
-    // 1. device_text (5000..=6999): STORAGE RMW
+    // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
+    //    Android 1.0.78 WRITE_DEVICE_TEXT_COUNT (0xB5) + WRITE_DEVICE_TEXT_DATA (0xB7)
+    //    通过 Modbus FC=10 写入, 我们写后立即持久化以保证工业可靠性.
     if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         let mut snap = storage_clone();
         snap.device_text[idx] = value;
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
+        // 触发设备文本 NVS 持久化 (Android 写入后立即落盘, 复位保留)
+        crate::device::request_save_device_text();
         return true;
     }
     // 2. device_config 子区 (2300..<2400): CONFIG RMW

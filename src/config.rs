@@ -440,6 +440,22 @@ pub mod regs {
     pub const PROTO_STATUS: u16 = PROTO_END + 4;
     pub const PROTO_MAGIC: u16 = PROTO_END + 5;
 
+    // ---- 设备功能区 (Android 1.0.78: 0x08FC = count, 0x08FE+ = config) ----
+    // 0x08FC: 设备功能条目计数 (复用 device_config::stored_count, 1 reg)
+    // 0x08FE+ 的 TLV 详细配置暂未实现 (Android 0xB2/0xB3 暂不支持),
+    // Android 0xB0 读 0x08FC 返回 0 表示 "无自定义功能", app 退化为基础 IO 界面.
+    pub const FUNC_COUNT: u16 = 0x08FC;
+
+    // ---- 设备文本区 (Android 1.0.78: 0x1388 = meta, 0x138A+ = data) ----
+    // 0x1388: 文本条目数 (1 reg)
+    // 0x1389: 文本数据总长度 字节 (1 reg)
+    // 0x138A+: UTF-16LE 文本数据, 每条 [len:2 BE][data:N]
+    pub const TEXT_META_BASE: u16 = 0x1388;
+    pub const TEXT_META_COUNT: u16 = 2;
+    pub const TEXT_DATA_BASE: u16 = 0x138A;
+    // TEXT_DATA 占用到 DEVICE_TEXT_END (6999)
+
+
     // ---- Internal-only registers (not exposed via Modbus, for backward compat) ----
     pub const CFG_BASE: u16 = HOLD_CFG_BASE;
     pub const CFG_FW_VER: u16 = INREG_FW_VER;
