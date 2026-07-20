@@ -119,9 +119,8 @@ fn main() -> AppResult<()> {
     }
 
     // 6. 复位计数持久化 (NVS 已就绪, 直接读写, 不用 catch_unwind)
-    log::debug!("[PROBE before load_reset_count");
     let mut reset_count = device::load_reset_count();
-    log::debug!("[PROBE after load_reset_count = {}", reset_count);
+    log::warn!("[MAIN-P2] after load_reset_count = {}", reset_count);
     reset_count = reset_count.wrapping_add(1);
     match device::save_reset_count(reset_count) {
         Ok(()) => log::info!("[main] reset count={}", reset_count),
@@ -130,16 +129,13 @@ fn main() -> AppResult<()> {
     // 复位计数/原因直接写 IO.sys 原子, 不再经 legacy Bus (阶段 D)
     bus::IO.sys.set_reset_count(reset_count);
     bus::IO.sys.set_reset_reason(reset_reason);
-    log::debug!("[PROBE after set_reset_count/reason");
 
     // 5. 启动以太网 (W5500)
     #[cfg(feature = "ethernet-w5500")]
     {
         log::info!("[main] starting ethernet (W5500)...");
-        log::debug!("[PROBE before ethernet::start");
        
         ethernet::start(hal.clone(), sys_loop.clone())?;
-        log::debug!("[PROBE after ethernet::start");
     }
 
     // 5.1 启动 Wi-Fi (ESP32-S3 内置, 作为以太网冗余链路, 默认不启用)

@@ -310,7 +310,9 @@ pub fn init() -> AppResult<()> {
         cfg.ble_mesh_enable
     );
 
-    // 4. 启动 DeviceActor (替代 watch_loop; 注册心跳 + 由 LazyLock::force 触发 spawn)
+    // 4. 启动 DeviceActor (替代 watch_loop)
+    // 关键: 必须在此处 force(), 否则后续 DEVICE_ACTOR.send() 会触发 lazy init
+    // 在其他线程/上下文访问 spinlock 时产生重入, 触发 FreeRTOS assert
     health::register(&WATCH_HB);
     health::set_next_thread_core(health::CORE_NET);
     LazyLock::force(&DEVICE_ACTOR);

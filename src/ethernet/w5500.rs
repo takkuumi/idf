@@ -61,7 +61,6 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 
     // 1) 硬件复位 W5500 (复用 Hal.gpio 的 ETH_RST 引脚, 避免重复 gpio_config)
     //    序列: HIGH(250ms) → LOW(50ms) → HIGH(350ms), 来自参考固件 ETHClass.cpp
-    log::debug!("[PROBE-eth] before eth_reset_pulse");
     log::info!("[eth] resetting W5500 via GPIO{}...", pins::ETH_RST);
     hal.gpio.eth_reset_pulse();
 
@@ -70,9 +69,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
     let bus_cfg = spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
     let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_CH_AUTO;
-    log::debug!("[PROBE-eth] before spi_bus_initialize");
     check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
-    log::debug!("[PROBE-eth] after spi_bus_initialize");
     log::info!("[eth] SPI bus initialized (host={}, DMA=auto)", spi_host);
 
     // 3) W5500 SPI 设备配置
@@ -85,9 +82,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 4) 创建 W5500 MAC
     let mac_cfg = eth_mac_config_default();
     let w5500_cfg = eth_w5500_config_default(spi_host, &dev_cfg, pins::ETH_INT);
-    log::debug!("[PROBE-eth] before esp_eth_mac_new_w5500");
     let mac = unsafe { esp_idf_sys::esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg) };
-    log::debug!("[PROBE-eth] after esp_eth_mac_new_w5500");
     if mac.is_null() {
         return Err(AppError::Ethernet("esp_eth_mac_new_w5500 returned null".into()));
     }
@@ -95,9 +90,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 5) 创建 PHY
     //    reset_gpio_num=-1: RST 由 hal.gpio.eth_reset_pulse() 手动管理, 不让 PHY 驱动重复控制
     let phy_cfg = eth_phy_config_default();
-    log::debug!("[PROBE-eth] before esp_eth_phy_new_w5500");
     let phy = unsafe { esp_idf_sys::esp_eth_phy_new_w5500(&phy_cfg) };
-    log::debug!("[PROBE-eth] after esp_eth_phy_new_w5500");
     if phy.is_null() {
         return Err(AppError::Ethernet("esp_eth_phy_new_w5500 returned null".into()));
     }
@@ -105,10 +98,8 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 6) 安装驱动
     let eth_cfg = eth_config_default(mac, phy);
     let mut eth_handle: esp_idf_sys::esp_eth_handle_t = std::ptr::null_mut();
-    log::debug!("[PROBE-eth] before esp_eth_driver_install");
     check(unsafe { esp_idf_sys::esp_eth_driver_install(&eth_cfg, &mut eth_handle as *mut _) },
           "esp_eth_driver_install")?;
-    log::debug!("[PROBE-eth] after esp_eth_driver_install");
 
     // 6.5) 设置 MAC 地址 (W5500 无预置 MAC, 需从 ESP32 eFuse 读取后写入)
     {

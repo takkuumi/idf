@@ -108,6 +108,7 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
     let name = format!("actor-{short}");
     std::thread::Builder::new()
         .name(name)
+        .stack_size(32 * 1024)  // 32KB, 防止 commit/reload 序列化 11KB snapshot 时栈溢出
         .spawn(move || {
             actor.init();
             loop {
