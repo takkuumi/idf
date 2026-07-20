@@ -484,7 +484,23 @@ unsafe extern "C" fn gatts_event_cb(
             let p = unsafe { &(*param).connect };
             *CONN_ID.lock() = Some(p.conn_id);
             *GATTS_IF.lock() = Some(gatts_if);
-            log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
+            log::info!("[ble_at] GATT client connected (conn_id={}, remote={:02x?})",
+                p.conn_id, p.remote_bda);
+            // 设置标准 Android 连接参数 (min=30ms, max=50ms, latency=0, timeout=4s)
+            // 防止默认参数 (7.5ms) 与 Android 协商失败导致连接断开
+            let mut conn_params = esp_idf_sys::esp_ble_conn_update_params_t {
+                bda: p.remote_bda,
+                min_int: 0x18,   // 30ms (24 * 1.25ms)
+                max_int: 0x28,   // 50ms (40 * 1.25ms)
+                latency: 0,
+                timeout: 320,    // 4s (320 * 10ms)
+            };
+            unsafe {
+                let ret = esp_idf_sys::esp_ble_gap_update_conn_params(&mut conn_params as *mut _);
+                if ret != esp_idf_sys::ESP_OK {
+                    log::warn!("[ble_at] update_conn_params failed: 0x{:x}", ret);
+                }
+            }
             
             // MCA 兼容: 连接后立即产一个心跳通知到 BINARY_TX 队列
             // Android BLEDataSyncManager.onStateConnected 会发心跳命令,
@@ -517,6 +533,8 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).disconnect };
+            log::warn!("[ble_at] GATT disconnect conn_id={} reason={:#x}",
+                p.conn_id, p.reason);
             *CONN_ID.lock() = None;
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
             // 清空 BINARY_TX 残留数据，防止旧帧在新连接时被发送
@@ -711,12 +729,14 @@ pub fn start() -> AppResult<()> {
         )));
     }
 
-    // BLE MTU 设 500 (与原始实现一致, Android 协商后通常为 min(500, request))
-    let mtu_ret = unsafe { esp_idf_sys::esp_ble_gatt_set_local_mtu(500) };
+    // BLE MTU 设 247 (Android 标准请求值, 兼容性好)
+    // 注: 500 是 MCA 原始值, 但 Android 1.0.78 默认请求 247, 协商后取 min(500, 247)=247
+    //     强制 500 在某些 Android 版本上会导致连接断开 (MTU 协商失败)
+    let mtu_ret = unsafe { esp_idf_sys::esp_ble_gatt_set_local_mtu(247) };
     if mtu_ret != esp_idf_sys::ESP_OK {
         log::warn!("[ble_at] set local MTU failed: 0x{:x}", mtu_ret);
     } else {
-        log::info!("[ble_at] local MTU set to 500");
+        log::info!("[ble_at] local MTU set to 247");
     }
 
     let ret = unsafe { esp_idf_sys::esp_ble_gatts_app_register(GATTS_APP_ID) };
