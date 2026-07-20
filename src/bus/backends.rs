@@ -238,11 +238,24 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
         return false;
     }
     // 3. HOLD_CFG_BASE..=HOLD_CFG_END: CFG + holding_buf
+    //
+    // WriteResult 语义 (见 device::system_config::WriteResult):
+    // - Ok       : 仅 RCU, 不持久化 (诊断/只读寄存器)
+    // - Persist  : RCU + NVS (用户可编辑但不需要重启, e.g. SN / PLACE / RS485)
+    // - Apply    : RCU + NVS + cfg_version++ (网络/BLE 等需要重新初始化外设)
+    // - Reset    : 恢复出厂 + NVS + apply_config
+    // - NotFound : 地址不在本配置区, 落 holding_buf 兜底
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
         let mut cs = config_clone();
         match cs.cfg.write_reg(addr, value) {
             WriteResult::Ok => {
                 super::config_state::CONFIG.write(cs);
+                return true;
+            }
+            WriteResult::Persist => {
+                // 写 RCU + 触发 NVS 持久化. 不增 cfg_version (运行时不需要重新初始化).
+                super::config_state::CONFIG.write(cs);
+                crate::device::request_apply_config();
                 return true;
             }
             WriteResult::Apply => {

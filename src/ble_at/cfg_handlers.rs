@@ -326,6 +326,12 @@ pub fn handle_cfgwrite(args: &str) -> String {
     let result = with_cfg_mut(|c| c.write_reg(addr, value));
     match result {
         WriteResult::Ok => ok_none(),
+        WriteResult::Persist => {
+            // 与 backends::write_hold_reg 保持一致: 触发异步持久化.
+            // 不增 cfg_version, 仅 NVS 写入. AT+CFG* 命令不需要额外回复.
+            crate::device::request_apply_config();
+            ok_data("persist requested")
+        }
         WriteResult::Apply => {
             // 触发异步应用
             crate::device::request_apply_config();

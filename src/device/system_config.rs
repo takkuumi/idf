@@ -98,15 +98,31 @@ pub struct SystemConfig {
 }
 
 /// 写入结果
+///
+/// `Ok` / `Persist` / `Apply` / `Reset` 都表示地址命中并已写入 cfg 字段.
+/// 区别仅在调用方 (`bus::backends::write_hold_reg`) 应触发的副作用:
+///
+/// - `Ok`       : 仅写入 CONFIG RCU, **不** 触发 NVS 持久化. 用于只读/诊断类寄存器
+///                (HW_VER / FW_VER / CFG_VER / UNKNOWN / TCP_COM 等).
+/// - `Persist`  : 写入 CONFIG RCU **且** 触发 NVS 持久化 (cfg_version 不变). 用于
+///                用户可编辑但不需要重启的配置 (SN / PLACE / BLE_NAME / BLE_MESH_EN /
+///                RS485 配置等). Android 1.0.78 直接 Modbus FC=10 写入, 不调 APPLY,
+///                所以这里必须主动 persist 否则配置不落盘.
+/// - `Apply`    : 写入 + 持久化 + cfg_version++ (网络 / BLE MAC 等需要重新初始化外设
+///                时使用; 网络配置不重启生效由各模块自行监听 cfg 变化).
+/// - `Reset`    : 恢复出厂默认 + 持久化 + apply_config (CFG_RESET_DEFAULT=0xD5D5 触发).
+/// - `NotFound` : 地址不在本配置区, 调用方应尝试 holding_buf 兜底或返回 false.
 #[derive(Debug, PartialEq)]
 pub enum WriteResult {
-    /// 普通字段写入成功
+    /// 普通字段写入成功 (不持久化, 用于诊断/只读字段)
     Ok,
-    /// APPLY 字段写入, 调用方应触发持久化+应用
+    /// 写入 + NVS 持久化 (不重启, cfg_version 不变, 用于用户可编辑配置)
+    Persist,
+    /// 写入 + 持久化 + cfg_version++ (网络 / BLE 等需要重新初始化)
     Apply,
-    /// RESET 字段写入, 调用方应恢复默认并应用
+    /// 恢复出厂 + 持久化 + apply_config
     Reset,
-    /// 地址不在配置区
+    /// 地址不在配置区, 调用方应尝试 holding_buf 兜底
     NotFound,
 }
 
@@ -444,21 +460,22 @@ impl SystemConfig {
     }
 
     pub fn write_reg(&mut self, addr: u16, value: u16) -> WriteResult {
-        // SN
+        // SN — 用户可编辑配置, 写入后立即持久化到 NVS.
+        // Android 1.0.78 WRITE_SN (0x21) 不调 APPLY, 必须 Persist 才能落盘.
         if (regs::HOLD_SN_BASE..regs::HOLD_SN_BASE + regs::HOLD_SN_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_SN_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.sn[idx] = hi;
             self.sn[idx + 1] = lo;
-            return WriteResult::Ok;
+            return WriteResult::Persist;
         }
-        // name
+        // 位置信息 (Android LOCATION) — 用户可编辑, Persist.
         if (regs::HOLD_PLACE_BASE..regs::HOLD_PLACE_BASE + regs::HOLD_PLACE_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_PLACE_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.name[idx] = hi;
             self.name[idx + 1] = lo;
-            return WriteResult::Ok;
+            return WriteResult::Persist;
         }
         match addr {
             regs::HOLD_HW_VER => {
@@ -515,17 +532,18 @@ impl SystemConfig {
             if idx + 1 < 6 { self.ble_mac[idx + 1] = lo; }
             return WriteResult::Apply;
         }
-        // BLE 名称 — 2字节/字 (自定义位置)
+        // BLE 名称 — 用户可编辑, Persist (实际生效需要重新初始化 BLE 外设, 但
+        // 持久化必须先做, 否则下次重启丢失).
         if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
-            return WriteResult::Ok;
+            return WriteResult::Persist;
         }
         if addr == regs::CFG_BLE_MESH_EN {
             self.ble_mesh_enable = value != 0;
-            return WriteResult::Ok;
+            return WriteResult::Persist;
         }
         // RS485 — Word1=组合格式匹配参考固件
         for i in 0..5usize {
@@ -554,7 +572,8 @@ impl SystemConfig {
                     2..=4 => {} // Retry/Timeout/Delay
                     _ => {}
                 }
-                return WriteResult::Ok;
+                // RS485 配置 — 用户可编辑, Persist (运行时切换由 rs485::port 监听).
+                return WriteResult::Persist;
             }
         }
         // 未知保留区 (2239-2242, 可写)
@@ -801,5 +820,188 @@ mod tests {
         // 默认 BLE 名称
         let name = cfg.ble_name_str();
         assert!(name.len() <= 16);
+    }
+
+    // ========================================================================
+    // 写入语义测试 (阶段 1: P0-B NVS 持久化基线)
+    // ========================================================================
+    //
+    // 关键约定:
+    // - 用户可编辑配置 (SN/PLACE/BLE_NAME/RS485/BLE_MESH_EN) → Persist
+    // - 诊断/只读字段 (HW_VER/FW_VER/UNKNOW/TCP_COM) → Ok (不持久化)
+    // - 网络/BLE MAC → Apply (需重启或重新初始化)
+    // - CFG_APPLY (0xB5B5) → Apply
+    // - CFG_RESET_DEFAULT (0xD5D5) → Reset
+
+    /// 写入 SN (0x0894) 必须返回 Persist (Android WRITE_SN 不调 APPLY).
+    #[test]
+    fn test_write_reg_sn_persist() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_SN_BASE, 0x4142); // "AB"
+        assert_eq!(result, WriteResult::Persist);
+    }
+
+    /// 写入 PLACE (0x089D) 必须返回 Persist (Android WRITE_LOCATION).
+    #[test]
+    fn test_write_reg_place_persist() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_PLACE_BASE, 0x2021); // " !"
+        assert_eq!(result, WriteResult::Persist);
+    }
+
+    /// 写入 BLE_NAME (HOLD_BLE_NAME_BASE..+4) 必须返回 Persist.
+    #[test]
+    fn test_write_reg_ble_name_persist() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_BLE_NAME_BASE, 0x4747); // "GG"
+        assert_eq!(result, WriteResult::Persist);
+    }
+
+    /// 写入 CFG_BLE_MESH_EN 必须返回 Persist.
+    #[test]
+    fn test_write_reg_ble_mesh_en_persist() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::CFG_BLE_MESH_EN, 1);
+        assert_eq!(result, WriteResult::Persist);
+    }
+
+    /// 写入 RS485 配置 (HOLD_RS485_BASE) 必须返回 Persist.
+    #[test]
+    fn test_write_reg_rs485_persist() {
+        let mut cfg = SystemConfig::defaults();
+        // Word1 = 0x3000 (9600/N/8/1/Master)
+        let result = cfg.write_reg(regs::HOLD_RS485_BASE, 0x3000);
+        assert_eq!(result, WriteResult::Persist);
+    }
+
+    /// HW_VER 写入必须返回 Ok (诊断字段, 不应触发 NVS 写入).
+    #[test]
+    fn test_write_reg_hw_ver_ok() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_HW_VER, 0x00F3);
+        assert_eq!(result, WriteResult::Ok);
+    }
+
+    /// UNKNOWN 区 (2239-2242) 写入必须返回 Ok (保留/诊断).
+    #[test]
+    fn test_write_reg_unknown_ok() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_UNKNOWN_BASE, 0x1234);
+        assert_eq!(result, WriteResult::Ok);
+    }
+
+    /// TCP_COM 端口 (2243-2246) 写入必须返回 Ok (诊断, 实际配置由 net.rs 管).
+    #[test]
+    fn test_write_reg_tcp_com_ok() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_TCP_COM_BASE, 502);
+        assert_eq!(result, WriteResult::Ok);
+    }
+
+    /// IP 写入必须返回 Apply (网络需重新初始化).
+    #[test]
+    fn test_write_reg_ip_apply() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_IP_BASE, 0xC0A8); // 192.168
+        assert_eq!(result, WriteResult::Apply);
+    }
+
+    /// BT_ADDR (HOLD_BT_ADDR_BASE) 写入必须返回 Apply (BLE MAC 需重启生效).
+    #[test]
+    fn test_write_reg_bt_addr_apply() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(regs::HOLD_BT_ADDR_BASE, 0xAABB);
+        assert_eq!(result, WriteResult::Apply);
+    }
+
+    // ========================================================================
+    // 寄存器布局对照 MCA (目标 #3: 与 MCA 每一个地址都不能偏差)
+    // ========================================================================
+
+    /// MCA SLAVE_REG_SN1 = 2196 = 0x894
+    #[test]
+    fn test_layout_sn_matches_mca() {
+        assert_eq!(regs::HOLD_SN_BASE, 0x0894, "SN base must be 0x0894 (MCA 2196)");
+        assert_eq!(regs::HOLD_SN_COUNT, 9, "SN count must be 9 (MCA 18 chars UTF-16)");
+    }
+
+    /// MCA SLAVE_REG_PLACE1 = 2205 = 0x89D
+    #[test]
+    fn test_layout_place_matches_mca() {
+        assert_eq!(regs::HOLD_PLACE_BASE, 0x089D, "PLACE base must be 0x089D (MCA 2205)");
+        assert_eq!(regs::HOLD_PLACE_COUNT, 8, "PLACE count must be 8 (MCA 16 chars UTF-16)");
+    }
+
+    /// MCA SLAVE_REG_HW_VER = 2213 = 0x8A5
+    #[test]
+    fn test_layout_hw_ver_matches_mca() {
+        assert_eq!(regs::HOLD_HW_VER, 0x08A5, "HW_VER must be 0x08A5 (MCA 2213)");
+    }
+
+    /// MCA SLAVE_REG_485_1_1 = 2214 = 0x8A6, stride=5
+    #[test]
+    fn test_layout_rs485_matches_mca() {
+        assert_eq!(regs::HOLD_RS485_BASE, 0x08A6, "RS485 base must be 0x08A6 (MCA 2214)");
+        assert_eq!(regs::HOLD_RS485_STRIDE, 5, "RS485 stride must be 5");
+    }
+
+    /// MCA SLAVE_REG_PIP1 = 2247 = 0x8C7
+    #[test]
+    fn test_layout_ip_matches_mca() {
+        assert_eq!(regs::HOLD_IP_BASE, 0x08C7, "IP base must be 0x08C7 (MCA 2247)");
+    }
+
+    /// MCA SLAVE_REG_PNTEMASK1 = 2251 = 0x8CB
+    #[test]
+    fn test_layout_mask_matches_mca() {
+        assert_eq!(regs::HOLD_MASK_BASE, 0x08CB, "MASK base must be 0x08CB (MCA 2251)");
+    }
+
+    /// MCA SLAVE_REG_PGW1 = 2255 = 0x8CF
+    #[test]
+    fn test_layout_gw_matches_mca() {
+        assert_eq!(regs::HOLD_GW_BASE, 0x08CF, "GW base must be 0x08CF (MCA 2255)");
+    }
+
+    /// MCA SLAVE_REG_MAC1 = 2263 = 0x8D7
+    #[test]
+    fn test_layout_mac_matches_mca() {
+        assert_eq!(regs::HOLD_MAC_BASE, 0x08D7, "MAC base must be 0x08D7 (MCA 2263)");
+    }
+
+    /// MCA SLAVE_REG_BT_ARRD1 = 2274 = 0x8E2
+    #[test]
+    fn test_layout_bt_addr_matches_mca() {
+        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x08E2, "BT_ADDR base must be 0x08E2 (MCA 2274)");
+    }
+
+    /// HOLD_485_ERR RO 必须返回 0 (cold boot 初值, 与 MCA 一致)
+    #[test]
+    fn test_read_reg_485_err_ro_zero() {
+        let cfg = SystemConfig::defaults();
+        assert_eq!(cfg.read_reg(regs::HOLD_485_1_COMERR), Some(0));
+        assert_eq!(cfg.read_reg(regs::HOLD_485_1_APPERR), Some(0));
+        assert_eq!(cfg.read_reg(regs::HOLD_485_2_COMERR), Some(0));
+        assert_eq!(cfg.read_reg(regs::HOLD_485_2_APPERR), Some(0));
+    }
+
+    /// 设备文本区对齐 Android 0x1388 (5000) 起始
+    #[test]
+    fn test_layout_device_text_matches_android() {
+        assert_eq!(regs::DEVICE_TEXT_BASE, 0x1388, "DEVICE_TEXT_BASE must be 0x1388 (Android 5000)");
+        assert_eq!(regs::DEVICE_TEXT_COUNT, 2000, "DEVICE_TEXT_COUNT must be 2000");
+        assert_eq!(regs::DEVICE_TEXT_END, 6999);
+    }
+
+    /// INREG_AI_COUNT 必须跟随 F-version (F16=4 / F48=8, 与 MCA REG_AMAX 对齐)
+    #[test]
+    fn test_inreg_ai_count_matches_hw_version() {
+        // 物理采 6 路 (ADC1_CH0..5), 但 Modbus 报告值跟随 hw_version
+        let expected = crate::config::hw_version::AI_COUNT;
+        assert_eq!(regs::INREG_AI_COUNT, crate::config::hw_version::AI_COUNT,
+            "INREG_AI_COUNT must follow hw_version (F16=4 / F48=8)");
+        // 至少 4, 最多 8 (硬编码范围)
+        assert!(expected >= 4 && expected <= 8,
+            "AI_COUNT must be 4..=8 (MCA F16/F48)");
     }
 }
