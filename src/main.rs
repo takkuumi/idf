@@ -236,8 +236,32 @@ fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
         ble_at::process_tick();
 
         // 消费 IO 事件 (避免事件队列满, 触发重置丢失关键状态变化)
-        // 实际生产环境中可在此根据事件类型触发即时响应 (如 DI 变化后通知 Modbus TCP 主站)
-        while crate::bus::event_bus::recv_event().is_some() {}
+        // 阶段 3: DI 变化触发 BLE notify (REPORT_COM_INPUT_IO_STATUS 0x94, Android tx_id=0x01)
+        while let Some(event) = crate::bus::event_bus::recv_event() {
+            match event {
+                crate::bus::IoEvent::DiChanged => {
+                    // DI 变化: 发 BLE 通知给 Android, 走 BINARY_TX 队列异步发送
+                    #[cfg(feature = "ble-at")]
+                    {
+                        // conn_id 取 0 (send_ble_frame 内会尝试锁定 GATTS_IF/CONN_ID 读)
+                        crate::ble_at::send_di_status_report(0);
+                    }
+                }
+                crate::bus::IoEvent::DoChanged => {
+                    // DO 变化: 暂不主动上报 (Modbus TCP 客户端可轮询)
+                    log::debug!("[main] DO changed event received");
+                }
+                crate::bus::IoEvent::AiSampled => {
+                    // AI 采样完成: 暂不主动上报
+                }
+                crate::bus::IoEvent::AoUpdated => {
+                    // AO 输出更新: 暂不主动上报
+                }
+                crate::bus::IoEvent::ResetRequested => {
+                    // 已在 1s tick 中处理, 忽略
+                }
+            }
+        }
 
         // 每 1s 更新 uptime + 检查任务心跳
         if tick % (1000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {

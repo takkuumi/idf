@@ -1122,6 +1122,45 @@ fn handle_mca_custom_command(
 }
 
 
+/// 发送 DI 状态变化上报 (REPORT_COM_INPUT_IO_STATUS, 0x94)
+///
+/// Android 1.0.78 CMDTransmissionIDManager 通过 tx_id=0x01 特殊 ID 识别本类上报.
+/// 帧格式 (与 Android 期望一致):
+///   tx_id(2 BE) = 0x0001  (Android TRANSMISSION_SPECIAL_ID_COM_INPUT_STATUS_CHANGED)
+///   proto_id(2 BE) = 0x0000
+///   length(2 BE) = 2 + ceil(DI_COUNT/8)
+///   pdu_data = [unit(1)][func(1)=0x94][di_bitmap_be...]
+///   crc(2 LE) = Modbus CRC16 of [tx_id|proto_id|length|pdu_data]
+///
+/// DI bitmap 字节序 = BE (大端, MSB first), DI0 在最高位字节的 LSB.
+/// 字节数 = ceil(DI_COUNT / 8). F16/F3=2 bytes (16 DI), F4=6 bytes (48 DI).
+///
+/// 调用时机: main_loop 消费 IoEvent::DiChanged 时调用. conn_id 取 0 (任意活跃连接).
+pub fn send_di_status_report(conn_id: u16) {
+    use crate::config::hw_version;
+    // 1. 读 DI 当前状态 (无锁, AtomicBits64)
+    let di_bits = crate::bus::IO.di.load_bits();
+    // 2. 构造 pdu
+    let di_count = hw_version::DI_COUNT;
+    let bitmap_bytes = (di_count + 7) / 8;
+    let mut pdu: heapless::Vec<u8, 16> = heapless::Vec::new();
+    let _ = pdu.push(0x01); // unit (slave id)
+    let _ = pdu.push(0x94); // func = REPORT_COM_INPUT_IO_STATUS
+    // DI bitmap BE: DI0 在 pdu[2] bit 0 (LSB first for first byte)
+    // Android 端 CMDResComInputIOReadModel 解析时:
+    //   byte 0 = DI0..DI7 (LSB=DI0)
+    //   byte 1 = DI8..DI15
+    //   ...
+    for i in 0..bitmap_bytes {
+        let byte = ((di_bits >> (i * 8)) & 0xFF) as u8;
+        let _ = pdu.push(byte);
+    }
+    // 3. 用 BLE 帧格式包装 (tx_id=0x0001 特殊 ID)
+    send_ble_frame(0x0001, 0x0000, &pdu, conn_id);
+    log::info!("[ble_at] DI status report: di_bits=0x{:016X} bytes={}",
+        di_bits, bitmap_bytes);
+}
+
 fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
     let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
