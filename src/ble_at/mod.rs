@@ -746,6 +746,44 @@ pub fn process_tick() {
     drop(h);
     if tx_handle == 0 { return; }
     
+    // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
+    //    完整行 (以 \n 结尾) 调 parser::process 处理, 响应推送 BINARY_TX
+    let mut at_response: Option<String> = None;
+    if let Some(mut rx) = RX_BUFFER.try_lock() {
+        if let Some(pos) = rx.find('\n') {
+            // 取行, 移除已处理部分 (heapless::String 无 replace_range, 用 pop_front)
+            let line_str: String = rx[..pos].trim_end_matches('\r').to_string();
+            // 删除前 pos+1 个字符 (= line + '\n')
+            for _ in 0..=pos {
+                if rx.is_empty() { break; }
+                let _ = rx.remove(0);
+            }
+            drop(rx);
+            log::info!("[ble_at] AT cmd: {}", line_str);
+            at_response = Some(crate::ble_at::parser::process(&line_str));
+        }
+    }
+    if let Some(resp) = at_response {
+        // 把 AT 文本响应包装成 BLE 帧 (tx_id=0, proto_id=0)
+        let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&0u16.to_be_bytes());
+        let _ = frame.extend_from_slice(&0u16.to_be_bytes());
+        let bytes = resp.as_bytes();
+        let len = bytes.len() as u16;
+        let _ = frame.extend_from_slice(&len.to_be_bytes());
+        let _ = frame.extend_from_slice(bytes);
+        let crc = modbus_crc16(&frame[..frame.len()]);
+        let _ = frame.push(crc as u8);
+        let _ = frame.push((crc >> 8) as u8);
+        if let Some(mut btx) = BINARY_TX.try_lock() {
+            if btx.len() + frame.len() <= 2048 {
+                let _ = btx.extend_from_slice(&frame);
+            } else {
+                log::warn!("[ble_at] AT response too long, dropping");
+            }
+        }
+    }
+    
     // 1. 优先发送 BINARY_TX 队列中的响应 (Android 请求的 Modbus 响应)
     if let Some(mut btx) = BINARY_TX.try_lock() {
         if !btx.is_empty() {
