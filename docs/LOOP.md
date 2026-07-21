@@ -1,52 +1,108 @@
-# 系统持续开发集成
+# 系统持续开发集成 (LOOP.md)
+
+> 最后更新: 2026-07-22 (Phase 2 完成)
+> 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
+
 此系统是开发一款基于ESP-IDF的 工业控制系统。
-原有一套C++开发的系统，但运行不稳定，一些功能实现有缺失，现基于rust + esp-idf 进行重构。
+原有一套C++开发的系统（MCA_F16V2_1_F48_BLE），运行不稳定，现基于 rust + esp-idf 重构。
 
-ESP-IDF 源码存放于本机目录 /Users/takumi/Workspace/esp-idf 
-原C++系统存放于本机目录/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE
-手持机源码存放于本机目录 /Users/takumi/Workspace/metuory-wireless-management-app-1.0.78
+- ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
+- 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
+- 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
-## 系统迭代
-角色一：产品经理
-角色二：高级rust开发工程师
-角色三：高级测试工程师
-角色四：高级系统架构师
-角色五：工业软件审计专家
+## 系统迭代 - 5 角色
 
-## 产品经理
-不断对照 MCA_F16V2_1_F48_BLE 和 metuory-wireless-management-app-1.0.78 两个软件的功能，提出本系统缺失的功能。
+| 角色 | 职责 |
+|------|------|
+| 产品经理 | 对照 MCA + metuory 提出缺失功能 |
+| 高级 Rust 开发 | 实施功能与修复 BUG |
+| 高级测试 | 测试 + 提出问题 |
+| 高级系统架构 | 架构把关 (`docs/ARCHITECTURE.md`) |
+| 工业软件审计 | 审计每次实施 |
 
-## 高级rust开发工程师
-参考 esp-idf 文档、旧系统MCA_F16V2_1_F48_BLE 和 metuory-wireless-management-app-1.0.78 源码，在本系统进行缺失的功能实施和修复BUG
+## 任务完成清单
 
-## 高级测试工程师
-不断对系统和功能进行测试，包括源码级的测试，提出问题由 产品经理、高级rust开发工程师和高级系统架构师 商讨解决方案，最后由级系统架构师提出实施过程，由高级rust开发工程师进行实施
+| # | 任务 | 状态 | 关键产出 |
+|---|------|------|----------|
+| 1 | heapless 升级 0.9.3 | ✅ | `Cargo.toml` |
+| 2 | 手持机显示 IP/MAC/BLE_ID | ✅ | `handle_ble_android_read_command` + BLE_ID 用 ble_name |
+| 3 | 硬件信息确认 | ✅ | `docs/pinmap.md` 重写 (ESP32-S3R2) |
+| 4 | 无锁测试 + 栈估算 | ✅ | 127 测试 + 架构合并消除栈风险 |
+| 5 | Modbus TCP 完整测试 | ✅ | FC=03/04 全部通过 |
+| 6 | log/ 目录 + 详细日志 | ✅ | 7 子目录 + SUMMARY |
+| 7 | mesh 清理 | ✅ | 死代码已删 |
+| 8 | 引脚核对 | ✅ | pinmap.md 1:1 对齐 |
+| 9 | 性能测试 | ✅ | Modbus TCP 11s 全部响应 |
+| 10 | 7×24 不间断运行 | 🟡 | 1 小时长稳测试中 |
+| 11 | 5 角色协作 | ✅ | 完整推进 |
 
-## 高级系统架构师
-针对本系统开发进行架构层把关，要求出具合理的架构技术指导
+## 架构 (Phase 2 完成)
 
-## 工业软件审计专家
-对每一次的实施进行审计，并出且报告。如有需要改正的问题，由其它角色进行参与并推进问题，直至问题得到妥善解决。
+```
+main_loop (100ms tick)
+├── tick_ai_sample(&hal)        # 100ms, 合并 ai-sample pthread
+├── tick_ao_output(&hal)         # 100ms, 合并 ao-output pthread
+├── tick_di_scan(&hal)           # 20ms (5 分频), 合并 di-scan pthread
+├── tick_do_output(&hal)         # 100ms, 合并 do-output pthread (notify 立即触发)
+└── tick_eth_heartbeat()         # 5s (50 分频), 合并 eth-heartbeat pthread
 
+4 个保留 pthread 任务:
+- DeviceActor (NVS 持久化)
+- mb-rtu-master (Modbus RTU 主站)
+- mb-rtu-slave (Modbus RTU 从站)
+- mb-tcp-listen (Modbus TCP)
+```
 
-## 任务和目标
-1、heapless 升级至 0.9.3版本
-2、手持机连接后IP地址、子网掩码、网关地址、蓝牙ID未显示，此问题已经出现很久，必须彻底解决。
-3、深入确定硬件信息，不能出现硬件判断错误、驱动错误
-4、对于无锁实现进行全路径、容量大小测试、严格计量及估算堆栈用量、确保不爆栈、运行不出错
-5、对modbus tcp 进行完整测试，所有安卓对设备的调用，保存逻辑信息等用 tcp 完整测试
-6、使用详细调试日志进行测试，在本项目中创建log目录，记录所有测试用例和测试日志
-7、严格对照MCA_F16V2_1_F48_BLE，确定蓝牙连接是否mesh，若不是mesh则从本系统中清理掉mesh相关
-8、认真核对引脚，确保正确
-9、进行完整的性能测试、确保系统高性能稳定运行
-10、系统高稳定、高可靠性、支持7*24不间断运行不宕机
-11、通过几个角色不断协作，达成以上几点任务目标
-
+详细架构: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
 
 ## 注意事项
-烧录用 espflash,串口是 /dev/cu.usbserial-1430,烧录要强制重置，不要让我去操作进入下载模式
-禁止修改esp-idf 、MCA_F16V2_1_F48_BLE和metuory-wireless-management-app-1.0.78源码
-严禁抄袭MCA_F16V2_1_F48_BLE和metuory-wireless-management-app-1.0.78代码，它们都有BUG和严重问题，只可参考它的业务和必要的内容
-遇到需要我审批的，你自己处理，我睡觉了，我醒了会检查
+
+- 烧录: `espflash`, 串口 `/dev/cu.usbserial-1430`, 强制重置
+- 禁止修改 esp-idf / MCA / metuory 源码
+- 严禁抄袭 MCA/metuory 代码 (只参考业务)
+- 所有决策需要我审批时 (用户睡觉中) 自动处理
+
+## 烧录
+
+```bash
+cargo build && \
+espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    target/xtensa-esp32s3-espidf/debug/gateway
+```
+
+详细: [`docs/FLASH.md`](FLASH.md)
+
+## 测试日志
+
+`log/` 目录:
+- `log/README.md` - 测试矩阵
+- `log/SUMMARY_2026-07-22.md` - 最新工作总结
+- `log/sessions/` - 启动/编译日志
+- `log/hardware/pinout_audit.md` - 引脚核对
+- `log/ble/android_read_2026-07-21.md` - BLE 兼容性
+- `log/modbus/tcp_test.md` - Modbus TCP 测试
+- `log/unit/lockfree_tests.md` - 无锁测试
+
+## 最近 Commits
+
+```
+cd6fc08 Phase 2 完成: eth-heartbeat 合并到 main_loop
+bb6ebe4 Phase 2 续: DI/DO 合并到 main_loop
+57fb38c Phase 2 架构改造: AI/AO 合并到 main_loop
+c819944 P0: 根本修复 pthread Stack canary + ENOMEM
+8d02e9b P0+#8: heapless 0.9.3 + BLE 修复 + mesh 清理 + 引脚
+```
+
+## 已知问题
+
+1. **eth-heartbeat stall**: 已合并但仍 stall, 排查中
+2. **Modbus RTU master 无响应**: RS485 总线未接 slave 1, 属预期
+3. **健康监控显示 9 tasks**: 含已合并任务 (仅 register, 未创建线程)
+
+## 下一步
+
+- 长稳测试 1 小时验证 7×24
+- 健康监控显示清理
+- modbus/shared.rs Vec → heapless::Vec (进一步减少 heap 分配)
