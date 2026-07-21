@@ -272,9 +272,12 @@ pub mod modbus {
         pub const DATA_BITS: u8 = 8;
     }
 
-    /// TCP Server 参数 - 匹配参考固件 MCA_F16V2_1_F48_BLE (4端口)
+    /// TCP Server 参数 - 减少为 1 端口 (502) 以节省 pthread 资源
+    /// 原 4 端口 (502/503/504/5002) 设计为参考固件兼容, 但 ESP32-S3R2 (512KB SRAM)
+    /// 在启用 BLE+ETH+Modbus RTU 后, pthread 创建第 5 个任务时 ENOMEM.
+    /// 单端口足以支持所有 Modbus TCP 客户端.
     pub mod tcp {
-        pub const PORTS: &[u16] = &[502, 503, 504, 5002];
+        pub const PORTS: &[u16] = &[502];
         pub const MAX_CONNECTIONS: usize = 4;
         pub const RX_TIMEOUT_MS: u64 = 2000;
         pub const TX_TIMEOUT_MS: u64 = 2000;

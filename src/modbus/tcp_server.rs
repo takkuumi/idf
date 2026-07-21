@@ -36,6 +36,7 @@ fn spawn_listener(port: u16) -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name(format!("mb-tcp-{}", port))
+        
         .spawn(move || {
             log::info!("[mb-tcp] listening on :{}", port);
             // 设置非阻塞以确保心跳可以定期 tick (避免任务被误判为停滞)
@@ -66,6 +67,7 @@ fn spawn_listener(port: u16) -> AppResult<()> {
                 health::set_next_thread_core(health::CORE_NET);
                 std::thread::Builder::new()
                     .name(format!("mb-tcp-conn-{id}"))
+                    
                     .spawn(move || {
                         if let Err(e) = handle_conn(stream) {
                             log::debug!("[mb-tcp-conn-{id}] closed: {}", e);

@@ -1272,15 +1272,20 @@ fn handle_ble_android_read_command(
             d
         }
         // READ_BLUETOOTH_ID (0x08E2, 0x0004): [4][ble_id(4)]
+        // Android 端 metuory-wireless-management-app-1.0.78 解析:
+        //   - fwVer >= 3.3.1.1115: 当 UTF-8 字符串 (如 "Mesh", "GW-1")
+        //   - 否则: 当 BigEndian int 转 hex 显示
+        // 我们返回 BLE 名称前 4 字节 (默认 "Mesh"), 两种解析都能显示有意义字符
         (0x08E2, 4) => {
+            // 找 ble_name 实际有效长度 (跳过尾部 0)
+            let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(cfg.ble_name.len());
+            let take = name_len.min(4);
             let mut id = [0u8; 4];
-            // BLE MAC 6 字节, 取后 4 字节 (与 MCA F16V2/F48 兼容)
-            id.copy_from_slice(&cfg.ble_mac[2..6]);
+            id[..take].copy_from_slice(&cfg.ble_name[..take]);
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
             let _ = d.push(4);
             let _ = d.extend_from_slice(&id);
-            log::info!("[ble_at] READ_BLE_ID: {:02X}{:02X}{:02X}{:02X}",
-                id[0], id[1], id[2], id[3]);
+            log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&id).unwrap_or("<bin>"));
             d
         }
         _ => return false, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
