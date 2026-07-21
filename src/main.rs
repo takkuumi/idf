@@ -243,6 +243,11 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
         #[cfg(feature = "io-di-do")]
         crate::io::do_::tick_do_output(&hal);
 
+        // ETH 心跳 (50 tick = 5s, 架构合并 Phase 2: 取消独立 pthread)
+        if tick % 50 == 0 {
+            crate::ethernet::w5500::tick_eth_heartbeat();
+        }
+
         // BLE 通知发送 (每 100ms, 替代独立线程)
         #[cfg(feature = "ble-at")]
         ble_at::process_tick();

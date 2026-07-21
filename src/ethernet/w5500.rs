@@ -305,54 +305,63 @@ fn fmt_ip(addr: &u32) -> heapless::String<15> {
 }
 
 // ---- 心跳任务：每 5s 检测网关连通性；连续失败 >= 3 次触发 esp_restart ----
+// 架构改造 Phase 2: eth-heartbeat 合并到 main_loop
+use std::sync::Mutex;
+
+struct EthHbState {
+    fail_count: u32,
+}
+
+unsafe impl Send for EthHbState {}
+unsafe impl Sync for EthHbState {}
+
+static ETH_HB_STATE: Mutex<Option<EthHbState>> = Mutex::new(None);
+
 fn spawn_heartbeat() -> AppResult<()> {
     health::register(&ETH_HB);
-    health::set_next_thread_core(health::CORE_NET);
-    let result = std::thread::Builder::new()
-        .name("eth-heartbeat".into())
-        .spawn(move || {
-            let mut fail_count: u32 = 0;
-            let period = std::time::Duration::from_secs(HEARTBEAT_PERIOD_S);
-            loop {
-                // 心跳: 每 5s 上报一次
-                ETH_HB.tick();
-                if heartbeat_once() {
-                    if fail_count > 0 {
-                        log::info!("[eth-heartbeat] link restored");
-                        // 网络恢复, 退出降级模式
-                        crate::error::recovery::enter_mode(
-                            crate::error::recovery::DegradedMode::Normal
-                        );
-                    }
-                    fail_count = 0;
-                } else {
-                    fail_count = fail_count.saturating_add(1);
-                    log::warn!("[eth-heartbeat] gateway unreachable (count={})", fail_count);
-                    // 分级恢复: 永远不立刻重启, 先尝试降级
-                    if fail_count >= 2 {
-                        let action = crate::error::recovery::decide_action(
-                            crate::error::recovery::Severity::Degradable,
-                            fail_count,
-                        );
-                        crate::error::recovery::apply_action(action, "eth-heartbeat");
-                    } else {
-                        // 短暂失败: 仅记录
-                        crate::error::recovery::record_failure(
-                            crate::error::recovery::Severity::Recoverable,
-                            "eth-heartbeat",
-                            "gateway ping failed",
-                        );
-                    }
-                    // 注: 旧逻辑是 fail_count >= HEARTBEAT_MAX_FAIL (3) 时重启
-                    // 新逻辑: 永远不重启, 降级运行, 网络恢复后自动恢复
-                }
-                std::thread::sleep(period);
-            }
-        });
-    health::reset_thread_core();
-    result.map_err(|e| AppError::Ethernet(format!("spawn heartbeat: {e}")))?;
-    log::info!("[eth] heartbeat task started, period={}s", HEARTBEAT_PERIOD_S);
+    let mut guard = ETH_HB_STATE.lock().map_err(|_| AppError::Ethernet("eth-hb state lock poisoned".into()))?;
+    *guard = Some(EthHbState { fail_count: 0 });
+    log::info!("[eth] heartbeat registered in main_loop (period={}s)", HEARTBEAT_PERIOD_S);
     Ok(())
+}
+
+/// main_loop 每 5s 调用一次
+pub fn tick_eth_heartbeat() {
+    let mut guard = match ETH_HB_STATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    ETH_HB.tick();
+    if heartbeat_once() {
+        if state.fail_count > 0 {
+            log::info!("[eth-heartbeat] link restored");
+            crate::error::recovery::enter_mode(
+                crate::error::recovery::DegradedMode::Normal
+            );
+        }
+        state.fail_count = 0;
+    } else {
+        state.fail_count = state.fail_count.saturating_add(1);
+        log::warn!("[eth-heartbeat] gateway unreachable (count={})", state.fail_count);
+        if state.fail_count >= 2 {
+            let action = crate::error::recovery::decide_action(
+                crate::error::recovery::Severity::Degradable,
+                state.fail_count,
+            );
+            crate::error::recovery::apply_action(action, "eth-heartbeat");
+        } else {
+            crate::error::recovery::record_failure(
+                crate::error::recovery::Severity::Recoverable,
+                "eth-heartbeat",
+                "gateway ping failed",
+            );
+        }
+    }
 }
 
 fn heartbeat_once() -> bool {
