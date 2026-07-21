@@ -256,6 +256,17 @@ fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
                 crate::bus::IoEvent::ResetRequested => {
                     // 已在 1s tick 中处理, 忽略
                 }
+                crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
+                    // DHCP 完成, 把 IP/mask/gw 写入 CONFIG RCU
+                    log::info!("[eth] main loop: IP assigned {}.{}.{}.{}",
+                        ip_b[0], ip_b[1], ip_b[2], ip_b[3]);
+                    crate::bus::backends::config_modify(|c| {
+                        c.ip = ip_b;
+                        c.mask = mask_b;
+                        c.gateway = gw_b;
+                        c.dhcp = true;
+                    });
+                }
             }
         }
 

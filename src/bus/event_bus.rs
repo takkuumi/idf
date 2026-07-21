@@ -29,6 +29,8 @@ pub enum IoEvent {
     AoUpdated,
     /// 设备复位请求
     ResetRequested,
+    /// IP 已分配 (DHCP 完成), 携带 (ip, mask, gw)
+    IpAssigned([u8; 4], [u8; 4], [u8; 4]),
 }
 
 /// 全局事件队列 (容量 32, 满了覆盖最旧)

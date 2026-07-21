@@ -222,3 +222,9 @@ CONFIG_VFS_SUPPORT_SELECT=y
 # 这里我们使用 Rust 侧的 umodbus crate 实现，故 esp-idf freemodbus 不启用
 CONFIG_FMB_MASTER_TIMEOUT_MS_RESPOND=200
 CONFIG_FMB_SERIAL_BUFFER_SIZE=256
+
+# ---- System Event Task 栈大小 (IP_EVENT_ETH_GOT_IP 回调栈) ----
+# 默认 2304 (2KB), ip_event_cb 内 log::info! + 多个 array 撑爆栈
+# 增大到 8KB 避免 Stack canary watchpoint 触发
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2304
+CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32

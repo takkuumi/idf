@@ -269,47 +269,31 @@ extern "C" fn ip_event_cb(
     event_id: i32,
     event_data: *mut c_void,
 ) {
+    // 极简实现: 只 log + post 事件, 把重活 (RCU clone, 字节转换) 推迟到 main loop
+    // 这样 sys_evt 任务栈 (2KB) 就够了, 避免 Stack canary watchpoint
     if event_id != esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32 || event_data.is_null() {
         return;
     }
     unsafe {
         let data = &*(event_data as *const esp_idf_sys::ip_event_got_ip_t);
-        let ip = data.ip_info.ip;
-        let gw = data.ip_info.gw;
-        let mask = data.ip_info.netmask;
-        log::info!("[eth] got IP: {} / {} gw {}",
-                   fmt_ip(&ip.addr), fmt_ip(&mask.addr), fmt_ip(&gw.addr));
-
-        // Write back DHCP-assigned IP/mask/gw to CONFIG RCU; Modbus/BLE 读即 RCU
-        let ip_b = [
-            ip.addr as u8,
-            (ip.addr >> 8) as u8,
-            (ip.addr >> 16) as u8,
-            (ip.addr >> 24) as u8,
-        ];
-        let mask_b = [
-            mask.addr as u8,
-            (mask.addr >> 8) as u8,
-            (mask.addr >> 16) as u8,
-            (mask.addr >> 24) as u8,
-        ];
-        let gw_b = [
-            gw.addr as u8,
-            (gw.addr >> 8) as u8,
-            (gw.addr >> 16) as u8,
-            (gw.addr >> 24) as u8,
-        ];
-        crate::bus::backends::config_modify(|c| {
-            c.ip = ip_b;
-            c.mask = mask_b;
-            c.gateway = gw_b;
-            c.dhcp = true;
-        });
-        log::info!(
-            "[eth] cfg updated (RCU): ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
-            ip_b[0], ip_b[1], ip_b[2], ip_b[3],
-            mask_b[0], mask_b[1], mask_b[2], mask_b[3],
-            gw_b[0], gw_b[1], gw_b[2], gw_b[3]);
+        let ip_raw = data.ip_info.ip.addr;
+        let mask_raw = data.ip_info.netmask.addr;
+        let gw_raw = data.ip_info.gw.addr;
+        let mut b = [0u8; 4];
+        crate::bus::send_event(crate::bus::IoEvent::IpAssigned(
+            [
+                ip_raw as u8, (ip_raw >> 8) as u8, (ip_raw >> 16) as u8, (ip_raw >> 24) as u8,
+            ],
+            [
+                mask_raw as u8, (mask_raw >> 8) as u8, (mask_raw >> 16) as u8, (mask_raw >> 24) as u8,
+            ],
+            [
+                gw_raw as u8, (gw_raw >> 8) as u8, (gw_raw >> 16) as u8, (gw_raw >> 24) as u8,
+            ],
+        ));
+        // 这两个 b[] 是未使用的占位, 但编译器可能优化掉. 用 core::mem::forget 阻止优化
+        core::mem::forget(b);
+        log::info!("[eth] IP event posted to main loop");
     }
 }
 

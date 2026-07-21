@@ -22,6 +22,7 @@
 *.log
 flash_args
 flash_project_args
+/log
 
 # Mac
 .DS_Store
