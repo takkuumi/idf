@@ -1047,6 +1047,14 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
+    // ---- metuory-wireless-management-app-1.0.78 通过 Modbus FC=03/04 读取设备信息 ----
+    // Android 期望自定义格式响应 ([length_byte][data]), 不是标准 Modbus RTU.
+    // 命中 Android 已知名单后直接返回, 跳过 Modbus RTU 路径.
+    if (func == 0x03 || func == 0x04) && data.len() >= 12 {
+        if handle_ble_android_read_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit) {
+            return true;
+        }
+    }
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
     if func >= 0xC0 && func <= 0xCF {
@@ -1160,6 +1168,135 @@ fn handle_mca_custom_command(
         }
     }
 }
+
+
+/// 处理 metuory-wireless-management-app-1.0.78 通过 BLE 发送的设备信息读命令
+///
+/// Android 端通过 Modbus FC=03/04 协议读取设备信息, 期望响应格式是
+/// 自定义格式 `[length_byte][data...]`, 不是标准 Modbus RTU 响应.
+///
+/// 已知寄存器地址 (与 metuory-wireless-management-app-1.0.78 CMDTransmissionTypeEnum 完全一致):
+/// | func | reg_addr | reg_cnt | 含义         | 响应格式
+/// | 0x04 | 0x087C   | 0x0002  | HW_INFO      | [4][DO][DI][ADC][RS485]
+/// | 0x04 | 0x087E   | 0x0002  | FW_VERSION   | [2][fw_hi][fw_lo]
+/// | 0x03 | 0x08A5   | 0x0001  | HW_VER       | [2][hw_hi][hw_lo]
+/// | 0x03 | 0x08C7   | 0x000C  | IP/MASK/GW   | [12][ip(4)][mask(4)][gw(4)]
+/// | 0x03 | 0x08D7   | 0x0006  | ETH_MAC      | [6][mac(6)]
+/// | 0x03 | 0x08E2   | 0x0004  | BT_ID        | [4][ble_id(4)]
+///
+/// 返回 true 表示已处理 (调用方应停止继续走 Modbus RTU 路径).
+fn handle_ble_android_read_command(
+    func: u8,
+    data: &[u8],
+    tx_id: u16,
+    proto_id: u16,
+    conn_id: u16,
+    unit: u8,
+) -> bool {
+    // 必须有 reg_addr(2) + reg_cnt(2) = 4 字节
+    if data.len() < 4 {
+        return false;
+    }
+    let reg_addr = u16::from_be_bytes([data[0], data[1]]);
+    let reg_cnt = u16::from_be_bytes([data[2], data[3]]);
+
+    // 只处理 FC=03 (READ03) / FC=04 (READ04)
+    if func != 0x03 && func != 0x04 {
+        return false;
+    }
+
+    let cfg_guard = match crate::bus::config_state::config_read() {
+        Some(cs) => cs,
+        None => return false,
+    };
+    // RCU 快照借用, 在函数作用域内有效
+    let cfg: &crate::device::system_config::SystemConfig = &cfg_guard.cfg;
+
+    let rsp_data: heapless::Vec<u8, 16> = match (reg_addr, reg_cnt) {
+        // READ_HARDWARE_INFO (0x087C, 0x0002): [4][DO][DI][ADC][RS485]
+        (0x087C, 2) => {
+            let do_cnt = crate::config::hw_version::DO_COUNT as u8;
+            let di_cnt = crate::config::hw_version::DI_COUNT as u8;
+            let adc_cnt = crate::config::hw_version::AI_COUNT as u8;
+            let rs485_cnt = 2u8;
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(4); // length
+            let _ = d.push(do_cnt);
+            let _ = d.push(di_cnt);
+            let _ = d.push(adc_cnt);
+            let _ = d.push(rs485_cnt);
+            d
+        }
+        // READ_FW_VERSION (0x087E, 0x0002): [2][fw_hi][fw_lo]
+        (0x087E, 2) => {
+            let fw = cfg.fw_version;
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(2); // length
+            let _ = d.push((fw >> 8) as u8); // major (build / 100)
+            let _ = d.push((fw & 0xFF) as u8); // minor (build % 100)
+            d
+        }
+        // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
+        (0x08A5, 1) => {
+            let hw = cfg.hw_version;
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(2);
+            let _ = d.push((hw >> 8) as u8);
+            let _ = d.push((hw & 0xFF) as u8);
+            d
+        }
+        // READ_IP (0x08C7, 0x000C): [12][ip(4)][mask(4)][gw(4)]
+        (0x08C7, 12) => {
+            let ip = cfg.ip;
+            let mask = cfg.mask;
+            let gw = cfg.gateway;
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(12); // length
+            let _ = d.extend_from_slice(&ip);
+            let _ = d.extend_from_slice(&mask);
+            let _ = d.extend_from_slice(&gw);
+            log::info!("[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3],
+                mask[0], mask[1], mask[2], mask[3],
+                gw[0], gw[1], gw[2], gw[3]);
+            d
+        }
+        // READ_MAC (0x08D7, 0x0006): [6][mac(6)]
+        (0x08D7, 6) => {
+            let mac = cfg.eth_mac;
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(6);
+            let _ = d.extend_from_slice(&mac);
+            log::info!("[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            d
+        }
+        // READ_BLUETOOTH_ID (0x08E2, 0x0004): [4][ble_id(4)]
+        (0x08E2, 4) => {
+            let mut id = [0u8; 4];
+            // BLE MAC 6 字节, 取后 4 字节 (与 MCA F16V2/F48 兼容)
+            id.copy_from_slice(&cfg.ble_mac[2..6]);
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(4);
+            let _ = d.extend_from_slice(&id);
+            log::info!("[ble_at] READ_BLE_ID: {:02X}{:02X}{:02X}{:02X}",
+                id[0], id[1], id[2], id[3]);
+            d
+        }
+        _ => return false, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
+    };
+
+    // 构造 pdu_data = [unit][func=0x03/0x04][length][data...]
+    // send_ble_frame 会自动加 tx_id/proto_id/length(=pdu_data.len())/crc
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&rsp_data);
+    send_ble_frame(tx_id, proto_id, &pdu, conn_id);
+    true
+}
+
+
 
 
 /// 发送 DI 状态变化上报 (REPORT_COM_INPUT_IO_STATUS, 0x94)

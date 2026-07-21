@@ -302,12 +302,11 @@ pub fn init() -> AppResult<()> {
         length, version
     );
     log::info!(
-        "[device] cfg loaded: sn='{}' ip={} mac={} fw=0x{:04X} ble_mesh={}",
+        "[device] cfg loaded: sn='{}' ip={} mac={} fw=0x{:04X}",
         cfg.sn_str(),
         cfg.ip_str(),
         cfg.mac_str(),
         cfg.fw_version,
-        cfg.ble_mesh_enable
     );
 
     // 4. 启动 DeviceActor (替代 watch_loop)

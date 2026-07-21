@@ -299,32 +299,7 @@ pub mod wifi {
 // ----------------------------------------------------------------------------
 // BLE Mesh 参数
 // ----------------------------------------------------------------------------
-pub mod ble_mesh {
-    /// 自身设备名
-    pub const DEVICE_NAME: &str = "ESP32S3-GW";
-    /// Mesh 网络 ID (用于区分不同网络)
-    pub const NET_KEY_IDX: u16 = 0;
-    pub const APP_KEY_IDX: u16 = 0;
-    /// Generic OnOff Server model
-    pub const MODEL_ID_ONOFF_SRV: u16 = 0x1000;
-    /// Generic OnOff Client model
-    pub const MODEL_ID_ONOFF_CLI: u16 = 0x1001;
-    /// 节点配网 OOB 数量
-    pub const OOB_SIZE: u8 = 4;
-    /// 心跳周期 (秒)
-    pub const HEARTBEAT_PERIOD_S: u32 = 60;
-}
 
-// ----------------------------------------------------------------------------
-// ============================================================================
-// Modbus 寄存器布局 — 与参考固件 MCA_F16V2_1_F48_BLE 兼容
-// ============================================================================
-//
-// 线圈 (Coils, 0x):     地址 512+ (0x200+), 对应 DO 点, 1-based 编号
-// 离散输入 (DIs, 1x):   地址 0+, 对应 DI 点
-// 输入寄存器 (IRs, 3x): 地址 128+ (0x80+), 对应 AI 模拟量
-// 保持寄存器 (HRs, 4x): 地址 2176+ (0x880+), 配置/参数区
-//
 pub mod regs {
     use crate::config::hw_version;
 
@@ -463,7 +438,6 @@ pub mod regs {
     pub const CFG_APPLY: u16 = 0xFF01;
     pub const CFG_RESET_DEFAULT: u16 = 0xFF02;
     pub const CFG_DHCP: u16 = 0xFF03;
-    pub const CFG_BLE_MESH_EN: u16 = 0xFF11;
     pub const CFG_BLE_MAC_BASE: u16 = 0;
     pub const CFG_END: u16 = HOLD_CFG_END + 1;
     // Backward compat aliases

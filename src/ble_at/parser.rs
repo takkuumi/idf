@@ -76,8 +76,6 @@ pub fn process(line: &str) -> String {
         cfg_handlers::handle_cfgbtmac(args)
     } else if cmd.eq_ignore_ascii_case("CFGBTNAME") {
         cfg_handlers::handle_cfgbtname(args)
-    } else if cmd.eq_ignore_ascii_case("CFGMESH") {
-        cfg_handlers::handle_cfgmesh(args)
     } else if cmd.eq_ignore_ascii_case("CFG485") {
         cfg_handlers::handle_cfg485(args)
     } else if cmd.eq_ignore_ascii_case("CFGAPPLY") {

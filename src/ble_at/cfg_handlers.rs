@@ -14,7 +14,6 @@
 //!   AT+CFGBTMAC                      读蓝牙 MAC
 //!   AT+CFGBTNAME=<name>              设置 BLE 名称 (8 字符)
 //!   AT+CFGBTNAME                     读 BLE 名称
-//!   AT+CFGMESH=<0|1>                 启用/禁用 BLE Mesh
 //!   AT+CFG485=<idx>,<baud>,<data>,<stop>,<parity>,<slave>,<mode>  设置 RS485
 //!   AT+CFG485=<idx>                   读 RS485 配置
 //!   AT+CFGAPPLY                      应用配置 (持久化 + 生效)
@@ -161,18 +160,6 @@ pub fn handle_cfgbtname(args: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// AT+CFGMESH=<0|1>
-// ----------------------------------------------------------------------------
-pub fn handle_cfgmesh(args: &str) -> String {
-    let v = match parse_u16(args) {
-        Some(v) => v,
-        None => return err(10, "invalid value"),
-    };
-    with_cfg_mut(|c| c.ble_mesh_enable = v != 0);
-    ok_data(&format!("ble_mesh={}", v))
-}
-
-// ----------------------------------------------------------------------------
 // AT+CFG485=<idx>,<baud>,<data>,<stop>,<parity>,<slave>,<mode>
 // AT+CFG485=<idx>
 // ----------------------------------------------------------------------------
@@ -265,7 +252,7 @@ pub fn handle_cfgreset(_args: &str) -> String {
 pub fn handle_cfginfo(_args: &str) -> String {
     let s = with_cfg(|c| {
         format!(
-            "sn={},name={},hw=0x{:04X},fw=0x{:04X},cfg_ver={},ip={},mask={},gw={},dhcp={},eth_mac={},ble_mac={},ble_name={},ble_mesh={},rs485_0=baud{}/slave{},rs485_1=baud{}/slave{}",
+            "sn={},name={},hw=0x{:04X},fw=0x{:04X},cfg_ver={},ip={},mask={},gw={},dhcp={},eth_mac={},ble_mac={},ble_name={},rs485_0=baud{}/slave{},rs485_1=baud{}/slave{}",
             c.sn_str(),
             c.name_str(),
             c.hw_version,
@@ -278,7 +265,6 @@ pub fn handle_cfginfo(_args: &str) -> String {
             c.mac_str(),
             c.ble_mac_str(),
             c.ble_name_str(),
-            c.ble_mesh_enable as u8,
             c.rs485[0].baudrate,
             c.rs485[0].slave_addr,
             c.rs485[1].baudrate,

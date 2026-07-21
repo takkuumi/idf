@@ -23,7 +23,6 @@ const NVS_MAGIC: u32 = 0x4757_4346; // "GWCF"
 /// 序列化后字节数 (固定布局)
 /// SN(32) + name(16) + hw(2) + fw(2) + cfg_ver(2) = 54
 /// eth_mac(6) + dhcp(1) + ip(4) + mask(4) + gw(4) + dns(4) = 23
-/// ble_mac(6) + ble_name(8) + ble_mesh(1) = 15
 /// rs485[0](9) + rs485[1](9) = 18
 /// 总 = 110, 取 128 留余量
 const CFG_BLOB_SIZE: usize = 128;
@@ -42,7 +41,6 @@ const OFF_GW: usize = 69;
 const OFF_DNS: usize = 73;
 const OFF_BLE_MAC: usize = 77;
 const OFF_BLE_NAME: usize = 83;
-const OFF_BLE_MESH: usize = 91;
 const OFF_RS485_0: usize = 92;
 const OFF_RS485_1: usize = 101;
 
@@ -92,7 +90,6 @@ pub struct SystemConfig {
 
     pub ble_mac: [u8; 6],
     pub ble_name: [u8; 8],
-    pub ble_mesh_enable: bool,
 
     pub rs485: [Rs485Config; 2],
 }
@@ -162,7 +159,6 @@ impl SystemConfig {
             dns: [192, 168, 51, 1],
             ble_mac: [0; 6],
             ble_name,
-            ble_mesh_enable: true,
             rs485: [Rs485Config::default(), Rs485Config::default()],
         }
     }
@@ -231,7 +227,6 @@ impl SystemConfig {
 
         b[OFF_BLE_MAC..OFF_BLE_MAC + 6].copy_from_slice(&self.ble_mac);
         b[OFF_BLE_NAME..OFF_BLE_NAME + 8].copy_from_slice(&self.ble_name);
-        b[OFF_BLE_MESH] = self.ble_mesh_enable as u8;
 
         for i in 0..2 {
             let r = &self.rs485[i];
@@ -268,7 +263,6 @@ impl SystemConfig {
         s.ble_mac.copy_from_slice(&b[OFF_BLE_MAC..OFF_BLE_MAC + 6]);
         s.ble_name
             .copy_from_slice(&b[OFF_BLE_NAME..OFF_BLE_NAME + 8]);
-        s.ble_mesh_enable = b[OFF_BLE_MESH] != 0;
 
         for i in 0..2 {
             let off = if i == 0 { OFF_RS485_0 } else { OFF_RS485_1 };
@@ -398,9 +392,6 @@ impl SystemConfig {
                 self.ble_name[idx],
                 self.ble_name[idx + 1],
             ]));
-        }
-        if addr == regs::CFG_BLE_MESH_EN {
-            return Some(self.ble_mesh_enable as u16);
         }
         // RS485 — 5端口×5字, Word1=组合格式匹配参考固件
         for i in 0..5usize {
@@ -539,10 +530,6 @@ impl SystemConfig {
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
-            return WriteResult::Persist;
-        }
-        if addr == regs::CFG_BLE_MESH_EN {
-            self.ble_mesh_enable = value != 0;
             return WriteResult::Persist;
         }
         // RS485 — Word1=组合格式匹配参考固件
