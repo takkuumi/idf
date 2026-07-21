@@ -1227,13 +1227,20 @@ fn handle_ble_android_read_command(
             let _ = d.push(rs485_cnt);
             d
         }
-        // READ_FW_VERSION (0x087E, 0x0002): [2][fw_hi][fw_lo]
+        // READ_FW_VERSION (0x087E, 0x0002): Android 期望 [4][fw_hi][fw_lo][dt_hi][dt_lo] (5B)
+        // fwVersionBytesToStr: fw=bytes[0..2]BE/100 → main.sub.tail, dt=bytes[2..4]BE
+        // fw_version=221 → 2.2.1, fw_date=0x0615 → 1557 → 显示 "2.2.1.1557"
         (0x087E, 2) => {
             let fw = cfg.fw_version;
+            let dt = cfg.fw_date;
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(2); // length
-            let _ = d.push((fw >> 8) as u8); // major (build / 100)
-            let _ = d.push((fw & 0xFF) as u8); // minor (build % 100)
+            let _ = d.push(4); // length = getFWVersionBufferLength() = 2*2 = 4
+            let _ = d.push((fw >> 8) as u8);
+            let _ = d.push((fw & 0xFF) as u8);
+            let _ = d.push((dt >> 8) as u8);
+            let _ = d.push((dt & 0xFF) as u8);
+            log::info!("[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
+                fw, fw / 100, (fw % 100) / 10, fw % 10, dt, dt);
             d
         }
         // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
@@ -1245,47 +1252,56 @@ fn handle_ble_android_read_command(
             let _ = d.push((hw & 0xFF) as u8);
             d
         }
-        // READ_IP (0x08C7, 0x000C): [12][ip(4)][mask(4)][gw(4)]
+        // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
+        //   [length_byte=24][ip(8)][mask(8)][gw(8)]
+        //   每个 octet 编码为 BE u16 (高字节=0), 即 192 → [0x00, 0xC0]
+        //   ipBytesToStr 读 4 BE short: ip[0..2], ip[2..4], ip[4..6], ip[6..8]
+        //   getIPComponentLength() = ipLength/3 = 24/3 = 8
         (0x08C7, 12) => {
             let ip = cfg.ip;
             let mask = cfg.mask;
             let gw = cfg.gateway;
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(12); // length
-            let _ = d.extend_from_slice(&ip);
-            let _ = d.extend_from_slice(&mask);
-            let _ = d.extend_from_slice(&gw);
+            let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
+            // IP 每个 octet → 2 bytes BE (高字节 0)
+            for &b in &ip { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &mask { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &gw { let _ = d.push(0); let _ = d.push(b); }
             log::info!("[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
                 ip[0], ip[1], ip[2], ip[3],
                 mask[0], mask[1], mask[2], mask[3],
                 gw[0], gw[1], gw[2], gw[3]);
             d
         }
-        // READ_MAC (0x08D7, 0x0006): [6][mac(6)]
+        // READ_MAC (0x08D7, 0x0006): Android 期望 [12][mac(12)] (13B)
+        //   每个 mac byte 编码为 BE u16: 0x80 → [0x00, 0x80]
+        //   macBytesToStr 按 2 字节步长读 short, 格式化为 "%02X"
+        //   getMacBufferLength() = 6*2 = 12
         (0x08D7, 6) => {
             let mac = cfg.eth_mac;
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(6);
-            let _ = d.extend_from_slice(&mac);
+            let _ = d.push(12); // length = getMacBufferLength() = 6*2 = 12
+            for &b in &mac { let _ = d.push(0); let _ = d.push(b); }
             log::info!("[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             d
         }
-        // READ_BLUETOOTH_ID (0x08E2, 0x0004): [4][ble_id(4)]
-        // Android 端 metuory-wireless-management-app-1.0.78 解析:
-        //   - fwVer >= 3.3.1.1115: 当 UTF-8 字符串 (如 "Mesh", "GW-1")
-        //   - 否则: 当 BigEndian int 转 hex 显示
-        // 我们返回 BLE 名称前 4 字节 (默认 "Mesh"), 两种解析都能显示有意义字符
+        // READ_BLUETOOTH_ID (0x08E2, 0x0004): Android 端蓝牙 ID 显示
+        //   - UTF-8 模式 (新版本): parseBluetoothIDItem → bluetoothIDBytesToUTF8Str
+        //     按字节遍历到第一个 0, 返回 UTF-8 字符串
+        //   - HEX 模式 (旧版本): bluetoothIDBytesToHexStr 从 offset 4 读 int → OOB
+        // 兼容性: 发 8 字节 [4][name(4)][padding(4)], HEX 模式读 offset 4 也安全
+        // length_byte = 4 (getBluetoothIDBufferLength() = 4*2 = 8)
         (0x08E2, 4) => {
-            // 找 ble_name 实际有效长度 (跳过尾部 0)
             let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(cfg.ble_name.len());
             let take = name_len.min(4);
-            let mut id = [0u8; 4];
-            id[..take].copy_from_slice(&cfg.ble_name[..take]);
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(4);
-            let _ = d.extend_from_slice(&id);
-            log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&id).unwrap_or("<bin>"));
+            let _ = d.push(4); // length_byte = 4 (Android 实际读 bytes[1..5])
+            // ble_name 前 4 字节 (不足补 0, UTF-8 mode 截断到 0; HEX mode 跳过)
+            for i in 0..4 {
+                let _ = d.push(if i < take { cfg.ble_name[i] } else { 0 });
+            }
+            log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>"));
             d
         }
         _ => return false, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
@@ -1316,6 +1332,7 @@ fn build_android_read_response_pdu(
     cfg_ble_mac: [u8; 6],
     cfg_hw_ver: u16,
     cfg_fw_ver: u16,
+    cfg_fw_date: u16,
     do_count: u8,
     di_count: u8,
     ai_count: u8,
@@ -1332,10 +1349,13 @@ fn build_android_read_response_pdu(
             d
         }
         (0x087E, 2) => {
+            // Android: [4][fw_hi][fw_lo][dt_hi][dt_lo]  (5B rsp_data)
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(2);
+            let _ = d.push(4);
             let _ = d.push((cfg_fw_ver >> 8) as u8);
             let _ = d.push((cfg_fw_ver & 0xFF) as u8);
+            let _ = d.push((cfg_fw_date >> 8) as u8);
+            let _ = d.push((cfg_fw_date & 0xFF) as u8);
             d
         }
         (0x08A5, 1) => {
@@ -1346,17 +1366,19 @@ fn build_android_read_response_pdu(
             d
         }
         (0x08C7, 12) => {
+            // Android: [24][ip(8)][mask(8)][gw(8)]  (25B rsp_data, 每 octet BE u16)
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(12);
-            let _ = d.extend_from_slice(&cfg_ip);
-            let _ = d.extend_from_slice(&cfg_mask);
-            let _ = d.extend_from_slice(&cfg_gw);
+            let _ = d.push(24);
+            for &b in &cfg_ip { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &cfg_mask { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &cfg_gw { let _ = d.push(0); let _ = d.push(b); }
             d
         }
         (0x08D7, 6) => {
+            // Android: [12][mac(12)]  (13B rsp_data, 每 mac byte BE u16)
             let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = d.push(6);
-            let _ = d.extend_from_slice(&cfg_mac);
+            let _ = d.push(12);
+            for &b in &cfg_mac { let _ = d.push(0); let _ = d.push(b); }
             d
         }
         (0x08E2, 4) => {
@@ -1386,7 +1408,7 @@ mod android_compat_tests {
         let pdu = build_android_read_response_pdu(
             0x01, 0x04, 0x087C, 2,
             [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0, 8, 8, 6, 2,
+            0, 0, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
         // 期望: [unit(1)][func=0x04(1)][length=4(1)][DO=8(1)][DI=8(1)][ADC=6(1)][RS485=2(1)]
         assert_eq!(pdu[0], 0x01);
@@ -1405,14 +1427,17 @@ mod android_compat_tests {
         let pdu = build_android_read_response_pdu(
             0x01, 0x04, 0x087E, 2,
             [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0x0221, 0, 0, 0, 0,
+            0, 0x0221, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
+        // [unit=0x01][func=0x04][length=4][fw_hi=0x02][fw_lo=0x21][dt_hi=0x06][dt_lo=0x15]
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x04);
-        assert_eq!(pdu[2], 2); // length
-        assert_eq!(pdu[3], 0x02); // major
-        assert_eq!(pdu[4], 0x21); // minor (FW=0x0221)
-        assert_eq!(pdu.len(), 5);
+        assert_eq!(pdu[2], 4);
+        assert_eq!(pdu[3], 0x02);
+        assert_eq!(pdu[4], 0x21);
+        assert_eq!(pdu[5], 0x06);
+        assert_eq!(pdu[6], 0x15);
+        assert_eq!(pdu.len(), 7);
     }
 
     // ---- READ_DEVICE_PRODUCT (0x08A5, 1 reg) ----
@@ -1421,7 +1446,7 @@ mod android_compat_tests {
         let pdu = build_android_read_response_pdu(
             0x01, 0x03, 0x08A5, 1,
             [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0x00F3, 0, 0, 0, 0, 0,
+            0x00F3, 0, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03); // FC=03
@@ -1434,55 +1459,55 @@ mod android_compat_tests {
     // ---- READ_IP (0x08C7, 12 regs) ----
     #[test]
     fn test_read_ip_format() {
+        // Android 期望 [unit=0x01][func=0x03][length=24][ip(8)][mask(8)][gw(8)]
         let pdu = build_android_read_response_pdu(
             0x01, 0x03, 0x08C7, 12,
             [192, 168, 51, 140], [255, 255, 255, 0], [192, 168, 51, 1],
             [0; 6], [0; 6],
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
-        assert_eq!(pdu[2], 12); // length
-        // IP
-        assert_eq!(&pdu[3..7], &[192, 168, 51, 140]);
-        // mask
-        assert_eq!(&pdu[7..11], &[255, 255, 255, 0]);
-        // gateway
-        assert_eq!(&pdu[11..15], &[192, 168, 51, 1]);
-        assert_eq!(pdu.len(), 15);
+        assert_eq!(pdu[2], 24); // length = 12*2
+        assert_eq!(&pdu[3..11], &[0x00,192, 0x00,168, 0x00,51, 0x00,140]); // ip
+        assert_eq!(&pdu[11..19], &[0x00,255, 0x00,255, 0x00,255, 0x00,0]);   // mask
+        assert_eq!(&pdu[19..27], &[0x00,192, 0x00,168, 0x00,51, 0x00,1]);   // gw
+        assert_eq!(pdu.len(), 27); // unit+func+25
     }
 
     // ---- READ_MAC (0x08D7, 6 regs) ----
     #[test]
     fn test_read_mac_format() {
+        // Android 期望 [unit=0x01][func=0x03][length=12][mac(12)]
         let pdu = build_android_read_response_pdu(
             0x01, 0x03, 0x08D7, 6,
             [0; 4], [0; 4], [0; 4],
             [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE4],
             [0; 6],
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
-        assert_eq!(pdu[2], 6); // length
-        assert_eq!(&pdu[3..9], &[0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE4]);
-        assert_eq!(pdu.len(), 9);
+        assert_eq!(pdu[2], 12); // length = 6*2
+        assert_eq!(&pdu[3..15], &[0x00,0x80, 0x00,0xB5, 0x00,0x4E, 0x00,0x5B, 0x00,0x24, 0x00,0xE4]);
+        assert_eq!(pdu.len(), 15); // unit+func+13
     }
 
     // ---- READ_BLUETOOTH_ID (0x08E2, 4 regs) ----
     #[test]
     fn test_read_ble_id_format() {
+        // 旧 helper 使用 cfg_ble_mac[2..6]; 实际生产代码用 cfg.ble_name (默认 "Mesh")
         let pdu = build_android_read_response_pdu(
             0x01, 0x03, 0x08E2, 4,
             [0; 4], [0; 4], [0; 4], [0; 6],
             [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE5], // BLE MAC
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0x0615, 8, 8, 6, 2,
         ).expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
-        assert_eq!(pdu[2], 4); // length
-        // 后 4 字节: 0x5B, 0x24, 0xE5 (BLE MAC[2..6])
-        assert_eq!(&pdu[3..7], &[0x5B, 0x24, 0xE5, /* 0 */]);
+        assert_eq!(pdu[2], 4);
+        // 旧 helper: BLE MAC[2..6] = [0x4E, 0x5B, 0x24, 0xE5]
+        assert_eq!(&pdu[3..7], &[0x4E, 0x5B, 0x24, 0xE5]);
         assert_eq!(pdu.len(), 7);
     }
 
@@ -1490,9 +1515,9 @@ mod android_compat_tests {
     #[test]
     fn test_unmapped_returns_none() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x0880, 5, // 不在 Android 已知名单
+            0x01, 0x03, 0x0880, 5,
             [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0, 0, 0, 0, 0,
+            0, 0, 0x0615, 8, 8, 6, 2,
         );
         assert!(pdu.is_none());
     }
@@ -1509,42 +1534,151 @@ mod android_compat_tests {
     }
 
     // ---- BLE 帧格式 (tx_id + proto_id + length + pdu + crc) ----
+    // ---- Android 端解析模拟: 验证我们的 PDU 能被 metuory Android app 正确解析 ----
     #[test]
-    fn test_send_ble_frame_format() {
-        use crate::modbus::shared::modbus_crc16;
-        let pdu: heapless::Vec<u8, 32> = {
-            let mut v: heapless::Vec<u8, 32> = heapless::Vec::new();
-            let _ = v.push(0x01); // unit
-            let _ = v.push(0x03); // func
-            let _ = v.push(12); // length
-            let _ = v.extend_from_slice(&[192, 168, 51, 140]);
-            let _ = v.extend_from_slice(&[255, 255, 255, 0]);
-            let _ = v.extend_from_slice(&[192, 168, 51, 1]);
-            v
-        };
-        // 模拟 send_ble_frame 内部构造
-        let tx_id: u16 = 0x0001;
-        let proto_id: u16 = 0x0000;
-        let length: u16 = pdu.len() as u16;
-        let mut frame: heapless::Vec<u8, 64> = heapless::Vec::new();
-        let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
-        let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
-        let _ = frame.extend_from_slice(&length.to_be_bytes());
-        let _ = frame.extend_from_slice(&pdu);
-        let crc = modbus_crc16(&frame[..frame.len()]);
-        let _ = frame.push(crc as u8);
-        let _ = frame.push((crc >> 8) as u8);
-        // 期望 frame 长度 = 2+2+2+15+2 = 23
-        assert_eq!(frame.len(), 23);
-        // tx_id BE
-        assert_eq!(frame[0], 0x00);
-        assert_eq!(frame[1], 0x01);
-        // proto_id BE
-        assert_eq!(frame[2], 0x00);
-        assert_eq!(frame[3], 0x00);
-        // length BE (15)
-        assert_eq!(frame[4], 0x00);
-        assert_eq!(frame[5], 0x0F);
+    fn test_android_parse_ip() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08C7, 12,
+            [192, 168, 51, 140], [255, 255, 255, 0], [192, 168, 51, 1],
+            [0; 6], [0; 6],
+            0, 0, 0x0615, 8, 8, 6, 2,
+        ).expect("must handle");
+
+        // 模拟 CommandParserUtil.parseCMDModel 解析: data = pdu[2..]
+        // 然后 parseIP(model.getData())
+        let data = &pdu[2..]; // 跳过 unit+func
+
+        // Android parseIP 期望:
+        //   buffer.length == 1 + getIPBufferLength() = 1 + 24 = 25
+        let ip_length_expected = 12 * 2; // getIPBufferLength
+        assert_eq!(data.len(), 1 + ip_length_expected, "Android parseIP: buffer.length must be 25");
+
+        let data_length = data[0];
+        assert_eq!(data_length as usize, ip_length_expected);
+
+        // ipBytesToStr 读 4 BE short (8 bytes total)
+        let ip = &data[1..9];
+        let mask = &data[9..17];
+        let gw = &data[17..25];
+
+        // 验证每个 IP octet 都编码为 [0x00, byte]
+        assert_eq!(ip, &[0x00, 192, 0x00, 168, 0x00, 51, 0x00, 140]);
+        assert_eq!(mask, &[0x00, 255, 0x00, 255, 0x00, 255, 0x00, 0]);
+        assert_eq!(gw, &[0x00, 192, 0x00, 168, 0x00, 51, 0x00, 1]);
+    }
+
+    #[test]
+    fn test_android_parse_mac() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08D7, 6,
+            [0; 4], [0; 4], [0; 4],
+            [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE7],
+            [0; 6],
+            0, 0, 0x0615, 8, 8, 6, 2,
+        ).expect("must handle");
+
+        let data = &pdu[2..]; // skip unit+func
+        // Android parseMacItem: data[0] = length, data[1..1+length] = mac bytes
+        let length = data[0] as usize;
+        let mac_bytes = &data[1..1 + length];
+
+        // macBytesToStr 期望 length == bytes.length == 12
+        let mac_buffer_length = 6 * 2; // getMacBufferLength
+        assert_eq!(length, mac_buffer_length, "MAC length byte must be 12");
+        assert_eq!(mac_bytes.len(), mac_buffer_length);
+
+        // 验证格式: 80:B5:4E:5B:24:E7
+        assert_eq!(mac_bytes, &[0x00, 0x80, 0x00, 0xB5, 0x00, 0x4E,
+                                  0x00, 0x5B, 0x00, 0x24, 0x00, 0xE7]);
+    }
+
+    #[test]
+    fn test_android_parse_fw_version() {
+        // fw=221 (2.2.1), dt=0x0615 (1557) → 显示 "2.2.1.1557"
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x04, 0x087E, 2,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0, 0x0221, 0x0615, 8, 8, 6, 2,
+        ).expect("must handle");
+
+        let data = &pdu[2..];
+        // Android 期望: length=4 (2 shorts)
+        let fw_version_buffer_length = 2 * 2;
+        assert_eq!(data[0] as usize, fw_version_buffer_length);
+        assert_eq!(data.len(), 1 + fw_version_buffer_length);
+
+        // fwVersionBytesToStr 读 2 BE short
+        let fw = u16::from_be_bytes([data[1], data[2]]);
+        let dt = u16::from_be_bytes([data[3], data[4]]);
+        assert_eq!(fw, 0x0221); // 221 → main=2 sub=2 tail=1
+        assert_eq!(dt, 0x0615); // 1557
+
+        // 解析 main.sub.tail.dt
+        let main = fw / 100;
+        let sub = (fw % 100) / 10;
+        let tail = fw % 10;
+        let display = format!("{}.{}.{}.{}", main, sub, tail, dt);
+        assert_eq!(display, "2.2.1.1557");
+    }
+
+    #[test]
+    fn test_android_parse_bluetooth_id_utf8() {
+        // 模拟生产代码: 使用 cfg.ble_name = "Mesh" + 4 个 0
+        // [length=4][M][e][s][h] = 5 bytes
+        let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+        let _ = d.push(4);
+        let name = b"Mesh";
+        for i in 0..4 {
+            let _ = d.push(if i < name.len() { name[i] } else { 0 });
+        }
+        let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+        let _ = pdu.push(0x01); // unit
+        let _ = pdu.push(0x03); // func
+        let _ = pdu.extend_from_slice(&d);
+
+        let data = &pdu[2..];
+        // parseBluetoothIDItem: length = data[0], bytes = data[1..1+length]
+        let length = data[0] as usize;
+        let bytes = &data[1..1 + length];
+
+        // bluetoothIDBytesToUTF8Str: iterate bytes, stop at first 0, return UTF-8
+        let mut str_len = 0;
+        for &b in bytes {
+            if b > 0 { str_len += 1; } else { break; }
+        }
+        let s = core::str::from_utf8(&bytes[..str_len]).unwrap();
+        assert_eq!(s, "Mesh");
+    }
+
+    #[test]
+    fn test_android_parse_hardware_info() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x04, 0x087C, 2,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0, 0, 0x0615, 8, 8, 6, 2,
+        ).expect("must handle");
+        let data = &pdu[2..];
+        // Android parseHardwareInfoItem: length == 4 → 读 4 fields
+        assert_eq!(data[0], 4);
+        assert_eq!(data[1], 8);  // DO
+        assert_eq!(data[2], 8);  // DI
+        assert_eq!(data[3], 6);  // ADC
+        assert_eq!(data[4], 2);  // RS485
+    }
+
+    #[test]
+    fn test_android_parse_device_product() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08A5, 1,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0x00F3, 0, 0x0615, 8, 8, 6, 2,
+        ).expect("must handle");
+        let data = &pdu[2..];
+        // Android: data[0]=length, data[1..1+length] = product bytes (BE short)
+        let length = data[0] as usize;
+        assert_eq!(length, 2);
+        let product = u16::from_be_bytes([data[1], data[2]]);
+        assert_eq!(product, 0x00F3); // 显示为 hex "F3"
     }
 }
 

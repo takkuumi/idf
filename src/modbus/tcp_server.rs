@@ -143,21 +143,23 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         if pdu_len < 1 { return Ok(()); }
         let func = pdu[0];  // PDU 首字节 = 功能码
         let resp_pdu = build_pdu(&backend, func, &pdu[1..pdu_len]);
-        let resp_len = 1 + resp_pdu.len();
+        // MBAP.length = unit_id(1) + resp_PDU(N), 总长度 = MBAP(7) + uid(1) + resp_PDU(N)
+        let mbap_len = 1 + resp_pdu.len();
         let mut mbap = [0u8; 7];
         mbap[..2].copy_from_slice(&header[..2]); // echo tx_id
         mbap[2..4].copy_from_slice(&0u16.to_be_bytes()); // proto = 0
-        mbap[4..6].copy_from_slice(&(resp_len as u16).to_be_bytes());
+        mbap[4..6].copy_from_slice(&(mbap_len as u16).to_be_bytes());
         mbap[6] = unit_id;
 
-        // 合并 MBAP + PDU 为单次写入, 避免 W5500 分批发送导致对端收到不完整帧
+        // 合并 MBAP + uid + PDU 为单次写入, 避免 W5500 分批发送导致对端收到不完整帧
         // 优化: 使用栈缓冲区避免每次响应 1 次堆分配 (高频 Modbus TCP 关键)
         const MAX_RESP: usize = 280;
         let mut response = [0u8; MAX_RESP];
-        let resp_len = 7 + resp_pdu.len();
+        let total_len = 8 + resp_pdu.len();
         response[..7].copy_from_slice(&mbap);
-        response[7..resp_len].copy_from_slice(&resp_pdu);
-        stream.write_all(&response[..resp_len])?;
+        response[7] = unit_id;  // 回应中也包含 uid (符合 MBAP.length 承诺)
+        response[8..total_len].copy_from_slice(&resp_pdu);
+        stream.write_all(&response[..total_len])?;
         stream.flush()?;
     }
 }

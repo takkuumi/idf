@@ -79,6 +79,9 @@ pub struct SystemConfig {
     pub name: [u8; 16],
     pub hw_version: u16,
     pub fw_version: u16,
+    /// 固件日期码 (Android 端 fwVersionBytesToStr 解析 dt 字段)
+    /// 例如 0x0615 = 1557, 显示为 "2.2.1.1557"
+    pub fw_date: u16,
     pub cfg_version: u16,
 
     pub eth_mac: [u8; 6],
@@ -150,6 +153,7 @@ impl SystemConfig {
             // 匹配 MCA F16 + NCA9555F16: MCA_FIRMWARE_VERSION=221, Date=0x0615
             // Android 端 fwVersionBytesToStr 解析: fw=221 → "2.2.1", dt=0x0615 → "1557"
             fw_version: 221,
+            fw_date: 0x0615,
             cfg_version: 0,
             eth_mac: [0; 6],
             dhcp: false,
