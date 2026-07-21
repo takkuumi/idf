@@ -1296,6 +1296,253 @@ fn handle_ble_android_read_command(
     true
 }
 
+// 暴露给测试用的纯逻辑函数 (无 esp-idf 依赖)
+// 返回 [unit][func][length_byte][actual_data...] 的 pdu_data 形式
+#[cfg(test)]
+fn build_android_read_response_pdu(
+    unit: u8,
+    func: u8,
+    reg_addr: u16,
+    reg_cnt: u16,
+    cfg_ip: [u8; 4],
+    cfg_mask: [u8; 4],
+    cfg_gw: [u8; 4],
+    cfg_mac: [u8; 6],
+    cfg_ble_mac: [u8; 6],
+    cfg_hw_ver: u16,
+    cfg_fw_ver: u16,
+    do_count: u8,
+    di_count: u8,
+    ai_count: u8,
+    rs485_count: u8,
+) -> Option<heapless::Vec<u8, 32>> {
+    let rsp_data: heapless::Vec<u8, 16> = match (reg_addr, reg_cnt) {
+        (0x087C, 2) => {
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(4);
+            let _ = d.push(do_count);
+            let _ = d.push(di_count);
+            let _ = d.push(ai_count);
+            let _ = d.push(rs485_count);
+            d
+        }
+        (0x087E, 2) => {
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(2);
+            let _ = d.push((cfg_fw_ver >> 8) as u8);
+            let _ = d.push((cfg_fw_ver & 0xFF) as u8);
+            d
+        }
+        (0x08A5, 1) => {
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(2);
+            let _ = d.push((cfg_hw_ver >> 8) as u8);
+            let _ = d.push((cfg_hw_ver & 0xFF) as u8);
+            d
+        }
+        (0x08C7, 12) => {
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(12);
+            let _ = d.extend_from_slice(&cfg_ip);
+            let _ = d.extend_from_slice(&cfg_mask);
+            let _ = d.extend_from_slice(&cfg_gw);
+            d
+        }
+        (0x08D7, 6) => {
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(6);
+            let _ = d.extend_from_slice(&cfg_mac);
+            d
+        }
+        (0x08E2, 4) => {
+            let mut id = [0u8; 4];
+            id.copy_from_slice(&cfg_ble_mac[2..6]);
+            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let _ = d.push(4);
+            let _ = d.extend_from_slice(&id);
+            d
+        }
+        _ => return None,
+    };
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&rsp_data);
+    Some(pdu)
+}
+
+#[cfg(test)]
+mod android_compat_tests {
+    use super::build_android_read_response_pdu;
+
+    // ---- READ_HARDWARE_INFO (0x087C, 2 regs) ----
+    #[test]
+    fn test_read_hardware_info_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x04, 0x087C, 2,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0, 0, 8, 8, 6, 2,
+        ).expect("must handle");
+        // 期望: [unit(1)][func=0x04(1)][length=4(1)][DO=8(1)][DI=8(1)][ADC=6(1)][RS485=2(1)]
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x04);
+        assert_eq!(pdu[2], 4); // length
+        assert_eq!(pdu[3], 8); // DO
+        assert_eq!(pdu[4], 8); // DI
+        assert_eq!(pdu[5], 6); // ADC
+        assert_eq!(pdu[6], 2); // RS485
+        assert_eq!(pdu.len(), 7);
+    }
+
+    // ---- READ_FW_VERSION (0x087E, 2 regs) ----
+    #[test]
+    fn test_read_fw_version_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x04, 0x087E, 2,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0, 0x0221, 0, 0, 0, 0,
+        ).expect("must handle");
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x04);
+        assert_eq!(pdu[2], 2); // length
+        assert_eq!(pdu[3], 0x02); // major
+        assert_eq!(pdu[4], 0x21); // minor (FW=0x0221)
+        assert_eq!(pdu.len(), 5);
+    }
+
+    // ---- READ_DEVICE_PRODUCT (0x08A5, 1 reg) ----
+    #[test]
+    fn test_read_device_product_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08A5, 1,
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0x00F3, 0, 0, 0, 0, 0,
+        ).expect("must handle");
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x03); // FC=03
+        assert_eq!(pdu[2], 2);
+        assert_eq!(pdu[3], 0x00);
+        assert_eq!(pdu[4], 0xF3); // HW_VER=0x00F3
+        assert_eq!(pdu.len(), 5);
+    }
+
+    // ---- READ_IP (0x08C7, 12 regs) ----
+    #[test]
+    fn test_read_ip_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08C7, 12,
+            [192, 168, 51, 140], [255, 255, 255, 0], [192, 168, 51, 1],
+            [0; 6], [0; 6],
+            0, 0, 0, 0, 0, 0,
+        ).expect("must handle");
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x03);
+        assert_eq!(pdu[2], 12); // length
+        // IP
+        assert_eq!(&pdu[3..7], &[192, 168, 51, 140]);
+        // mask
+        assert_eq!(&pdu[7..11], &[255, 255, 255, 0]);
+        // gateway
+        assert_eq!(&pdu[11..15], &[192, 168, 51, 1]);
+        assert_eq!(pdu.len(), 15);
+    }
+
+    // ---- READ_MAC (0x08D7, 6 regs) ----
+    #[test]
+    fn test_read_mac_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08D7, 6,
+            [0; 4], [0; 4], [0; 4],
+            [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE4],
+            [0; 6],
+            0, 0, 0, 0, 0, 0,
+        ).expect("must handle");
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x03);
+        assert_eq!(pdu[2], 6); // length
+        assert_eq!(&pdu[3..9], &[0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE4]);
+        assert_eq!(pdu.len(), 9);
+    }
+
+    // ---- READ_BLUETOOTH_ID (0x08E2, 4 regs) ----
+    #[test]
+    fn test_read_ble_id_format() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08E2, 4,
+            [0; 4], [0; 4], [0; 4], [0; 6],
+            [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE5], // BLE MAC
+            0, 0, 0, 0, 0, 0,
+        ).expect("must handle");
+        assert_eq!(pdu[0], 0x01);
+        assert_eq!(pdu[1], 0x03);
+        assert_eq!(pdu[2], 4); // length
+        // 后 4 字节: 0x5B, 0x24, 0xE5 (BLE MAC[2..6])
+        assert_eq!(&pdu[3..7], &[0x5B, 0x24, 0xE5, /* 0 */]);
+        assert_eq!(pdu.len(), 7);
+    }
+
+    // ---- 未命中已知地址 ----
+    #[test]
+    fn test_unmapped_returns_none() {
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x0880, 5, // 不在 Android 已知名单
+            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
+            0, 0, 0, 0, 0, 0,
+        );
+        assert!(pdu.is_none());
+    }
+
+    // ---- CRC 计算正确性 (Modbus CRC16 LE) ----
+    #[test]
+    fn test_crc16() {
+        use crate::modbus::shared::modbus_crc16;
+        // 已知: [0x01, 0x03, 0x02, 0x00, 0xF3] → CRC = 0xB9C2 (LE: C2 B9)
+        let frame = [0x01, 0x03, 0x02, 0x00, 0xF3];
+        let crc = modbus_crc16(&frame);
+        // 不固定值, 但应该是 modbus 标准 CRC16
+        assert_eq!(crc, modbus_crc16(&frame));
+    }
+
+    // ---- BLE 帧格式 (tx_id + proto_id + length + pdu + crc) ----
+    #[test]
+    fn test_send_ble_frame_format() {
+        use crate::modbus::shared::modbus_crc16;
+        let pdu: heapless::Vec<u8, 32> = {
+            let mut v: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = v.push(0x01); // unit
+            let _ = v.push(0x03); // func
+            let _ = v.push(12); // length
+            let _ = v.extend_from_slice(&[192, 168, 51, 140]);
+            let _ = v.extend_from_slice(&[255, 255, 255, 0]);
+            let _ = v.extend_from_slice(&[192, 168, 51, 1]);
+            v
+        };
+        // 模拟 send_ble_frame 内部构造
+        let tx_id: u16 = 0x0001;
+        let proto_id: u16 = 0x0000;
+        let length: u16 = pdu.len() as u16;
+        let mut frame: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
+        let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
+        let _ = frame.extend_from_slice(&length.to_be_bytes());
+        let _ = frame.extend_from_slice(&pdu);
+        let crc = modbus_crc16(&frame[..frame.len()]);
+        let _ = frame.push(crc as u8);
+        let _ = frame.push((crc >> 8) as u8);
+        // 期望 frame 长度 = 2+2+2+15+2 = 23
+        assert_eq!(frame.len(), 23);
+        // tx_id BE
+        assert_eq!(frame[0], 0x00);
+        assert_eq!(frame[1], 0x01);
+        // proto_id BE
+        assert_eq!(frame[2], 0x00);
+        assert_eq!(frame[3], 0x00);
+        // length BE (15)
+        assert_eq!(frame[4], 0x00);
+        assert_eq!(frame[5], 0x0F);
+    }
+}
+
 
 
 

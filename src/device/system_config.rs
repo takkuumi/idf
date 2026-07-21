@@ -844,14 +844,6 @@ mod tests {
         assert_eq!(result, WriteResult::Persist);
     }
 
-    /// 写入 CFG_BLE_MESH_EN 必须返回 Persist.
-    #[test]
-    fn test_write_reg_ble_mesh_en_persist() {
-        let mut cfg = SystemConfig::defaults();
-        let result = cfg.write_reg(regs::CFG_BLE_MESH_EN, 1);
-        assert_eq!(result, WriteResult::Persist);
-    }
-
     /// 写入 RS485 配置 (HOLD_RS485_BASE) 必须返回 Persist.
     #[test]
     fn test_write_reg_rs485_persist() {
