@@ -7,7 +7,6 @@
 //! 工程量尺度：scaled = 工程量 * 1000 (0..=10000 表示 0.000-10.000 V)
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
@@ -29,43 +28,57 @@ static TASK_HB: TaskHb = TaskHb::new("ao-output");
 /// 启动 AO 输出任务
 ///
 /// TODO: 假设 `hal.ledc.set_duty(idx: usize, duty: u32) -> ()`，由 hal/ledc 模块实现后接入。
-pub fn start_output_task(hal: Arc<Hal>) -> AppResult<()> {
+// 架构改造 Phase 2: AO 合并到 main_loop
+use std::sync::Mutex;
+
+struct AoState {
+    last_duty: [u32; CHANNEL_COUNT],
+}
+
+unsafe impl Send for AoState {}
+unsafe impl Sync for AoState {}
+
+static AO_STATE: Mutex<Option<AoState>> = Mutex::new(None);
+
+pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    health::set_next_thread_core(health::CORE_RT);
-    let result = std::thread::Builder::new()
-        .name("ao-output".into())
-        .spawn(move || {
-            log::info!("[ao] output task started, period={}ms", OUTPUT_PERIOD_MS);
-
-            // 上一次输出的 duty，初值全 1 使首次必然全量刷新
-            let mut last_duty = [u32::MAX; CHANNEL_COUNT];
-
-            loop {
-                // 心跳: 每次循环 (100ms) 上报一次
-                TASK_HB.tick();
-                // 1. 读取 scaled, 计算 duty, 写回 duty 到总线
-                //    阶段 A: 读 scaled + 写 duty 全过 bus::IO.ao (原子), 无锁
-                let mut duties = [0u32; CHANNEL_COUNT];
-                for ch in 0..CHANNEL_COUNT {
-                    let scaled = crate::bus::IO.ao.get_scaled(ch);
-                    duties[ch] = (scaled as u32) * DUTY_MAX / SCALED_MAX;
-                    crate::bus::IO.ao.set_duty(ch, duties[ch]);
-                }
-                crate::bus::send_event(crate::bus::IoEvent::AoUpdated);
-
-                // 2. 仅在 duty 变化时调用 LEDC (硬件 IO 在总线锁外执行)
-                for ch in 0..CHANNEL_COUNT {
-                    if duties[ch] != last_duty[ch] {
-                        hal.ledc.set_duty(ch, duties[ch]);
-                        last_duty[ch] = duties[ch];
-                    }
-                }
-
-                std::thread::sleep(Duration::from_millis(OUTPUT_PERIOD_MS));
-            }
-        });
-    health::reset_thread_core();
-    result.map_err(|e| AppError::Channel(format!("spawn ao-output: {e}")))?;
-
+    let mut guard = AO_STATE.lock().map_err(|_| AppError::Channel("ao state lock poisoned".into()))?;
+    *guard = Some(AoState {
+        last_duty: [u32::MAX; CHANNEL_COUNT],
+    });
+    log::info!("[ao] output task registered in main_loop (period={}ms)", OUTPUT_PERIOD_MS);
     Ok(())
+}
+
+/// main_loop 每 100ms 调用一次
+pub fn tick_ao_output(hal: &crate::hal::Hal) {
+    let mut guard = match AO_STATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    TASK_HB.tick();
+    let mut duties = [0u32; CHANNEL_COUNT];
+    for ch in 0..CHANNEL_COUNT {
+        let scaled = crate::bus::IO.ao.get_scaled(ch);
+        duties[ch] = (scaled as u32) * DUTY_MAX / SCALED_MAX;
+        crate::bus::IO.ao.set_duty(ch, duties[ch]);
+    }
+    drop(guard);
+    crate::bus::send_event(crate::bus::IoEvent::AoUpdated);
+
+    // 仅在 duty 变化时调用 LEDC
+    let mut guard = AO_STATE.lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        for ch in 0..CHANNEL_COUNT {
+            if duties[ch] != state.last_duty[ch] {
+                hal.ledc.set_duty(ch, duties[ch]);
+                state.last_duty[ch] = duties[ch];
+            }
+        }
+    }
 }

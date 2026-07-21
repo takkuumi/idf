@@ -51,6 +51,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_sys::{self as _};
 
+use crate::hal::Hal;
 use crate::config::MAIN_LOOP_PERIOD_MS;
 use crate::error::AppResult;
 
@@ -188,7 +189,7 @@ fn main() -> AppResult<()> {
     log::info!("[main] entering main loop (period={}ms)", MAIN_LOOP_PERIOD_MS);
     // 打印任务-核心分配 (便于验证双核优化)
     health::print_core_assignment();
-    if let Err(e) = main_loop(timer_svc) {
+    if let Err(e) = main_loop(timer_svc, hal.clone()) {
         log::error!("[main] main loop returned error: {e}");
         // 不再立即重启, 尝试降级运行
         crate::error::recovery::record_failure(
@@ -213,7 +214,7 @@ fn main() -> AppResult<()> {
 // ----------------------------------------------------------------------------
 // 主循环：周期性更新系统状态、复位计数、喂狗、健康检查
 // ----------------------------------------------------------------------------
-fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
+fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
     let mut tick: u32 = 0;
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
     let start = std::time::Instant::now();
@@ -226,6 +227,13 @@ fn main_loop(_timer_svc: EspTaskTimerService) -> AppResult<()> {
 
         // 每个周期喂狗 (100ms), 远小于 WDT 超时 10s
         health::feed_wdt();
+
+        // AI/AO 100ms tick (架构合并 Phase 2: 取消独立 pthread)
+        #[cfg(feature = "ai-ao")]
+        {
+            crate::channel::ai::tick_ai_sample(&hal);
+            crate::channel::ao::tick_ao_output(&hal);
+        }
 
         // BLE 通知发送 (每 100ms, 替代独立线程)
         #[cfg(feature = "ble-at")]
