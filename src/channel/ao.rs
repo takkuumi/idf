@@ -60,8 +60,8 @@ pub fn tick_ao_output(hal: &crate::hal::Hal) {
         Some(s) => s,
         None => return,
     };
-
     TASK_HB.tick();
+
     let mut duties = [0u32; CHANNEL_COUNT];
     for ch in 0..CHANNEL_COUNT {
         let scaled = crate::bus::IO.ao.get_scaled(ch);

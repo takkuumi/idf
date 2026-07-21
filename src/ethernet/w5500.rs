@@ -35,7 +35,7 @@ const HEARTBEAT_PERIOD_S: u64 = 5;
 const HEARTBEAT_MAX_FAIL: u32 = 3; // 旧值, 实际由 recovery 模块分级处理
 
 /// 以太网心跳任务记录 (静态分配, main_loop 监控)
-static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 2);
+static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 6);
 
 /// 启动 W5500 以太网。
 ///

@@ -79,12 +79,8 @@ pub fn tick_di_scan(hal: &Hal) {
         Some(s) => s,
         None => return,
     };
-
+    TASK_HB.tick();
     state.tick_div = state.tick_div.wrapping_add(1);
-    // HB_DIV 等效处理: 每 100ms tick 一次 (main_loop 5 tick = 100ms)
-    if state.tick_div % HB_DIV == 0 {
-        TASK_HB.tick();
-    }
 
     let bits: u64 = match hal.dio().read_di_all() {
         Ok(v) => v,

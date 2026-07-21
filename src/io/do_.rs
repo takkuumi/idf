@@ -70,11 +70,7 @@ pub fn tick_do_output(hal: &Hal) {
         Some(s) => s,
         None => return,
     };
-
-    state.tick_div = state.tick_div.wrapping_add(1);
-    if state.tick_div % HB_DIV == 0 {
-        TASK_HB.tick();
-    }
+    TASK_HB.tick();
 
     let dirty = DO_DIRTY.swap(false, Ordering::Acquire);
     if !dirty {
