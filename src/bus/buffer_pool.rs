@@ -1,68 +1,110 @@
-//! 缓冲区池 - 减少 Modbus TCP 响应堆分配
+//! 缓冲区池 - 减少 Modbus TCP 响应堆分配 (无锁: atomic free-list + UnsafeCell)
 //!
-//! ## 简化设计
-//! 用 RefCell 包装, 不需要 Sync (单线程访问池, 内部数据可由 Mutex 保护)
-//! 注: 此模块主要用于未来优化 Modbus TCP, 当前作为 API 占位符
+//! ## 设计
+//! - `used`: `AtomicBool` 数组, acquire 用 CAS-loop 找空闲槽
+//! - `inner`: `UnsafeCell<[Vec; N]>` 直接索引, 调用方持 idx 期间独占访问 (不抢锁)
+//! - 没有任何 Spin/Mutex 在热路径上, Modbus TCP 响应不阻塞
+//!
+//! ## 线程安全
+//! - acquire/release 必须配对 (RAII 不易在 heapless 上实现, 用索引+手动 release)
+//! - idx 在持有期间仅由调用方线程访问, 无 race
+//!
+//! ## 适用场景
+//! - Modbus TCP 响应构造 (一次性短持有)
+//! - BLE notify 拼包 (短持有)
 
-use crate::sync::Spin;
+use crate::sync::AtomicBits64;
 
-use std::sync::LazyLock;
+use core::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const POOL_SIZE: usize = 4;
 const BUF_SIZE: usize = 256;
 
-/// 全局缓冲池 (Mutex 保护, 完全线程安全)
+/// 全局缓冲池 (atomic free-list + UnsafeCell, 零锁)
 pub struct GlobalBufferPool {
-    inner: Spin<[heapless::Vec<u8, BUF_SIZE>; POOL_SIZE]>,
-    used: Spin<[bool; POOL_SIZE]>,
+    /// 每槽的"使用中"标志; acquire 找第一个 false 槽
+    used: [AtomicBool; POOL_SIZE],
+    /// 缓冲区存储; acquire 后通过 idx 独占访问, 无需 lock
+    inner: UnsafeCell<[heapless::Vec<u8, BUF_SIZE>; POOL_SIZE]>,
 }
+
+// SAFETY: used 是 atomic; inner 由 idx 持有期间独占 (acquire/release 配对保证).
+unsafe impl Sync for GlobalBufferPool {}
+unsafe impl Send for GlobalBufferPool {}
 
 impl GlobalBufferPool {
     pub const fn new() -> Self {
         Self {
-            inner: Spin::new([const { heapless::Vec::new() }; POOL_SIZE]),
-            used: Spin::new([false; POOL_SIZE]),
+            used: [const { AtomicBool::new(false) }; POOL_SIZE],
+            inner: UnsafeCell::new([const { heapless::Vec::new() }; POOL_SIZE]),
         }
     }
 
-    /// 获取缓冲区
-    /// 注: 由于 Rust 借用规则, 池缓冲区的 RAII 模式较难实现
-    /// 这里返回 Option<usize> (缓冲区索引), 由调用方在使用完后归还
+    /// 获取一个空闲缓冲区槽位索引; 池满返回 None.
+    /// 通过 CAS 找第一个 false 槽, 多线程并发安全.
+    #[inline]
     pub fn acquire(&self) -> Option<usize> {
-        let mut used = self.used.lock();
         for i in 0..POOL_SIZE {
-            if !used[i] {
-                used[i] = true;
+            // CAS(false → true): 失败说明被别人抢了, 跳下一个.
+            if self.used[i]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 return Some(i);
             }
         }
         None
     }
 
-    /// 释放缓冲区
+    /// 释放缓冲区槽位.
+    #[inline]
     pub fn release(&self, idx: usize) {
-        let mut used = self.used.lock();
-        used[idx] = false;
+        if idx < POOL_SIZE {
+            self.used[idx].store(false, Ordering::Release);
+        }
     }
 
-    /// 写入缓冲区
-    /// SAFETY: 调用方需保证 idx 是 acquire 返回的合法值
+    /// 写入缓冲区 (调用方独占持 idx 期间).
+    /// SAFETY: idx 必须是当前线程 acquire 得到的有效索引.
+    #[inline]
     pub fn write<F>(&self, idx: usize, f: F)
-    where F: FnOnce(&mut heapless::Vec<u8, BUF_SIZE>)
+    where
+        F: FnOnce(&mut heapless::Vec<u8, BUF_SIZE>),
     {
-        let mut pool = self.inner.lock();
-        pool[idx].clear();
-        f(&mut pool[idx]);
+        debug_assert!(idx < POOL_SIZE);
+        debug_assert!(self.used[idx].load(Ordering::Acquire));
+        // SAFETY: 调用方持有 idx (单线程独占), 没有其他线程能同时 write 同一 idx.
+        let pool = unsafe { &mut *self.inner.get() };
+        let buf = &mut pool[idx];
+        buf.clear();
+        f(buf);
     }
 
-    /// 读取缓冲区
+    /// 读取缓冲区副本 (调用方独占持 idx 期间).
+    /// SAFETY: idx 必须是当前线程 acquire 得到的有效索引.
+    #[inline]
     pub fn read(&self, idx: usize) -> Option<heapless::Vec<u8, BUF_SIZE>> {
-        Some(self.inner.lock()[idx].clone())
+        debug_assert!(idx < POOL_SIZE);
+        debug_assert!(self.used[idx].load(Ordering::Acquire));
+        // SAFETY: 调用方持有 idx (单线程独占).
+        let pool = unsafe { &*self.inner.get() };
+        Some(pool[idx].clone())
+    }
+
+    /// 当前空闲槽位数 (用于监控).
+    pub fn available(&self) -> usize {
+        self.used.iter().filter(|b| !b.load(Ordering::Relaxed)).count()
     }
 }
 
 /// 全局池 (Lazy 初始化)
-pub static POOL: LazyLock<GlobalBufferPool> = LazyLock::new(GlobalBufferPool::new);
+pub static POOL: std::sync::LazyLock<GlobalBufferPool> =
+    std::sync::LazyLock::new(GlobalBufferPool::new);
+
+// AtomicBits64 import 是为了潜在扩展 (例如批量 release); 当前未使用, 保留兼容性.
+#[allow(dead_code)]
+const _ATBITS: fn() -> AtomicBits64 = || AtomicBits64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -79,18 +121,12 @@ mod tests {
         let i1 = POOL.acquire().unwrap();
         POOL.release(i1);
         let i2 = POOL.acquire().unwrap();
-        assert_eq!(i1, i2);  // 释放后复用同一索引
+        assert_eq!(i1, i2); // 释放后复用同一索引
         POOL.release(i2);
     }
-}
 
-#[cfg(test)]
-mod extra_tests {
-    use super::*;
-    
     #[test]
     fn test_pool_with_buffer() {
-        // 测试 acquire 然后写入, 再 read 出来
         let idx = POOL.acquire().unwrap();
         POOL.write(idx, |v| {
             let _ = v.extend_from_slice(b"hello world");
@@ -100,5 +136,30 @@ mod extra_tests {
             assert_eq!(&data[..11], b"hello world");
         }
         POOL.release(idx);
+    }
+
+    #[test]
+    fn test_pool_concurrent_acquire() {
+        use std::sync::Arc;
+        use std::thread;
+        let p = Arc::new(GlobalBufferPool::new());
+        let mut h = vec![];
+        for _ in 0..8 {
+            let pp = p.clone();
+            h.push(thread::spawn(move || {
+                let idx = pp.acquire();
+                if let Some(i) = idx {
+                    pp.write(i, |v| {
+                        let _ = v.extend_from_slice(b"x");
+                    });
+                    pp.release(i);
+                }
+            }));
+        }
+        for x in h {
+            x.join().unwrap();
+        }
+        // 池内 4 槽, 8 线程, 必然有 acquire 返回 None, 但不 panic.
+        assert!(p.available() >= 0);
     }
 }

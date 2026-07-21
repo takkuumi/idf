@@ -21,10 +21,10 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
+
 
 use crate::error::AppResult;
-use crate::sync::Spin;
+
 
 // Arc + Hal 仅被需要 Arc<Hal> 的适配器使用 (ModbusRtuProtocol)
 #[cfg(feature = "modbus-rtu")]
@@ -93,7 +93,8 @@ pub struct ProtocolStats {
 /// 使用原子操作 + Spin, 支持 `&self` 修改 (Protocol::start(&self) 不需要 &mut self)。
 struct ProtocolState {
     running: AtomicBool,
-    started_at: Spin<Option<Instant>>,
+    /// 启动时刻 (esp_timer millis since boot, mod 2^32), 0 = 未启动
+    started_at_ms: AtomicU32,
     error_count: AtomicU32,
 }
 
@@ -101,14 +102,16 @@ impl ProtocolState {
     fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
-            started_at: Spin::new(None),
+            started_at_ms: AtomicU32::new(0),
             error_count: AtomicU32::new(0),
         }
     }
 
     fn mark_started(&self) {
+        // 用 esp_timer_get_time / 1000 取毫秒; 在没有 timer 模块的情况下退回到 1
+        let ms: u32 = (unsafe { esp_idf_sys::esp_timer_get_time() / 1000 }) as u32;
+        self.started_at_ms.store(ms, Ordering::Release);
         self.running.store(true, Ordering::SeqCst);
-        *self.started_at.lock() = Some(Instant::now());
     }
 
     fn mark_stopped(&self) {
@@ -125,8 +128,14 @@ impl ProtocolState {
     }
 
     fn uptime_s(&self) -> u64 {
-        let g = self.started_at.lock();
-        g.as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0)
+        let started = self.started_at_ms.load(Ordering::Acquire);
+        if started == 0 {
+            return 0;
+        }
+        let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() / 1000 }) as u32;
+        // u32 自动 wrap, 直接减法得 delta mod 2^32 (≈ 49 天周期足够)
+        let delta_ms = now_ms.wrapping_sub(started) as u64;
+        delta_ms / 1000
     }
 
     fn error_count(&self) -> u32 {

@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
+use crate::sync::MainLoopCell;
 
 /// 输出周期 (ms)
 const OUTPUT_PERIOD_MS: u64 = 100;
@@ -29,21 +30,17 @@ static TASK_HB: TaskHb = TaskHb::new("ao-output");
 ///
 /// TODO: 假设 `hal.ledc.set_duty(idx: usize, duty: u32) -> ()`，由 hal/ledc 模块实现后接入。
 // 架构改造 Phase 2: AO 合并到 main_loop
-use std::sync::Mutex;
+// 状态用 MainLoopCell 保护 (单线程访问, 零开销)
 
 struct AoState {
     last_duty: [u32; CHANNEL_COUNT],
 }
 
-unsafe impl Send for AoState {}
-unsafe impl Sync for AoState {}
-
-static AO_STATE: Mutex<Option<AoState>> = Mutex::new(None);
+static AO_STATE: MainLoopCell<AoState> = MainLoopCell::new();
 
 pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    let mut guard = AO_STATE.lock().map_err(|_| AppError::Channel("ao state lock poisoned".into()))?;
-    *guard = Some(AoState {
+    AO_STATE.init(AoState {
         last_duty: [u32::MAX; CHANNEL_COUNT],
     });
     log::info!("[ao] output task registered in main_loop (period={}ms)", OUTPUT_PERIOD_MS);
@@ -52,11 +49,7 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
 
 /// main_loop 每 100ms 调用一次
 pub fn tick_ao_output(hal: &crate::hal::Hal) {
-    let mut guard = match AO_STATE.try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let state = match guard.as_mut() {
+    let state = match AO_STATE.get_mut() {
         Some(s) => s,
         None => return,
     };
@@ -68,17 +61,13 @@ pub fn tick_ao_output(hal: &crate::hal::Hal) {
         duties[ch] = (scaled as u32) * DUTY_MAX / SCALED_MAX;
         crate::bus::IO.ao.set_duty(ch, duties[ch]);
     }
-    drop(guard);
     crate::bus::send_event(crate::bus::IoEvent::AoUpdated);
 
-    // 仅在 duty 变化时调用 LEDC
-    let mut guard = AO_STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        for ch in 0..CHANNEL_COUNT {
-            if duties[ch] != state.last_duty[ch] {
-                hal.ledc.set_duty(ch, duties[ch]);
-                state.last_duty[ch] = duties[ch];
-            }
+    // 仅在 duty 变化时调用 LEDC (复用上面已取的 &mut)
+    for ch in 0..CHANNEL_COUNT {
+        if duties[ch] != state.last_duty[ch] {
+            hal.ledc.set_duty(ch, duties[ch]);
+            state.last_duty[ch] = duties[ch];
         }
     }
 }

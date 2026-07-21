@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 
 use crate::config::ai_calib;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::hal::Hal;
 use esp_idf_svc::timer::EspTaskTimerService;
 use crate::health::{self, TaskHb};
+use crate::sync::MainLoopCell;
 
 /// 采样周期 (ms)
 const SAMPLE_PERIOD_MS: u64 = 100;
@@ -31,8 +32,8 @@ static TASK_HB: TaskHb = TaskHb::new("ai-sample");
 /// TODO: 假设 `hal.adc.sample(idx: usize) -> u16`，由 hal/adc 模块实现后接入。
 /// TODO: `_timer_svc` 可用于更精确的定时采样，当前用 std::thread::sleep。
 // 架构改造 Phase 2: AI 合并到 main_loop
-// 状态用 Mutex 保护 (try_lock 非阻塞, 死锁安全)
-use std::sync::Mutex;
+// 状态用 MainLoopCell 保护 (单线程访问, 无 atomic CAS 开销)
+
 
 struct AiState {
     buf: [[u16; AVG_WINDOW]; CHANNEL_COUNT],
@@ -40,22 +41,16 @@ struct AiState {
     filled: usize,
 }
 
-unsafe impl Send for AiState {}
-unsafe impl Sync for AiState {}
-
-static AI_STATE: Mutex<Option<AiState>> = Mutex::new(None);
+static AI_STATE: MainLoopCell<AiState> = MainLoopCell::new();
 
 pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppResult<()> {
     health::register(&TASK_HB);
     // 不再创建独立 pthread. ADC driver 通过 hal.adc 访问, 状态由 main_loop 持有.
-    let mut guard = AI_STATE.lock().map_err(|_| AppError::Channel("ai state lock poisoned".into()))?;
-    *guard = Some(AiState {
+    AI_STATE.init(AiState {
         buf: [[0u16; AVG_WINDOW]; CHANNEL_COUNT],
         pos: 0,
         filled: 0,
     });
-    // hal 不需要保存, ADC 在 main_loop 中通过全局 hal 访问
-    drop(guard);
     let _ = hal; // 抑制 unused 警告
     log::info!("[ai] sample task registered in main_loop (period={}ms)", SAMPLE_PERIOD_MS);
     Ok(())
@@ -63,11 +58,7 @@ pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppR
 
 /// main_loop 每 100ms 调用一次
 pub fn tick_ai_sample(hal: &crate::hal::Hal) {
-    let mut guard = match AI_STATE.try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let state = match guard.as_mut() {
+    let state = match AI_STATE.get_mut() {
         Some(s) => s,
         None => return,
     };
@@ -90,6 +81,5 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     }
     state.pos = (state.pos + 1) % AVG_WINDOW;
     state.filled = (state.filled + 1).min(AVG_WINDOW);
-    drop(guard);
     crate::bus::send_event(crate::bus::IoEvent::AiSampled);
 }

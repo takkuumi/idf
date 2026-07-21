@@ -2,14 +2,13 @@
 //!
 //! - 默认版本: 周期 1ms 读取 8 路 GPIO DI (光耦隔离输入)
 //! - F3/F4 版本: 周期 1ms 读取 16/48 路 I2C MCP23017 扩展 DI
-use std::sync::Mutex;
-
 use std::sync::Arc;
 
 use crate::config::hw_version;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
+use crate::sync::MainLoopCell;
 
 /// 扫描周期 (ms)
 /// DI 扫描周期:
@@ -45,16 +44,12 @@ struct DiState {
     last_hb: u32,
 }
 
-unsafe impl Send for DiState {}
-unsafe impl Sync for DiState {}
-
-static DI_STATE: Mutex<Option<DiState>> = Mutex::new(None);
+static DI_STATE: MainLoopCell<DiState> = MainLoopCell::new();
 
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    let mut guard = DI_STATE.lock().map_err(|_| AppError::Io("di state lock poisoned".into()))?;
-    *guard = Some(DiState {
+    DI_STATE.init(DiState {
         stable: 0,
         candidate: 0,
         candidate_count: 0,
@@ -71,11 +66,7 @@ pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
 
 /// main_loop 每 20ms 调用一次 (5 分频)
 pub fn tick_di_scan(hal: &Hal) {
-    let mut guard = match DI_STATE.try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let state = match guard.as_mut() {
+    let state = match DI_STATE.get_mut() {
         Some(s) => s,
         None => return,
     };

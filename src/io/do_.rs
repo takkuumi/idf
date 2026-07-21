@@ -2,15 +2,14 @@
 //!
 //! - F16 版本: 周期 ~1ms 检查 `BUS.do_.bits`, 变化时更新 PCA9555 输出
 //! - 支持事件驱动: Modbus 写入后调用 `notify()` 立即触发刷新
-use std::sync::Mutex;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::hw_version;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
+use crate::sync::MainLoopCell;
 
 /// 输出刷新间隔 (ms) — 细粒度检查, 配合 notify 实现亚 ms 级响应
 const TICK_MS: u64 = 1;
@@ -39,16 +38,12 @@ struct DoState {
     tick_div: u32,
 }
 
-unsafe impl Send for DoState {}
-unsafe impl Sync for DoState {}
-
-static DO_STATE: Mutex<Option<DoState>> = Mutex::new(None);
+static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
 
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    let mut guard = DO_STATE.lock().map_err(|_| AppError::Io("do state lock poisoned".into()))?;
-    *guard = Some(DoState {
+    DO_STATE.init(DoState {
         last: u64::MAX,
         tick_div: 0,
     });
@@ -62,11 +57,7 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
 
 /// main_loop 每 100ms 调用一次 (事件驱动由 DOChanged 事件触发额外 tick)
 pub fn tick_do_output(hal: &Hal) {
-    let mut guard = match DO_STATE.try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let state = match guard.as_mut() {
+    let state = match DO_STATE.get_mut() {
         Some(s) => s,
         None => return,
     };

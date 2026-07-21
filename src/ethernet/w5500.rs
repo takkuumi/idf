@@ -19,6 +19,7 @@
 //! 注意: 需在 sdkconfig.defaults 中启用 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
 use core::fmt::Write as _;
+use crate::sync::MainLoopCell;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -306,32 +307,23 @@ fn fmt_ip(addr: &u32) -> heapless::String<15> {
 
 // ---- 心跳任务：每 5s 检测网关连通性；连续失败 >= 3 次触发 esp_restart ----
 // 架构改造 Phase 2: eth-heartbeat 合并到 main_loop
-use std::sync::Mutex;
-
+// 状态用 MainLoopCell 保护 (单线程访问, 零开销)
 struct EthHbState {
     fail_count: u32,
 }
 
-unsafe impl Send for EthHbState {}
-unsafe impl Sync for EthHbState {}
-
-static ETH_HB_STATE: Mutex<Option<EthHbState>> = Mutex::new(None);
+static ETH_HB_STATE: MainLoopCell<EthHbState> = MainLoopCell::new();
 
 fn spawn_heartbeat() -> AppResult<()> {
     health::register(&ETH_HB);
-    let mut guard = ETH_HB_STATE.lock().map_err(|_| AppError::Ethernet("eth-hb state lock poisoned".into()))?;
-    *guard = Some(EthHbState { fail_count: 0 });
+    ETH_HB_STATE.init(EthHbState { fail_count: 0 });
     log::info!("[eth] heartbeat registered in main_loop (period={}s)", HEARTBEAT_PERIOD_S);
     Ok(())
 }
 
 /// main_loop 每 5s 调用一次
 pub fn tick_eth_heartbeat() {
-    let mut guard = match ETH_HB_STATE.try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let state = match guard.as_mut() {
+    let state = match ETH_HB_STATE.get_mut() {
         Some(s) => s,
         None => return,
     };
