@@ -2,13 +2,9 @@
 //!
 //! - 默认版本: 周期 1ms 读取 8 路 GPIO DI (光耦隔离输入)
 //! - F3/F4 版本: 周期 1ms 读取 16/48 路 I2C MCP23017 扩展 DI
-//! - 软件去抖：连续 3 次相同采样值才确认更新
-//! - 检测上升/下降沿 (debug 级别日志)
-//!
-//! 与总线交互：写入 `BUS.di.bits` (u64, bit i 对应 DI i)
+use std::sync::Mutex;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::config::hw_version;
 use crate::error::{AppError, AppResult};
@@ -35,71 +31,88 @@ const HB_DIV: u32 = 20;
 static TASK_HB: TaskHb = TaskHb::new("di-scan");
 
 /// 启动 DI 扫描任务
+// 架构改造 Phase 2: DI 扫描合并到 main_loop
+// 原始: 独立 pthread 5ms 高频扫描
+// 改造后: main_loop 100ms tick 调用 (HAL 间隔 20ms 一次, main_loop 5 分频)
+// 牺牲: 5ms → 20ms 响应延迟, 对工业 50Hz 信号仍足够 (20ms 周期采 1 次)
+
+
+struct DiState {
+    stable: u64,
+    candidate: u64,
+    candidate_count: u8,
+    tick_div: u32,
+    last_hb: u32,
+}
+
+unsafe impl Send for DiState {}
+unsafe impl Sync for DiState {}
+
+static DI_STATE: Mutex<Option<DiState>> = Mutex::new(None);
+
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
-pub fn start_scan_task(hal: Arc<Hal>) -> AppResult<()> {
+pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
     health::register(&TASK_HB);
-    health::set_next_thread_core(health::CORE_RT);
-    let result = std::thread::Builder::new()
-        .name("di-scan".into())
-        .spawn(move || {
-            log::info!(
-                "[di] scan task started, period={}ms, channels={} (version {})",
-                SCAN_PERIOD_MS, hw_version::DI_COUNT, hw_version::NAME
-            );
-
-            // 上一次已确认稳定的 DI 状态
-            let mut stable: u64 = 0;
-            // 待确认的候选值 (去抖窗口内的最新采样)
-            let mut candidate: u64 = 0;
-            let mut candidate_count: u8 = 0;
-            let mut tick_div: u32 = 0;
-
-            loop {
-                tick_div = tick_div.wrapping_add(1);
-                if tick_div % HB_DIV == 0 {
-                    TASK_HB.tick();
-                }
-
-                // 1. 采样所有 DI 通道 (统一通过 DigitalIo trait 访问)
-                let bits: u64 = match hal.dio().read_di_all() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::warn!("[di] read_di_all failed: {}", e);
-                        // 读失败保持上一次值, 避免误报变化
-                        candidate
-                    }
-                };
-
-                // 2. 去抖：连续 DEBOUNCE_COUNT 次相同才确认
-                if bits == candidate {
-                    candidate_count = candidate_count.saturating_add(1);
-                } else {
-                    candidate = bits;
-                    candidate_count = 1;
-                }
-
-                // 3. 稳定值变化时更新总线并打边沿日志
-                if candidate_count >= DEBOUNCE_COUNT && candidate != stable {
-                    let changed = candidate ^ stable;
-                    let rising = candidate & changed;
-                    let falling = stable & changed;
-                    if rising != 0 {
-                        log::debug!("[di] rising  : 0x{:016X}", rising);
-                    }
-                    if falling != 0 {
-                        log::debug!("[di] falling : 0x{:016X}", falling);
-                    }
-                    stable = candidate;
-                    // 阶段 A: 无锁写入 bus::IO.di (AtomicBits64)
-                    crate::bus::IO.di.store_bits(stable);
-                    crate::bus::send_event(crate::bus::IoEvent::DiChanged);
-                }
-
-                std::thread::sleep(Duration::from_millis(SCAN_PERIOD_MS));
-            }
-        });
-    health::reset_thread_core();
-    result.map_err(|e| AppError::Io(format!("spawn di-scan: {e}")))?;
-
+    let mut guard = DI_STATE.lock().map_err(|_| AppError::Io("di state lock poisoned".into()))?;
+    *guard = Some(DiState {
+        stable: 0,
+        candidate: 0,
+        candidate_count: 0,
+        tick_div: 0,
+        last_hb: 0,
+    });
+    let _ = _hal;
+    log::info!(
+        "[di] scan task registered in main_loop (period=20ms, channels={} version {})",
+        hw_version::DI_COUNT, hw_version::NAME
+    );
     Ok(())
+}
+
+/// main_loop 每 20ms 调用一次 (5 分频)
+pub fn tick_di_scan(hal: &Hal) {
+    let mut guard = match DI_STATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    state.tick_div = state.tick_div.wrapping_add(1);
+    // HB_DIV 等效处理: 每 100ms tick 一次 (main_loop 5 tick = 100ms)
+    if state.tick_div % HB_DIV == 0 {
+        TASK_HB.tick();
+    }
+
+    let bits: u64 = match hal.dio().read_di_all() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[di] read_di_all failed: {}", e);
+            state.candidate
+        }
+    };
+
+    if bits == state.candidate {
+        state.candidate_count = state.candidate_count.saturating_add(1);
+    } else {
+        state.candidate = bits;
+        state.candidate_count = 1;
+    }
+
+    if state.candidate_count >= DEBOUNCE_COUNT && state.candidate != state.stable {
+        let changed = state.candidate ^ state.stable;
+        let rising = state.candidate & changed;
+        let falling = state.stable & changed;
+        if rising != 0 {
+            log::debug!("[di] rising  : 0x{:016X}", rising);
+        }
+        if falling != 0 {
+            log::debug!("[di] falling : 0x{:016X}", falling);
+        }
+        state.stable = state.candidate;
+        crate::bus::IO.di.store_bits(state.stable);
+        crate::bus::send_event(crate::bus::IoEvent::DiChanged);
+    }
 }

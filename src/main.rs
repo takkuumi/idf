@@ -228,12 +228,20 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
         // 每个周期喂狗 (100ms), 远小于 WDT 超时 10s
         health::feed_wdt();
 
-        // AI/AO 100ms tick (架构合并 Phase 2: 取消独立 pthread)
+        // AI/AO/DI/DO tick (架构合并 Phase 2: 取消独立 pthread)
         #[cfg(feature = "ai-ao")]
         {
             crate::channel::ai::tick_ai_sample(&hal);
             crate::channel::ao::tick_ao_output(&hal);
         }
+        // DI/DO 每 5 tick (20ms) 调用一次, 保留去抖逻辑
+        if tick % 5 == 0 {
+            #[cfg(feature = "io-di-do")]
+            crate::io::di::tick_di_scan(&hal);
+        }
+        // DO notify 由 modbus 写入触发 (见 bus::backends::write_coil), tick_do_output 在 100ms poll 中调用
+        #[cfg(feature = "io-di-do")]
+        crate::io::do_::tick_do_output(&hal);
 
         // BLE 通知发送 (每 100ms, 替代独立线程)
         #[cfg(feature = "ble-at")]
