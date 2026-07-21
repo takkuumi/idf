@@ -1,0 +1,14 @@
+=== Test 1: READ_IP (FC=03, addr=0x08C7, cnt=12) ===
+err: [Errno 54] Connection reset by peer
+
+=== Test 2: READ_MAC (FC=03, addr=0x08D7, cnt=6) ===
+err: [Errno 54] Connection reset by peer
+
+=== Test 3: READ_FW_VERSION (FC=04, addr=0x087E, cnt=2) ===
+recv 13 bytes: 00010000000701040400010267
+
+=== Test 4: READ_HW_INFO (FC=04, addr=0x087C, cnt=2) ===
+recv 13 bytes: 00010000000701040410100402
+
+=== Test 5: READ_HW_VER (FC=03, addr=0x08A5, cnt=1) ===
+err: [Errno 54] Connection reset by peer
