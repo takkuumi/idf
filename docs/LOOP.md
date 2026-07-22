@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-22 (Phase 2 完成)
+> 最后更新: 2026-07-23 (LOOP3: BLE ID + RS485 持久化路径修复)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -27,16 +27,56 @@
 | # | 任务 | 状态 | 关键产出 |
 |---|------|------|----------|
 | 1 | heapless 升级 0.9.3 | ✅ | `Cargo.toml` |
-| 2 | 手持机显示 IP/MAC/BLE_ID | ✅ | `handle_ble_android_read_command` + BLE_ID 用 ble_name |
+| 2 | 手持机显示 IP/MAC/BLE_ID | ✅ | `handle_ble_android_read_command` (LOOP2) |
 | 3 | 硬件信息确认 | ✅ | `docs/pinmap.md` 重写 (ESP32-S3R2) |
 | 4 | 无锁测试 + 栈估算 | ✅ | 127 测试 + 架构合并消除栈风险 |
-| 5 | Modbus TCP 完整测试 | ✅ | FC=03/04 全部通过 |
+| 5 | Modbus TCP 完整测试 | 🟡 | FC=03/04 通过; FC=06/10 写响应丢失 (后续) |
 | 6 | log/ 目录 + 详细日志 | ✅ | 7 子目录 + SUMMARY |
 | 7 | mesh 清理 | ✅ | 死代码已删 |
 | 8 | 引脚核对 | ✅ | pinmap.md 1:1 对齐 |
 | 9 | 性能测试 | ✅ | Modbus TCP 11s 全部响应 |
 | 10 | 7×24 不间断运行 | 🟡 | 1 小时长稳测试中 |
 | 11 | 5 角色协作 | ✅ | 完整推进 |
+| 12 | **BLE ID 写入 0x08E2 路由修复** | ✅ (LOOP3) | commit `d9654f7` |
+| 13 | **MBAP.length 兼容 pymodbus** | ✅ (LOOP3) | commit `22a6e0a` |
+
+## LOOP3 关键修复 (2026-07-23)
+
+### 问题 1: BLE ID 写入 0x08E2 被错误路由到 BLE MAC
+
+**根因**:
+- metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51) 通过 BLE Modbus FC=10 写 `0x08E2` (4 寄存器)
+- 期望更新 `cfg.ble_name` (蓝牙 ID 显示字段)
+- 旧代码 `HOLD_BT_ADDR_BASE = 0x08E2` 把 0x08E2 路由到 `cfg.ble_mac`
+- 写入被错误地修改 BLE MAC, 而 `ble_name` 永远不变
+- 读取看似正常, 是因为 `handle_ble_android_read_command` 自定义读 handler 直接返回 `cfg.ble_name`
+
+**修复** (`d9654f7`):
+- `HOLD_BLE_NAME_BASE: 4000 → 0x08E2` (metuory 期望地址)
+- `HOLD_BT_ADDR_BASE: 2274 → 0x0FA4` (用户区 4004, 保留兼容)
+- `read_reg/write_reg`: BLE_NAME 优先 BLE_MAC 检查
+- BLE_NAME 写返回 `Persist` (而非 Apply)
+- 6 个新增回归测试: `test_ble_name_at_metuory_addr_is_persist` 等
+
+### 问题 2: MBAP.length 响应字段不包含 unit_id, pymodbus 3.x 解析失败
+
+**根因**:
+- Modbus TCP 标准 (Modbus_Application_Protocol_V1_1b3 §4.1) 规定:
+  `MBAP.length = unit_id(1) + func(1) + data(N) = 2 + N`
+- 旧实现 `mbap_len = resp_pdu.len() (= 1+N)` 导致 pymodbus 3.8.6 解析时
+  把 func 误认为 unit_id, 报错 `Unable to decode frame: byte_count N > length of packet N`
+
+**修复** (`22a6e0a`):
+- `src/modbus/tcp_server.rs: mbap_len = 1 + resp_pdu.len()`
+- pymodbus 3.8.6 验证: 5 个 RS485 寄存器读正确 (0x3000, 1, 0, 1000, 20)
+
+## 待解决问题
+
+### BLE 写入 (metuory → 0x08E2) 仍需端到端验证
+- 代码修复 ✅, 单元测试 ✅, BLE 路径需手持机实测
+- metuory 写入流程: WRITE_BLUETOOTH_ID (0x51) → BLE Modbus FC=10 → `try_handle_binary_protocol` →
+  `handle_modbus_rtu` → `write_multi_regs_pdu` → `backends::write_hold_reg(0x08E2+i, v)`
+- 修复后: 写入 `cfg.ble_name[0..8]` (BE), 返回 `Persist`, actor 异步落盘 NVS
 
 ## 架构 (Phase 2 完成)
 
@@ -49,7 +89,7 @@ main_loop (100ms tick)
 └── tick_eth_heartbeat()         # 5s (50 分频), 合并 eth-heartbeat pthread
 
 4 个保留 pthread 任务:
-- DeviceActor (NVS 持久化)
+- DeviceActor (NVS 持久化, 8KB 栈)
 - mb-rtu-master (Modbus RTU 主站)
 - mb-rtu-slave (Modbus RTU 从站)
 - mb-tcp-listen (Modbus TCP)
@@ -67,8 +107,7 @@ main_loop (100ms tick)
 ## 烧录
 
 ```bash
-cargo build && \
-espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     target/xtensa-esp32s3-espidf/debug/gateway
 ```
 
@@ -78,31 +117,3 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 
 `log/` 目录:
 - `log/README.md` - 测试矩阵
-- `log/SUMMARY_2026-07-22.md` - 最新工作总结
-- `log/sessions/` - 启动/编译日志
-- `log/hardware/pinout_audit.md` - 引脚核对
-- `log/ble/android_read_2026-07-21.md` - BLE 兼容性
-- `log/modbus/tcp_test.md` - Modbus TCP 测试
-- `log/unit/lockfree_tests.md` - 无锁测试
-
-## 最近 Commits
-
-```
-cd6fc08 Phase 2 完成: eth-heartbeat 合并到 main_loop
-bb6ebe4 Phase 2 续: DI/DO 合并到 main_loop
-57fb38c Phase 2 架构改造: AI/AO 合并到 main_loop
-c819944 P0: 根本修复 pthread Stack canary + ENOMEM
-8d02e9b P0+#8: heapless 0.9.3 + BLE 修复 + mesh 清理 + 引脚
-```
-
-## 已知问题
-
-1. **eth-heartbeat stall**: 已合并但仍 stall, 排查中
-2. **Modbus RTU master 无响应**: RS485 总线未接 slave 1, 属预期
-3. **健康监控显示 9 tasks**: 含已合并任务 (仅 register, 未创建线程)
-
-## 下一步
-
-- 长稳测试 1 小时验证 7×24
-- 健康监控显示清理
-- modbus/shared.rs Vec → heapless::Vec (进一步减少 heap 分配)
