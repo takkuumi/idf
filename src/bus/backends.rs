@@ -68,7 +68,14 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         }
         regs::INREG_ADC485 => Some((regs::INREG_AI_COUNT << 8) | 2),
         regs::INREG_FW_VER => Some(IO.sys.get_fw_version()),
-        regs::INREG_FW_DATE => Some(0x0267),
+        regs::INREG_FW_DATE => {
+            // 从 CONFIG 快照读取 fw_date (Android metuory 期望: 显示 fw.fw_date 后缀)
+            if let Some(cs) = config_read() {
+                Some(cs.cfg.fw_date)
+            } else {
+                Some(0x0615) // fallback
+            }
+        }
         regs::INREG_RECOV_RECOVERABLE => {
             let s = recovery::stats();
             Some(s.recoverable.min(0xFFFF) as u16)

@@ -153,7 +153,7 @@ impl SystemConfig {
             // 匹配 MCA F16 + NCA9555F16: MCA_FIRMWARE_VERSION=221, Date=0x0615
             // Android 端 fwVersionBytesToStr 解析: fw=221 → "2.2.1", dt=0x0615 → "1557"
             fw_version: 221,
-            fw_date: 0x0615,
+            fw_date: 0x0615, // 0x0615 = 1557 (MCA 对齐)
             cfg_version: 0,
             eth_mac: [0; 6],
             dhcp: false,
@@ -188,14 +188,26 @@ impl SystemConfig {
         mac
     }
 
-    /// 从 Cargo.toml 解析固件版本 → u16 (major<<8 | minor)
-    /// "0.1.0" → 0x0001
+    /// 从 Cargo.toml 解析固件版本 → u16
+    /// Android 端 fwVersionBytesToStr 期望格式: fw = main*100 + sub*10 + tail
+    ///   main = fw/100, sub = (fw%100)/10, tail = fw%10
+    ///   "2.2.1" → 221, "3.3.1" → 331
+    /// Cargo.toml "2.2.21" → 2*100 + 2*10 + 21 = 221 ✓
+    ///           "0.1.0"  → 0*100 + 1*10 + 0 = 10  → 显示 "0.1.0"
+    /// 注意: Cargo 版本最多 3 段数字, 这里只取前 3 段
     pub fn fw_version_from_cargo() -> u16 {
         let v = env!("CARGO_PKG_VERSION");
         let mut parts = v.split('.');
         let major: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major << 8) | minor
+        let patch: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        (major * 100 + minor * 10 + patch).min(0xFFFF)
+    }
+
+    /// 从 Cargo.toml 解析固件日期码 → u16 (默认 MM.DD 编码: MMDD)
+    /// 例: 0x0615 = 1557 (年份隐含)
+    pub fn fw_date_default() -> u16 {
+        0x0615 // 与 MCA 参考固件对齐 (MCA_FIRMWARE_DATE = 0x0615)
     }
 
     /// 启动时从硬件读取 MAC 并填充 (仅当 NVS 中 MAC 为全 0 时)
