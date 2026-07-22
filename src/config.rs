@@ -339,6 +339,14 @@ pub mod regs {
     // ---- 错误环日志 (RO, FC=04) ----
     // 用于远程诊断: 拉取最近 8 条错误记录
     // 每条 4 个 U16: timestamp_low, timestamp_high+level+module, code, context_low, context_high
+    // ---- BLE Android 兼容寄存器 (RO, FC=04) ----
+    // 0x08A5-0x08E2 是 metuory-wireless-management-app-1.0.78 通过 BLE 读取的寄存器,
+    // 也通过 Modbus TCP 暴露给远程 Master (用于调试)
+    pub const INREG_HW_VER: u16 = 0x08A5;        // 硬件版本号 (CONFIG.cfg.hw_version)
+    pub const INREG_IP_BASE: u16 = 0x08C7;      // IP/Mask/GW (12 regs = 24 bytes)
+    pub const INREG_MAC_BASE: u16 = 0x08D7;      // MAC (6 regs = 12 bytes)
+    pub const INREG_BLE_ID_BASE: u16 = 0x08E2;  // BLE 名称 (4 regs = 8 bytes)
+
     pub const INREG_RINGLOG_COUNT: u16 = 0x0885;      // 当前环日志条目数 (0-100)
     pub const INREG_RINGLOG_WRITES: u16 = 0x0886;     // 总写入次数 (mod 2^32)
     pub const INREG_RINGLOG_BASE: u16 = 0x0887;       // 8 条最近日志基地址

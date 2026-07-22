@@ -76,6 +76,96 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
                 Some(0x0615) // fallback
             }
         }
+        // ---- BLE Android 兼容寄存器 (Modbus TCP 也可读) ----
+        regs::INREG_HW_VER => {
+            if let Some(cs) = config_read() {
+                Some(cs.cfg.hw_version)
+            } else {
+                Some(0x0100) // F16 default
+            }
+        }
+        regs::INREG_IP_BASE => {
+            // IP (4 octets, BE u16 each)
+            if let Some(cs) = config_read() {
+                let ip = cs.cfg.ip;
+                Some(u16::from_be_bytes([ip[0], ip[1]]))
+            } else {
+                Some(0)
+            }
+        }
+        2248 => {
+            if let Some(cs) = config_read() {
+                let ip = cs.cfg.ip;
+                Some(u16::from_be_bytes([ip[2], ip[3]]))
+            } else { Some(0) }
+        }
+        2249 => {
+            if let Some(cs) = config_read() {
+                let m = cs.cfg.mask;
+                Some(u16::from_be_bytes([m[0], m[1]]))
+            } else { Some(0) }
+        }
+        2250 => {
+            if let Some(cs) = config_read() {
+                let m = cs.cfg.mask;
+                Some(u16::from_be_bytes([m[2], m[3]]))
+            } else { Some(0) }
+        }
+        2251 => {
+            if let Some(cs) = config_read() {
+                let g = cs.cfg.gateway;
+                Some(u16::from_be_bytes([g[0], g[1]]))
+            } else { Some(0) }
+        }
+        2252 => {
+            if let Some(cs) = config_read() {
+                let g = cs.cfg.gateway;
+                Some(u16::from_be_bytes([g[2], g[3]]))
+            } else { Some(0) }
+        }
+        regs::INREG_MAC_BASE => {
+            if let Some(cs) = config_read() {
+                let m = cs.cfg.eth_mac;
+                Some(u16::from_be_bytes([m[0], m[1]]))
+            } else { Some(0) }
+        }
+        2264 => {
+            if let Some(cs) = config_read() {
+                let m = cs.cfg.eth_mac;
+                Some(u16::from_be_bytes([m[2], m[3]]))
+            } else { Some(0) }
+        }
+        2265 => {
+            if let Some(cs) = config_read() {
+                let m = cs.cfg.eth_mac;
+                Some(u16::from_be_bytes([m[4], m[5]]))
+            } else { Some(0) }
+        }
+        regs::INREG_BLE_ID_BASE => {
+            // BLE 名称前 4 字节 (UTF-8 模式兼容)
+            if let Some(cs) = config_read() {
+                let n = cs.cfg.ble_name;
+                Some(u16::from_be_bytes([n[0], n[1]]))
+            } else { Some(0) }
+        }
+        2275 => {
+            if let Some(cs) = config_read() {
+                let n = cs.cfg.ble_name;
+                Some(u16::from_be_bytes([n[2], n[3]]))
+            } else { Some(0) }
+        }
+        2276 => {
+            if let Some(cs) = config_read() {
+                let n = cs.cfg.ble_name;
+                Some(u16::from_be_bytes([n[4], n[5]]))
+            } else { Some(0) }
+        }
+        2277 => {
+            if let Some(cs) = config_read() {
+                let n = cs.cfg.ble_name;
+                Some(u16::from_be_bytes([n[6], n[7]]))
+            } else { Some(0) }
+        }
         regs::INREG_RECOV_RECOVERABLE => {
             let s = recovery::stats();
             Some(s.recoverable.min(0xFFFF) as u16)
