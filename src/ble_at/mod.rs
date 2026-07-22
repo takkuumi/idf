@@ -1212,14 +1212,18 @@ fn handle_ble_android_read_command(
     // RCU 快照借用, 在函数作用域内有效
     let cfg: &crate::device::system_config::SystemConfig = &cfg_guard.cfg;
 
-    let rsp_data: heapless::Vec<u8, 16> = match (reg_addr, reg_cnt) {
+    let rsp_data: heapless::Vec<u8, 32> = match (reg_addr, reg_cnt) {
+        // ⚠️ 所有 push 必须在 Vec 容量 (32) 内! 超出会静默截断 → Android 严格长度检查失败 → UI 空
+        // ⚠️ READ_IP (0x08C7) 需 25 字节 (1 length + 8 ip + 8 mask + 8 gw), 旧 Vec<u8, 16> bug 见 LOOP2
+        // 回归测试: test_android_parse_ip_no_truncation
+
         // READ_HARDWARE_INFO (0x087C, 0x0002): [4][DO][DI][ADC][RS485]
         (0x087C, 2) => {
             let do_cnt = crate::config::hw_version::DO_COUNT as u8;
             let di_cnt = crate::config::hw_version::DI_COUNT as u8;
             let adc_cnt = crate::config::hw_version::AI_COUNT as u8;
             let rs485_cnt = 2u8;
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4); // length
             let _ = d.push(do_cnt);
             let _ = d.push(di_cnt);
@@ -1233,7 +1237,7 @@ fn handle_ble_android_read_command(
         (0x087E, 2) => {
             let fw = cfg.fw_version;
             let dt = cfg.fw_date;
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4); // length = getFWVersionBufferLength() = 2*2 = 4
             let _ = d.push((fw >> 8) as u8);
             let _ = d.push((fw & 0xFF) as u8);
@@ -1246,7 +1250,7 @@ fn handle_ble_android_read_command(
         // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
         (0x08A5, 1) => {
             let hw = cfg.hw_version;
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(2);
             let _ = d.push((hw >> 8) as u8);
             let _ = d.push((hw & 0xFF) as u8);
@@ -1261,7 +1265,7 @@ fn handle_ble_android_read_command(
             let ip = cfg.ip;
             let mask = cfg.mask;
             let gw = cfg.gateway;
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
             // IP 每个 octet → 2 bytes BE (高字节 0)
             for &b in &ip { let _ = d.push(0); let _ = d.push(b); }
@@ -1279,7 +1283,7 @@ fn handle_ble_android_read_command(
         //   getMacBufferLength() = 6*2 = 12
         (0x08D7, 6) => {
             let mac = cfg.eth_mac;
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(12); // length = getMacBufferLength() = 6*2 = 12
             for &b in &mac { let _ = d.push(0); let _ = d.push(b); }
             log::info!("[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -1295,7 +1299,7 @@ fn handle_ble_android_read_command(
         (0x08E2, 4) => {
             let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(cfg.ble_name.len());
             let take = name_len.min(4);
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4); // length_byte = 4 (Android 实际读 bytes[1..5])
             // ble_name 前 4 字节 (不足补 0, UTF-8 mode 截断到 0; HEX mode 跳过)
             for i in 0..4 {
@@ -1338,9 +1342,11 @@ fn build_android_read_response_pdu(
     ai_count: u8,
     rs485_count: u8,
 ) -> Option<heapless::Vec<u8, 32>> {
-    let rsp_data: heapless::Vec<u8, 16> = match (reg_addr, reg_cnt) {
+    let rsp_data: heapless::Vec<u8, 32> = match (reg_addr, reg_cnt) {
+        // 所有 push 必须保证不超 Vec 容量 (32); 超出会导致 Android 严格长度检查失败
+        // 见 test_android_parse_ip_no_truncation 回归测试
         (0x087C, 2) => {
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4);
             let _ = d.push(do_count);
             let _ = d.push(di_count);
@@ -1350,7 +1356,7 @@ fn build_android_read_response_pdu(
         }
         (0x087E, 2) => {
             // Android: [4][fw_hi][fw_lo][dt_hi][dt_lo]  (5B rsp_data)
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4);
             let _ = d.push((cfg_fw_ver >> 8) as u8);
             let _ = d.push((cfg_fw_ver & 0xFF) as u8);
@@ -1359,7 +1365,7 @@ fn build_android_read_response_pdu(
             d
         }
         (0x08A5, 1) => {
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(2);
             let _ = d.push((cfg_hw_ver >> 8) as u8);
             let _ = d.push((cfg_hw_ver & 0xFF) as u8);
@@ -1367,7 +1373,7 @@ fn build_android_read_response_pdu(
         }
         (0x08C7, 12) => {
             // Android: [24][ip(8)][mask(8)][gw(8)]  (25B rsp_data, 每 octet BE u16)
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(24);
             for &b in &cfg_ip { let _ = d.push(0); let _ = d.push(b); }
             for &b in &cfg_mask { let _ = d.push(0); let _ = d.push(b); }
@@ -1376,7 +1382,7 @@ fn build_android_read_response_pdu(
         }
         (0x08D7, 6) => {
             // Android: [12][mac(12)]  (13B rsp_data, 每 mac byte BE u16)
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(12);
             for &b in &cfg_mac { let _ = d.push(0); let _ = d.push(b); }
             d
@@ -1384,7 +1390,7 @@ fn build_android_read_response_pdu(
         (0x08E2, 4) => {
             let mut id = [0u8; 4];
             id.copy_from_slice(&cfg_ble_mac[2..6]);
-            let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(4);
             let _ = d.extend_from_slice(&id);
             d
@@ -1567,6 +1573,24 @@ mod android_compat_tests {
         assert_eq!(gw, &[0x00, 192, 0x00, 168, 0x00, 51, 0x00, 1]);
     }
 
+    // ---- 回归测试: 防止 rsp_data Vec 容量不足 (16→32) 导致 Android 不显示 IP ----
+    // Bug 根因: rsp_data Vec 容量=16, IP 响应需 25 字节 → push 静默截断到 16
+    // Android 严格检查 buffer.length==25, 截断后解析失败 → UI 显示空
+    #[test]
+    fn test_android_parse_ip_no_truncation() {
+        // 边界值 0xFF 测试最大情况
+        let pdu = build_android_read_response_pdu(
+            0x01, 0x03, 0x08C7, 12,
+            [0xFF; 4], [0xFF; 4], [0xFF; 4],
+            [0xFF; 6], [0xFF; 6],
+            0, 0xFFFF, 0xFFFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ).expect("must handle");
+        let data = &pdu[2..];
+        // 必须是 25 字节 (1 length + 8 ip + 8 mask + 8 gw)
+        assert_eq!(data.len(), 25, "rsp_data 容量不足! IP 响应被截断");
+        assert_eq!(data[0], 24, "data_length 必须是 24");
+    }
+
     #[test]
     fn test_android_parse_mac() {
         let pdu = build_android_read_response_pdu(
@@ -1625,7 +1649,7 @@ mod android_compat_tests {
     fn test_android_parse_bluetooth_id_utf8() {
         // 模拟生产代码: 使用 cfg.ble_name = "Mesh" + 4 个 0
         // [length=4][M][e][s][h] = 5 bytes
-        let mut d: heapless::Vec<u8, 16> = heapless::Vec::new();
+        let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
         let _ = d.push(4);
         let name = b"Mesh";
         for i in 0..4 {
