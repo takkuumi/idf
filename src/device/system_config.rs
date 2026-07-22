@@ -393,21 +393,23 @@ impl SystemConfig {
         if let Some(v) = read_mac(&self.eth_mac, regs::HOLD_MAC_BASE, addr) {
             return Some(v);
         }
-        // BLE MAC 地址 — 6 字节 → 4 个 U16 (高字节在前, 不足 8 字节用 0 填充)
-        // Android 端 READ_BLUETOOTH_ID 期望读 4 寄存器 (8 bytes)
-        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
-            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
-            let b0 = if idx < 6 { self.ble_mac[idx] } else { 0 };
-            let b1 = if idx + 1 < 6 { self.ble_mac[idx + 1] } else { 0 };
-            return Some(u16::from_be_bytes([b0, b1]));
-        }
-        // BLE 名称 — 2字节/字 (自定义位置 HOLD_BLE_NAME_BASE)
+        // BLE 名称 (0x08E2, 4 regs = 8 bytes) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51)
+        // 必须放在 BLE MAC 之前检查, 虽然两者不重叠, 但 0x08E2 是 metuory 蓝牙 ID 显示字段,
+        // 误写会污染 BLE MAC → BLE 重启时显示异常
         if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             return Some(u16::from_be_bytes([
                 self.ble_name[idx],
                 self.ble_name[idx + 1],
             ]));
+        }
+        // BLE MAC 地址 — 6 字节 → 4 个 U16 (高字节在前, 不足 8 字节用 0 填充)
+        // 已迁移到用户区 0x0FA4 (4004), 不再与 BLE NAME 冲突
+        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
+            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
+            let b0 = if idx < 6 { self.ble_mac[idx] } else { 0 };
+            let b1 = if idx + 1 < 6 { self.ble_mac[idx + 1] } else { 0 };
+            return Some(u16::from_be_bytes([b0, b1]));
         }
         // RS485 — 5端口×5字, Word1=组合格式匹配参考固件
         for i in 0..5usize {
@@ -531,22 +533,23 @@ impl SystemConfig {
         if let Some(()) = write_mac(&mut self.eth_mac, regs::HOLD_MAC_BASE, addr, value) {
             return WriteResult::Apply;
         }
-        // BLE MAC — 高字节在前, 写入 4 寄存器 (前 3 个寄存器 = 6 bytes MAC)
-        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
-            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
-            let [hi, lo] = value.to_be_bytes();
-            if idx < 6 { self.ble_mac[idx] = hi; }
-            if idx + 1 < 6 { self.ble_mac[idx + 1] = lo; }
-            return WriteResult::Apply;
-        }
-        // BLE 名称 — 用户可编辑, Persist (实际生效需要重新初始化 BLE 外设, 但
-        // 持久化必须先做, 否则下次重启丢失).
+        // BLE 名称 (0x08E2, 4 regs) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51) 必须 Persist
+        // 顺序必须在 BLE MAC 之前: metuory 写入 0x08E2 期待更新 ble_name (蓝牙 ID 显示)
+        // 若先匹配 BLE_MAC (旧地址), ble_name 永远不会被写入, 重启后丢失
         if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
             return WriteResult::Persist;
+        }
+        // BLE MAC — 已迁到用户区 0x0FA4 (4004, 4 regs)
+        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
+            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
+            let [hi, lo] = value.to_be_bytes();
+            if idx < 6 { self.ble_mac[idx] = hi; }
+            if idx + 1 < 6 { self.ble_mac[idx + 1] = lo; }
+            return WriteResult::Apply;
         }
         // RS485 — Word1=组合格式匹配参考固件
         for i in 0..5usize {
@@ -907,6 +910,140 @@ mod tests {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(regs::HOLD_BT_ADDR_BASE, 0xAABB);
         assert_eq!(result, WriteResult::Apply);
+    }
+
+    // ========================================================================
+    // 回归测试: BLE NAME (0x08E2) / RS485 (0x08A6) 持久化路径
+    // 背景: metuory 1.0.78 通过 BLE 写 0x08E2 期望更新蓝牙 ID (ble_name), 不是 BLE MAC.
+    //       旧代码误路由到 ble_mac (Persist/Apply 但写错字段), 重启后显示丢失.
+    //       同样 RS485 (0x08A6) 也必须正确路由并 Persist, 否则重启后回归默认 9600/8/N/1.
+    // ========================================================================
+
+    /// metuory 写入 0x08E2 (4 regs) → 必须 Persist + 写入 ble_name, 不污染 ble_mac
+    #[test]
+    fn test_ble_name_at_metuory_addr_is_persist() {
+        let mut cfg = SystemConfig::defaults();
+        let original_mac = cfg.ble_mac; // 不应被改
+        // 模拟 metuory WRITE_BLUETOOTH_ID: 写 4 个寄存器到 0x08E2
+        // "AB" = 0x4142 (大端 BE), "CD" = 0x4344
+        let result0 = cfg.write_reg(0x08E2, 0x4142);
+        let result1 = cfg.write_reg(0x08E3, 0x4344);
+        let result2 = cfg.write_reg(0x08E4, 0x4500); // 'E' + padding
+        let result3 = cfg.write_reg(0x08E5, 0x0000);
+        assert_eq!(result0, WriteResult::Persist, "metuory BLE ID write must trigger NVS persist");
+        assert_eq!(result1, WriteResult::Persist);
+        assert_eq!(result2, WriteResult::Persist);
+        assert_eq!(result3, WriteResult::Persist);
+        // 验证 ble_name 已被更新 (BE 编码)
+        assert_eq!(&cfg.ble_name[0..2], b"AB", "ble_name[0..2] should be AB");
+        assert_eq!(&cfg.ble_name[2..4], b"CD", "ble_name[2..4] should be CD");
+        // 关键: ble_mac 必须保持不变
+        assert_eq!(cfg.ble_mac, original_mac, "ble_mac must NOT be touched by metuory BLE ID write");
+    }
+
+    /// 0x0FA4 (用户区 BLE MAC) 仍可写 (兼容遗留 master)
+    #[test]
+    fn test_ble_mac_at_user_area_still_writable() {
+        let mut cfg = SystemConfig::defaults();
+        let result = cfg.write_reg(0x0FA4, 0xAABB);
+        assert_eq!(result, WriteResult::Apply, "BLE MAC write still works at 0x0FA4 (legacy)");
+        assert_eq!(cfg.ble_mac[0], 0xAA);
+        assert_eq!(cfg.ble_mac[1], 0xBB);
+    }
+
+    /// metuory 读 0x08E2 (4 regs) → 必须返回 ble_name (不是 ble_mac)
+    #[test]
+    fn test_ble_name_read_at_metuory_addr() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.ble_name = *b"Mesh\0\0\0\0";
+        cfg.ble_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let v0 = cfg.read_reg(0x08E2).expect("must be Some");
+        let v1 = cfg.read_reg(0x08E3).expect("must be Some");
+        // ble_name[0..2] = "Me" = 0x4D 0x65 → BE u16 = 0x4D65
+        assert_eq!(v0, 0x4D65, "0x08E2 read should return ble_name[0..2] BE = Me");
+        assert_eq!(v1, 0x7368, "0x08E3 read should return ble_name[2..4] BE = sh");
+    }
+
+    /// RS485 (0x08A6..0x08BD, 5 端口 × 5 字) Persist 路径完整覆盖
+    /// Word1 编码: (baud_idx<<12)|(parity<<10)|(stop<<9)|(data<<8)|mode
+    #[test]
+    fn test_rs485_persist_full_5ports() {
+        let mut cfg = SystemConfig::defaults();
+        // 115200 / Even / 1 stop / 8 data / Master mode = (7<<12)|(2<<10)|(0<<9)|(0<<8)|0 = 0x7800
+        let word1 = 0x7800u16;
+        // idx=0, baud=115200, parity=Even, stop=1, data=8, mode=0
+        let r0 = cfg.write_reg(0x08A6, word1);
+        let r1 = cfg.write_reg(0x08A7, 5); // slave=5
+        let r2 = cfg.write_reg(0x08A8, 3); // retry=3
+        let r3 = cfg.write_reg(0x08A9, 500); // timeout=500ms
+        let r4 = cfg.write_reg(0x08AA, 50);  // interval=50ms
+        for r in [r0, r1, r2, r3, r4] {
+            assert_eq!(r, WriteResult::Persist, "RS485 reg write must Persist (not Ok/Apply)");
+        }
+        assert_eq!(cfg.rs485[0].baudrate, 115200);
+        assert_eq!(cfg.rs485[0].parity, 2);
+        assert_eq!(cfg.rs485[0].stop_bits, 1);
+        assert_eq!(cfg.rs485[0].data_bits, 8);
+        assert_eq!(cfg.rs485[0].slave_addr, 5);
+        // idx=1 (0x08AB..0x08AF)
+        let r5 = cfg.write_reg(0x08AB, 0x9800); // idx=1 baud=921600
+        assert_eq!(r5, WriteResult::Persist);
+        assert_eq!(cfg.rs485[1].baudrate, 921600);
+    }
+
+    /// RS485 写入后, 立即读取必须返回相同值 (RCU RMW 闭环)
+    #[test]
+    fn test_rs485_write_then_read_consistency() {
+        let mut cfg = SystemConfig::defaults();
+        // idx=0, baud_idx=7 (115200), parity=1 (Odd), stop=2 bits, data=7, mode=1 (Slave)
+        // 编码: (7<<12)|(1<<10)|(1<<9)|(1<<8)|1 = 0x7D01
+        cfg.write_reg(0x08A6, 0x7D01);
+        cfg.write_reg(0x08A7, 42); // slave=42
+
+        // 读回
+        let w1 = cfg.read_reg(0x08A6).expect("Word1 must be Some");
+        let w2 = cfg.read_reg(0x08A7).expect("Word2 must be Some");
+        // baud_idx=7, parity=1, stop=1 (from bit9 + 1), data=7 (from bit8), mode=1
+        assert_eq!(w1, 0x7D01, "round-trip word1: write 0x7D01 → read 0x7D01");
+        assert_eq!(w2, 42, "round-trip word2: write 42 → read 42");
+    }
+
+    /// NVS encode → decode 闭环: 修改后保存, 加载必须等于修改后
+    #[test]
+    fn test_nvs_roundtrip_rs485_and_ble_name() {
+        let mut cfg = SystemConfig::defaults();
+        // 修改 RS485 idx=0
+        cfg.rs485[0] = Rs485Config {
+            baudrate: 19200,
+            data_bits: 7,
+            stop_bits: 2,
+            parity: 1, // Odd
+            slave_addr: 12,
+            mode: 2,   // Gateway
+        };
+        // 修改 BLE NAME
+        cfg.ble_name = *b"Test1234";
+        // 修改 ETH MAC
+        cfg.eth_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        // 修改 IP
+        cfg.ip = [10, 20, 30, 40];
+
+        // encode → decode
+        let buf = cfg.encode();
+        assert_eq!(buf.len(), CFG_BLOB_SIZE);
+        let decoded = SystemConfig::decode(&buf);
+
+        assert_eq!(decoded.rs485[0].baudrate, 19200);
+        assert_eq!(decoded.rs485[0].data_bits, 7);
+        assert_eq!(decoded.rs485[0].stop_bits, 2);
+        assert_eq!(decoded.rs485[0].parity, 1);
+        assert_eq!(decoded.rs485[0].slave_addr, 12);
+        assert_eq!(decoded.rs485[0].mode, 2);
+        assert_eq!(&decoded.ble_name[..8], b"Test1234");
+        assert_eq!(decoded.eth_mac, [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
+        assert_eq!(decoded.ip, [10, 20, 30, 40]);
+        // BLE MAC 默认 (HW) 在 encode/decode 后应保持不变
+        assert_eq!(decoded.ble_mac, cfg.ble_mac);
     }
 
     // ========================================================================

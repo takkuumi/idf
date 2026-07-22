@@ -391,9 +391,13 @@ pub mod regs {
     pub const HOLD_MASTER_COM: u16 = 2269;
     pub const HOLD_MASTER_IP_BASE: u16 = 2270;
     // 蓝牙地址 (2274-2277)
-    pub const HOLD_BT_ADDR_BASE: u16 = 2274;
-    // BLE 名称 — 自定义 (4000-4003 = 4 words = 8 bytes)
-    pub const HOLD_BLE_NAME_BASE: u16 = HOLD_USER_BASE;
+    // 蓝牙 MAC — 移到用户区 0x0FA4 (4004, 4 words) 避开 metuory 0x08E2 BLE NAME 冲突
+    // 0x08E2 在 metuory 1.0.78 中是 BLE 名称 (WRITE_BLUETOOTH_ID 0x51), 不是 BLE MAC
+    pub const HOLD_BT_ADDR_BASE: u16 = 0x0FA4;
+    // BLE 名称 — metuory 1.0.78 用 0x08E2 (4 words = 8 bytes) 读写 (WRITE_BLUETOOTH_ID 0x51)
+    // MCA C++ 参考固件此处是 BLE MAC, 但 metuory Android 把它当 BLE NAME (蓝牙 ID 显示), 
+    // 故本系统优先 BLE NAME 在 0x08E2, BLE MAC 移到 0x0FA4 保留兼容性
+    pub const HOLD_BLE_NAME_BASE: u16 = 0x08E2;
     pub const HOLD_BLE_NAME_COUNT: u16 = 4;
     // 传感器标定 (2280-2295, 8 sensors × 2 values)
     pub const HOLD_SENSOR_MIN_BASE: u16 = 2280;
@@ -503,8 +507,8 @@ mod tests {
         assert_eq!(regs::HOLD_MAC_BASE, 2263);
         // SLAVE_REG_MASTER_COM = 2269
         assert_eq!(regs::HOLD_MASTER_COM, 2269);
-        // SLAVE_REG_BT_ARRD1 = 2274
-        assert_eq!(regs::HOLD_BT_ADDR_BASE, 2274);
+        // BT_ADDR 已迁到用户区 0x0FA4 (4004), 避开 metuory BLE NAME 0x08E2
+        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x0FA4);
         // SLAVE_SERSOR_MIN = 2280
         assert_eq!(regs::HOLD_SENSOR_MIN_BASE, 2280);
         // SLAVE_SERSOR_MAX = 2288
