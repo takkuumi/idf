@@ -233,7 +233,7 @@ CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
 # ESP32-S3R2 资源紧张: 11 个用户 pthread 任务 + BLE/ETH/Wi-Fi 系统任务
 # 默认 3KB 不够 (Vec 临时分配 + 深调用链), 增大到 6KB
 # 配合 modbus/shared.rs 的 Vec→heapless::Vec 改造彻底消除 heap 分配
-CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=6144
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288
 
 # 减小 BLE host 栈 (默认 4096 → 3072) 释放 SRAM
 CONFIG_BT_BLE_HOST_TASK_STACK_SIZE=3072
