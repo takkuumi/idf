@@ -64,6 +64,7 @@ fn spawn_listener(port: u16) -> AppResult<()> {
                 }
                 CONN_COUNT.fetch_add(1, Ordering::SeqCst);
                 let id = CONN_COUNT.load(Ordering::SeqCst);
+                log::info!("[mb-tcp] conn_id={} start", id);
                 health::set_next_thread_core(health::CORE_NET);
                 std::thread::Builder::new()
                     .name(format!("mb-tcp-conn-{id}"))
@@ -143,11 +144,13 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         if pdu_len < 1 { return Ok(()); }
         let func = pdu[0];  // PDU 首字节 = 功能码
         let resp_pdu = build_pdu(&backend, func, &pdu[1..pdu_len]);
-        // MBAP.length 约定: 不含 unit_id (与 pymodbus/libmodbus 一致)
-        //   响应格式: [MBAP(7)][PDU(N)], MBAP.length = PDU.len()
-        //   unit_id 仅存在于 MBAP[6], 不重复出现在 PDU 前
-        // 这样客户端可直接用 MBAP.length 读取 N 字节 PDU, 不需拆分
-        let mbap_len = resp_pdu.len();
+        // MBAP.length 标准约定 (Modbus_Application_Protocol_V1_1b3 §4.1):
+        //   length = unit_id(1) + func(1) + data(N) = 2 + N
+        // 这是 pymodbus 3.x / libmodbus 的标准期望.
+        // 旧实现: mbap_len = resp_pdu.len() (= func + data = 1+N)
+        //   → pymodbus 3.8.6 解析时将 func 误认为 unit_id, 报错:
+        //     "Unable to decode frame: byte_count N > length of packet N"
+        let mbap_len = 1 + resp_pdu.len();
         let mut mbap = [0u8; 7];
         mbap[..2].copy_from_slice(&header[..2]); // echo tx_id
         mbap[2..4].copy_from_slice(&0u16.to_be_bytes()); // proto = 0
