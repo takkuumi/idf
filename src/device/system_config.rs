@@ -42,7 +42,7 @@ const OFF_DNS: usize = 73;
 const OFF_BLE_MAC: usize = 77;
 const OFF_BLE_NAME: usize = 83;
 const OFF_RS485_0: usize = 92;
-const OFF_RS485_1: usize = 101;
+const OFF_RS485_1: usize = 107;  // LOOP5 修复: 原来是 101, 与 OFF_RS485_0+9 (retry_count) 重叠
 
 // ----------------------------------------------------------------------------
 // 数据结构
@@ -56,6 +56,9 @@ pub struct Rs485Config {
     pub parity: u8,     // 0=None 1=Odd 2=Even
     pub slave_addr: u8, // 0=主站
     pub mode: u8,       // 0=Master 1=Slave 2=Gateway
+    pub retry_count: u16,    // LOOP5: 之前漏存, 现加上 (Word3 of RS485 config)
+    pub timeout_ms: u16,     // LOOP5: Word4 of RS485 config
+    pub interval_ms: u16,    // LOOP5: Word5 of RS485 config
 }
 
 impl Default for Rs485Config {
@@ -69,6 +72,9 @@ impl Default for Rs485Config {
             parity: 0,
             slave_addr: 1,
             mode: 0, // Master
+            retry_count: 0,
+            timeout_ms: 1000,
+            interval_ms: 20,
         }
     }
 }
@@ -253,6 +259,9 @@ impl SystemConfig {
             b[off + 6] = r.parity;
             b[off + 7] = r.slave_addr;
             b[off + 8] = r.mode;
+            b[off + 9..off + 11].copy_from_slice(&r.retry_count.to_le_bytes());
+            b[off + 11..off + 13].copy_from_slice(&r.timeout_ms.to_le_bytes());
+            b[off + 13..off + 15].copy_from_slice(&r.interval_ms.to_le_bytes());
         }
         b
     }
@@ -290,6 +299,9 @@ impl SystemConfig {
                 parity: b[off + 6],
                 slave_addr: b[off + 7],
                 mode: b[off + 8],
+                retry_count: u16::from_le_bytes([b[off + 9], b[off + 10]]),
+                timeout_ms: u16::from_le_bytes([b[off + 11], b[off + 12]]),
+                interval_ms: u16::from_le_bytes([b[off + 13], b[off + 14]]),
             };
         }
         s
@@ -445,9 +457,9 @@ impl SystemConfig {
                             | (r.mode as u16 & 0xFF)
                     }
                     1 => r.slave_addr as u16, // Word 2: Slave ID
-                    2 => 0u16,                // Word 3: Retry count (default 0)
-                    3 => 1000u16,             // Word 4: Response timeout (default 1000ms)
-                    4 => 20u16,               // Word 5: Delay between polls (default 20ms)
+                    2 => r.retry_count,       // Word 3: Retry count (LOOP5 修复)
+                    3 => r.timeout_ms,        // Word 4: Response timeout (LOOP5 修复)
+                    4 => r.interval_ms,       // Word 5: Delay between polls (LOOP5 修复)
                     _ => 0,
                 });
             }
@@ -575,7 +587,9 @@ impl SystemConfig {
                         r.mode = (value & 0xFF) as u8;
                     }
                     1 => r.slave_addr = value as u8,
-                    2..=4 => {} // Retry/Timeout/Delay
+                    2 => r.retry_count = value,  // LOOP5 修复: 之前 2..=4 => {} 漏存 retry/timeout/interval
+                    3 => r.timeout_ms = value,
+                    4 => r.interval_ms = value,
                     _ => {}
                 }
                 // RS485 配置 — 用户可编辑, Persist (运行时切换由 rs485::port 监听).
@@ -1020,6 +1034,9 @@ mod tests {
             parity: 1, // Odd
             slave_addr: 12,
             mode: 2,   // Gateway
+            retry_count: 3,
+            timeout_ms: 500,
+            interval_ms: 50,
         };
         // 修改 BLE NAME
         cfg.ble_name = *b"Test1234";

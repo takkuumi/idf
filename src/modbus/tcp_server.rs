@@ -68,7 +68,7 @@ fn spawn_listener(port: u16) -> AppResult<()> {
                 health::set_next_thread_core(health::CORE_NET);
                 std::thread::Builder::new()
                     .name(format!("mb-tcp-conn-{id}"))
-                    .stack_size(12 * 1024) // 12KB (was 6KB) — 6KB 不足以容纳 253B PDU + 280B resp + 调用栈
+                    .stack_size(20 * 1024) // LOOP5 修复: 12KB 不足以容纳 config_clone 递归克隆 DeviceConfigTable (3KB) 触发 Guru Meditation (Unhandled debug exception)
                     .spawn(move || {
                         if let Err(e) = handle_conn(stream) {
                             log::debug!("[mb-tcp-conn-{id}] closed: {}", e);
