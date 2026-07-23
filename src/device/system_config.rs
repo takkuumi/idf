@@ -136,11 +136,14 @@ impl SystemConfig {
     /// 默认配置 (出厂值)
     pub fn defaults() -> Self {
         let mut sn = [0u8; 32];
-        let sn_str = b"ESP32S3-UNKNOWN-0001";
+        // LOOP6: 默认值必须在 9 字符内 (9 SN 寄存器 = 18 字节 = 9 UTF-16 BE 字符)
+        // 原默认 "ESP32S3-UNKNOWN-0001" (19 字符) 超出 Modbus 容量, 经 Modbus 写后被截断
+        let sn_str = b"ESP32-001";
         sn[..sn_str.len()].copy_from_slice(sn_str);
 
         let mut name = [0u8; 16];
-        let name_str = b"GW-ESP32S3";
+        // LOOP6: 默认值必须在 8 字符内 (8 LOCATION 寄存器 = 16 字节 = 8 UTF-16 BE 字符)
+        let name_str = b"GW-ESP32";
         name[..name_str.len()].copy_from_slice(name_str);
 
         let mut ble_name = [0u8; 8];
