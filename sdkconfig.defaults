@@ -237,3 +237,9 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288
 
 # 减小 BLE host 栈 (默认 4096 → 3072) 释放 SRAM
 CONFIG_BT_BLE_HOST_TASK_STACK_SIZE=3072
+
+# I2C: 旧驱动弃用警告抑制 (LOOP6)
+# 我们只用 sw_i2c (软件 I2C, src/hal/sw_i2c.rs) 和新 I2C master 框架
+# i2c_bus.rs (MCP23017/F3/F4) 走 esp_idf_hal::i2c 旧 API, 但本项目只用 PCA9555 (sw_i2c)
+# 旧驱动被链接但不被调用, 启动时 abort_check 触发弃用警告
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
