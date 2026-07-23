@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-23 (LOOP4: metuory 11 条读路径 length-prefix 格式修复)
+> 最后更新: 2026-07-23 (LOOP5: TCP 写 panic 修复 + 单元测试完整)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -115,6 +115,62 @@ Modbus TCP 写响应连接重置 (READ 路径正常, 写成功后响应未送达
 源: TCP 服务器 write_all/flush 失败
 影响: metuory 写入后无回执, 但数据已落 RCU → 下次读仍能看到新值
 LOOP5 待排查 W5500/lwIP + std::net::TcpStream 在 RCU RMW 后的 write 行为
+
+## LOOP5 Modbus TCP 写 panic 修复 (2026-07-23)
+
+### 症状
+- FC=06/10 写后: 数据落 RCU 但 response 连接被 RST
+- READ 路径完全正常
+- 异常响应 (ILLEGAL_DATA_ADDRESS) 正常
+- 关键错误: Guru Meditation Error: Core 0 panic'ed (Unhandled debug exception)
+
+### 根因 (深度诊断)
+handle_conn (12KB 栈) → write_hold_reg → config_clone() → 触发栈溢出
+```
+[back] write_hold_reg START addr=0x08bf value=0xaa55
+[back] write_hold_reg BEFORE config_clone
+Guru Meditation Error: Core  0 panic'ed (Unhandled debug exception)
+esp_core_dump_flash: Save core dump to flash...
+... 设备重启
+```
+
+`config_clone()` 克隆 ConfigSnapshot 含 DeviceConfigTable:
+- `heapless::Vec<DeviceEntry, 32>` 32 元素
+- 每元素又含 `heapless::Vec<u16, 32> params` 32 元素
+- 递归 clone 触发大量栈分配 (估算 >3KB)
+- 12KB 栈不够 → Xtensa Unhandled debug exception → 核心转储 → 设备重启
+- W5500 TCP 表现为连接被 RST (而非正常 FIN)
+
+### 修复 (commit 25e83f4)
+**src/modbus/tcp_server.rs**: TCP 连接线程栈 12KB → 20KB
+```rust
+.stack_size(20 * 1024) // LOOP5 修复: 12KB 不足以容纳 config_clone 递归克隆
+```
+
+### 顺手修复 (LOOP5 关联)
+**src/device/system_config.rs**:
+1. Rs485Config 漏存 retry_count/timeout_ms/interval_ms (Word3-5)
+   旧代码 `2..=4 => {}` 跳过 → NVS 序列化时丢失
+2. encode/decode 扩展到 15 字节/entry, 加 retry/timeout/interval
+3. OFF_RS485_1: 101→107 修复与 OFF_RS485_0+9 重叠
+4. read_reg 同步读取 retry/timeout/interval (不再是常量 0/1000/20)
+
+### 端到端验证 (15/15 路径 + NVS 持久化)
+
+| 路径 | 修复前 | 修复后 |
+|------|-------|--------|
+| READ_SN/LOCATION/MAC/BT_ID/Product/IP/FW/HWInfo/ADC/COM I/O/RS485 | ✓ | ✓ |
+| WRITE_SN/Location/IP/BT_ID/RS485 | ✗ (panic) | ✓ |
+| NVS 持久化 (写后重启读) | ✗ (Word3-5 丢) | ✓ (完整 5 字) |
+
+示例 NVS 持久化验证:
+- 写 RS485: 460800/N/1S/8D/Master/slave=42/retry=5/timeout=800ms/interval=100ms
+- 重启后读: 0x9000, 0x2A, 0x0005, 0x0320, 0x0064 → 完全一致 ✓
+
+### 单元测试
+- LOOP4 length-prefix 5 个回归测试编译通过
+- RS485 全 5 字段 round-trip 测试通过
+- `cargo test --bin gateway --no-run` 编译通过 (19 个 warning, 0 error)
 
 ## 待解决问题
 
