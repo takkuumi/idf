@@ -1308,6 +1308,103 @@ fn handle_ble_android_read_command(
             log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>"));
             d
         }
+        // READ_SN (0x0894, 0x0009): Android 期望 [length][length bytes of SN ASCII]
+        // parseSNItem 读 buffer[0] = length, 然后 [1..1+length] = SN bytes
+        (0x0894, 9) => {
+            let sn_str = cfg.sn_str();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let bytes = sn_str.as_bytes();
+            let take = bytes.len().min(32); // 单个返回 Vec 上限 32
+            let _ = d.push(take as u8);
+            for i in 0..take { let _ = d.push(bytes[i]); }
+            log::info!("[ble_at] READ_SN: {} bytes", take);
+            d
+        }
+        // READ_LOCATION (0x089D, 0x0008): 同 SN 格式, [length][location bytes]
+        (0x089D, 8) => {
+            let name_str = cfg.name_str();
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let bytes = name_str.as_bytes();
+            let take = bytes.len().min(32);
+            let _ = d.push(take as u8);
+            for i in 0..take { let _ = d.push(bytes[i]); }
+            log::info!("[ble_at] READ_LOCATION: {} bytes", take);
+            d
+        }
+        // READ_ADC_VALUE (0x0080, count): Android 期望 [length][length bytes of BE u16]
+        // parseResReadADC: length = buffer[0], 然后 for i=1; i<buffer.length; i+=2 → BE short
+        (0x0080, _) => {
+            // 读所有 AI 通道 (F16=4, F4=8)
+            let ai_count = crate::config::hw_version::AI_COUNT as u16;
+            let n = reg_cnt.min(ai_count) as usize;
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = d.push((n * 2) as u8); // length = 2*N bytes
+            for i in 0..n {
+                let v = crate::bus::backends::read_input_reg(0x0080 + i as u16).unwrap_or(0);
+                let _ = d.push((v >> 8) as u8);
+                let _ = d.push((v & 0xFF) as u8);
+            }
+            log::info!("[ble_at] READ_ADC: {} channels", n);
+            d
+        }
+        // READ_COM_INPUT_IO_STATUS (0x0000, count): Android 期望 [N bytes][N bytes of packed I/O bits]
+        // parseResReadComInputIOStatus: bufferLength = buffer[0], 读 bufferLength*8 bits
+        // READ_COM_OUTPUT_IO_STATUS (0x0200, count): 同上, 解析复用
+        (0x0000, _) | (0x0200, _) => {
+            let n_bytes = ((reg_cnt as usize) + 7) / 8;
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = d.push(n_bytes as u8); // length = N bytes of packed I/O
+            // 读 coil/disc 状态并打包
+            let mut acc: u8 = 0;
+            for i in 0..n_bytes {
+                acc = 0;
+                for j in 0..8 {
+                    let bit_idx = i * 8 + j;
+                    if bit_idx >= reg_cnt as usize { break; }
+                    let val = if reg_addr == 0x0200 {
+                        crate::bus::backends::read_coil(reg_addr + bit_idx as u16).unwrap_or(false)
+                    } else {
+                        crate::bus::backends::read_disc(reg_addr + bit_idx as u16).unwrap_or(false)
+                    };
+                    if val { acc |= 1 << j; }
+                }
+                let _ = d.push(acc);
+            }
+            log::info!("[ble_at] READ_COM_IO: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
+            d
+        }
+        // READ_RS485_VALUE (用户自定义地址, count): 透传读取输入寄存器, length-prefix BE u16
+        // 匹配: 任何 FC=04 读非 0x0080/0x0880-0x08CF 范围 (排除硬件信息等已知名单)
+        // 实际 metuory 透传地址由 DEVICE_FUNCTION_CONFIG 配置
+        (addr, _) if func == 0x04 && !(0x087C..=0x087F).contains(&addr)
+            && addr != 0x0080 && addr < 0x4000 => {
+            // 透传: 读输入寄存器, length-prefix BE u16
+            let n = reg_cnt as usize;
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = d.push(((n * 2).min(32)) as u8); // length = 2*N bytes
+            for i in 0..n.min(16) {
+                let v = crate::bus::backends::read_input_reg(addr + i as u16).unwrap_or(0);
+                let _ = d.push((v >> 8) as u8);
+                let _ = d.push((v & 0xFF) as u8);
+            }
+            log::info!("[ble_at] READ_RS485_VALUE: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
+            d
+        }
+        // READ_RS485_CUSTOM_VALUE: 同上但 FC=03 (读保持寄存器)
+        (addr, _) if func == 0x03 && !(0x087C..=0x08FF).contains(&addr)
+            && addr < 0x4000 => {
+            // 透传: 读保持寄存器, length-prefix 原始字节
+            let n = reg_cnt as usize;
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = d.push((n * 2).min(32) as u8);
+            for i in 0..n.min(16) {
+                let v = crate::bus::backends::read_hold_reg(addr + i as u16).unwrap_or(0);
+                let _ = d.push((v >> 8) as u8);
+                let _ = d.push((v & 0xFF) as u8);
+            }
+            log::info!("[ble_at] READ_RS485_CUSTOM: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
+            d
+        }
         _ => return false, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
     };
 
@@ -1401,6 +1498,108 @@ fn build_android_read_response_pdu(
     let _ = pdu.push(unit);
     let _ = pdu.push(func);
     let _ = pdu.extend_from_slice(&rsp_data);
+    Some(pdu)
+}
+
+// 暴露给测试用的纯逻辑函数: 构建 SN length-prefix 响应
+#[cfg(test)]
+pub(crate) fn mod_test_build_sn_response(
+    unit: u8,
+    func: u8,
+    cfg: &crate::device::system_config::SystemConfig,
+) -> Option<heapless::Vec<u8, 32>> {
+    let sn_str = cfg.sn_str();
+    let bytes = sn_str.as_bytes();
+    let take = bytes.len().min(32);
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = d.push(take as u8);
+    for i in 0..take { let _ = d.push(bytes[i]); }
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&d);
+    Some(pdu)
+}
+
+#[cfg(test)]
+pub(crate) fn mod_test_build_location_response(
+    unit: u8,
+    func: u8,
+    cfg: &crate::device::system_config::SystemConfig,
+) -> Option<heapless::Vec<u8, 32>> {
+    let name_str = cfg.name_str();
+    let bytes = name_str.as_bytes();
+    let take = bytes.len().min(32);
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = d.push(take as u8);
+    for i in 0..take { let _ = d.push(bytes[i]); }
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&d);
+    Some(pdu)
+}
+
+#[cfg(test)]
+pub(crate) fn mod_test_build_adc_response(
+    unit: u8,
+    func: u8,
+    _reg_addr: u16,
+    count: u16,
+    values: [u16; 4],
+) -> Option<heapless::Vec<u8, 32>> {
+    let n = count.min(4) as usize;
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = d.push((n * 2) as u8);
+    for i in 0..n {
+        let _ = d.push((values[i] >> 8) as u8);
+        let _ = d.push((values[i] & 0xFF) as u8);
+    }
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&d);
+    Some(pdu)
+}
+
+#[cfg(test)]
+pub(crate) fn mod_test_build_com_input_response(
+    unit: u8,
+    func: u8,
+    _reg_addr: u16,
+    count: u16,
+    packed: [u8; 2],
+) -> Option<heapless::Vec<u8, 32>> {
+    let n_bytes = ((count as usize) + 7) / 8;
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = d.push(n_bytes.min(2) as u8);
+    for i in 0..n_bytes.min(2) { let _ = d.push(packed[i]); }
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&d);
+    Some(pdu)
+}
+
+#[cfg(test)]
+pub(crate) fn mod_test_build_rs485_value_response(
+    unit: u8,
+    func: u8,
+    _reg_addr: u16,
+    count: u16,
+    values: [u16; 4],
+) -> Option<heapless::Vec<u8, 32>> {
+    let n = count.min(4) as usize;
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = d.push((n * 2) as u8);
+    for i in 0..n {
+        let _ = d.push((values[i] >> 8) as u8);
+        let _ = d.push((values[i] & 0xFF) as u8);
+    }
+    let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = pdu.push(unit);
+    let _ = pdu.push(func);
+    let _ = pdu.extend_from_slice(&d);
     Some(pdu)
 }
 
@@ -1614,6 +1813,114 @@ mod android_compat_tests {
         // 验证格式: 80:B5:4E:5B:24:E7
         assert_eq!(mac_bytes, &[0x00, 0x80, 0x00, 0xB5, 0x00, 0x4E,
                                   0x00, 0x5B, 0x00, 0x24, 0x00, 0xE7]);
+    }
+
+    // ---- 回归测试: READ_SN length-prefix 格式 (LOOP4) ----
+    // Bug 根因: metuory READ_SN 走标准 Modbus FC=03, 返回 [func][bc][data],
+    //          Android 期望 [length][length bytes], 格式不匹配 → UI 空白
+    // 修复: 0x0894/9 在 handle_ble_android_read_command 走 length-prefix 路径
+    #[test]
+    fn test_android_parse_sn_length_prefix() {
+        // SN: 18 字节 ASCII "ESP32S3-UNKNOWN-1"
+        let mut cfg = crate::device::system_config::SystemConfig::defaults();
+        let mut sn = [0u8; 32];
+        let s = b"ESP32S3-UNKNOWN-1";
+        sn[..s.len()].copy_from_slice(s);
+        cfg.sn = sn;
+        let pdu = crate::ble_at::mod_test_build_sn_response(0x01, 0x03, &cfg).expect("must handle");
+        let data = &pdu[2..]; // skip unit+func
+
+        // Android parseSNItem: data[0] = length, data[1..1+length] = SN
+        let length = data[0] as usize;
+        let sn_bytes = &data[1..1 + length];
+        let sn_str = core::str::from_utf8(sn_bytes).unwrap();
+        assert_eq!(length, 18, "SN length must match actual SN byte count");
+        assert_eq!(sn_str, "ESP32S3-UNKNOWN-1", "SN bytes must match cfg");
+    }
+
+    // ---- 回归测试: READ_LOCATION length-prefix 格式 ----
+    #[test]
+    fn test_android_parse_location_length_prefix() {
+        let mut cfg = crate::device::system_config::SystemConfig::defaults();
+        let mut name = [0u8; 16];
+        let s = b"POS-001";
+        name[..s.len()].copy_from_slice(s);
+        cfg.name = name;
+        let pdu = crate::ble_at::mod_test_build_location_response(0x01, 0x03, &cfg).expect("must handle");
+        let data = &pdu[2..];
+
+        let length = data[0] as usize;
+        let loc_bytes = &data[1..1 + length];
+        let loc_str = core::str::from_utf8(loc_bytes).unwrap();
+        assert_eq!(length, 7, "LOCATION length must be 7");
+        assert_eq!(loc_str, "POS-001", "LOCATION bytes must match cfg");
+    }
+
+    // ---- 回归测试: READ_ADC_VALUE length-prefix BE u16 格式 ----
+    // Android parseResReadADC: length = buffer[0], 然后 BE u16 values
+    #[test]
+    fn test_android_parse_adc_length_prefix() {
+        let pdu = crate::ble_at::mod_test_build_adc_response(0x01, 0x04, 0x0080, 4, [0x0123, 0x0456, 0x0789, 0x0ABC])
+            .expect("must handle");
+        let data = &pdu[2..];
+
+        // ADC: 4 通道, 长度=8
+        let length = data[0] as usize;
+        assert_eq!(length, 8, "ADC length must be 4 channels * 2 bytes = 8");
+
+        // 4 个 BE u16 值
+        let v0 = u16::from_be_bytes([data[1], data[2]]);
+        let v1 = u16::from_be_bytes([data[3], data[4]]);
+        let v2 = u16::from_be_bytes([data[5], data[6]]);
+        let v3 = u16::from_be_bytes([data[7], data[8]]);
+        assert_eq!((v0, v1, v2, v3), (0x0123, 0x0456, 0x0789, 0x0ABC));
+    }
+
+    // ---- 回归测试: READ_COM_INPUT length-prefix packed I/O 格式 ----
+    // Android parseResReadComInputIOStatus: bufferLength = buffer[0], 读 bufferLength*8 bits
+    #[test]
+    fn test_android_parse_com_input_length_prefix() {
+        // 16 DI, packed as 2 bytes [0xAA, 0x55]
+        let pdu = crate::ble_at::mod_test_build_com_input_response(0x01, 0x02, 0x0000, 16, [0xAA, 0x55])
+            .expect("must handle");
+        let data = &pdu[2..];
+
+        let buffer_length = data[0] as usize;
+        assert_eq!(buffer_length, 2, "16 DI must pack into 2 bytes");
+
+        // Android: temp = buffer[1]; for j=0..7: (temp & (1<<j)) > 0 ? 1 : 0
+        let byte0 = data[1];
+        let byte1 = data[2];
+        // 验证 16 位模式
+        let mut bits = [0u8; 16];
+        for j in 0..8 {
+            if (byte0 & (1 << j)) > 0 { bits[j] = 1; }
+            if (byte1 & (1 << j)) > 0 { bits[8 + j] = 1; }
+        }
+        // 0xAA = 0b10101010 → bits[0]=0, bits[1]=1, bits[2]=0, ..., bits[7]=1
+        assert_eq!(bits[0], 0); assert_eq!(bits[1], 1); assert_eq!(bits[2], 0); assert_eq!(bits[3], 1);
+        assert_eq!(bits[4], 0); assert_eq!(bits[5], 1); assert_eq!(bits[6], 0); assert_eq!(bits[7], 1);
+        // 0x55 = 0b01010101
+        assert_eq!(bits[8], 1); assert_eq!(bits[9], 0); assert_eq!(bits[10], 1); assert_eq!(bits[11], 0);
+        assert_eq!(bits[12], 1); assert_eq!(bits[13], 0); assert_eq!(bits[14], 1); assert_eq!(bits[15], 0);
+    }
+
+    // ---- 回归测试: READ_RS485_VALUE length-prefix BE u16 格式 (用户自定义地址) ----
+    // Android parseResReadRS485Value: length = buffer[0], 然后 BE u16 values
+    #[test]
+    fn test_android_parse_rs485_value_length_prefix() {
+        let pdu = crate::ble_at::mod_test_build_rs485_value_response(0x01, 0x04, 0x1000, 4, [0x1234, 0x5678, 0x9ABC, 0xDEF0])
+            .expect("must handle");
+        let data = &pdu[2..];
+
+        let length = data[0] as usize;
+        assert_eq!(length, 8, "4 values * 2 bytes = 8");
+
+        let v0 = u16::from_be_bytes([data[1], data[2]]);
+        let v1 = u16::from_be_bytes([data[3], data[4]]);
+        let v2 = u16::from_be_bytes([data[5], data[6]]);
+        let v3 = u16::from_be_bytes([data[7], data[8]]);
+        assert_eq!((v0, v1, v2, v3), (0x1234, 0x5678, 0x9ABC, 0xDEF0));
     }
 
     #[test]
