@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-23 (LOOP3: BLE ID + RS485 持久化路径修复)
+> 最后更新: 2026-07-23 (LOOP4: metuory 11 条读路径 length-prefix 格式修复)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -69,6 +69,52 @@
 **修复** (`22a6e0a`):
 - `src/modbus/tcp_server.rs: mbap_len = 1 + resp_pdu.len()`
 - pymodbus 3.8.6 验证: 5 个 RS485 寄存器读正确 (0x3000, 1, 0, 1000, 20)
+
+## LOOP4 metuory 读路径 length-prefix 格式 (2026-07-23)
+
+### 背景
+metuory Android 端所有 `parseXxxItem` 使用 length-prefix 格式:
+```
+buffer[0] = length
+data[1..1+length] = 实际数据
+```
+但本系统 FC=03/04 走标准 Modbus 路径返回 `[func][byte_count][data]` 格式
+导致 metuory 解析失败 → UI 显示空/异常
+
+### 修复 (commit a10a9ef, src/ble_at/mod.rs)
+在 `handle_ble_android_read_command` 新增 5 个读 handler:
+
+| 命令 | 地址 | FC | 响应格式 |
+|------|------|-----|----------|
+| READ_SN         | 0x0894, 9 | 0x03 | [18][SN bytes] |
+| READ_LOCATION   | 0x089D, 8 | 0x03 | [16][location bytes] |
+| READ_ADC        | 0x0080, n | 0x04 | [2n][BE u16 × n] |
+| READ_COM_INPUT  | 0x0000, n | 0x02 | [n/8 bytes][packed bits] |
+| READ_COM_OUTPUT | 0x0200, n | 0x01 | [n/8 bytes][packed bits] |
+| READ_RS485_VALUE       | 0x1000+, n | 0x04 | [2n][BE u16 × n] |
+| READ_RS485_CUSTOM_VALUE| 0x1000+, n | 0x03 | [2n][BE u16 × n] |
+
+### 端到端验证 (11/11 全部通过)
+- SN='ESP32S3-UNKNOWN-00' (18 bytes ASCII)
+- LOCATION='GW-ESP32S3' (16 bytes ASCII)
+- BT_ID='Mesh' (8 bytes ASCII)
+- MAC=80:B5:4E:5B:24:E7
+- IP=192.168.51.140 / 255.255.255.0 / 192.168.51.1
+- FW=00DD0615 (2.2.1.1557) HW=10100402 (F16/16DI/16DO/4AI/2RS485)
+- ADC=4 通道, COM I/O=16 位, RS485 idx0=5 寄存器
+
+### 新增测试 (5 个回归测试 + 5 个 test helper)
+- test_android_parse_sn_length_prefix
+- test_android_parse_location_length_prefix
+- test_android_parse_adc_length_prefix
+- test_android_parse_com_input_length_prefix
+- test_android_parse_rs485_value_length_prefix
+
+### 已知问题 (与本 LOOP 独立)
+Modbus TCP 写响应连接重置 (READ 路径正常, 写成功后响应未送达)
+源: TCP 服务器 write_all/flush 失败
+影响: metuory 写入后无回执, 但数据已落 RCU → 下次读仍能看到新值
+LOOP5 待排查 W5500/lwIP + std::net::TcpStream 在 RCU RMW 后的 write 行为
 
 ## 待解决问题
 
