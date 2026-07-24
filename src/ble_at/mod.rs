@@ -82,6 +82,13 @@ static CONN_ID: Spin<Option<u16>> = Spin::new(None);
 
 /// TX Characteristic CCCD 使能标志 (主机写 0x0001 启用 notify)
 static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
+/// LOOP7: BLE 名字变化通知 (Metuory 写完 ble_name 后置位, process_tick 处理)
+static PENDING_GAP_NAME_UPDATE: AtomicBool = AtomicBool::new(false);
+
+/// LOOP7: 标记 BLE 名字待更新 (在 write_hold_reg 写完 0x08E2 时调用)
+pub fn notify_ble_name_changed() {
+    PENDING_GAP_NAME_UPDATE.store(true, Ordering::SeqCst);
+}
 
 /// AT 命令处理任务心跳 (静态分配)
 static TASK_HB: TaskHb = TaskHb::new("ble-at");
@@ -735,9 +742,28 @@ pub fn start() -> AppResult<()> {
 
 /// AT 命令处理循环
 ///
+/// LOOP7: 写完 BLE 名字后立即同步 GAP 设备名
+/// 不重启广播 — esp_ble_gap_set_device_name 后下次广播自动用新名字
+pub fn update_gap_device_name() {
+    let configured_name = crate::bus::config_state::config_read()
+        .map(|cs| cs.cfg.ble_name_str())
+        .unwrap_or_else(|| "Mesh".to_owned());
+    log::warn!("[ble_at] update_gap_device_name: cfg.ble_name='{}'", configured_name);
+    if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
+        let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
+        log::warn!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
+    } else {
+        log::warn!("[ble_at] CString::new failed (NUL in name?)");
+    }
+}
+
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
 /// 有则调用 parser::process 处理, 响应写入 TX_BUFFER 等待 notify。
 pub fn process_tick() {
+    // LOOP7: 处理待更新的 GAP 设备名 (Metuory 写完 0x08E2 后)
+    if PENDING_GAP_NAME_UPDATE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        update_gap_device_name();
+    }
     if !TX_NOTIFY_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
     let Some(conn_id) = *CONN_ID.lock() else { return; };
     let Some(gatts_if) = *GATTS_IF.lock() else { return; };

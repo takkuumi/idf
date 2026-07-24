@@ -155,6 +155,8 @@ pub fn handle_cfgbtname(args: &str) -> String {
         let mut name = [0u8; 8];
         name[..args.len()].copy_from_slice(args.as_bytes());
         with_cfg_mut(|c| c.ble_name = name);
+        // LOOP7: 写完立即同步 GAP 设备名
+        crate::ble_at::update_gap_device_name();
         ok_none()
     }
 }

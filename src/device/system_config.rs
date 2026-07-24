@@ -483,8 +483,7 @@ impl SystemConfig {
         None
     }
 
-    pub fn write_reg(&mut self, addr: u16, value: u16) -> WriteResult {
-        // SN — 用户可编辑配置, 写入后立即持久化到 NVS.
+    pub fn write_reg(&mut self, addr: u16, value: u16) -> WriteResult {        // SN — 用户可编辑配置, 写入后立即持久化到 NVS.
         // Android 1.0.78 WRITE_SN (0x21) 不调 APPLY, 必须 Persist 才能落盘.
         if (regs::HOLD_SN_BASE..regs::HOLD_SN_BASE + regs::HOLD_SN_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_SN_BASE) as usize * 2;
@@ -556,6 +555,8 @@ impl SystemConfig {
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
+            log::warn!("[write_reg] BLE_NAME write addr=0x{:04X} idx={} hi={:02X} lo={:02X}", addr, idx, hi, lo);
+            crate::ble_at::notify_ble_name_changed();
             return WriteResult::Persist;
         }
         // BLE MAC — 已迁到用户区 0x0FA4 (4004, 4 regs)
@@ -619,18 +620,54 @@ impl SystemConfig {
     // --------------------------------------------------------------------
 
     pub fn sn_str(&self) -> String {
-        let end = self.sn.iter().position(|&b| b == 0).unwrap_or(32);
-        String::from_utf8_lossy(&self.sn[..end]).to_string()
+        // LOOP7 fix: 同样用 BE 字节序解码
+        let mut chars = heapless::Vec::<char, 16>::new();
+        let mut i = 0;
+        while i + 1 < self.sn.len() {
+            let hi = self.sn[i];
+            let lo = self.sn[i + 1];
+            if hi == 0 && lo == 0 { break; }
+            if let Some(c) = char::from_u32(((hi as u32) << 8) | (lo as u32)) {
+                let _ = chars.push(c);
+            }
+            i += 2;
+        }
+        chars.into_iter().collect()
     }
 
     pub fn name_str(&self) -> String {
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(16);
-        String::from_utf8_lossy(&self.name[..end]).to_string()
+        // LOOP7 fix: 同样用 BE 字节序解码
+        let mut chars = heapless::Vec::<char, 8>::new();
+        let mut i = 0;
+        while i + 1 < self.name.len() {
+            let hi = self.name[i];
+            let lo = self.name[i + 1];
+            if hi == 0 && lo == 0 { break; }
+            if let Some(c) = char::from_u32(((hi as u32) << 8) | (lo as u32)) {
+                let _ = chars.push(c);
+            }
+            i += 2;
+        }
+        chars.into_iter().collect()
     }
 
     pub fn ble_name_str(&self) -> String {
-        let end = self.ble_name.iter().position(|&b| b == 0).unwrap_or(8);
-        String::from_utf8_lossy(&self.ble_name[..end]).to_string()
+        // LOOP7 fix: original finds first 0 byte as end, but UTF-16 BE has 0x00 high byte per char
+        // so always returns empty. Fix: manually decode BE, skip trailing null chars
+        let mut chars = heapless::Vec::<char, 8>::new();
+        let mut i = 0;
+        while i + 1 < self.ble_name.len() {
+            let hi = self.ble_name[i];
+            let lo = self.ble_name[i + 1];
+            if hi == 0 && lo == 0 { break; }
+            if let Some(c) = char::from_u32(((hi as u32) << 8) | (lo as u32)) {
+                let _ = chars.push(c);
+            }
+            i += 2;
+        }
+        let mut s_out = String::with_capacity(chars.len());
+        for c in &chars { s_out.push(*c); }
+        s_out
     }
 
     pub fn ip_str(&self) -> String {
