@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-23 (LOOP5: TCP 写 panic 修复 + 单元测试完整)
+> 最后更新: 2026-07-24 (LOOP7: BLE 名字 GAP 同步完成 + 编译烧录文档完成)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -219,3 +219,48 @@ cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 
 `log/` 目录:
 - `log/README.md` - 测试矩阵
+
+## LOOP7 BLE 名字 GAP 同步 (2026-07-24) - COMPLETE
+
+### 问题
+Metuory 写完蓝牙 ID 后搜不到设备. 之前以为是路径覆盖不全 (LOOP4 修复了 length-prefix),
+但实测仍搜不到 — 根本原因是 GAP device name 没更新.
+
+### 根因 (LOOP7 真因)
+`SystemConfig::ble_name_str()` 实现 bug:
+```rust
+let end = self.ble_name.iter().position(|&b| b == 0).unwrap_or(8);
+String::from_utf8_lossy(&self.ble_name[..end]).to_string()
+```
+UTF-16 BE 编码下每个字符高字节 = 0x00, `position(&b == 0)` 立即命中 idx=0, 返回空字符串.
+`update_gap_device_name` 拿空名调 `esp_ble_gap_set_device_name` → 失败 → 广播名字不变.
+
+### 修复 (commit 6c51359)
+1. `ble_name_str` / `sn_str` / `name_str` 全部改为按 BE 字节序手动解码:
+   ```rust
+   while i + 1 < self.ble_name.len() {
+       let hi = self.ble_name[i]; let lo = self.ble_name[i + 1];
+       if hi == 0 && lo == 0 { break; }
+       if let Some(c) = char::from_u32(((hi as u32) << 8) | (lo as u32)) {
+           chars.push(c);
+       }
+       i += 2;
+   }
+   chars.into_iter().collect()
+   ```
+2. GAP 同步机制 (src/ble_at/mod.rs):
+   - `static PENDING_GAP_NAME_UPDATE: AtomicBool`
+   - `notify_ble_name_changed()` 写完置 true
+   - `process_tick()` swap 后调 `update_gap_device_name()`
+   - `update_gap_device_name()` 调 `esp_ble_gap_set_device_name`
+3. AT 命令路径 (cfg_handlers.rs): `handle_cfgtbtname` 写完也调 `update_gap_device_name()`
+
+### 验证
+- Python 模拟: `'XY'` (UTF-16 BE) 修复前→`''` 修复后→`'XY'` ✓
+- Python 模拟: `'Mesh'` 修复前→`''` 修复后→`'Mesh'` ✓
+- 设备实测 Modbus FC=10 写 0x08E2='XY': cfg.ble_name 读回 `'XY'` ✓
+- GAP 设备名更新路径触发, 下次广播用新名字
+
+### 已知问题 (SN/LOCATION 历史数据)
+NVS 中残留旧 LE 编码的 SN 数据. 修复后用 BE 解码读 LE 字节会出现乱码.
+解决: 重新通过 Modbus/AT 写一次新值即可覆盖. 不影响当前修复.

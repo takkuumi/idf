@@ -1,6 +1,6 @@
 # 烧录指南 (ESP32-S3 工业网关)
 
-> 最后更新: 2026-07-21
+> 最后更新: 2026-07-24 (LOOP7 BLE 名字同步修复后)
 > 工具: `espflash 4.5.0` (cargo install espflash)
 > 串口: `/dev/cu.usbserial-1430`
 > 芯片: ESP32-S3 (Xtensa LX7 双核, 8MB Flash, 2MB PSRAM)
@@ -176,4 +176,114 @@ expect -c '
 
 ```bash
 cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip target/xtensa-esp32s3-espidf/debug/gateway
+```
+
+---
+
+## 八、LOOP7 后烧录流程更新
+
+### 8.1 完整烧录流程 (强制刷入完整固件)
+
+```bash
+# 1. 完整擦除 flash
+espflash erase-flash --port /dev/cu.usbserial-1430
+
+# 2. 烧录 bootloader + 分区表 + app
+espflash flash --port /dev/cu.usbserial-1430 --no-skip     target/xtensa-esp32s3-espidf/debug/gateway
+
+# 3. 硬复位 (DTR 拉低 500ms 让 EN 断电, 见 §8.2)
+python3 -c "
+import serial, time
+ser = serial.Serial('/dev/cu.usbserial-1430', 115200, timeout=1)
+ser.dtr = True; time.sleep(0.5); ser.dtr = False
+time.sleep(15)  # 等设备冷启动 + DHCP
+ser.close()
+"
+
+# 4. 找 IP
+python3 -c "
+import serial, time, re
+ser = serial.Serial('/dev/cu.usbserial-1430', 115200, timeout=1)
+end = time.time() + 10; buf = b''
+while time.time() < end:
+    try: d = ser.read(4096); buf += d if d else b''
+    except: pass
+ser.close()
+m = re.search(rb'ip: ([\d.]+)', buf)
+print(m.group(1).decode() if m else 'NO IP')
+"
+```
+
+### 8.2 DTR/RTS 硬复位详解 (LOOP7 实测)
+
+| 状态 | 操作 | 时序 |
+|------|------|------|
+| 软复位 (DTR pulse 100ms) | `ser.dtr = True; sleep(0.1); ser.dtr = False` | 通常不够, esp32s3 + CH340 在反复擦除后失灵 |
+| 半硬复位 (RTS 高电平) | `ser.rts = True; sleep(0.5); ser.rts = False` | 触发 BOOT 引脚高, 可能进入下载模式 |
+| **完全断电 (推荐)** | `ser.dtr = True; sleep(0.5); ser.dtr = False` | DTR 接 EN 引脚, 拉低断电, **必触发 POR** |
+| 完全拔 USB | 物理操作 | 等 5 秒, 100% 可靠 |
+
+### 8.3 LOOP7 验证烧录
+
+```bash
+# 烧录后验证 BLE 名字写入路径
+# 1. 读默认
+python3 -c "
+import socket, struct
+def mb(pdu, ip='192.168.51.140'):
+    s = socket.socket(); s.settimeout(3)
+    try: s.connect((ip, 502)); s.sendall(struct.pack('>HHHB', 1, 0, len(pdu)+1, 1) + pdu); import time; time.sleep(0.3); r = s.recv(256); return r
+    finally: s.close()
+r = mb(struct.pack('>BHH', 0x03, 0x08E2, 4))
+print(r.hex())
+# 期望: cfg 默认 'Mesh' (0x4d 0x00 0x65 0x00 0x73 0x00 0x68 0x00)
+# MBAP + 0x03 + 长度 4 + Mesh 字节
+
+# 2. 写 'XY' (2 字符)
+name = 'XY'.encode('utf-16-be') + b'\x00' * 6
+regs = [struct.unpack('>H', name[i:i+2])[0] for i in range(0, 8, 2)]
+pdu = struct.pack('>BHHB', 0x10, 0x08E2, 4, 8)
+for r in regs: pdu += struct.pack('>H', r)
+rsp = mb(pdu)
+print('write:', 'OK' if rsp else 'FAIL')
+
+# 3. 读回
+r = mb(struct.pack('>BHH', 0x03, 0x08E2, 4))
+body = r[7:]
+length = body[1]
+sn = body[2:2+length]
+print(f'cfg.ble_name = {sn.decode("utf-16-be").rstrip(chr(0))!r}')
+# 期望: 'XY' (LOOP7 修复前是 '', 修复后是 'XY')
+```
+
+### 8.4 烧录失败常见问题
+
+| 症状 | 原因 | 解决 |
+|------|------|------|
+| 烧录后 App version 还是旧 | esp-idf-sys 没重链接 | `touch build.rs && rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-* && cargo build` |
+| 烧录后设备没 IP | DTR/RTS 软复位失灵 | 用 §8.2 DTR 500ms 完全断电复位 |
+| 烧录后设备不启动 | erase-flash 后 W5500 SPI 卡住 | 完全拔 USB 重插 5 秒 |
+| `Failed to open serial port` | 上一个进程占用了 | 关闭 espflash monitor / minicom / putty |
+| `Wrong boot mode detected (0x13)!` | ESP32 进入了下载模式 | 短按 RST 重新上电, 不要按 BOOT |
+
+### 8.5 烧录 + 重置一键命令 (LOOP7 验证通过)
+
+```bash
+# 一键完整烧录 + 硬复位 + 找 IP
+ESPFLASH=espflash && SER=/dev/cu.usbserial-1430 && espflash erase-flash --port $SER && espflash flash --port $SER --no-skip target/xtensa-esp32s3-espidf/debug/gateway && python3 -c "
+import serial, time
+ser = serial.Serial('$SER', 115200, timeout=1)
+ser.dtr = True; time.sleep(0.5); ser.dtr = False
+time.sleep(15)
+ser.close()
+" && python3 -c "
+import serial, time, re
+ser = serial.Serial('$SER', 115200, timeout=1)
+end = time.time() + 10; buf = b''
+while time.time() < end:
+    try: d = ser.read(4096); buf += d if d else b''
+    except: pass
+ser.close()
+m = re.search(rb'ip: ([\d.]+)', buf)
+print(f'设备 IP: {m.group(1).decode() if m else "NO IP"}')"
 ```

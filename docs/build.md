@@ -477,3 +477,60 @@ cargo build --release
 - Debug: 23 MB (含调试符号, 126 warnings, 0 errors)
 - Release: 1.6 MB (已 strip, fat LTO)
 - 编译时间: 首次 ~30 分钟, 增量 ~25 秒
+
+
+## LOOP1-7 累计修复完成
+
+| LOOP | 修复内容 | 提交 |
+|------|----------|------|
+| LOOP1 | 路径覆盖 (Metuory 11 读路径 length-prefix 格式) | `a10a9ef` |
+| LOOP2 | TCP 写 panic 修复 (线程栈 12KB→20KB) | `25e83f4` |
+| LOOP3 | BLE 名字 MBAP.length 修复 + I2C 旧驱动警告抑制 | `22a6e0a`, `eac88db` |
+| LOOP4 | SN/LOCATION 默认值调整, 长度适配 Modbus 容量 | `88c7cc9` |
+| LOOP5 | TCP 连接线程栈 20KB (12KB 栈溢出修复) | `25e83f4` |
+| LOOP6 | I2C_SKIP_LEGACY_CONFLICT_CHECK 配置 | `eac88db` |
+| LOOP7 | BLE 名字 GAP 同步 (ble_name_str UTF-16 BE 解码) | `6c51359` |
+
+## 完整构建命令 (LOOP7 后)
+
+```bash
+# 1. 准备环境 (一次性)
+. $HOME/export-esp.sh  # 或: . $HOME/esp/esp-idf/export.sh
+export PATH="$HOME/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin:$PATH"
+
+# 2. 完整构建 (Debug 版, 含完整调试信息)
+cargo build
+
+# 3. 完整构建 (Release 版, 优化 + strip)
+cargo build --release
+
+# 4. 仅 cargo check (不链接, 快速验证编译)
+cargo check
+
+# 5. 单元测试 (编译测试 binary, ESP-IDF 平台需 qemu 跑)
+cargo test --bin gateway --no-run
+```
+
+### 关键 cargo 命令解释
+
+| 命令 | 作用 | 时间 |
+|------|------|------|
+| `cargo build` | Debug 构建 (不优化, 1.4MB binary) | ~25s 增量 |
+| `cargo build --release` | Release 构建 (LTO + strip, 1.6MB) | ~3min 全量 |
+| `cargo check` | 编译检查, 不链接生成 binary | ~10s |
+| `cargo test --no-run` | 编译测试 binary (Xtensa) | ~25s |
+| `cargo clean` | 清理 target/ 目录 | 0s |
+| `touch build.rs && rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*` | 强制重生成 esp-idf-sys (App version 等) | 3min |
+
+### 常见问题 (LOOP7 经验)
+
+1. **App version 不更新**: cargo build 不会重链接 esp-idf-sys, 烧录后 App version 还是旧的
+   - 解决: `touch build.rs && rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-* && cargo build`
+
+2. **DTR/RTS 软复位失灵**: CH340 在反复擦除后软复位不响应, 必须冷启动
+   - 解决: `ser.dtr = True; time.sleep(0.5); ser.dtr = False` (拉低 DTR 500ms 让 EN 断电)
+   - 或完全断 USB 重插
+
+3. **BLE 名字写入搜不到设备**: 见 LOOP7 修复
+   - 修复前 `ble_name_str()` 返回空字符串, GAP 设备名不更新
+   - 修复后按 BE 字节序解码, 正确返回名字
