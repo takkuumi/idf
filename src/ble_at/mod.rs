@@ -1064,24 +1064,22 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     let unit = data[6];
     let func = data[7];
     if func == 0x11 {
-        // 心跳应答 - 最小化以适应默认 BLE MTU 23
-        // BLE 帧格式: [tx_id(2)][proto_id(2)][length(2)][unit(1)][func(1)][data(N)][crc(2)]
-        // Android parseCMDModel: data_len=length-2, data=data[8..8+data_len]
-        // Android parseHeartbeat: slave=data[0], runStatus=data[1], terminal=data[2..]
-        // 
-        // pdu_data 必须包含 [unit, func, data_bytes] 长度 >= 2
-        // 最小情况: 2 字节 (slave + runStatus, 但 Android 需要 unit 和 func 来自 BLE 帧)
-        // 
-        // 实际: pdu_data = [unit, func=0x11, slave, runStatus] 4 字节
-        // BLE 帧: 2+2+2+4+2 = 12 字节
+        // 心跳应答 — LOOP9: 补全 terminal (6字节) 以匹配 metuory parseHeartbeat 格式
+        // metuory parseHeartbeat: slave=data[0], runStatus=data[1], terminal=data[2..]
+        // pdu_data = [unit, func=0x11, slave_addr, runStatus, terminal(6)] = 10 字节
+        // BLE 帧: 2+2+2+10+2 = 18 字节
         let hb = heartbeat_counter();
-        let mut rsp: heapless::Vec<u8, 4> = heapless::Vec::new();
-        let _ = rsp.push(unit);          // pdu[0] = slave (unit_id)
-        let _ = rsp.push(func);          // pdu[1] = runStatus = 0x11 (心跳标志)
-        // pdu[2..3] 作为 terminal (Android 存入 BLEDataSyncModel)
-        let _ = rsp.push((hb >> 8) as u8);
-        let _ = rsp.push((hb & 0xFF) as u8);
-        log::debug!("[ble_at] heartbeat: hb_seq={}", hb);
+        let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
+        let _ = rsp.push(unit);              // pdu[0] = unit_id (Modbus slave addr)
+        let _ = rsp.push(func);              // pdu[1] = func = 0x11
+        let _ = rsp.push(unit);              // pdu[2] = slave address (echo unit)
+        let _ = rsp.push(0x01);              // pdu[3] = runStatus = 1 (运行中)
+        // terminal: 6 字节 BLE MAC (设备标识, metuory 存入 BLEDataSyncModel)
+        let mut mac = [0u8; 6];
+        unsafe { esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2); } // ESP_MAC_BT=2
+        for b in mac { let _ = rsp.push(b); }
+        log::debug!("[ble_at] heartbeat: hb_seq={} mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            hb, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
