@@ -678,8 +678,8 @@ pub fn start() -> AppResult<()> {
     }
 
     // device::init() 已在本函数之前加载配置；广播使用可配置的短名称（最多 8 字节）
-    let configured_name = crate::bus::config_state::config_read()
-        .map(|cs| cs.cfg.ble_name_str())
+    // LOOP11: 零拷贝, 闭包内构造最终 String
+    let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "GW-S3".to_owned());
     let name = CString::new(configured_name.as_str())
@@ -751,8 +751,8 @@ pub fn start() -> AppResult<()> {
 /// LOOP7: 写完 BLE 名字后立即同步 GAP 设备名
 /// 不重启广播 — esp_ble_gap_set_device_name 后下次广播自动用新名字
 pub fn update_gap_device_name() {
-    let configured_name = crate::bus::config_state::config_read()
-        .map(|cs| cs.cfg.ble_name_str())
+    // LOOP11: 零拷贝, 闭包内返回 String (ble_name_str() 返回 String, 不含借用)
+    let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
         .unwrap_or_else(|| "Mesh".to_owned());
     log::warn!("[ble_at] update_gap_device_name: cfg.ble_name='{}'", configured_name);
     if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
@@ -1144,8 +1144,7 @@ fn handle_mca_custom_command(
     match func {
         0xCE => {
             // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
-            let (ip, mask, gw) = crate::bus::config_state::config_read()
-                .map(|cs| (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway))
+            let (ip, mask, gw) = crate::bus::config_state::config_read_with(|cs| (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway))
                 .unwrap_or(([0u8; 4], [0u8; 4], [0u8; 4]));
             let mut rsp: heapless::Vec<u8, 16> = heapless::Vec::new();
             let _ = rsp.push(0xCE); // cmd
@@ -1163,8 +1162,7 @@ fn handle_mca_custom_command(
         }
         0xC2 => {
             // GET_SN_CODE
-            let sn = crate::bus::config_state::config_read()
-                .map(|cs| cs.cfg.sn)
+            let sn = crate::bus::config_state::config_read_with(|cs| cs.cfg.sn)
                 .unwrap_or([0u8; 32]);
             let mut rsp: heapless::Vec<u8, 20> = heapless::Vec::new();
             let _ = rsp.push(0xC2);
@@ -1197,8 +1195,7 @@ fn handle_mca_custom_command(
         }
         0xC6 => {
             // GET_ETH_MAC
-            let mac = crate::bus::config_state::config_read()
-                .map(|cs| cs.cfg.eth_mac)
+            let mac = crate::bus::config_state::config_read_with(|cs| cs.cfg.eth_mac)
                 .unwrap_or([0u8; 6]);
             let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
             let _ = rsp.push(0xC6);
@@ -1261,14 +1258,12 @@ fn handle_ble_android_read_command(
         return false;
     }
 
-    let cfg_guard = match crate::bus::config_state::config_read() {
-        Some(cs) => cs,
-        None => return false,
-    };
-    // RCU 快照借用, 在函数作用域内有效
-    let cfg: &crate::device::system_config::SystemConfig = &cfg_guard.cfg;
-
-    let rsp_data: heapless::Vec<u8, 32> = match (reg_addr, reg_cnt) {
+    // LOOP11: 零拷贝, 把整个 match 包进 config_read_with 闭包, 避免 BTC_TASK
+    // 栈上 clone ConfigSnapshot (~2.5KB). 闭包内借用 &cs.cfg, 所有 cfg.xxx
+    // 字段访问零栈开销. 闭包返回 Option<heapless::Vec<u8,32>>, None 表示未命中.
+    let rsp_data: Option<Option<heapless::Vec<u8, 32>>> = crate::bus::config_state::config_read_with(|cs| {
+        let cfg: &crate::device::system_config::SystemConfig = &cs.cfg;
+        match (reg_addr, reg_cnt) {
         // ⚠️ 所有 push 必须在 Vec 容量 (32) 内! 超出会静默截断 → Android 严格长度检查失败 → UI 空
         // ⚠️ READ_IP (0x08C7) 需 25 字节 (1 length + 8 ip + 8 mask + 8 gw), 旧 Vec<u8, 16> bug 见 LOOP2
         // 回归测试: test_android_parse_ip_no_truncation
@@ -1285,7 +1280,7 @@ fn handle_ble_android_read_command(
             let _ = d.push(di_cnt);
             let _ = d.push(adc_cnt);
             let _ = d.push(rs485_cnt);
-            d
+            Some(d)
         }
         // READ_FW_VERSION (0x087E, 0x0002): Android 期望 [4][fw_hi][fw_lo][dt_hi][dt_lo] (5B)
         // fwVersionBytesToStr: fw=bytes[0..2]BE/100 → main.sub.tail, dt=bytes[2..4]BE
@@ -1301,7 +1296,7 @@ fn handle_ble_android_read_command(
             let _ = d.push((dt & 0xFF) as u8);
             log::info!("[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
                 fw, fw / 100, (fw % 100) / 10, fw % 10, dt, dt);
-            d
+            Some(d)
         }
         // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
         (0x08A5, 1) => {
@@ -1310,7 +1305,7 @@ fn handle_ble_android_read_command(
             let _ = d.push(2);
             let _ = d.push((hw >> 8) as u8);
             let _ = d.push((hw & 0xFF) as u8);
-            d
+            Some(d)
         }
         // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
         //   [length_byte=24][ip(8)][mask(8)][gw(8)]
@@ -1331,7 +1326,7 @@ fn handle_ble_android_read_command(
                 ip[0], ip[1], ip[2], ip[3],
                 mask[0], mask[1], mask[2], mask[3],
                 gw[0], gw[1], gw[2], gw[3]);
-            d
+            Some(d)
         }
         // READ_MAC (0x08D7, 0x0006): Android 期望 [12][mac(12)] (13B)
         //   每个 mac byte 编码为 BE u16: 0x80 → [0x00, 0x80]
@@ -1344,7 +1339,7 @@ fn handle_ble_android_read_command(
             for &b in &mac { let _ = d.push(0); let _ = d.push(b); }
             log::info!("[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            d
+            Some(d)
         }
         // READ_BLUETOOTH_ID (0x08E2, 0x0004): Android 端蓝牙 ID 显示
         //   - UTF-8 模式 (新版本): parseBluetoothIDItem → bluetoothIDBytesToUTF8Str
@@ -1362,7 +1357,7 @@ fn handle_ble_android_read_command(
                 let _ = d.push(if i < take { cfg.ble_name[i] } else { 0 });
             }
             log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>"));
-            d
+            Some(d)
         }
         // READ_SN (0x0894, 0x0009): Android 期望 [length][length bytes of SN ASCII]
         // parseSNItem 读 buffer[0] = length, 然后 [1..1+length] = SN bytes
@@ -1374,7 +1369,7 @@ fn handle_ble_android_read_command(
             let _ = d.push(take as u8);
             for i in 0..take { let _ = d.push(bytes[i]); }
             log::info!("[ble_at] READ_SN: {} bytes", take);
-            d
+            Some(d)
         }
         // READ_LOCATION (0x089D, 0x0008): 同 SN 格式, [length][location bytes]
         (0x089D, 8) => {
@@ -1385,7 +1380,7 @@ fn handle_ble_android_read_command(
             let _ = d.push(take as u8);
             for i in 0..take { let _ = d.push(bytes[i]); }
             log::info!("[ble_at] READ_LOCATION: {} bytes", take);
-            d
+            Some(d)
         }
         // READ_RS485_INDEX_CONFIG (0x08A6/0x08AB/0x08B0, 5): metuory 期望 packed 10-byte struct
         // parseRS485ConfigItem: [0x0a][packed][masterSlave][slaveAddr(2BE)][retry(2BE)][timeout(2BE)][interval(2BE)]
@@ -1412,7 +1407,7 @@ fn handle_ble_android_read_command(
             let _ = d.push((r.interval_ms & 0xFF) as u8);
             log::info!("[ble_at] READ_RS485_CONFIG: port={} baud={} parity={} stop={} data={} mode={} slave={} retry={} timeout={} interval={}",
                 port, r.baudrate, r.parity, r.stop_bits, r.data_bits, r.mode, r.slave_addr, r.retry_count, r.timeout_ms, r.interval_ms);
-            d
+            Some(d)
         }
         // READ_ADC_VALUE (0x0080, count): Android 期望 [length][length bytes of BE u16]
         // parseResReadADC: length = buffer[0], 然后 for i=1; i<buffer.length; i+=2 → BE short
@@ -1428,7 +1423,7 @@ fn handle_ble_android_read_command(
                 let _ = d.push((v & 0xFF) as u8);
             }
             log::info!("[ble_at] READ_ADC: {} channels", n);
-            d
+            Some(d)
         }
         // READ_COM_INPUT_IO_STATUS (0x0000, count): Android 期望 [N bytes][N bytes of packed I/O bits]
         // parseResReadComInputIOStatus: bufferLength = buffer[0], 读 bufferLength*8 bits
@@ -1453,7 +1448,7 @@ fn handle_ble_android_read_command(
                 let _ = d.push(acc);
             }
             log::info!("[ble_at] READ_COM_IO: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            d
+            Some(d)
         }
         // READ_RS485_VALUE (用户自定义地址, count): 透传读取输入寄存器, length-prefix BE u16
         // 匹配: 任何 FC=04 读非 0x0080/0x0880-0x08CF 范围 (排除硬件信息等已知名单)
@@ -1470,7 +1465,7 @@ fn handle_ble_android_read_command(
                 let _ = d.push((v & 0xFF) as u8);
             }
             log::info!("[ble_at] READ_RS485_VALUE: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            d
+            Some(d)
         }
         // READ_RS485_CUSTOM_VALUE: 同上但 FC=03 (读保持寄存器)
         (addr, _) if func == 0x03 && !(0x087C..=0x08FF).contains(&addr)
@@ -1485,9 +1480,14 @@ fn handle_ble_android_read_command(
                 let _ = d.push((v & 0xFF) as u8);
             }
             log::info!("[ble_at] READ_RS485_CUSTOM: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            d
+            Some(d)
         }
-        _ => return false, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
+        _ => None, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
+    }
+    });
+    let rsp_data = match rsp_data {
+        Some(Some(d)) => d,
+        _ => return false,
     };
 
     // 构造 pdu_data = [unit][func=0x03/0x04][length][data...]

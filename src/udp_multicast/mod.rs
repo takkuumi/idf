@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use crate::bus::config_state::config_read;
+use crate::bus::config_state::config_read_with;
 use crate::config::regs;
 use crate::error::AppResult;
 use crate::health::{self, TaskHb};
@@ -53,48 +53,48 @@ const RECV_TIMEOUT_MS: u64 = 1000;
 const BACKOFF_MS: u64 = 5000;
 
 /// 从 CONFIG RCU 读取组播配置 (端口 + 组地址 + 源 IP 过滤)
+///
+/// LOOP11: 零拷贝, 闭包内构造 MulticastConfig 返回 (避免 udp-mcast 6KB 栈上 clone ~2.5KB).
 fn read_multicast_config() -> MulticastConfig {
-    let cs = match config_read() {
-        Some(cs) => cs,
-        None => return MulticastConfig::default(),
-    };
-    // 2190-2194 是 HOLD_CFG_BASE (0x0880) 偏移的子寄存器, 通过 SystemConfig::read_reg 读取
-    let mcast_ip12 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP1_2).unwrap_or(0);
-    let mcast_ip34 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP3_4).unwrap_or(0);
-    let mcast_port = cs.cfg.read_reg(regs::INREG_MULTICAST_PORT).unwrap_or(0);
-    let switch_ip12 = cs.cfg.read_reg(regs::INREG_SWITCH_IP1_2).unwrap_or(0);
-    let switch_ip34 = cs.cfg.read_reg(regs::INREG_SWITCH_IP3_4).unwrap_or(0);
+    config_read_with(|cs| {
+        // 2190-2194 是 HOLD_CFG_BASE (0x0880) 偏移的子寄存器, 通过 SystemConfig::read_reg 读取
+        let mcast_ip12 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP1_2).unwrap_or(0);
+        let mcast_ip34 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP3_4).unwrap_or(0);
+        let mcast_port = cs.cfg.read_reg(regs::INREG_MULTICAST_PORT).unwrap_or(0);
+        let switch_ip12 = cs.cfg.read_reg(regs::INREG_SWITCH_IP1_2).unwrap_or(0);
+        let switch_ip34 = cs.cfg.read_reg(regs::INREG_SWITCH_IP3_4).unwrap_or(0);
 
-    let group = if mcast_ip12 == 0 && mcast_ip34 == 0 {
-        DEFAULT_MCAST_ADDR
-    } else {
-        [
-            (mcast_ip12 >> 8) as u8,
-            (mcast_ip12 & 0xFF) as u8,
-            (mcast_ip34 >> 8) as u8,
-            (mcast_ip34 & 0xFF) as u8,
-        ]
-    };
-    let port = if mcast_port == 0 {
-        DEFAULT_MCAST_PORT
-    } else {
-        mcast_port
-    };
-    let switch_ip = if switch_ip12 == 0 && switch_ip34 == 0 {
-        None // 不过滤源 IP
-    } else {
-        Some([
-            (switch_ip12 >> 8) as u8,
-            (switch_ip12 & 0xFF) as u8,
-            (switch_ip34 >> 8) as u8,
-            (switch_ip34 & 0xFF) as u8,
-        ])
-    };
-    MulticastConfig {
-        group,
-        port,
-        switch_ip,
-    }
+        let group = if mcast_ip12 == 0 && mcast_ip34 == 0 {
+            DEFAULT_MCAST_ADDR
+        } else {
+            [
+                (mcast_ip12 >> 8) as u8,
+                (mcast_ip12 & 0xFF) as u8,
+                (mcast_ip34 >> 8) as u8,
+                (mcast_ip34 & 0xFF) as u8,
+            ]
+        };
+        let port = if mcast_port == 0 {
+            DEFAULT_MCAST_PORT
+        } else {
+            mcast_port
+        };
+        let switch_ip = if switch_ip12 == 0 && switch_ip34 == 0 {
+            None // 不过滤源 IP
+        } else {
+            Some([
+                (switch_ip12 >> 8) as u8,
+                (switch_ip12 & 0xFF) as u8,
+                (switch_ip34 >> 8) as u8,
+                (switch_ip34 & 0xFF) as u8,
+            ])
+        };
+        MulticastConfig {
+            group,
+            port,
+            switch_ip,
+        }
+    }).unwrap_or_else(MulticastConfig::default)
 }
 
 struct MulticastConfig {
@@ -251,9 +251,8 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
         imr_interface: u32,
     }
 
-    // 从 CONFIG RCU 读取设备 IP 作为接口地址 (INADDR_ANY 在 ESP-IDF LwIP 上不可靠)
-    let if_ip = crate::bus::config_state::config_read()
-        .map(|cs| cs.cfg.ip)
+    // LOOP11: 零拷贝读设备 IP (避免 udp-mcast 6KB 栈上 clone ~2.5KB)
+    let if_ip = config_read_with(|cs| cs.cfg.ip)
         .unwrap_or([0, 0, 0, 0]);
     log::info!(
         "[udp-mcast] join group={}.{}.{}.{} iface={}.{}.{}.{}",

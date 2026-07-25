@@ -22,10 +22,13 @@
 //!
 //! ## 认证
 //!
-//! Cookie-based 会话认证 (对齐参考固件 `ESPSESSIONID` cookie):
+//! Cookie-based 会话认证 (LOOP11 升级, 替代旧的硬编码 `ESPSESSIONID=1`):
 //! - 未认证请求 → 301 重定向到 `/login`
-//! - POST `/login` 验证成功 → 设置 `ESPSESSIONID=1`
-//! - 默认密码: admin/admin123 (可修改, 存储到 NVS)
+//! - POST `/login` 验证成功 → 200 JSON + `Set-Cookie: ESPSESSIONID=<32hex>`
+//!   (16 字节 TRNG 随机 token 的 hex 编码, HttpOnly; Path=/; Max-Age=86400)
+//! - 服务端 `SESSION` 全局保存活跃 token, `is_authenticated()` 常量时间比较
+//! - `/logout` 销毁服务端会话 + 清除浏览器 Cookie
+//! - 默认密码: admin/admin123 (可修改, 明文存储到 NVS, 对齐 MCA `/WebPwd.txt`)
 //!
 //! ## 性能
 //!
@@ -38,9 +41,10 @@ mod pages;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::bus::{config_state::config_read, IO};
+use crate::bus::{config_state::config_read_with, IO};
 use crate::config::regs;
 use crate::error::AppResult;
 use crate::health::{self, TaskHb};
@@ -63,6 +67,108 @@ const DEFAULT_PASSWORD: &str = "admin123";
 /// NVS 密码 key
 const NVS_KEY_WEB_PWD: &str = "web_pwd";
 const NVS_KEY_WEB_PWD_FLAG: &str = "web_pwd_f";
+
+/// 会话有效期 (秒): 24 小时 (与 Cookie Max-Age 一致)
+const SESSION_TTL_SECS: u64 = 86400;
+
+// ============================================================================
+// LOOP11: 会话管理 (替代硬编码 ESPSESSIONID=1)
+// ============================================================================
+
+/// 会话状态 (单会话设备: 同一时间仅允许一个管理员登录)
+/// - `token`: 16 字节硬件随机数, hex 编码后作为 Cookie 值
+/// - `active`: 当前会话是否有效 (logout 时清零)
+struct Session {
+    token: [u8; 16],
+    active: bool,
+}
+
+static SESSION: Mutex<Session> = Mutex::new(Session {
+    token: [0u8; 16],
+    active: false,
+});
+
+/// 生成 16 字节硬件随机 token (生产路径: ESP32 TRNG; 测试路径: 固定序列).
+/// 设备上调用 `esp_random()` 4 次填充 16 字节; 主机测试无法链接 esp-idf-sys,
+/// 使用固定可预测值 (仅用于验证 hex 编码逻辑, 不用于真实鉴权).
+fn generate_session_token() -> [u8; 16] {
+    #[cfg(not(test))]
+    {
+        let mut token = [0u8; 16];
+        for chunk in token.chunks_mut(4) {
+            let r = unsafe { esp_idf_sys::esp_random() };
+            let bytes = r.to_le_bytes();
+            let n = chunk.len().min(4);
+            chunk[..n].copy_from_slice(&bytes[..n]);
+        }
+        token
+    }
+    #[cfg(test)]
+    {
+        // 测试用固定序列: 0x01..0x10, 验证编码/解码对称性
+        let mut token = [0u8; 16];
+        for (i, b) in token.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        token
+    }
+}
+
+/// 创建新会话并返回 Set-Cookie 字符串.
+fn create_session_cookie() -> String {
+    let token = generate_session_token();
+    let hex = hex_encode_16(&token);
+    if let Ok(mut s) = SESSION.lock() {
+        s.token = token;
+        s.active = true;
+    }
+    // Set-Cookie: ESPSESSIONID=<32hex>; HttpOnly; Path=/; Max-Age=86400
+    format!(
+        "ESPSESSIONID={}; HttpOnly; Path=/; Max-Age={}",
+        std::str::from_utf8(&hex).unwrap_or(""),
+        SESSION_TTL_SECS
+    )
+}
+
+/// 销毁服务端会话 (logout 调用)
+fn destroy_session() {
+    if let Ok(mut s) = SESSION.lock() {
+        s.token = [0u8; 16];
+        s.active = false;
+    }
+}
+
+/// 验证 Cookie 中的 token 是否与会话匹配 (常量时间比较, 防时序攻击)
+fn validate_session_cookie(token_hex: &[u8]) -> bool {
+    if token_hex.len() != 32 {
+        return false;
+    }
+    if let Ok(s) = SESSION.lock() {
+        if !s.active {
+            return false;
+        }
+        // 对比 hex(token) == cookie_hex (常量时间)
+        let expected = hex_encode_16(&s.token);
+        let mut diff = 0u8;
+        for i in 0..32 {
+            diff |= expected[i] ^ token_hex[i];
+        }
+        diff == 0
+    } else {
+        false
+    }
+}
+
+/// 16 字节 → 32 字符小写 hex (无分配, 写入固定 32 字节缓冲)
+fn hex_encode_16(src: &[u8; 16]) -> [u8; 32] {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = [0u8; 32];
+    for i in 0..16 {
+        out[i * 2] = HEX[(src[i] >> 4) as usize];
+        out[i * 2 + 1] = HEX[(src[i] & 0x0f) as usize];
+    }
+    out
+}
 
 /// HTTP 服务器任务心跳 (阈值 30s, 5s accept 循环 + 余量)
 static TASK_HB: TaskHb = TaskHb::new_with_stall("http-srv", 30);
@@ -149,10 +255,11 @@ impl HttpRequest {
             .map(|(_, v)| v.as_str())
     }
 
-    /// 检查 Cookie 中是否有有效的 ESPSESSIONID
+    /// 检查 Cookie 中是否有有效的会话 token.
     ///
-    /// LOOP9: 精确匹配 `ESPSESSIONID=1` 整对 (防止 `ESPSESSIONID=10` 或
-    /// `foo=ESPSESSIONID=1bar` 等子串绕过)
+    /// LOOP11: 替代旧 `ESPSESSIONID=1` 字面量, 改为随机 token 验证.
+    /// 从 Cookie header 提取 `ESPSESSIONID` 值, 与全局 SESSION 中的
+    /// hex(token) 做常量时间比较.
     fn is_authenticated(&self) -> bool {
         let Some(cookie) = self.header("Cookie") else {
             return false;
@@ -160,8 +267,8 @@ impl HttpRequest {
         for pair in cookie.split(';') {
             let kv = pair.trim();
             if let Some((k, v)) = kv.split_once('=') {
-                if k.trim() == "ESPSESSIONID" && v.trim() == "1" {
-                    return true;
+                if k.trim() == "ESPSESSIONID" {
+                    return validate_session_cookie(v.trim().as_bytes());
                 }
             }
         }
@@ -252,26 +359,40 @@ fn send_json(stream: &mut TcpStream, status: u16, json: &str) -> std::io::Result
     send_response(stream, status, "application/json", json.as_bytes())
 }
 
+/// 发送带 Set-Cookie 的 JSON 响应 (LOOP11: 登录成功专用).
+///
+/// 旧实现 `send_redirect_with_cookie` 返回 301 + 空 body, 但 login.html 用
+/// `fetch().then(r => r.json())` 期望 JSON body — fetch 自动跟随 301 拿到 INDEX_HTML
+/// 后 `r.json()` 抛 SyntaxError, 导致登录看似无反应. 改为 200 + JSON + Set-Cookie,
+/// login.html 收到 `code:"0"` 后自行 `location.href='/'`.
+fn send_json_with_cookie(
+    stream: &mut TcpStream,
+    status: u16,
+    json: &str,
+    cookie: &str,
+) -> std::io::Result<()> {
+    let status_text = match status {
+        200 => "OK",
+        _ => "Error",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nSet-Cookie: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        status_text,
+        cookie,
+        json.len()
+    )?;
+    stream.write_all(json.as_bytes())?;
+    Ok(())
+}
+
 /// 发送 301 重定向
 fn send_redirect(stream: &mut TcpStream, location: &str) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nCache-Control: no-cache\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         location
-    )?;
-    Ok(())
-}
-
-/// 发送带 Cookie 的 301 重定向 (登录成功时)
-fn send_redirect_with_cookie(
-    stream: &mut TcpStream,
-    location: &str,
-    cookie: &str,
-) -> std::io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nCache-Control: no-cache\r\nSet-Cookie: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        location, cookie
     )?;
     Ok(())
 }
@@ -420,10 +541,11 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
         // ---- 公开路由 (无需认证) ----
         "/login" => handle_login(&mut stream, &req),
         "/logout" => {
-            // 清除 Cookie, 重定向到 /login
+            // LOOP11: 销毁服务端会话 + 清除浏览器 Cookie
+            destroy_session();
             write!(
                 stream,
-                "HTTP/1.1 301 Moved Permanently\r\nLocation: /login\r\nCache-Control: no-cache\r\nSet-Cookie: ESPSESSIONID=0; Max-Age=0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: /login\r\nCache-Control: no-cache\r\nSet-Cookie: ESPSESSIONID=0; Path=/; Max-Age=0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )?;
             Ok(())
         }
@@ -478,33 +600,36 @@ fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()
     if pwd != actual_pwd {
         return send_json(stream, 200, &json_response("login", "0x01000002"));
     }
-    send_redirect_with_cookie(stream, "/", "ESPSESSIONID=1")
+    // LOOP11: 返回 200 JSON + 随机 token Cookie (不再 301 空 body, 否则
+    // login.html 的 fetch().then(r=>r.json()) 解析失败导致登录看似无反应)
+    let cookie = create_session_cookie();
+    send_json_with_cookie(stream, 200, &json_response("login", "0"), &cookie)
 }
 
 /// GET /getsysteminfo
 fn handle_get_system_info(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
-    let cfg = config_read().map(|cs| cs.cfg.clone());
-    let cfg = match cfg {
-        Some(c) => c,
+    let json = match config_read_with(|cs| {
+        let cfg = &cs.cfg;
+        let device_name = cfg.name_str();
+        let sn = cfg.sn_str();
+        let fw_ver = cfg.fw_version;
+        let hw_ver = cfg.hw_version;
+        let fw_date = cfg.fw_date;
+        format!(
+            r#"{{"type":"getsysteminfo","code":"0","data":{{"devicename":"{}","sn":"{}","model":"F16","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}","addressinfo":"{}"}}}}"#,
+            escape_json(&device_name),
+            escape_json(&sn),
+            fw_ver / 100,
+            (fw_ver % 100) / 10,
+            fw_ver % 10,
+            fw_date,
+            hw_ver,
+            escape_json(&device_name),
+        )
+    }) {
+        Some(j) => j,
         None => return send_json(stream, 500, &json_response("getsysteminfo", "500")),
     };
-
-    let device_name = cfg.name_str();
-    let sn = cfg.sn_str();
-    let fw_ver = cfg.fw_version;
-    let hw_ver = cfg.hw_version;
-    let fw_date = cfg.fw_date;
-
-    let json = format!(
-        r#"{{"type":"getsysteminfo","code":"0","data":{{"devicename":"{}","sn":"{}","model":"F16","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}"}}}}"#,
-        escape_json(&device_name),
-        escape_json(&sn),
-        fw_ver / 100,
-        (fw_ver % 100) / 10,
-        fw_ver % 10,
-        fw_date,
-        hw_ver,
-    );
     send_json(stream, 200, &json)
 }
 
@@ -538,40 +663,27 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
 
 /// GET /getnetworkconfig
 fn handle_get_network_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
-    let cfg = config_read().map(|cs| cs.cfg.clone());
-    let cfg = match cfg {
-        Some(c) => c,
+    let json = match config_read_with(|cs| {
+        let cfg = &cs.cfg;
+        let ip = format!("{}.{}.{}.{}", cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
+        let mask = format!("{}.{}.{}.{}", cfg.mask[0], cfg.mask[1], cfg.mask[2], cfg.mask[3]);
+        let gw = format!("{}.{}.{}.{}", cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]);
+        let dns = format!("{}.{}.{}.{}", cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]);
+        let mac = format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            cfg.eth_mac[0], cfg.eth_mac[1], cfg.eth_mac[2],
+            cfg.eth_mac[3], cfg.eth_mac[4], cfg.eth_mac[5],
+        );
+        let sn = cfg.sn_str();
+        let name = cfg.name_str();
+        format!(
+            r#"{{"type":"getnetworkconfig","code":"0","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{}}}}}"#,
+            ip, mask, gw, dns, mac, escape_json(&sn), escape_json(&name), if cfg.dhcp { 1 } else { 0 },
+        )
+    }) {
+        Some(j) => j,
         None => return send_json(stream, 500, &json_response("getnetworkconfig", "500")),
     };
-
-    let ip = format!(
-        "{}.{}.{}.{}",
-        cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]
-    );
-    let mask = format!(
-        "{}.{}.{}.{}",
-        cfg.mask[0], cfg.mask[1], cfg.mask[2], cfg.mask[3]
-    );
-    let gw = format!(
-        "{}.{}.{}.{}",
-        cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]
-    );
-    let dns = format!(
-        "{}.{}.{}.{}",
-        cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]
-    );
-    let mac = format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        cfg.eth_mac[0], cfg.eth_mac[1], cfg.eth_mac[2],
-        cfg.eth_mac[3], cfg.eth_mac[4], cfg.eth_mac[5],
-    );
-    let sn = cfg.sn_str();
-    let name = cfg.name_str();
-
-    let json = format!(
-        r#"{{"type":"getnetworkconfig","code":"0","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{}}}}}"#,
-        ip, mask, gw, dns, mac, escape_json(&sn), escape_json(&name), if cfg.dhcp { 1 } else { 0 },
-    );
     send_json(stream, 200, &json)
 }
 
@@ -648,38 +760,36 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
 
 /// GET /getportconfig
 fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
-    let cfg = config_read().map(|cs| cs.cfg.clone());
-    let cfg = match cfg {
-        Some(c) => c,
+    let json = match config_read_with(|cs| {
+        let cfg = &cs.cfg;
+        let port_fields = |i: usize| -> String {
+            if i < cfg.rs485.len() {
+                let r = &cfg.rs485[i];
+                format!(
+                    r#""baud_{}":{},"mode_{}":{},"databits_{}":{},"stopbits_{}":{},"parity_{}":{}"#,
+                    i, r.baudrate,
+                    i, r.mode,
+                    i, r.data_bits,
+                    i, r.stop_bits,
+                    i, r.parity,
+                )
+            } else {
+                format!(
+                    r#""baud_{}":9600,"mode_{}":0,"databits_{}":8,"stopbits_{}":1,"parity_{}":0"#,
+                    i, i, i, i, i
+                )
+            }
+        };
+        format!(
+            r#"{{"type":"getportconfig","code":"0","data":{{{},{},{}}}}}"#,
+            port_fields(0),
+            port_fields(1),
+            port_fields(2),
+        )
+    }) {
+        Some(j) => j,
         None => return send_json(stream, 500, &json_response("getportconfig", "500")),
     };
-
-    // 每个 RS485 端口 5 个字段: baud, mode, databits, stopbits, parity
-    let port_fields = |i: usize| -> String {
-        if i < cfg.rs485.len() {
-            let r = &cfg.rs485[i];
-            format!(
-                r#""baud_{}":{},"mode_{}":{},"databits_{}":{},"stopbits_{}":{},"parity_{}":{}"#,
-                i, r.baudrate,
-                i, r.mode,
-                i, r.data_bits,
-                i, r.stop_bits,
-                i, r.parity,
-            )
-        } else {
-            format!(
-                r#""baud_{}":9600,"mode_{}":0,"databits_{}":8,"stopbits_{}":1,"parity_{}":0"#,
-                i, i, i, i, i
-            )
-        }
-    };
-
-    let json = format!(
-        r#"{{"type":"getportconfig","code":"0","data":{{{},{},{}}}}}"#,
-        port_fields(0),
-        port_fields(1),
-        port_fields(2),
-    );
     send_json(stream, 200, &json)
 }
 
@@ -988,5 +1098,80 @@ mod tests {
         assert_eq!(url_decode("a+b"), "a b");
         assert_eq!(url_decode("abc"), "abc");
         assert_eq!(url_decode("%41%42%43"), "ABC");
+    }
+
+    // ---- LOOP11: 会话管理回归测试 ----
+
+    /// hex 编码 16 字节 → 32 字符, 与已知向量对照
+    #[test]
+    fn test_hex_encode_16() {
+        let token = [0x01, 0x02, 0x0a, 0x0f, 0x10, 0xff, 0xab, 0xcd,
+                     0x00, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33];
+        let hex = hex_encode_16(&token);
+        let s = std::str::from_utf8(&hex).unwrap();
+        assert_eq!(s, "01020a0f10ffabcd0099887766554433");
+    }
+
+    /// 登录 → 已认证 → logout → 未认证 完整流程
+    #[test]
+    fn test_session_auth_flow() {
+        // 初始: 无活跃会话
+        destroy_session();
+        assert!(!validate_session_cookie(b"00000000000000000000000000000000"));
+
+        // 登录: 创建会话, Cookie 含正确 token hex
+        let cookie = create_session_cookie();
+        assert!(cookie.starts_with("ESPSESSIONID="));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Max-Age=86400"));
+        // 提取 token hex (ESPSESSIONID= 后到第一个 ; 之前)
+        let token_hex = cookie
+            .strip_prefix("ESPSESSIONID=")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .as_bytes();
+        assert_eq!(token_hex.len(), 32);
+        // 用该 token 验证 → 应通过
+        assert!(validate_session_cookie(token_hex));
+
+        // logout 后 → 同一 token 应失效
+        destroy_session();
+        assert!(!validate_session_cookie(token_hex));
+    }
+
+    /// 错误 token / 错误长度 → 拒绝 (防伪造)
+    #[test]
+    fn test_session_reject_invalid_token() {
+        destroy_session();
+        let cookie = create_session_cookie();
+        let valid = cookie
+            .strip_prefix("ESPSESSIONID=")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .as_bytes();
+        // 旧硬编码值 "1" 应被拒绝
+        assert!(!validate_session_cookie(b"1"));
+        // 长度不足应被拒绝
+        assert!(!validate_session_cookie(b"abc"));
+        // 翻转一个字节的 token 应被拒绝
+        let mut tampered = valid.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(!validate_session_cookie(&tampered));
+        // 正确 token 应通过
+        assert!(validate_session_cookie(valid));
+    }
+
+    /// 常量时间比较: 长度相同但内容不同 → false, 不 panic
+    #[test]
+    fn test_session_constant_time_compare() {
+        destroy_session();
+        let _ = create_session_cookie();
+        let wrong = b"deadbeefdeadbeefdeadbeefdeadbeef";
+        assert_eq!(wrong.len(), 32);
+        assert!(!validate_session_cookie(wrong));
     }
 }

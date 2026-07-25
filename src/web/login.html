@@ -39,13 +39,21 @@ transition:opacity .2s}
 <script>
 document.getElementById('f').onsubmit=async e=>{
   e.preventDefault();
+  const err=document.getElementById('err');
+  err.textContent='';
   const fd=new FormData(e.target);
-  const r=await fetch('/login',{method:'POST',body:new URLSearchParams(fd)});
-  const j=await r.json();
-  if(j.code==='0'){location.href='/';}
-  else{
+  const btn=document.querySelector('.btn');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/login',{method:'POST',body:new URLSearchParams(fd),credentials:'same-origin'});
+    const j=await r.json();
+    if(j.code==='0'){location.href='/';return;}
     const m={'0x01000001':'用户名不存在','0x01000002':'密码错误'};
-    document.getElementById('err').textContent=m[j.code]||('错误: '+j.code);
+    err.textContent=m[j.code]||('错误: '+j.code);
+  }catch(_ex){
+    err.textContent='网络错误, 请检查设备连接';
+  }finally{
+    btn.disabled=false;
   }
 };
 </script>

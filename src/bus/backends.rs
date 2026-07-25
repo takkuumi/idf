@@ -12,12 +12,14 @@
 //! `STORAGE` / `CONFIG` 的 `Rcu::write` 假定串行执笔 (单 Modbus 任务串 / 单 DeviceActor).
 //! 多写者并发 push 同一 retire 槽可能丢一个未回收快照 (泄漏 1 帧, 极罕见) — 见 `rcu.rs`.
 
+use std::sync::Arc;
+
 use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
 
 use super::io_global::IO;
-use super::storage_state::{storage_read, proto_status, StorageSnapshot, STORAGE};
-use super::config_state::{config_read, ConfigSnapshot};
+use super::storage_state::{storage_read, storage_read_with, proto_status, StorageSnapshot, STORAGE};
+use super::config_state::{config_read, config_read_with, ConfigSnapshot};
 
 // ----------------------------------------------------------------------------
 // LOOP8: RCU 写者串行化锁
@@ -92,102 +94,53 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         regs::INREG_ADC485 => Some((regs::INREG_AI_COUNT << 8) | 2),
         regs::INREG_FW_VER => Some(IO.sys.get_fw_version()),
         regs::INREG_FW_DATE => {
-            // 从 CONFIG 快照读取 fw_date (Android metuory 期望: 显示 fw.fw_date 后缀)
-            if let Some(cs) = config_read() {
-                Some(cs.cfg.fw_date)
-            } else {
-                Some(0x0615) // fallback
-            }
+            // LOOP11: read_with 零拷贝 — ConfigSnapshot ~2.5KB, BTC_TASK 栈仅 8KB,
+            // 原 config_read() 的 Arc::new(s.clone()) clone 整个快照到栈上导致 Stack canary 溢出
+            Some(config_read_with(|cs| cs.cfg.fw_date).unwrap_or(0x0615))
         }
         // ---- BLE Android 兼容寄存器 (Modbus TCP 也可读) ----
         regs::INREG_HW_VER => {
-            if let Some(cs) = config_read() {
-                Some(cs.cfg.hw_version)
-            } else {
-                Some(0x0100) // F16 default
-            }
+            Some(config_read_with(|cs| cs.cfg.hw_version).unwrap_or(0x0100))
         }
         regs::INREG_IP_BASE => {
-            // IP (4 octets, BE u16 each)
-            if let Some(cs) = config_read() {
-                let ip = cs.cfg.ip;
-                Some(u16::from_be_bytes([ip[0], ip[1]]))
-            } else {
-                Some(0)
-            }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[0], cs.cfg.ip[1]])).unwrap_or(0))
         }
         2248 => {
-            if let Some(cs) = config_read() {
-                let ip = cs.cfg.ip;
-                Some(u16::from_be_bytes([ip[2], ip[3]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[2], cs.cfg.ip[3]])).unwrap_or(0))
         }
         2249 => {
-            if let Some(cs) = config_read() {
-                let m = cs.cfg.mask;
-                Some(u16::from_be_bytes([m[0], m[1]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[0], cs.cfg.mask[1]])).unwrap_or(0))
         }
         2250 => {
-            if let Some(cs) = config_read() {
-                let m = cs.cfg.mask;
-                Some(u16::from_be_bytes([m[2], m[3]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[2], cs.cfg.mask[3]])).unwrap_or(0))
         }
         2251 => {
-            if let Some(cs) = config_read() {
-                let g = cs.cfg.gateway;
-                Some(u16::from_be_bytes([g[0], g[1]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[0], cs.cfg.gateway[1]])).unwrap_or(0))
         }
         2252 => {
-            if let Some(cs) = config_read() {
-                let g = cs.cfg.gateway;
-                Some(u16::from_be_bytes([g[2], g[3]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[2], cs.cfg.gateway[3]])).unwrap_or(0))
         }
         regs::INREG_MAC_BASE => {
-            if let Some(cs) = config_read() {
-                let m = cs.cfg.eth_mac;
-                Some(u16::from_be_bytes([m[0], m[1]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[0], cs.cfg.eth_mac[1]])).unwrap_or(0))
         }
         2264 => {
-            if let Some(cs) = config_read() {
-                let m = cs.cfg.eth_mac;
-                Some(u16::from_be_bytes([m[2], m[3]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[2], cs.cfg.eth_mac[3]])).unwrap_or(0))
         }
         2265 => {
-            if let Some(cs) = config_read() {
-                let m = cs.cfg.eth_mac;
-                Some(u16::from_be_bytes([m[4], m[5]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[4], cs.cfg.eth_mac[5]])).unwrap_or(0))
         }
         regs::INREG_BLE_ID_BASE => {
             // BLE 名称前 4 字节 (UTF-8 模式兼容)
-            if let Some(cs) = config_read() {
-                let n = cs.cfg.ble_name;
-                Some(u16::from_be_bytes([n[0], n[1]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[0], cs.cfg.ble_name[1]])).unwrap_or(0))
         }
         2275 => {
-            if let Some(cs) = config_read() {
-                let n = cs.cfg.ble_name;
-                Some(u16::from_be_bytes([n[2], n[3]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[2], cs.cfg.ble_name[3]])).unwrap_or(0))
         }
         2276 => {
-            if let Some(cs) = config_read() {
-                let n = cs.cfg.ble_name;
-                Some(u16::from_be_bytes([n[4], n[5]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[4], cs.cfg.ble_name[5]])).unwrap_or(0))
         }
         2277 => {
-            if let Some(cs) = config_read() {
-                let n = cs.cfg.ble_name;
-                Some(u16::from_be_bytes([n[6], n[7]]))
-            } else { Some(0) }
+            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[6], cs.cfg.ble_name[7]])).unwrap_or(0))
         }
         regs::INREG_RECOV_RECOVERABLE => {
             let s = recovery::stats();
@@ -262,7 +215,7 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
     // 1. device_text (5000..=6999): 来自 STORAGE (Rcu 主存)
     if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
-        return storage_read().map(|s| s.device_text[idx]);
+        return storage_read_with(|s| s.device_text[idx]);
     }
     // 2. CFG / device_config / holding_buf (0x0880..=0x107F)
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
@@ -271,37 +224,35 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         // 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非实际配置值.
         // 2b. device_config 子区 (2300..<2400): 来自 CONFIG.device_config
         if addr >= 2300 && addr < 2400 {
-            // 先尝试 CONFIG 快照内的 device_config 表
-            if let Some(cs) = config_read() {
-                if let Some(v) = cs.device_config.read_reg(addr) {
-                    return Some(v);
-                }
+            // LOOP11: 零拷贝读 — device_config 含 heapless::Vec<DeviceEntry,32> (~2.5KB),
+            // 原 config_read() 在 BTC_TASK 栈上 clone 整个快照触发 Stack canary
+            // read_with 返回 Option<Option<u16>>, and_then 展平为 Option<u16>
+            if let Some(Some(v)) = config_read_with(|cs| cs.device_config.read_reg(addr)) {
+                return Some(v);
             }
         }
         // 2c. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
-        if let Some(cs) = config_read() {
-            if let Some(v) = cs.cfg.read_reg(addr) {
-                return Some(v);
-            }
+        if let Some(Some(v)) = config_read_with(|cs| cs.cfg.read_reg(addr)) {
+            return Some(v);
         }
         // 2d. HOLD_PXX 残余 (0x0880..=0x107F 中 CFG 未覆盖部分): 来自 STORAGE.holding_buf
         let idx = (addr - regs::HOLD_PXX_BASE) as usize;
         if idx < regs::HOLD_PXX_COUNT {
-            return storage_read().map(|s| s.holding_buf[idx]);
+            return storage_read_with(|s| s.holding_buf[idx]);
         }
         return Some(0);
     }
     // 3. PROTO 区 (0x4000..<PROTO_END): 来自 STORAGE.proto
     if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
         let idx = (addr - regs::PROTO_BASE) as usize;
-        return storage_read().map(|s| s.proto.data[idx]);
+        return storage_read_with(|s| s.proto.data[idx]);
     }
     // 4. Proto 控制字 (PROTO_COMMIT..=PROTO_MAGIC)
     match addr {
         regs::PROTO_COMMIT => Some(0),
         regs::PROTO_RELOAD => Some(0),
-        regs::PROTO_VERSION => storage_read().map(|s| s.proto.version),
-        regs::PROTO_LENGTH => storage_read().map(|s| s.proto.length),
+        regs::PROTO_VERSION => storage_read_with(|s| s.proto.version),
+        regs::PROTO_LENGTH => storage_read_with(|s| s.proto.length),
         regs::PROTO_STATUS => Some(proto_status() as u16),
         regs::PROTO_MAGIC => Some(crate::device::PROTO_MAGIC),
         _ => None,
@@ -368,6 +319,10 @@ fn storage_clone() -> StorageSnapshot {
 }
 
 /// 克隆当前 CONFIG 快照.
+///
+/// LOOP11: device_config 现在是 `Arc<DeviceConfigTable>`, clone 仅原子 +1 (~5ns).
+/// 整体 clone 栈成本: SystemConfig 144B memcpy + Arc 8B 原子, 共 ~152B
+/// (原 ~2700B 降 94%). 写路径无需 Arc::make_mut (持有独立快照).
 #[inline]
 fn config_clone() -> ConfigSnapshot {
     config_read()
@@ -408,7 +363,8 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // 2. device_config 子区 (2300..<2400): CONFIG RMW
     if addr >= 2300 && addr < 2400 {
         let mut cs = config_clone();
-        if cs.device_config.write_reg(addr, value) {
+        // LOOP11: Arc<DeviceConfigTable> → 用 Arc::make_mut 获取 &mut (COW)
+        if Arc::make_mut(&mut cs.device_config).write_reg(addr, value) {
             super::config_state::CONFIG.write(cs);
             return true;
         }

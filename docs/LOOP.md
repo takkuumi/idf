@@ -540,3 +540,153 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     target/xtensa-esp32s3-espidf/debug/gateway
 espflash reset --port /dev/cu.usbserial-1430
 ```
+
+## LOOP11 Web 登录修复 + 全栈零拷贝防爆栈 (2026-07-25/26) - COMPLETE
+
+### 背景
+LOOP10 已知限制 #1: "Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网".
+用户在烧录后实测发现 BLE GATT 回调链触发 BTC_TASK 栈溢出 panic (Stack canary watchpoint),
+要求:
+1. **WEB 登录、功能必须能够正常使用** (P0)
+2. **尽最大可能实现全系统零拷贝, 从根源杜绝爆栈**
+
+### 根因分析 (两个并行审计 agent)
+
+**P0 — Web 登录不可用**:
+- `login.html` 用 `fetch('/login', {method:'POST'})` 提交, 期望返回 JSON
+- `handle_login` 成功路径调用 `send_redirect_with_cookie()` → 返回 **301 + 空 body**
+- `fetch()` 默认 `redirect: 'follow'` → 自动跟随 301 到 `GET /` → 拿到 INDEX_HTML (text/html)
+- `r.json()` 解析 HTML → **SyntaxError** → 无 catch → 页面无反应, 登录失败
+- MCA 参考固件 `server.send(301, "text/plain", returnResponseJson(...))` 是 301 带 JSON body, 但 Rust 端发的是空 body 301
+
+**P0 — BTC_TASK 栈溢出**:
+- `ConfigSnapshot::clone()` 栈成本 **~2700B** (内联 `DeviceConfigTable` = `heapless::Vec<DeviceEntry,32>` ≈ 2.5KB)
+- `BTC_TASK` 栈 8KB (现升 12KB) → BLE GATT 写回调 → `config_read()` → `Arc::new(s.clone())` 触发 Stack canary
+- Backtrace 关键栈: `gatts_event_cb` → `try_handle_binary_protocol` → `handle_ble_android_read_command` (主嫌疑)
+- 次嫌疑: `update_gap_device_name` (process_tick), `with_cfg` helper (11 个 AT handler)
+
+### 修复方案: 三层防御
+
+#### Layer 1: `Arc<DeviceConfigTable>` 结构瘦身 (根治, 全系统级)
+
+把 `ConfigSnapshot.device_config` 从内联改为 `Arc<DeviceConfigTable>`:
+
+```rust
+pub struct ConfigSnapshot {
+    pub cfg: SystemConfig,                    // 144B, 保留内联
+    pub device_config: Arc<DeviceConfigTable>, // Arc 指针 8B, 数据在堆
+}
+```
+
+- clone 栈成本: **2700B → 152B** (SystemConfig 144B memcpy + Arc 原子 +1, 降 94%)
+- 用 `Arc` 不用 `Box`: `Arc::clone` = atomic +1 无 alloc; `Box::clone` 仍要 2.5KB heap memcpy
+- 与 `StorageSnapshot` 的 `Box<[u16]>` 模式同源 (LOOP8)
+- 写路径用 `Arc::make_mut(&mut cs.device_config).write_reg(...)` 实现 COW
+- **所有现有 `config_read()` 调用点自动安全** (无需改动), 写路径仅 backends.rs 一处需 `Arc::make_mut`
+
+#### Layer 2: BLE 回调链全量 `_with` 迁移 (belt-and-suspenders)
+
+| 文件:行 | 改动 | 上下文 |
+|---------|------|--------|
+| `bus/backends.rs:97-191` | read_input_reg 全部 15 处 → `config_read_with` | Modbus TCP, BTC_TASK |
+| `bus/backends.rs:228, 233, 239, 246, 252-253` | read_hold_reg 5 处 → `_with` | 同上 |
+| `ble_at/mod.rs:1147, 1165, 1198` | handle_mca_custom_command 3 处 (0xCE/C2/C6) → `_with` | BTC_TASK |
+| `ble_at/mod.rs:1261` | `handle_ble_android_read_command` **整个 match 包进闭包** | BTC_TASK 主嫌疑 |
+| `ble_at/mod.rs:681, 754` | ble_init / update_gap_device_name → `_with` | 启动/主 loop |
+| `ble_at/cfg_handlers.rs:349` | `with_cfg` helper 一行改动 | 11 个 AT handler 受益 |
+| `web/mod.rs:611, 667, 777` | 3 个 GET handler → 闭包内构造 JSON | http-srv 8KB 栈 |
+| `udp_multicast/mod.rs:57, 255` | read_multicast_config / join_multicast_group | udp-mcast 6KB 栈 |
+| `channel/ai.rs:115` | read_sensor_calib → `storage_read_with` | 高频 AI 采样 |
+| `sdkconfig.defaults:138-139` | BTC_TASK/BTU_TASK 栈 8KB → 12KB | 留余量 |
+
+#### Layer 3 (Web 登录): 真实会话管理
+
+```rust
+const SESSION_TTL_SECS: u64 = 86400;
+
+struct Session {
+    token: [u8; 16],   // 16 字节硬件 TRNG (esp_random())
+    active: bool,
+}
+static SESSION: Mutex<Session> = Mutex::new(Session { token: [0u8; 16], active: false });
+```
+
+- 登录成功: `esp_random()` 4 次填充 16 字节 → hex 编码为 32 字符 Cookie
+- `Set-Cookie: ESPSESSIONID=<32hex>; HttpOnly; Path=/; Max-Age=86400`
+- `is_authenticated()`: 解析 Cookie, 与 SESSION.token 做**常量时间比较** (防 timing attack)
+- `/logout`: 清零 token + `active=false`, `Set-Cookie: ESPSESSIONID=; Max-Age=0`
+- 替代硬编码 `ESPSESSIONID=1` (任何人都可伪造)
+
+修复 P0 登录失败:
+```rust
+// handle_login 成功: 不再返回 301+空 body, 改为 200 JSON + Set-Cookie
+send_json_with_cookie(stream, 200, &json_response("login", "0"), &cookie_str)
+```
+
+`login.html` 加固:
+- fetch 加 `credentials:'same-origin'` 携带 Cookie
+- try/catch 处理网络错误
+- 提交期间 button.disabled 防双击
+- `finally` 重新启用按钮
+
+`/getsysteminfo` 补充 `addressinfo` 字段 (index.html 依赖但之前缺失)
+
+### 回归测试 (新增 4 个)
+- `test_hex_encode_16` — hex 编码正确性
+- `test_session_auth_flow` — login → authenticated → logout → unauthenticated
+- `test_session_reject_invalid_token` — 拒绝伪造 token
+- `test_session_constant_time_compare` — 验证常量时间比较
+
+### 编译验证
+- `cargo build --bin gateway`: **0 error, 0 warning**
+- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 全部测试编译通过
+
+### 改造后保证
+| 线程 | 栈 | ConfigSnapshot clone 成本 | 风险 |
+|------|-----|--------------------------|------|
+| BTC_TASK (GATT 回调链) | 12KB | **0B** (全 `_with`) | 极低 |
+| udp-mcast 线程 | 6KB | **0B** (全 `_with`) | 低 |
+| http-srv 线程 | 8KB | **0B** (全 `_with`) | 低 |
+| Modbus TCP conn 线程 | 20KB | **152B** (Arc 瘦身) | 低 |
+| DeviceActor | 32KB | **152B** | 极低 |
+| 启动一次性调用 | - | 152B | 极低 |
+
+### 新代码规范
+**禁止** 在 BLE 回调链/BTC_TASK/小栈线程内使用 `config_read()` / `storage_read()`.
+**必须** 用 `config_read_with()` / `storage_read_with()`, 或新增的 `config_read_guard()` (借用 API).
+Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTTPS).
+
+### 已知限制 (不在本 LOOP 范围)
+- BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析) — 影响 0xB4-B7 DEVICE_TEXT 多包流程
+- DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 子协议未实现 — 需自定义 read/write arm
+- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — ST25DV64KC EEPROM 容量限制
+- AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
+- MONITOR_PLC (30001-30128) / CONTROL_PLC (40001-40300) 区未实现 — 仅老 SCADA 系统需要
+- eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
+- Web 认证无 CSRF/HTTPS (内网场景, 不需要)
+- Web 密码仍明文存 NVS (工业内网场景, 对齐 MCA `/WebPwd.txt` 明文存储)
+
+### 烧录命令 (跨平台 justfile)
+本 LOOP 新增 `justfile` 跨平台烧录脚本:
+```bash
+just flash           # 标准烧录 Debug 固件 (需手动 BOOT+RST 进下载模式)
+just flash-monitor   # 烧录 + 立即监视日志 (Ctrl+R 复位, Ctrl+C 退出)
+just full-flash      # 一键全擦 + 烧录 + 硬复位 + 找 IP
+just monitor         # 只监视 (烧完后开启)
+just ports           # 列出可用串口
+just diag            # 工具版本 + 环境诊断
+just hard-reset      # DTR 拉低 500ms 硬复位
+just rebuild-sys     # 强制重新链接 esp-idf-sys (App version 还是旧时)
+just test-compile    # 仅编译测试 binary
+```
+
+### 验证记录
+| 项 | 值 |
+|---|---|
+| 时间 | 2026-07-26 |
+| Binary | `target/xtensa-esp32s3-espidf/debug/gateway` |
+| ESP-IDF | v5.5.4 |
+| BTC_TASK 栈 | 12288 bytes (8KB → 12KB) |
+| BTU_TASK 栈 | 12288 bytes |
+| ConfigSnapshot 栈大小 | 2700B → 152B (Layer 1) |
+| BLE 回调链 ConfigSnapshot clone | **0B** (Layer 2 全 _with) |

@@ -23,17 +23,25 @@ use crate::device::system_config::SystemConfig;
 use crate::device_config::DeviceConfigTable;
 
 /// 单个配置快照 (不可变)
+///
+/// LOOP11: `device_config` 用 `Arc<DeviceConfigTable>` 而非内联, 使 clone 成本从
+/// ~2700B (DeviceConfigTable 内联 heapless::Vec<DeviceEntry,32> ≈ 2.5KB 栈拷贝)
+/// 降到 ~152B (SystemConfig 144B memcpy + Arc 原子 +1). 根治 BTC_TASK 栈溢出.
+///
+/// 与 `StorageSnapshot` 的 `Box<[u16]>` 模式同源: 大字段移堆, clone 走引用计数/heap,
+/// 不经栈. 用 `Arc` 而非 `Box` 因 DeviceConfigTable 需多线程共享读, `Arc::clone`
+/// 是原子 +1 无堆分配, `Box::clone` 仍要 2.5KB heap→heap memcpy.
 #[derive(Clone)]
 pub struct ConfigSnapshot {
     pub cfg: SystemConfig,
-    pub device_config: DeviceConfigTable,
+    pub device_config: Arc<DeviceConfigTable>,
 }
 
 impl ConfigSnapshot {
     pub fn new() -> Self {
         Self {
             cfg: SystemConfig::defaults(),
-            device_config: DeviceConfigTable::default(),
+            device_config: Arc::new(DeviceConfigTable::default()),
         }
     }
 }

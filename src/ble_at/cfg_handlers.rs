@@ -342,13 +342,18 @@ fn ipv4_str(b: &[u8; 4]) -> String {
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
-/// 读取 SystemConfig (RCU). RCU 永不空 (LazyLock 配置 init 后非 null),
+/// 读取 SystemConfig (RCU, 零拷贝).
+///
+/// LOOP11: 改用 `config_read_with` 闭包模式, 避免 ConfigSnapshot
+/// 在 BTC_TASK 栈上 clone (~2.5KB). 闭包内直接借用, Drop 时退计数.
 /// `.unwrap_or_else(defaults)` 仅为防御性回退 (单元测试或非生产路径).
 fn with_cfg<R>(f: impl FnOnce(&SystemConfig) -> R) -> R {
-    // match 两臂各自按值取 f; rustc 推断只有命中臂会 move f, 故编译通过.
-    match crate::bus::config_state::config_read() {
-        Some(cs) => f(&cs.cfg),
-        None => f(&SystemConfig::defaults()),
+    // config_read_with 返回 Option<R>; f 是 FnOnce 只能调一次.
+    // 把 f 包在 Option 里, 哪个分支用就 take 出来.
+    let mut f = Some(f);
+    match crate::bus::config_state::config_read_with(|cs| f.take().unwrap()(&cs.cfg)) {
+        Some(r) => r,
+        None => f.take().unwrap()(&SystemConfig::defaults()),
     }
 }
 

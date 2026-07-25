@@ -105,21 +105,22 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
 /// LOOP9: 校准值由 calib::run_auto_calibration 写入 holding_buf (2280..2288 / 2288..2296).
 fn read_sensor_calib(is_min: bool) -> [u16; 6] {
     use crate::config::regs;
-    let mut out = [0u16; 6];
     let base = if is_min {
         regs::HOLD_SENSOR_MIN_BASE
     } else {
         regs::HOLD_SENSOR_MAX_BASE
     };
+    // LOOP11: 零拷贝 (避免 AI 高频采样时 storage_read() 触发 Box alloc)
+    let mut out = [0u16; 6];
     let idx_base = (base as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
-    if let Some(snap) = crate::bus::storage_state::storage_read() {
+    crate::bus::storage_state::storage_read_with(|snap| {
         for ch in 0..6 {
             let i = idx_base + ch;
             if i < snap.holding_buf.len() {
                 out[ch] = snap.holding_buf[i];
             }
         }
-    }
+    });
     out
 }
 

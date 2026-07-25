@@ -32,6 +32,7 @@ pub mod system_config;
 use std::time::Duration;
 
 use std::sync::LazyLock;
+use std::sync::Arc;
 
 use crate::actor::{spawn, Actor, ActorRef};
 use crate::sync::Spin;
@@ -288,7 +289,7 @@ pub fn init() -> AppResult<()> {
 
         let cs = ConfigSnapshot {
             cfg: cfg.clone(),
-            device_config: crate::device_config::DeviceConfigTable::default(),
+            device_config: Arc::new(crate::device_config::DeviceConfigTable::default()),
         };
         config_write(cs);
 
