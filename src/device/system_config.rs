@@ -526,9 +526,10 @@ impl SystemConfig {
             return WriteResult::Persist;
         }
         match addr {
+            // LOOP10: HW_VER 写入必须持久化 (对齐 MCA PRegBuf → /MODSPRegSaveBuf.bin)
             regs::HOLD_HW_VER => {
                 self.hw_version = value;
-                return WriteResult::Ok;
+                return WriteResult::Persist;
             }
             regs::CFG_FW_VER => {
                 self.fw_version = value;
@@ -936,12 +937,13 @@ mod tests {
         assert_eq!(result, WriteResult::Persist);
     }
 
-    /// HW_VER 写入必须返回 Ok (诊断字段, 不应触发 NVS 写入).
+    /// LOOP10: HW_VER 写入必须返回 Persist (对齐 MCA PRegBuf 持久化)
     #[test]
-    fn test_write_reg_hw_ver_ok() {
+    fn test_write_reg_hw_ver_persist() {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(regs::HOLD_HW_VER, 0x00F3);
-        assert_eq!(result, WriteResult::Ok);
+        assert_eq!(result, WriteResult::Persist);
+        assert_eq!(cfg.hw_version, 0x00F3);
     }
 
     /// UNKNOWN 区 (2239-2242) 写入必须返回 Ok (保留/诊断).
@@ -1168,10 +1170,12 @@ mod tests {
         assert_eq!(regs::HOLD_MAC_BASE, 0x08D7, "MAC base must be 0x08D7 (MCA 2263)");
     }
 
-    /// MCA SLAVE_REG_BT_ARRD1 = 2274 = 0x8E2
+    /// LOOP3: BLE MAC 已从 MCA 0x08E2 迁到 0x0FA4 (metuory 1.0.78 用 0x08E2 作为 BLE NAME)
+    /// LOOP10: 更新测试断言, 匹配实际常量值
     #[test]
-    fn test_layout_bt_addr_matches_mca() {
-        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x08E2, "BT_ADDR base must be 0x08E2 (MCA 2274)");
+    fn test_layout_bt_addr_matches_design() {
+        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x0FA4, "BT_ADDR 迁到用户区 0x0FA4 (metuory 0x08E2 被 BLE NAME 占用)");
+        assert_eq!(regs::HOLD_BLE_NAME_BASE, 0x08E2, "BLE_NAME 必须在 0x08E2 (metuory WRITE_BLUETOOTH_ID 0x51)");
     }
 
     /// HOLD_485_ERR RO 必须返回 0 (cold boot 初值, 与 MCA 一致)

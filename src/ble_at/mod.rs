@@ -1230,6 +1230,16 @@ fn handle_mca_custom_command(
 /// | 0x03 | 0x08D7   | 0x0006  | ETH_MAC      | [6][mac(6)]
 /// | 0x03 | 0x08E2   | 0x0004  | BT_ID        | [4][ble_id(4)]
 ///
+/// LOOP10: 波特率 → metuory packed nibble 索引 (与 system_config.rs baud_table 顺序一致)
+/// 对齐 CommandDataUtil.decodeSerialBaudRate: (value & 0xf0) >> 4
+fn baud_to_index(baud: u32) -> u8 {
+    match baud {
+        1200 => 0, 2400 => 1, 4800 => 2, 9600 => 3, 19200 => 4, 38400 => 5,
+        57600 => 6, 115200 => 7, 230400 => 8, 460800 => 9, 921600 => 10,
+        _ => 3, // 默认 9600
+    }
+}
+
 /// 返回 true 表示已处理 (调用方应停止继续走 Modbus RTU 路径).
 fn handle_ble_android_read_command(
     func: u8,
@@ -1375,6 +1385,33 @@ fn handle_ble_android_read_command(
             let _ = d.push(take as u8);
             for i in 0..take { let _ = d.push(bytes[i]); }
             log::info!("[ble_at] READ_LOCATION: {} bytes", take);
+            d
+        }
+        // READ_RS485_INDEX_CONFIG (0x08A6/0x08AB/0x08B0, 5): metuory 期望 packed 10-byte struct
+        // parseRS485ConfigItem: [0x0a][packed][masterSlave][slaveAddr(2BE)][retry(2BE)][timeout(2BE)][interval(2BE)]
+        // packed byte: baud(high nibble) | parity(bits 3-2) | stop(bit 1) | data(bit 0)
+        // LOOP10: 之前落入 generic FC=03 catch-all 返回 BE u16 列表, metuory 解析失败
+        (0x08A6, 5) | (0x08AB, 5) | (0x08B0, 5) => {
+            let port = ((reg_addr - 0x08A6) / 5) as usize;
+            let r = if port < cfg.rs485.len() { &cfg.rs485[port] } else { &cfg.rs485[0] };
+            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+            let _ = d.push(0x0a); // length = 10
+            let baud_idx = baud_to_index(r.baudrate);
+            let stop_enc: u8 = if r.stop_bits >= 2 { 1 } else { 0 };
+            let data_enc: u8 = if r.data_bits == 7 { 1 } else { 0 };
+            let packed = ((baud_idx & 0xF) << 4) | ((r.parity & 0x3) << 2) | (stop_enc << 1) | data_enc;
+            let _ = d.push(packed);
+            let _ = d.push(r.mode); // masterSlaveType
+            let _ = d.push((r.slave_addr as u16 >> 8) as u8);
+            let _ = d.push(r.slave_addr & 0xFF);
+            let _ = d.push((r.retry_count >> 8) as u8);
+            let _ = d.push((r.retry_count & 0xFF) as u8);
+            let _ = d.push((r.timeout_ms >> 8) as u8);
+            let _ = d.push((r.timeout_ms & 0xFF) as u8);
+            let _ = d.push((r.interval_ms >> 8) as u8);
+            let _ = d.push((r.interval_ms & 0xFF) as u8);
+            log::info!("[ble_at] READ_RS485_CONFIG: port={} baud={} parity={} stop={} data={} mode={} slave={} retry={} timeout={} interval={}",
+                port, r.baudrate, r.parity, r.stop_bits, r.data_bits, r.mode, r.slave_addr, r.retry_count, r.timeout_ms, r.interval_ms);
             d
         }
         // READ_ADC_VALUE (0x0080, count): Android 期望 [length][length bytes of BE u16]
@@ -2245,6 +2282,20 @@ mod tests {
         assert_eq!(SERVICE_UUID_128.len(), 16);
         assert_eq!(SERVICE_UUID_128[0], 0x4b);
         assert_eq!(SERVICE_UUID_128[15], 0x4f);
+    }
+
+    /// LOOP10 回归测试: baud_to_index 编码对齐 metuory decodeSerialBaudRate
+    /// metuory: (value & 0xf0) >> 4, 故索引 7 (115200) 应编入 high nibble = 0x70
+    #[test]
+    fn test_baud_to_index_alignment() {
+        assert_eq!(baud_to_index(9600), 3);
+        assert_eq!(baud_to_index(115200), 7);
+        assert_eq!(baud_to_index(460800), 9);
+        // 未知波特率默认回退 9600 (索引 3)
+        assert_eq!(baud_to_index(12345), 3);
+        // 验证编码后 metuory 解码回正确索引
+        let packed = (baud_to_index(115200) & 0xF) << 4;
+        assert_eq!((packed >> 4) & 0xF, 7);
     }
 
     #[test]

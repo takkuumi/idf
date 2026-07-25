@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-25 (LOOP9: 全链路审计 + 关键 bug 全面修复)
+> 最后更新: 2026-07-25 (LOOP10: 内存布局对齐审计 + metuory 业务兼容修复)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -427,6 +427,110 @@ espflash reset --port /dev/cu.usbserial-1430
 - BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析)
 - NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份)
 - AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
+- eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
+
+### 烧录命令
+```bash
+cargo build --bin gateway
+espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    target/xtensa-esp32s3-espidf/debug/gateway
+espflash reset --port /dev/cu.usbserial-1430
+```
+
+## LOOP10 内存布局对齐审计 + metuory 业务兼容修复 (2026-07-25) - COMPLETE
+
+### 审计方法
+2 个并行调研 agent 分别覆盖:
+1. metuory Android 端全部业务交互流程 (BLE/Modbus 命令清单 + 响应格式)
+2. MCA C++ 参考固件 vs 本系统寄存器地址逐字节对齐审计
+
+审计后针对 P0/P1 问题逐一修复, 补充回归测试, 最终 **0 error / 0 warning** 编译通过.
+
+### 修复清单 (4 项)
+
+| # | 严重度 | 文件 | 问题 | 修复 |
+|---|--------|------|------|------|
+| 1 | 🔴 P0 | `bus/backends.rs` | LOOP9 引入 ringlog FC=03 拦截, 0x0887-0x08A6 与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 地址重叠, 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非配置值 | ringlog 数据条目 (32 字) 从 `read_hold_reg` (FC=03) 移到 `read_input_reg` (FC=04), FC=03 恢复正常 SystemConfig 读取 |
+| 2 | 🔴 P0 | `device/system_config.rs` | `HOLD_HW_VER` 写入返回 `WriteResult::Ok` (仅内存), 与 MCA PRegBuf→`/MODSPRegSaveBuf.bin` 持久化语义不一致 | 改为 `WriteResult::Persist`, 写入后落 NVS |
+| 3 | 🟠 P1 | `device/system_config.rs` | 测试 `test_layout_bt_addr_matches_mca` 断言 `HOLD_BT_ADDR_BASE == 0x08E2`, 但实际常量已是 `0x0FA4` (LOOP3 迁移) — 测试必失败 | 重命名为 `test_layout_bt_addr_matches_design`, 断言 0x0FA4 + 验证 `HOLD_BLE_NAME_BASE == 0x08E2` |
+| 4 | 🟠 P1 | `ble_at/mod.rs` | `READ_RS485_INDEX_CONFIG` (0x08A6/0x08AB/0x08B0, 5 regs) 落入 generic FC=03 catch-all, 返回 BE u16 列表; metuory `parseRS485ConfigItem` 期望 packed 10-byte struct (`length==0x0a`), 解析失败 → UI 显示空 | 新增 bespoke handler, 按 metuory packed 格式构造: `[0x0a][combo][mode][slave BE][retry BE][timeout BE][interval BE]`, combo = `(baud_idx<<4)\|(parity<<2)\|(stop<<1)\|data` |
+
+### LOOP9 ringlog 遮蔽 bug 深度诊断
+- **根因**: LOOP9 修复 #5 "ringlog 地址 0x0887-0x08A6 被 CFG_BASE catch-all 遮蔽" 时, 把 ringlog 检查提前到 `read_hold_reg` CFG 块内 SystemConfig 之前, 但 ringlog 区 32 字 (0x0887..0x08A6) **物理覆盖** SN(0x0894, 9字)/PLACE(0x089D, 8字)/HW_VER(0x08A5, 1字), 导致这些地址 FC=03 读取被 ringlog 拦截
+- **影响**: metuory WRITE_SN (0x21) / WRITE_LOCATION (0x31) 写入正常 (写入不走 ringlog), 但读取 SN/LOCATION 走 BLE custom read path (LOOP4 length-prefix, 不受影响); **Modbus TCP 直连读 0x0894..0x08A5 会返回 ringlog 数据**, 与 MCA 不兼容
+- **修复**: ringlog 改为 FC=04 只读 (Input Register, 地址 0x0887-0x08A6 + COUNT/WRITES 0x0885/0x0886 全在 FC=04), FC=03 恢复 SystemConfig 路径, SN/PLACE/HW_VER 读正确
+
+### metuory 业务覆盖矩阵 (调研结果)
+
+| 命令码 | 功能 | 地址 | 状态 | 备注 |
+|--------|------|------|------|------|
+| 0x00 | HEARTBEAT | – | ✅ | LOOP9 |
+| 0x10 | READ_ADC | 0x0080 | ✅ | length-prefix BE u16 |
+| 0x20/21 | READ/WRITE_SN | 0x0894 | ✅ | RTU + length-prefix read |
+| 0x30/31 | READ/WRITE_LOCATION | 0x089D | ✅ | RTU + length-prefix read |
+| 0x40 | READ_MAC | 0x08D7 | ✅ | bespoke arm |
+| 0x50/51 | READ/WRITE_BLUETOOTH_ID | 0x08E2 | ✅ | bespoke + notify_ble_name_changed |
+| 0x60 | READ_DEVICE_PRODUCT | 0x08A5 | ✅ | bespoke arm |
+| 0x70/71 | READ/WRITE_IP | 0x08C7 | ✅ | bespoke read; RTU write |
+| 0x80 | READ_FW_VERSION | 0x087E | ✅ | bespoke arm |
+| 0x81 | READ_HARDWARE_INFO | 0x087C | ✅ | bespoke arm |
+| 0x90/91 | READ_COM_INPUT/OUTPUT_IO | 0x0000/0x0200 | ✅ | bespoke packed bits |
+| 0x92 | WRITE_COM_OUTPUT_IO | FC=0x05 | ✅ | RTU → write_coil (0x0200+pos) |
+| 0x93 | WRITE_COM_OUTPUT_MULTI_IO | FC=0x0F | ✅ | RTU → write_multi_coils (LOOP9 已加 count 校验) |
+| 0xA0-A5 | READ/WRITE_RS485_CONFIG | 0x08A6/AB/B0 | ✅ | **LOOP10 修复** packed 10B 格式 |
+| 0xC0 | MODBUS_COMMAND | – | ✅ | metuory 端注释掉, 不用 |
+| 0xC2/CF/CE | MCA 自定义读 | – | ✅ | handle_mca_custom_command |
+| 0xD0-D3 | LOGIC/COM_REQUEST | – | ✅ | logic_handlers |
+| 0xD0-DF | READ_RS485_INDEX_VALUE | 用户址 | ✅ | generic FC=04 arm |
+| 0xE0-EF | READ_RS485_CUSTOM_VALUE | 用户址 | ✅ | generic FC=03 arm |
+| 0xB0-B3 | DEVICE_FUNCTION_COUNT/CONFIG | 0x08FC | ⚠️ | 见已知限制 (需自定义子协议) |
+| 0xB4-B7 | DEVICE_TEXT_COUNT/DATA | 0x1388 | ⚠️ | 见已知限制 (需分片重组) |
+
+### MCA 地址对齐审计结论
+
+| 区段 | MCA 地址 | 本系统地址 | 状态 |
+|------|---------|----------|------|
+| DI (FC=02) | 0x0000+ | 0x0000+ | ✅ |
+| DO (FC=01) | 0x0200+ | 0x0200+ | ✅ |
+| AI (FC=04) | 0x0080+ | 0x0080+ | ✅ |
+| 组播状态 | 0x0090-0x0100 | 0x0090-0x0100 | ✅ |
+| 485 错误 | 0x0880-0x0883 | 0x0880-0x0883 | ✅ |
+| SN | 0x0894-0x089C | 0x0894-0x089C | ✅ (LOOP10 修复遮蔽) |
+| PLACE | 0x089D-0x08A4 | 0x089D-0x08A4 | ✅ (LOOP10 修复遮蔽) |
+| HW_VER | 0x08A5 | 0x08A5 | ✅ (LOOP10 修复遮蔽+持久化) |
+| RS485 配置 | 0x08A6-0x08BD | 0x08A6-0x08BD | ✅ |
+| TCP COM | 0x08C2-0x08C5 | 0x08C2-0x08C5 | ✅ |
+| IP/MASK/GW/DNS/MAC | 0x08C7-0x08DC | 0x08C7-0x08DC | ✅ |
+| MASTER | 0x08DD-0x08E1 | 0x08DD-0x08E1 | ✅ |
+| 0x08E2 | BLE MAC (MCA) | BLE NAME (metuory) | ⚠️ 设计迁移 (LOOP3) |
+| BLE MAC 迁移 | – | 0x0FA4 | 🆕 (LOOP3) |
+| SENSOR MIN/MAX | 0x08E8-0x08F7 | 0x08E8-0x08F7 | ✅ (holding_buf 兜底) |
+| DEVICE_CONFIG | 0x08FC+ | 0x08FC+ | ✅ |
+| 用户区 | 0x0FA0+ | 0x0FA0+ | ✅ |
+| device_text | 0x1388-0x1B57 | 0x1388-0x1B57 | ✅ |
+| MONITOR_PLC | 0x7531-0x7917 | – | ⚠️ 未实现 (老 SCADA 兼容) |
+| CONTROL_PLC | 0x9C41-0xA027 | – | ⚠️ 未实现 (老 SCADA 兼容) |
+
+### 新增回归测试 (3 个)
+- `test_ringlog_data_readable_via_input_reg` — ringlog 数据经 FC=04 可读
+- `test_ringlog_does_not_shadow_sn_place_hwver` — SN/PLACE/HW_VER 经 FC=03 不被 ringlog 屏蔽
+- `test_baud_to_index_alignment` — baud_to_index 编码对齐 metuory decodeSerialBaudRate
+
+### 修改的测试
+- `test_write_reg_hw_ver_ok` → `test_write_reg_hw_ver_persist` (断言 Persist)
+- `test_layout_bt_addr_matches_mca` → `test_layout_bt_addr_matches_design` (断言 0x0FA4 + BLE_NAME 0x08E2)
+
+### 编译验证
+- `cargo build --bin gateway`: **0 error, 0 warning**
+- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 测试编译通过
+
+### 已知限制 (不在本 LOOP 范围)
+- Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
+- BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析) — 影响 0xB4-B7 DEVICE_TEXT 多包流程
+- DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 子协议未实现 — 需自定义 read/write arm
+- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — ST25DV64KC EEPROM 容量限制
+- AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
+- MONITOR_PLC (30001-30128) / CONTROL_PLC (40001-40300) 区未实现 — 仅老 SCADA 系统需要
 - eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
 
 ### 烧录命令

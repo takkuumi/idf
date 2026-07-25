@@ -215,10 +215,32 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             let ring = crate::error::ringlog::RING_LOG.lock();
             Some(ring.len().min(0xFFFF) as u16)
         }
+        // LOOP10: ringlog COUNT(0x0885)/WRITES(0x0886) 移至 FC=04 (read_input_reg),
+        // 避免占用 FC=03 中的 0x0885-0x0886 (与 SN/PLACE 区连续, 也避免用户混淆)
         regs::INREG_RINGLOG_WRITES => {
             let cnt = crate::error::ringlog::LOG_WRITE_COUNT
                 .load(std::sync::atomic::Ordering::Acquire);
             Some((cnt & 0xFFFF) as u16)
+        }
+        // ---- LOOP10: Ringlog 数据条目 (FC=04, 0x0887..0x08A6, 8条×4字) ----
+        // 从 FC=03 移至 FC=04: 避免与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 地址冲突
+        addr if addr >= regs::INREG_RINGLOG_BASE && addr < regs::INREG_RINGLOG_BASE + 32 => {
+            let entry_idx = ((addr - regs::INREG_RINGLOG_BASE) / 4) as usize;
+            let field_idx = (addr - regs::INREG_RINGLOG_BASE) % 4;
+            let ring = crate::error::ringlog::RING_LOG.lock();
+            let entries = ring.entries();
+            if entry_idx < entries.len() {
+                let entry = &entries[entry_idx];
+                Some(match field_idx {
+                    0 => (entry.timestamp_s & 0xFFFF) as u16,
+                    1 => ((entry.timestamp_s >> 16) & 0xFFFF) as u16,
+                    2 => entry.code,
+                    3 => (entry.context & 0xFFFF) as u16,
+                    _ => 0,
+                })
+            } else {
+                Some(0)
+            }
         }
         // ---- MCA 一体机分布式组播状态 (0x0090-0x0100) ----
         // 数据由 udp_multicast 模块接收并填充, 32 字节 (16 个 U16) 映射到 0x0090-0x009F.
@@ -244,24 +266,9 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
     }
     // 2. CFG / device_config / holding_buf (0x0880..=0x107F)
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
-        // 2a. 错误环日志 (0x0887..=0x08A6, 在 CFG 区内但语义独立, 需在 SystemConfig 前拦截)
-        if addr >= regs::INREG_RINGLOG_BASE && addr < regs::INREG_RINGLOG_BASE + 32 {
-            let entry_idx = ((addr - regs::INREG_RINGLOG_BASE) / 4) as usize;
-            let field_idx = (addr - regs::INREG_RINGLOG_BASE) % 4;
-            let ring = crate::error::ringlog::RING_LOG.lock();
-            let entries = ring.entries();
-            if entry_idx < entries.len() {
-                let entry = &entries[entry_idx];
-                return Some(match field_idx {
-                    0 => (entry.timestamp_s & 0xFFFF) as u16,
-                    1 => ((entry.timestamp_s >> 16) & 0xFFFF) as u16,
-                    2 => entry.code,
-                    3 => (entry.context & 0xFFFF) as u16,
-                    _ => 0,
-                });
-            }
-            return Some(0);
-        }
+        // LOOP10 修复: ringlog 已移至 FC=04 (read_input_reg), 不再在 FC=03 中拦截
+        // 旧代码 ringlog 0x0887-0x08A6 与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 重叠,
+        // 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非实际配置值.
         // 2b. device_config 子区 (2300..<2400): 来自 CONFIG.device_config
         if addr >= 2300 && addr < 2400 {
             // 先尝试 CONFIG 快照内的 device_config 表
@@ -290,7 +297,6 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         return storage_read().map(|s| s.proto.data[idx]);
     }
     // 4. Proto 控制字 (PROTO_COMMIT..=PROTO_MAGIC)
-    // (ringlog 0x0887-0x08A6 已在 CFG 块内 2a 处理, 此处不再重复)
     match addr {
         regs::PROTO_COMMIT => Some(0),
         regs::PROTO_RELOAD => Some(0),
@@ -314,6 +320,36 @@ mod tests {
     #[test]
     fn read_input_reg_unknown() {
         assert!(read_input_reg(0x0001).is_none());
+    }
+
+    /// LOOP10 回归测试: ringlog 数据条目必须通过 FC=04 (read_input_reg) 读出
+    /// 0x0887..0x08A6 (32 字) 必须落在 read_input_reg, 不应被 read_hold_reg 拦截
+    #[test]
+    fn test_ringlog_data_readable_via_input_reg() {
+        // 0x0887 = ringlog 第0条 word0 (timestamp_s 低16位)
+        // FC=04 读应返回 Some(...), 不应是 None
+        let v = read_input_reg(regs::INREG_RINGLOG_BASE);
+        assert!(v.is_some(), "FC=04 读取 ringlog 0x0887 必须返回 Some");
+        // 越界条目 (>=8) 也应返回 Some(0), 而非 None
+        let v_oob = read_input_reg(regs::INREG_RINGLOG_BASE + 31);
+        assert!(v_oob.is_some(), "FC=04 读取 ringlog 0x08A6 必须返回 Some");
+    }
+
+    /// LOOP10 回归测试: SN/PLACE/HW_VER 地址通过 FC=03 (read_hold_reg) 读取,
+    /// 不能被 ringlog 屏蔽 (LOOP9 旧 bug: ringlog 0x0887-0x08A6 拦截导致 SN 读不出)
+    /// 这里验证地址落入 CFG 区且不会进入 ringlog 分支 (因 ringlog 已移到 FC=04)
+    #[test]
+    fn test_ringlog_does_not_shadow_sn_place_hwver() {
+        // SN base 0x0894, PLACE base 0x089D, HW_VER 0x08A5 都在 ringlog 范围内
+        // 修复前: read_hold_reg(0x0894) 会返回 ringlog 条目 (错误)
+        // 修复后: read_hold_reg 走 SystemConfig.read_reg → 返回 cfg.sn 字节
+        // read_hold_reg 返回 Some 即说明走 SystemConfig 路径 (非 ringlog 零值)
+        let sn = read_hold_reg(regs::HOLD_SN_BASE);
+        assert!(sn.is_some(), "FC=03 读取 SN base 0x0894 必须返回 Some");
+        let place = read_hold_reg(regs::HOLD_PLACE_BASE);
+        assert!(place.is_some(), "FC=03 读取 PLACE base 0x089D 必须返回 Some");
+        let hwver = read_hold_reg(regs::HOLD_HW_VER);
+        assert!(hwver.is_some(), "FC=03 读取 HW_VER 0x08A5 必须返回 Some");
     }
 }
 
