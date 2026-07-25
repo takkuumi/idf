@@ -220,6 +220,13 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
                 .load(std::sync::atomic::Ordering::Acquire);
             Some((cnt & 0xFFFF) as u16)
         }
+        // ---- MCA 一体机分布式组播状态 (0x0090-0x0100) ----
+        // 数据由 udp_multicast 模块接收并填充, 32 字节 (16 个 U16) 映射到 0x0090-0x009F.
+        // 余下 0x00A0-0x00FF 保留为 0 (对齐参考固件 REG_STATU_SWITCH_END=0x0100).
+        addr if (regs::INREG_SWITCH_STATUS_BASE..regs::INREG_SWITCH_STATUS_END).contains(&addr) => {
+            let word_idx = (addr - regs::INREG_SWITCH_STATUS_BASE) as u16;
+            crate::udp_multicast::read_switch_status(word_idx)
+        }
         _ => None,
     }
 }

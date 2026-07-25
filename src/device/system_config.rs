@@ -23,9 +23,10 @@ const NVS_MAGIC: u32 = 0x4757_4346; // "GWCF"
 /// 序列化后字节数 (固定布局)
 /// SN(32) + name(16) + hw(2) + fw(2) + cfg_ver(2) = 54
 /// eth_mac(6) + dhcp(1) + ip(4) + mask(4) + gw(4) + dns(4) = 23
-/// rs485[0](9) + rs485[1](9) = 18
-/// 总 = 110, 取 128 留余量
-const CFG_BLOB_SIZE: usize = 128;
+/// ble_mac(6) + ble_name(8) = 14
+/// rs485[0](15) + rs485[1](15) + rs485[2](15) = 45  (对齐参考固件 3 端口)
+/// 总 = 136, 取 144 留余量
+const CFG_BLOB_SIZE: usize = 144;
 
 // NVS 偏移
 const OFF_SN: usize = 0;
@@ -42,7 +43,12 @@ const OFF_DNS: usize = 73;
 const OFF_BLE_MAC: usize = 77;
 const OFF_BLE_NAME: usize = 83;
 const OFF_RS485_0: usize = 92;
-const OFF_RS485_1: usize = 107;  // LOOP5 修复: 原来是 101, 与 OFF_RS485_0+9 (retry_count) 重叠
+const OFF_RS485_1: usize = 107; // LOOP5 修复: 原来是 101, 与 OFF_RS485_0+9 (retry_count) 重叠
+const OFF_RS485_2: usize = 122; // RS485 第 3 端口 (对齐参考固件 3 端口)
+
+// RS485 配置结构: baudrate(4) + data_bits(1) + stop_bits(1) + parity(1) +
+//                 slave_addr(1) + mode(1) + retry_count(2) + timeout_ms(2) + interval_ms(2) = 15 bytes
+const RS485_ENTRY_SIZE: usize = 15;
 
 // ----------------------------------------------------------------------------
 // 数据结构
@@ -100,7 +106,11 @@ pub struct SystemConfig {
     pub ble_mac: [u8; 6],
     pub ble_name: [u8; 8],
 
-    pub rs485: [Rs485Config; 2],
+    /// RS485 端口配置 (3 端口, 对齐参考固件 RS485RTU_NUM=3)
+    /// - [0] = RS485-1 (UART1, 主站/从站可配, 支持 DIP 拨码覆盖地址)
+    /// - [1] = RS485-2 (UART2)
+    /// - [2] = RS485-3 (UART0, 与 USB 串口复用 — 仅从站监听模式)
+    pub rs485: [Rs485Config; 3],
 }
 
 /// 写入结果
@@ -131,6 +141,8 @@ pub enum WriteResult {
     /// 地址不在配置区, 调用方应尝试 holding_buf 兜底
     NotFound,
 }
+
+pub const SENSOR_CHANNELS: usize = 8; // 校准寄存器通道数 (对齐参考固件 SENSOR_NUM=8)
 
 impl SystemConfig {
     /// 默认配置 (出厂值)
@@ -170,7 +182,22 @@ impl SystemConfig {
             dns: [192, 168, 51, 1],
             ble_mac: [0; 6],
             ble_name,
-            rs485: [Rs485Config::default(), Rs485Config::default()],
+            rs485: [
+                Rs485Config::default(),
+                Rs485Config::default(),
+                // RS485-3 默认: 9600 baud, slave, addr=1
+                Rs485Config {
+                    baudrate: 9600,
+                    data_bits: 8,
+                    stop_bits: 1,
+                    parity: 0,
+                    slave_addr: 1,
+                    mode: 1, // Slave
+                    retry_count: 0,
+                    timeout_ms: 1000,
+                    interval_ms: 20,
+                },
+            ],
         }
     }
 
@@ -251,9 +278,9 @@ impl SystemConfig {
         b[OFF_BLE_MAC..OFF_BLE_MAC + 6].copy_from_slice(&self.ble_mac);
         b[OFF_BLE_NAME..OFF_BLE_NAME + 8].copy_from_slice(&self.ble_name);
 
-        for i in 0..2 {
+        for i in 0..3 {
             let r = &self.rs485[i];
-            let off = if i == 0 { OFF_RS485_0 } else { OFF_RS485_1 };
+            let off = OFF_RS485_0 + i * RS485_ENTRY_SIZE;
             b[off..off + 4].copy_from_slice(&r.baudrate.to_le_bytes());
             b[off + 4] = r.data_bits;
             b[off + 5] = r.stop_bits;
@@ -290,8 +317,8 @@ impl SystemConfig {
         s.ble_name
             .copy_from_slice(&b[OFF_BLE_NAME..OFF_BLE_NAME + 8]);
 
-        for i in 0..2 {
-            let off = if i == 0 { OFF_RS485_0 } else { OFF_RS485_1 };
+        for i in 0..3 {
+            let off = OFF_RS485_0 + i * RS485_ENTRY_SIZE;
             let baud = u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]);
             s.rs485[i] = Rs485Config {
                 baudrate: if baud == 0 { 9600 } else { baud },

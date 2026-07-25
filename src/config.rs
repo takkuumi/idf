@@ -60,6 +60,16 @@ pub mod pins {
     pub const RS485_1_RX: u8 = 41;
     pub const RS485_1_DE: u8 = 8;
 
+    // ---- RS485 #2 (第 3 端口, UART0, 对齐参考固件 RS485-3) ----
+    // 参考固件: rs485_3 使用 Serial (UART0), 默认 9600 8N1.
+    // 注意: UART0 与 USB CDC/JTAG 控制台复用, 启用 RS485-2 将失去调试串口.
+    // 默认不启动; 如需使用, 在 config::modbus::rtu_port2::ENABLED 设为 true.
+    // 引脚: UART0 默认 TX=GPIO43, RX=GPIO44, 无硬件 DE 控制 (软件模拟或外接 MAX485)
+    pub const RS485_2_UART: u8 = 0; // UART0 (与 USB CDC 复用)
+    pub const RS485_2_TX: u8 = 43;
+    pub const RS485_2_RX: u8 = 44;
+    pub const RS485_2_DE: u8 = 255; // 255 = 无 DE 引脚 (不使用 RTS 自动控制)
+
     // ---- 电源使能引脚 (开机时需拉高) ----
     // GPIO21: 灯板电源使能 (HIGH=上电)
     // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
@@ -244,6 +254,16 @@ pub mod ai_calib {
     pub const MA_MIN: u32 = 4000;
     /// 20mA 对应的 scaled 值 (mA*1000)
     pub const MA_MAX: u32 = 20000;
+
+    /// ADC 自动校准参考值 (对齐参考固件 SENSOR_MIN/SENSOR_MAX)
+    /// 4mA 对应的 ADC 原始值 (理论值, 校准窗口判定基准)
+    pub const SENSOR_MIN: u16 = 605;
+    /// 20mA 对应的 ADC 原始值 (理论值, 校准窗口判定基准)
+    pub const SENSOR_MAX: u16 = 3016;
+    /// 校准窗口时长 (ms) — 对齐参考固件 millis() < 8000
+    pub const CALIB_WINDOW_MS: u64 = 8000;
+    /// 校准采样间隔 (ms)
+    pub const CALIB_SAMPLE_INTERVAL_MS: u64 = 50;
 }
 
 // ----------------------------------------------------------------------------
@@ -272,15 +292,37 @@ pub mod modbus {
         pub const DATA_BITS: u8 = 8;
     }
 
-    /// TCP Server 参数 - 减少为 1 端口 (502) 以节省 pthread 资源
-    /// 原 4 端口 (502/503/504/5002) 设计为参考固件兼容, 但 ESP32-S3R2 (512KB SRAM)
-    /// 在启用 BLE+ETH+Modbus RTU 后, pthread 创建第 5 个任务时 ENOMEM.
-    /// 单端口足以支持所有 Modbus TCP 客户端.
+    /// RTU 第 3 端口参数 (RS485-3, UART0, 对齐参考固件)
+    /// 默认仅从站监听模式; UART0 与 USB CDC/JTAG 复用, 启用将失去调试串口.
+    /// 由 `ENABLED` 控制是否启动 (默认 false, 需手动启用).
+    pub mod rtu_port2 {
+        pub const ENABLED: bool = false; // 默认禁用 (UART0 与 USB 串口复用)
+        pub const BAUD: u32 = 9600;
+        pub const ADDR: u8 = 1;
+        pub const PARITY: char = 'N';
+        pub const STOP_BITS: u8 = 1;
+        pub const DATA_BITS: u8 = 8;
+    }
+
+    /// TCP Server 参数
+    ///
+    /// 4 端口设计对齐参考固件 MCA (server_wifi/1/2/3 = SLAVE_REG_TCP_COM1..4):
+    ///   - 502  标准 Modbus TCP
+    ///   - 503/504  扩展 (与 502 同协议, 供不同上位机接入)
+    ///   - 5002 备用通道
+    ///
+    /// 内存优化: 由 `tcp_server::start_multiclient` 用单线程 poll 多路复用所有端口,
+    /// 而非每端口一个监听线程 (LOOP8 曾因第 5 个 pthread 触发 ENOMEM 而裁剪到 1 端口).
+    /// 单线程 + 非阻塞 accept 实测在 ESP32-S3R2 (512KB SRAM) 上稳定运行.
     pub mod tcp {
-        pub const PORTS: &[u16] = &[502];
-        pub const MAX_CONNECTIONS: usize = 4;
+        /// 默认 4 端口 (对齐参考固件 ext_tcp_port1..4 = {502,503,504,5002}).
+        /// 运行时端口可由 Modbus 写 HOLD_TCP_COM_BASE..3 (2243-2246) 动态修改.
+        pub const PORTS: &[u16] = &[502, 503, 504, 5002];
+        pub const MAX_CONNECTIONS: usize = 8;
         pub const RX_TIMEOUT_MS: u64 = 2000;
         pub const TX_TIMEOUT_MS: u64 = 2000;
+        /// 单线程 poll 轮询监听器的间隔 (非阻塞 accept 间的睡眠)
+        pub const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
     }
 }
 
@@ -351,6 +393,21 @@ pub mod regs {
     pub const INREG_RINGLOG_WRITES: u16 = 0x0886;     // 总写入次数 (mod 2^32)
     pub const INREG_RINGLOG_BASE: u16 = 0x0887;       // 8 条最近日志基地址
     // 0x0887-0x08A6: 8 条 × 4 U16 = 32 个寄存器
+
+    // ---- MCA 一体机分布式组播同步状态 (RO, FC=04) ----
+    // 移植自参考固件 REG_STATU_SWITCH_START..END (0x0090-0x0100, 113 个 U16)
+    // 接收的 32 字节组播数据填入 [0x0090..0x00AF], 余下保留.
+    pub const INREG_SWITCH_STATUS_BASE: u16 = 0x0090;
+    pub const INREG_SWITCH_STATUS_END: u16 = 0x0100;
+    pub const INREG_SWITCH_STATUS_COUNT: u16 =
+        INREG_SWITCH_STATUS_END - INREG_SWITCH_STATUS_BASE;
+    pub const INREG_MULTICAST_IP1_2: u16 = 2190; // 组播 IP (octet1<<8 | octet2)
+    pub const INREG_MULTICAST_IP3_4: u16 = 2191; // 组播 IP (octet3<<8 | octet4)
+    pub const INREG_MULTICAST_PORT: u16 = 2192;  // 组播端口 (默认 5003)
+    pub const INREG_SWITCH_IP1_2: u16 = 2193;    // 源 IP 过滤 (octet1<<8 | octet2)
+    pub const INREG_SWITCH_IP3_4: u16 = 2194;    // 源 IP 过滤 (octet3<<8 | octet4)
+    /// 组播接收缓冲区大小 (对齐参考固件 RECEIVE_MULTICAST_BUF_SIZE)
+    pub const MULTICAST_BUF_SIZE: usize = 32;
 
     // ---- 保持寄存器 (Holding Register, FC=03/06/16, RW) ----
     // 参考固件: SLAVE_REG_P01 = 0x0880 (2176)

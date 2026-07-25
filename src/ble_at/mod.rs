@@ -38,6 +38,7 @@
 
 pub mod cfg_handlers;
 pub mod handlers;
+pub mod logic_handlers;
 pub mod ota_handlers;
 pub mod parser;
 
@@ -1095,6 +1096,14 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
     if func >= 0xC0 && func <= 0xCF {
         return handle_mca_custom_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit);
+    }
+    // ---- MCA 逻辑配置协议 (0xD0-0xD3) ----
+    // 0xD0 LOGIC_CONFIG / 0xD1 LOGIC_RETRIEVE / 0xD2 DELETE_CONFIG / 0xD3 COM_REQUEST
+    if func >= 0xD0 && func <= 0xD3 {
+        if let Some(rsp) = logic_handlers::dispatch_logic_cmd(func, &data[8..crc_begin]) {
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+            return true;
+        }
     }
     // 其它 PDU: unit_id 字节作为 Modbus slave 地址, func+data 作为 Modbus PDU
     let pdu = &data[6..crc_begin]; // [unit][func][data...]

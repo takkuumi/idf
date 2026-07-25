@@ -26,3 +26,6 @@ flash_project_args
 
 # Mac
 .DS_Store
+
+# Claude Code session data
+.claude/

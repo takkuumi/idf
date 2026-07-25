@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>控制面板 - ESP32-S3 网关</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1419;--card:#1a1f26;--border:#2a3340;--text:#e0e0e0;--dim:#7a8a9a;
+--accent:#4a9eff;--green:#34d399;--red:#f87171;--amber:#fbbf24}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+background:var(--bg);color:var(--text);line-height:1.5}
+.top{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;
+background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+.top h1{font-size:16px;font-weight:600}
+.top .ver{font-size:12px;color:var(--dim);margin-left:10px}
+.top a{color:var(--accent);font-size:13px;text-decoration:none}
+.top a:hover{text-decoration:underline}
+.wrap{max-width:1200px;margin:0 auto;padding:16px}
+.tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid var(--border)}
+.tab{padding:10px 18px;font-size:13px;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:14px}
+.card h2{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.field label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+.field input,.field select{width:100%;padding:8px 10px;background:#141920;border:1px solid var(--border);
+border-radius:5px;color:var(--text);font-size:13px;outline:none}
+.field input:focus,.field select:focus{border-color:var(--accent)}
+.btn{padding:9px 20px;border:none;border-radius:5px;font-size:13px;font-weight:500;cursor:pointer;transition:.2s}
+.btn-p{background:var(--accent);color:#fff}.btn-p:hover{opacity:.85}
+.btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
+.btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
+.di-list,.do-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
+.io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
+.led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
+.led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.led.do-off{background:#4a4a4a}.led.do-on{background:var(--red);box-shadow:0 0 6px var(--red)}
+.tgl{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+.tgl input{display:none}.tgl .slider{position:absolute;inset:0;background:#4a4a4a;border-radius:10px;cursor:pointer;transition:.2s}
+.tgl .slider:before{content:"";position:absolute;width:16px;height:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:.2s}
+.tgl input:checked+.slider{background:var(--green)}.tgl input:checked+.slider:before{transform:translateX(16px)}
+.ai-item{display:flex;align-items:center;gap:10px;padding:8px 10px;background:#141920;border-radius:6px;font-size:13px}
+.ai-bar{flex:1;height:6px;background:#2a3340;border-radius:3px;overflow:hidden}
+.ai-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:3px;transition:width .3s}
+.ai-val{font-size:18px;font-weight:600;min-width:42px;text-align:right;font-variant-numeric:tabular-nums}
+.ai-ma{font-size:11px;color:var(--dim);min-width:50px}
+.nav{display:flex;gap:10px;margin-top:14px}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:6px;font-size:13px;
+transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.ok{background:#0d3320;color:var(--green);border:1px solid #1a5c3a}
+.toast.err{background:#3d1a1a;color:var(--red);border:1px solid #5c2a2a}
+.ota-bar{height:8px;background:#2a3340;border-radius:4px;margin:10px 0;overflow:hidden}
+.ota-bar i{display:block;height:100%;background:var(--accent);border-radius:4px;width:0;transition:width .3s}
+@media(max-width:640px){.row{grid-template-columns:1fr}.tabs{overflow-x:auto}}
+.hidden{display:none}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div style="display:flex;align-items:center;gap:8px">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2">
+      <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/>
+      <line x1="12" y1="17" x2="12" y2="21"/></svg>
+    <h1>IoT Gateway</h1>
+    <span class="ver" id="fw_ver"></span>
+  </div>
+  <a href="/logout">退出登录</a>
+</div>
+
+<div class="wrap">
+  <div class="tabs">
+    <div class="tab active" data-t="io">I/O 数据</div>
+    <div class="tab" data-t="net">网络配置</div>
+    <div class="tab" data-t="port">RS485 端口</div>
+    <div class="tab" data-t="sys">系统设置</div>
+  </div>
+
+  <!-- I/O 数据面板 -->
+  <div id="p-io">
+    <div class="card">
+      <h2>数字输入 (DI)</h2>
+      <div class="di-list" id="di_list"></div>
+    </div>
+    <div class="card">
+      <h2>数字输出 (DO)</h2>
+      <div class="do-list" id="do_list"></div>
+    </div>
+    <div class="card">
+      <h2>模拟输入 (AI)</h2>
+      <div id="ai_list"></div>
+    </div>
+  </div>
+
+  <!-- 网络配置面板 -->
+  <div id="p-net" class="hidden">
+    <div class="card">
+      <h2>网络参数</h2>
+      <div class="row">
+        <div class="field"><label>IP 地址</label><input id="n_ip"></div>
+        <div class="field"><label>子网掩码</label><input id="n_mask"></div>
+        <div class="field"><label>默认网关</label><input id="n_gw"></div>
+        <div class="field"><label>DNS</label><input id="n_dns"></div>
+        <div class="field"><label>MAC 地址</label><input id="n_mac" disabled></div>
+        <div class="field"><label>DHCP</label><input id="n_dhcp" disabled></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="saveNet()">保存网络配置</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>设备标识</h2>
+      <div class="row">
+        <div class="field"><label>SN 序列号</label><input id="n_sn" disabled></div>
+        <div class="field"><label>位置/桩号</label><input id="n_loc"></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="saveSys()">保存设备信息</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- RS485 端口面板 -->
+  <div id="p-port" class="hidden">
+    <div class="card" id="port_cards"></div>
+  </div>
+
+  <!-- 系统设置面板 -->
+  <div id="p-sys" class="hidden">
+    <div class="card">
+      <h2>修改密码</h2>
+      <div class="row">
+        <div class="field"><label>旧密码</label><input id="pw_old" type="password"></div>
+        <div class="field"><label>新密码</label><input id="pw_new" type="password"></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-w" onclick="changePwd()">修改密码</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>固件升级 (OTA)</h2>
+      <p style="font-size:13px;color:var(--dim);margin-bottom:12px">选择 .bin 固件文件后点击上传, 设备将自动重启.</p>
+      <input type="file" id="ota_file" accept=".bin" style="font-size:13px;margin-bottom:10px">
+      <div class="ota-bar hidden" id="ota_bar"><i id="ota_prog"></i></div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="uploadOta()">上传固件</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+// Tab switching
+$$('.tab').forEach(t => t.onclick = () => {
+  $$('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  ['io','net','port','sys'].forEach(k => {
+    $('#p-' + k).classList.toggle('hidden', k !== t.dataset.t);
+  });
+});
+
+// Toast
+function toast(msg, ok) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + (ok ? 'ok' : 'err');
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// Load system info
+async function loadSysInfo() {
+  try {
+    const r = await fetch('/getsysteminfo');
+    const j = await r.json();
+    if (j.data) {
+      $('#fw_ver').textContent = j.data.version || '';
+      $('#n_sn').value = j.data.sn || '';
+      $('#n_loc').value = j.data.addressinfo || '';
+    }
+  } catch(e) { console.error('sysinfo', e); }
+}
+
+// Load network config
+async function loadNet() {
+  try {
+    const r = await fetch('/getnetworkconfig');
+    const j = await r.json();
+    if (j.data) {
+      $('#n_ip').value = j.data.ip || '';
+      $('#n_mask').value = j.data.mask || '';
+      $('#n_gw').value = j.data.gateway || '';
+      $('#n_dns').value = j.data.dns || '';
+      $('#n_mac').value = j.data.mac || '';
+      $('#n_dhcp').value = j.data.dhcp ? '已启用' : '未启用';
+      if (j.data.addressinfo) $('#n_loc').value = j.data.addressinfo;
+    }
+  } catch(e) { console.error('net', e); }
+}
+
+// Save network config
+async function saveNet() {
+  try {
+    const fd = new URLSearchParams({
+      ip: $('#n_ip').value,
+      mask: $('#n_mask').value,
+      gateway: $('#n_gw').value,
+      dns: $('#n_dns').value,
+      addressinfo: $('#n_loc').value
+    });
+    const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
+    const j = await r.json();
+    toast(j.code === '0' ? '网络配置已保存' : '保存失败: ' + j.code, j.code === '0');
+  } catch(e) { toast('保存失败: ' + e, false); }
+}
+
+// Save system info
+async function saveSys() {
+  try {
+    const fd = new URLSearchParams({
+      devicename: '',
+      addressinfo: $('#n_loc').value
+    });
+    const r = await fetch('/updatesysteminfoconfig', { method: 'POST', body: fd });
+    const j = await r.json();
+    toast(j.code === '0' ? '设备信息已保存' : '保存失败: ' + j.code, j.code === '0');
+  } catch(e) { toast('保存失败: ' + e, false); }
+}
+
+// Load RS485 port config
+async function loadPorts() {
+  try {
+    const r = await fetch('/getportconfig');
+    const j = await r.json();
+    if (!j.data) return;
+    const d = j.data;
+    let html = '<h2>RS485 端口配置</h2>';
+    for (let i = 0; i < 3; i++) {
+      const modes = ['主机(Master)','从机(Slave)','网关(Gateway)'];
+      html += `<div style="margin-bottom:16px">
+        <h3 style="font-size:13px;margin-bottom:10px;color:var(--accent)">端口 ${i+1}</h3>
+        <div class="row">
+          <div class="field"><label>波特率</label>
+            <select id="p_baud_${i}">
+              ${[2400,4800,9600,19200,38400,57600,115200].map(b =>
+                `<option value="${b}" ${b==d['baud_'+i]?'selected':''}>${b}</option>`).join('')}
+            </select></div>
+          <div class="field"><label>模式</label>
+            <select id="p_mode_${i}">
+              ${modes.map((m,mi) =>
+                `<option value="${mi}" ${mi==d['mode_'+i]?'selected':''}>${m}</option>`).join('')}
+            </select></div>
+          <div class="field"><label>从机地址</label><input id="p_addr_${i}" value="${d['databits_'+i]||8}"></div>
+        </div></div>`;
+    }
+    html += '<div class="nav"><button class="btn btn-p" onclick="savePorts()">保存端口配置</button></div>';
+    $('#port_cards').innerHTML = html;
+  } catch(e) { console.error('port', e); }
+}
+
+// Save RS485 port config
+async function savePorts() {
+  try {
+    for (let i = 0; i < 3; i++) {
+      const fd = new URLSearchParams({
+        index: i,
+        baud: $(`#p_baud_${i}`).value,
+        masterslaveport: $(`#p_mode_${i}`).value,
+        slaveaddress: $(`#p_addr_${i}`).value,
+        datalen: 8, stopbit: 1, checkmode: 0,
+      });
+      await fetch('/updateportconfig', { method: 'POST', body: fd });
+    }
+    toast('端口配置已保存', true);
+  } catch(e) { toast('保存失败: ' + e, false); }
+}
+
+// Poll IO data
+let pollTimer;
+async function pollIO() {
+  try {
+    const r = await fetch('/getiodata');
+    const j = await r.json();
+    if (!j.data) return;
+    const d = j.data;
+
+    // DI
+    let diHtml = '';
+    if (d.di_data) {
+      const keys = Object.keys(d.di_data).sort();
+      keys.forEach(k => {
+        const n = k.replace('di_addr_', '');
+        const on = d.di_data[k];
+        diHtml += `<div class="io-item"><span class="led ${on?'on':''}"></span><span>DI${n}</span></div>`;
+      });
+    }
+    $('#di_list').innerHTML = diHtml;
+
+    // DO
+    let doHtml = '';
+    if (d.do_data) {
+      const keys = Object.keys(d.do_data).sort();
+      keys.forEach(k => {
+        const n = k.replace('do_addr_', '');
+        const on = d.do_data[k];
+        doHtml += `<div class="io-item">
+          <label class="tgl"><input type="checkbox" ${on?'checked':''} onchange="toggleDO(${n},this.checked)">
+          <span class="slider"></span></label><span>DO${n}</span></div>`;
+      });
+    }
+    $('#do_list').innerHTML = doHtml;
+
+    // AI
+    let aiHtml = '';
+    if (d.ai_data) {
+      const keys = Object.keys(d.ai_data).sort();
+      keys.forEach(k => {
+        const n = k.replace('ai_addr_', '');
+        const v = d.ai_data[k];
+        const pct = Math.min(100, (v / 4095) * 100);
+        aiHtml += `<div class="ai-item"><span style="min-width:32px;font-size:12px;color:var(--dim)">AI${n}</span>
+          <div class="ai-bar"><i style="width:${pct}%"></i></div>
+          <span class="ai-val">${v}</span></div>`;
+      });
+    }
+    $('#ai_list').innerHTML = aiHtml;
+  } catch(e) { console.error('poll', e); }
+}
+
+// Toggle DO
+async function toggleDO(addr, val) {
+  try {
+    const fd = new URLSearchParams({ type:'iocontrol', addr: addr, value: val ? 1 : 0 });
+    const r = await fetch('/iocontrol', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.code !== '0') { toast('控制失败: ' + j.code, false); }
+  } catch(e) { toast('控制失败: ' + e, false); }
+}
+
+// Change password
+async function changePwd() {
+  const opwd = $('#pw_old').value;
+  const npwd = $('#pw_new').value;
+  if (!opwd || !npwd) { toast('请填写旧密码和新密码', false); return; }
+  try {
+    const fd = new URLSearchParams({ opwd, npwd });
+    const r = await fetch('/updatepwd', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.code === '0') {
+      toast('密码已修改, 请重新登录', true);
+      setTimeout(() => location.href = '/logout', 1500);
+    } else {
+      toast('修改失败: ' + (j.code === '0x00010001' ? '旧密码错误' : j.code), false);
+    }
+  } catch(e) { toast('修改失败: ' + e, false); }
+}
+
+// OTA upload
+async function uploadOta() {
+  const file = $('#ota_file').files[0];
+  if (!file) { toast('请选择固件文件', false); return; }
+  if (!confirm('确认上传固件? 设备将在上传完成后自动重启.')) return;
+
+  $('#ota_bar').classList.remove('hidden');
+  const prog = $('#ota_prog');
+  prog.style.width = '0%';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/updateota', true);
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      prog.style.width = Math.round(e.loaded / e.total * 100) + '%';
+    }
+  };
+  xhr.onload = () => {
+    try {
+      const j = JSON.parse(xhr.responseText);
+      if (j.code === '0') {
+        toast('固件上传成功, 设备正在重启...', true);
+        setTimeout(() => {
+          let s = 10;
+          const iv = setInterval(() => {
+            toast(`设备重启中 (${--s}s)...`, true);
+            if (s <= 0) { clearInterval(iv); location.href = '/'; }
+          }, 1000);
+        }, 2000);
+      } else { toast('上传失败: ' + j.code, false); }
+    } catch(e) { toast('上传失败', false); }
+  };
+  xhr.onerror = () => toast('上传失败: 网络错误', false);
+  xhr.send(file);
+}
+
+// Init
+loadSysInfo();
+loadNet();
+loadPorts();
+pollIO();
+pollTimer = setInterval(pollIO, 1500);
+</script>
+</body></html>

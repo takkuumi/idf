@@ -55,13 +55,15 @@ impl Rs485Port {
         }
 
         // 2. 设置引脚 (TX/RX/CTS 不用, RTS 接到 DE)
+        //    当 de_pin == 255 时不配置 RTS 引脚, 仅使用普通 UART (无 DE 控制)
         unsafe {
+            let rts_pin = if cfg.de_pin != 255 { cfg.rts_pin as i32 } else { -1 };
             let r = uart_set_pin(
                 port,
                 cfg.tx_pin as i32,
                 cfg.rx_pin as i32,
-                cfg.rts_pin as i32, // RTS → DE
-                -1,                // CTS 不用
+                rts_pin,              // RTS → DE (255 = 不配置)
+                -1,                   // CTS 不用
             );
             check(r, "uart_set_pin")?;
 
@@ -69,9 +71,12 @@ impl Rs485Port {
             let r = uart_driver_install(port, RX_BUF_SIZE, RX_BUF_SIZE, 0, std::ptr::null_mut(), 0);
             check(r, "uart_driver_install")?;
 
-            // 4. 切换为 RS485 半双工模式
-            let r = uart_set_mode(port, uart_mode_t_UART_MODE_RS485_HALF_DUPLEX);
-            check(r, "uart_set_mode")?;
+            // 4. 当有 RTS/DE 引脚时, 切换为 RS485 半双工模式
+            //    无 DE 引脚时保持默认 UART 模式 (仅 RX/TX, 无方向控制)
+            if cfg.de_pin != 255 {
+                let r = uart_set_mode(port, uart_mode_t_UART_MODE_RS485_HALF_DUPLEX);
+                check(r, "uart_set_mode")?;
+            }
 
             // 5. 启用硬件 RX 帧间隔检测 (Modbus RTU 3.5 字符时间)
             // 参数单位为字符时间 (11 bits/char), 3 表示 3 个字符静默即触发接收超时

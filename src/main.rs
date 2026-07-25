@@ -40,6 +40,9 @@ mod channel;
 mod health;
 mod ota;
 mod protocol;
+mod nfc;
+mod udp_multicast;
+mod web;
 #[cfg(feature = "wifi")]
 mod wifi;
 
@@ -110,6 +113,16 @@ fn main() -> AppResult<()> {
     let reset_reason = unsafe { esp_idf_sys::esp_reset_reason() as u32 as u8 };
     log::info!("[main] reset reason={}", reset_reason);
 
+    // 4.1 RS485 拨码开关读取 (对齐参考固件 RS485_ADDRESS)
+    // 使用 ESP-IDF 原生 GPIO API, 不消费 Peripherals 句柄, 可在 Hal::init 后随时调用.
+    let dip_addr = rs485::dip::read_dip_address();
+    if dip_addr.address > 0 {
+        log::warn!(
+            "[main] DIP switch: RS485-1 forced to slave addr={} (overrides register config)",
+            dip_addr.address
+        );
+    }
+
     // 5. 设备协议存储初始化 (含 NVS 加载 + 监听线程)
     log::info!("[main] starting device protocol store...");
     match device::init() {
@@ -118,6 +131,13 @@ fn main() -> AppResult<()> {
             "[main] device init failed, falling back to empty ProtoStore: {}",
             e
         ),
+    }
+
+    // 5.1 应用 DIP 拨码覆盖 (必须在 device::init 之后, CONFIG RCU 已就绪)
+    if dip_addr.address > 0 {
+        crate::bus::backends::config_modify(|c| {
+            crate::rs485::dip::apply_to_config(dip_addr, c);
+        });
     }
 
     // 6. 复位计数持久化 (NVS 已就绪, 直接读写, 不用 catch_unwind)
@@ -171,6 +191,46 @@ fn main() -> AppResult<()> {
     {
         log::info!("[main] starting ai/ao task...");
         channel::start(hal.clone(), timer_svc.clone())?;
+    }
+
+    // 8.1 ADC 自动校准 (开机 8 秒窗口, 对齐参考固件)
+    // 在 IO 任务启动后立即执行, 校准期间阻塞主循环;
+    // 校准窗口结束前 IO/AO 任务使用默认标定值 (固定 4-20mA 范围).
+    #[cfg(feature = "ai-ao")]
+    {
+        use crate::channel::calib;
+        if let Err(e) = calib::run_auto_calibration(&hal) {
+            log::warn!("[main] ADC auto-calibration failed: {}", e);
+        }
+    }
+
+    // 8.2 启动 UDP 组播接收 (MCA 一体机分布式资源)
+    // 加入保持寄存器 2190-2194 配置的组播组, 接收 32 字节状态数据
+    // 写入 INREG_SWITCH_STATUS_BASE (0x0090) 段, 供 Modbus FC=04 读取.
+    // 启动失败仅记日志, 不阻断主流程 (与 NTP 等辅助服务一致).
+    {
+        if let Err(e) = udp_multicast::start() {
+            log::warn!("[main] UDP multicast start failed: {}", e);
+        }
+    }
+
+    // 8.3 启动 NFC ST25DV64KC 配置备份/恢复 (对齐参考固件 RFID_Init)
+    // 后台线程每 5s 检测标签, 检测到即执行一次同步 (备份或恢复).
+    // 启动失败仅记日志, 不阻断主流程.
+    {
+        if let Err(e) = nfc::start() {
+            log::warn!("[main] NFC ST25DV64KC start failed: {}", e);
+        }
+    }
+
+    // 8.4 启动 HTTP Web 配置服务器 (端口 80, JSON API)
+    // 提供 13 个 REST 路由 (login / getsysteminfo / getiodata / updateota 等).
+    // Cookie 认证 (ESPSESSIONID=1), 密码存储在 NVS (默认 admin/admin123).
+    // 启动失败仅记日志, 不阻断主流程.
+    {
+        if let Err(e) = web::start() {
+            log::warn!("[main] HTTP web server start failed: {}", e);
+        }
     }
 
     // 9. 注册 + 启动 Modbus 通信协议 (通过 ProtocolRegistry 插件化管理)

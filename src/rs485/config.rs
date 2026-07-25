@@ -62,7 +62,7 @@ impl Rs485Config {
         }
     }
 
-    /// 从 `config::modbus::rtu_slave` 构造 (RS485 #1 = UART0)
+    /// 从 `config::modbus::rtu_slave` 构造 (RS485 #1 = UART2)
     ///
     /// 注意: UART0 与下载串口复用，调试期间建议改用 UART1
     pub fn from_rtu_slave() -> Self {
@@ -77,6 +77,26 @@ impl Rs485Config {
             parity: rtu_slave::PARITY,
             stop_bits: rtu_slave::STOP_BITS,
             rts_pin: p::RS485_1_DE,
+        }
+    }
+
+    /// 构造 RS485 #2 (第 3 端口 = UART0, 对齐参考固件 RS485-3)
+    ///
+    /// 默认 9600 8N1, 仅从站监听模式. UART0 与 USB CDC/JTAG 复用,
+    /// 启用后将失去调试串口; 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动.
+    pub fn from_rtu_port2() -> Self {
+        use crate::config::pins as p;
+        Self {
+            uart_port: p::RS485_2_UART,
+            tx_pin: p::RS485_2_TX,
+            rx_pin: p::RS485_2_RX,
+            de_pin: p::RS485_2_DE,
+            baud: 9600,
+            data_bits: 8,
+            parity: 'N',
+            stop_bits: 1,
+            // RS485-2 无 DE 引脚 (255), 使用 UART 内置 RS485 模式时 RTS=-1 即不启用自动 DE
+            rts_pin: p::RS485_2_DE,
         }
     }
 }
