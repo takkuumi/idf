@@ -525,7 +525,7 @@ mod tests {
         for t in 0..8 {
             let bb = b.clone();
             h.push(thread::spawn(move || {
-                for i in 0..1000 {
+                for _ in 0..1000 {
                     bb.set_bit((t * 8) & 63, true);
                 }
             }));

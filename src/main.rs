@@ -196,11 +196,16 @@ fn main() -> AppResult<()> {
     // 8.1 ADC 自动校准 (开机 8 秒窗口, 对齐参考固件)
     // 在 IO 任务启动后立即执行, 校准期间阻塞主循环;
     // 校准窗口结束前 IO/AO 任务使用默认标定值 (固定 4-20mA 范围).
+    // LOOP9: 校准期间 calib.rs 调用 feed_wdt(), 必须先订阅 WDT,
+    //        否则高频报 "task not found" 刷屏 (~150 条/8s)
+    health::subscribe_wdt();
     #[cfg(feature = "ai-ao")]
     {
         use crate::channel::calib;
         if let Err(e) = calib::run_auto_calibration(&hal) {
             log::warn!("[main] ADC auto-calibration failed: {}", e);
+            // LOOP9: 失败也标记完成, 避免心跳停滞触发强制重启
+            calib::mark_task_completed();
         }
     }
 
@@ -285,7 +290,7 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
     let start = std::time::Instant::now();
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
-    health::subscribe_wdt();
+    // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
 
     loop {
         tick = tick.wrapping_add(1);

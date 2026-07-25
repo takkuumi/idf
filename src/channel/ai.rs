@@ -65,6 +65,13 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
 
     TASK_HB.tick();
     let raws: [u16; 6] = hal.adc.sample_all();
+
+    // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
+    // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
+    // 缺失校准 (min==max==0) 时回退到 4-20mA 线性映射 (旧逻辑)
+    let sensor_min = read_sensor_calib(true);
+    let sensor_max = read_sensor_calib(false);
+
     for ch in 0..CHANNEL_COUNT {
         let raw: u16 = raws[ch];
         state.buf[ch][state.pos % AVG_WINDOW] = raw;
@@ -74,12 +81,104 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
         } else {
             (sum / state.filled.max(1) as u32) as u16
         };
-        let scaled = ai_calib::MA_MIN
-            + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX;
+        let cal_min = sensor_min[ch];
+        let cal_max = sensor_max[ch];
+        let scaled: u16 = if cal_min != cal_max {
+            // 校准生效: 参考固件 map(avg, cal_max, cal_min, 4095, 0)
+            map_range(avg, cal_max, cal_min, 4095, 0)
+        } else {
+            // 无校准: 回退 4-20mA 线性映射 (ADC 0..4095 → 4000..20000 mA*1000)
+            (ai_calib::MA_MIN
+                + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX) as u16
+        };
         crate::bus::IO.ai.set_raw(ch, avg);
-        crate::bus::IO.ai.set_scaled(ch, scaled as u16);
+        crate::bus::IO.ai.set_scaled(ch, scaled);
     }
     state.pos = (state.pos + 1) % AVG_WINDOW;
     state.filled = (state.filled + 1).min(AVG_WINDOW);
     crate::bus::send_event(crate::bus::IoEvent::AiSampled);
+}
+
+/// 读取 SENSOR_MIN/MAX 校准值数组 (8 通道, 对齐 HOLD_SENSOR_MIN/MAX_BASE)
+///
+/// 返回 [u16; 6] (仅取前 6 通道, 与 CHANNEL_COUNT 一致).
+/// LOOP9: 校准值由 calib::run_auto_calibration 写入 holding_buf (2280..2288 / 2288..2296).
+fn read_sensor_calib(is_min: bool) -> [u16; 6] {
+    use crate::config::regs;
+    let mut out = [0u16; 6];
+    let base = if is_min {
+        regs::HOLD_SENSOR_MIN_BASE
+    } else {
+        regs::HOLD_SENSOR_MAX_BASE
+    };
+    let idx_base = (base as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
+    if let Some(snap) = crate::bus::storage_state::storage_read() {
+        for ch in 0..6 {
+            let i = idx_base + ch;
+            if i < snap.holding_buf.len() {
+                out[ch] = snap.holding_buf[i];
+            }
+        }
+    }
+    out
+}
+
+/// 线性映射 (对齐 Arduino map / 参考固件): 把 x 从 [in_min, in_max] 映射到 [out_min, out_max].
+/// 若 in_min == in_max 返回 out_min (避免除零).
+fn map_range(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u16 {
+    if in_min == in_max {
+        return out_min;
+    }
+    // 用 i32 避免 u16 减法下溢
+    let x = x as i32;
+    let in_min = in_min as i32;
+    let in_max = in_max as i32;
+    let out_min = out_min as i32;
+    let out_max = out_max as i32;
+    let num = (x - in_min) as i64 * (out_max - out_min) as i64;
+    let den = (in_max - in_min) as i64;
+    let v = out_min as i64 + num / den;
+    v.clamp(out_min as i64, out_max as i64) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LOOP9 回归测试: map_range 对齐参考固件 map(x, in_max, in_min, 4095, 0)
+    /// 参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0)
+    #[test]
+    fn test_map_range_basic() {
+        // x=in_max → out=4095 (满量程)
+        assert_eq!(map_range(3016, 605, 3016, 4095, 0), 4095);
+        // x=in_min → out=0 (零点)
+        assert_eq!(map_range(605, 605, 3016, 4095, 0), 0);
+        // x 中点 → out 中点
+        let mid_in = (605 + 3016) / 2;
+        let mid_out = map_range(mid_in, 605, 3016, 4095, 0);
+        assert!(mid_out > 1900 && mid_out < 2100, "mid_out={mid_out} 应接近 2047");
+    }
+
+    #[test]
+    fn test_map_range_clamp() {
+        // x 超出 in_max → clamp 到 out_max
+        assert_eq!(map_range(4000, 605, 3016, 4095, 0), 4095);
+        // x 低于 in_min → clamp 到 out_min
+        assert_eq!(map_range(0, 605, 3016, 4095, 0), 0);
+    }
+
+    #[test]
+    fn test_map_range_div_zero() {
+        // in_min == in_max → 返回 out_min (避免除零)
+        assert_eq!(map_range(100, 50, 50, 4095, 0), 4095);
+        assert_eq!(map_range(100, 50, 50, 0, 4095), 0);
+    }
+
+    #[test]
+    fn test_map_range_inverted_output() {
+        // 反向映射 (out_min > out_max): 参考固件 cal_max→4095, cal_min→0
+        // 当 x=cal_max(3016) 输出 4095, x=cal_min(605) 输出 0
+        assert_eq!(map_range(3016, 605, 3016, 4095, 0), 4095);
+        assert_eq!(map_range(605, 605, 3016, 4095, 0), 0);
+    }
 }

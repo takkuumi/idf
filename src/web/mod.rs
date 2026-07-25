@@ -47,8 +47,14 @@ use crate::health::{self, TaskHb};
 
 /// HTTP 端口 (对齐参考固件: server(80))
 const HTTP_PORT: u16 = 80;
-/// 收发缓冲区大小
+/// 收发缓冲区大小 (流式 OTA/header 读取的单块大小)
 const BUF_SIZE: usize = 4096;
+/// 单条 HTTP header 行最大字节数 (防止恶意超长 header → OOM)
+const MAX_HEADER_LINE: usize = 1024;
+/// POST body 总量上限 (对齐参考固件最大包, 防 Content-Length 伪造 → OOM)
+const MAX_BODY_SIZE: usize = 512 * 1024; // 512KB 足够配置/JSON; OTA 走流式 (见下方)
+/// 流式 OTA body 总量上限 (与 flash 分区大小一致: ota 分区 2.25MB)
+const MAX_OTA_SIZE: usize = 2 * 1024 * 1024;
 /// 默认用户名
 const DEFAULT_USERNAME: &str = "admin";
 /// 默认密码 (NVS 未保存时使用)
@@ -75,6 +81,8 @@ pub fn start() -> AppResult<()> {
 
 /// 服务器主循环
 fn server_loop() {
+    // LOOP9: 订阅硬件 WDT, 否则 feed_wdt() 高频报 "task not found" 刷屏
+    health::subscribe_wdt();
     loop {
         TASK_HB.tick();
         health::feed_wdt();
@@ -142,10 +150,22 @@ impl HttpRequest {
     }
 
     /// 检查 Cookie 中是否有有效的 ESPSESSIONID
+    ///
+    /// LOOP9: 精确匹配 `ESPSESSIONID=1` 整对 (防止 `ESPSESSIONID=10` 或
+    /// `foo=ESPSESSIONID=1bar` 等子串绕过)
     fn is_authenticated(&self) -> bool {
-        self.header("Cookie")
-            .map(|c| c.contains("ESPSESSIONID=1"))
-            .unwrap_or(false)
+        let Some(cookie) = self.header("Cookie") else {
+            return false;
+        };
+        for pair in cookie.split(';') {
+            let kv = pair.trim();
+            if let Some((k, v)) = kv.split_once('=') {
+                if k.trim() == "ESPSESSIONID" && v.trim() == "1" {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 从 body 中解析 URL 编码的表单字段
@@ -264,22 +284,39 @@ fn json_response(response_type: &str, code: &str) -> String {
     )
 }
 
-/// 解析请求行 + headers + body
-fn parse_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+/// 解析请求行 + headers (不含 body)
+///
+/// LOOP9 安全加固:
+/// - header 行长度上限 MAX_HEADER_LINE (防恶意超长 header → OOM)
+/// 返回 (HttpRequest 框架, content_length, reader) — body 由调用方按需读取,
+/// OTA 走流式 (handle_ota_upload_stream), 其余路由走 read_exact 上限 MAX_BODY_SIZE.
+fn parse_request_headers(stream: TcpStream) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
     let mut reader = BufReader::new(stream);
-    // 读请求行
+    // 读请求行 (限制长度)
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
+    if request_line.len() > MAX_HEADER_LINE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request line too long",
+        ));
+    }
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
     let method = parts.first().unwrap_or(&"").to_string();
     let path_raw = parts.get(1).unwrap_or(&"/");
     let path = url_decode(path_raw);
 
-    // 读 headers
+    // 读 Headers (每行限制长度)
     let mut headers = Vec::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
+        if line.len() > MAX_HEADER_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "header line too long",
+            ));
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
@@ -289,31 +326,53 @@ fn parse_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         }
     }
 
-    // 读 body
     let content_length: usize = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
+
+    Ok((
+        HttpRequest {
+            method,
+            path,
+            headers,
+            body: Vec::new(),
+        },
+        content_length,
+        reader,
+    ))
+}
+
+/// 解析请求行 + headers + body (body 走 read_exact, 上限 MAX_BODY_SIZE).
+/// OTA 路由不调用此函数 (走流式).
+fn parse_request(stream: TcpStream) -> std::io::Result<HttpRequest> {
+    let (mut req, content_length, mut reader) = parse_request_headers(stream)?;
+    if content_length > MAX_BODY_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("body too large: {} > {}", content_length, MAX_BODY_SIZE),
+        ));
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
-
-    Ok(HttpRequest {
-        method,
-        path,
-        headers,
-        body,
-    })
+    req.body = body;
+    Ok(req)
 }
 
 // ============================================================================
 // 连接处理
 // ============================================================================
 
-fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
-    let req = parse_request(&mut stream)?;
+fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
+    // LOOP9: OTA 走流式路径, 不缓存整 body (防 OOM); 其余路由缓存 body (上限 MAX_BODY_SIZE)
+    let path_peek = parse_request_headers(stream)?;
+    let req = path_peek.0;
+    let content_length = path_peek.1;
+    let mut reader = path_peek.2;
+
     log::debug!(
         "[http] {} {} (auth={})",
         req.method,
@@ -321,6 +380,42 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         req.is_authenticated()
     );
 
+    // OTA 流式: 直接消费 reader, 不构造完整 body
+    if req.path == "/updateota" {
+        if req.method != "POST" {
+            let mut s = reader.into_inner();
+            send_json(&mut s, 405, &json_response("updateota", "405"))?;
+            return Ok(());
+        }
+        if !req.is_authenticated() {
+            let mut s = reader.into_inner();
+            send_redirect(&mut s, "/login")?;
+            return Ok(());
+        }
+        return handle_ota_upload_stream(reader.into_inner(), content_length);
+    }
+
+    // 非 OTA: 缓存 body (上限校验)
+    let mut req = req;
+    if content_length > MAX_BODY_SIZE {
+        let mut s = reader.into_inner();
+        send_json(&mut s, 413, &json_response("error", "413"))?;
+        return Ok(());
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+        req.body = body;
+        let stream = reader.into_inner();
+        return dispatch_request(stream, req);
+    }
+    // content_length == 0: 无 body, 直接 dispatch
+    let stream = reader.into_inner();
+    dispatch_request(stream, req)
+}
+
+/// 分发已解析的请求到各路由处理器
+fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<()> {
     match req.path.as_str() {
         // ---- 公开路由 (无需认证) ----
         "/login" => handle_login(&mut stream, &req),
@@ -339,14 +434,6 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
             } else {
                 send_redirect(&mut stream, "/login")
             }
-        }
-
-        // ---- OTA (POST, 认证) ----
-        "/updateota" => {
-            if !req.is_authenticated() {
-                return send_redirect(&mut stream, "/login");
-            }
-            handle_ota_upload(&mut stream, &req)
         }
 
         // ---- 其余路由均需认证 ----
@@ -752,41 +839,63 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
     send_json(stream, 200, &json_response("updatepwd", "0"))
 }
 
-/// POST /updateota (OTA 固件上传)
-fn handle_ota_upload(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
-    if req.method != "POST" {
-        return send_json(stream, 405, &json_response("updateota", "405"));
+/// POST /updateota (OTA 固件上传 — 流式, 不缓存整 body)
+///
+/// LOOP9 重构: 旧实现 `vec![0u8; content_length]` 会立即 OOM (ESP32-S3 仅 ~200KB
+/// 可用 internal heap, 固件可达 2MB)。新实现按 BUF_SIZE(4KB) chunk 流式读取,
+/// 边读边写入 OTA 分区, 内存占用恒定 ~4KB。
+///
+/// 同时放宽 TCP read/write 超时 (固件上传耗时较长, 3s 太短)。
+fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io::Result<()> {
+    if content_length == 0 {
+        return send_json(&mut { stream }, 400, &json_response("updateota", "400"));
+    }
+    if content_length > MAX_OTA_SIZE {
+        log::warn!(
+            "[http] OTA rejected: content_length={} > MAX_OTA_SIZE={}",
+            content_length,
+            MAX_OTA_SIZE
+        );
+        return send_json(&mut { stream }, 413, &json_response("updateota", "413"));
     }
 
-    // OTA 数据在 body 中 (raw binary 固件)
-    if req.body.is_empty() {
-        return send_json(stream, 400, &json_response("updateota", "400"));
-    }
+    // 放宽超时: 固件上传是慢操作, 3s 全局超时易误触发
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(60))).ok();
 
-    let total = req.body.len() as u32;
-    log::info!("[http] OTA upload: {} bytes", total);
+    let total = content_length as u32;
+    log::info!("[http] OTA upload (streaming): {} bytes", total);
 
     // 分块写入 OTA 分区
     match crate::ota::begin(total) {
         Ok(()) => {}
         Err(e) => {
             log::error!("[http] OTA begin failed: {}", e);
-            return send_json(stream, 500, &json_response("updateota", "500"));
+            // LOOP9: begin 失败时也尝试 abort (abort 内部对空会话是幂等 no-op), 防状态泄漏
+            let _ = crate::ota::abort();
+            return send_json(&mut { stream }, 500, &json_response("updateota", "500"));
         }
     }
 
-    // 分块写入 (OTA_CHUNK_MAX=4KB, 与 ota 模块对齐)
-    const CHUNK: usize = 4096;
-    let mut offset = 0usize;
-    while offset < req.body.len() {
-        let end = (offset + CHUNK).min(req.body.len());
-        let chunk = &req.body[offset..end];
-        match crate::ota::write_chunk(chunk) {
-            Ok(n) => offset += n,
+    let mut reader = BufReader::new(stream);
+    let mut buf = [0u8; BUF_SIZE];
+    let mut received = 0usize;
+    while received < content_length {
+        let want = (content_length - received).min(BUF_SIZE);
+        if let Err(e) = reader.read_exact(&mut buf[..want]) {
+            log::error!("[http] OTA read failed at {}: {}", received, e);
+            let _ = crate::ota::abort();
+            // 取回 stream 发送错误响应
+            let mut s = reader.into_inner();
+            return send_json(&mut s, 500, &json_response("updateota", "500"));
+        }
+        match crate::ota::write_chunk(&buf[..want]) {
+            Ok(n) => received += n,
             Err(e) => {
-                log::error!("[http] OTA write failed at {}: {}", offset, e);
+                log::error!("[http] OTA write failed at {}: {}", received, e);
                 let _ = crate::ota::abort();
-                return send_json(stream, 500, &json_response("updateota", "500"));
+                let mut s = reader.into_inner();
+                return send_json(&mut s, 500, &json_response("updateota", "500"));
             }
         }
         TASK_HB.tick();
@@ -796,14 +905,16 @@ fn handle_ota_upload(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
     match crate::ota::end() {
         Ok(()) => {
             log::info!("[http] OTA complete, rebooting in 1s");
-            send_json(stream, 200, &json_response("updateota", "0"))?;
+            let mut s = reader.into_inner();
+            send_json(&mut s, 200, &json_response("updateota", "0"))?;
             std::thread::sleep(Duration::from_secs(1));
             crate::ota::reboot_to_new_firmware();
         }
         Err(e) => {
             log::error!("[http] OTA end failed: {}", e);
             let _ = crate::ota::abort();
-            send_json(stream, 500, &json_response("updateota", "500"))
+            let mut s = reader.into_inner();
+            send_json(&mut s, 500, &json_response("updateota", "500"))
         }
     }
 }

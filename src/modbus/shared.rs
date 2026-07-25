@@ -335,6 +335,10 @@ fn write_multi_coils_pdu<B: ModbusBackend>(
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let count = u16::from_be_bytes([pdu[2], pdu[3]]);
     let byte_count = pdu[4] as usize;
+    // LOOP9: count 范围校验 (对齐 read_bits_pdu: count==0 或 count>2000 非法)
+    if count == 0 || count as usize > MAX_BITS_PER_READ {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
+    }
     if pdu.len() < 5 + byte_count {
         return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
     }
@@ -367,6 +371,10 @@ fn write_multi_regs_pdu<B: ModbusBackend>(
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let count = u16::from_be_bytes([pdu[2], pdu[3]]);
     let byte_count = pdu[4] as usize;
+    // LOOP9: count 范围校验 (对齐 read_regs_pdu: count==0 或 count>125 非法)
+    if count == 0 || count as usize > MAX_REGS_PER_READ {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
+    }
     if pdu.len() < 5 + byte_count || byte_count != count as usize * 2 {
         return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
     }
@@ -560,6 +568,55 @@ mod tests {
         let mut out = [0u8; PDU_BUF_SIZE];
         let n = handle_pdu(&backend, 0x03, &pdu, &mut out);
         assert_eq!(out[0], 0x83);
+        assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
+        assert_eq!(n, 2);
+    }
+
+    // LOOP9 回归测试: FC=0F/FC=10 缺少 count 校验 (旧实现 count=0 返回成功)
+    #[test]
+    fn test_write_multi_coils_count_zero_rejected() {
+        let backend = DummyBackend::new();
+        // FC=0F, addr=0, count=0, byte_count=0
+        let pdu = [0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&backend, 0x0F, &pdu, &mut out);
+        assert_eq!(out[0], 0x8F);
+        assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_write_multi_coils_count_too_large_rejected() {
+        let backend = DummyBackend::new();
+        // FC=0F, addr=0, count=2001 (> MAX_BITS_PER_READ=2000)
+        let pdu = [0x00, 0x00, 0x07, 0xD1, 0x00];
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&backend, 0x0F, &pdu, &mut out);
+        assert_eq!(out[0], 0x8F);
+        assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_write_multi_regs_count_zero_rejected() {
+        let backend = DummyBackend::new();
+        // FC=10, addr=0, count=0, byte_count=0
+        let pdu = [0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&backend, 0x10, &pdu, &mut out);
+        assert_eq!(out[0], 0x90);
+        assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_write_multi_regs_count_too_large_rejected() {
+        let backend = DummyBackend::new();
+        // FC=10, addr=0, count=126 (> MAX_REGS_PER_READ=125)
+        let pdu = [0x00, 0x00, 0x00, 0x7E, 0x00];
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&backend, 0x10, &pdu, &mut out);
+        assert_eq!(out[0], 0x90);
         assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
         assert_eq!(n, 2);
     }

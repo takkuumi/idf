@@ -266,8 +266,8 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
         }
         None => {
             log::info!("[logic_cfg] D1: sub=0x{:02X} ({}) not configured", sub, sub_name(sub));
-            // 参考固件: 未配置时返回 [0xD0, 0x00, 0x84] (DEAL error)
-            Some(build_ack(0xD0, 0x00, 0x84))
+            // 参考固件: 未配置时返回错误帧 (cmd 字段保持 0xD1 与请求匹配)
+            Some(build_ack(0xD1, sub, 0x84))
         }
     }
 }

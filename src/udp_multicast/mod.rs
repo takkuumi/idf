@@ -128,6 +128,8 @@ pub fn start() -> AppResult<()> {
 
 /// 接收主循环
 fn recv_loop() {
+    // LOOP9: 订阅硬件 WDT, 否则 feed_wdt() 高频报 "task not found" 刷屏
+    health::subscribe_wdt();
     loop {
         TASK_HB.tick();
         health::feed_wdt();
@@ -230,6 +232,15 @@ fn src_ip_matches(src: &SocketAddr, filter: [u8; 4]) -> bool {
 }
 
 /// 通过 setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP) 加入 IPv4 组播组
+///
+/// LOOP9 字节序修复 (最终正确版): `in_addr.s_addr` 期望**网络字节序** (BE),
+/// `group`/`if_ip` 已是主机序 octet 数组, 必须用 `from_be_bytes` 转 BE u32.
+///
+/// (前一个 LOOP9 错误版本用 `from_ne_bytes` — 在 ESP32-S3 LE 平台上等价
+/// `from_le_bytes`, 产生 `0x010000EF` 而非 `0xEF000001`, 组播加入失败。)
+///
+/// 同时, LwIP 中 `imr_interface=INADDR_ANY` 可能因无默认 netif 而失败 (errno=125),
+/// 因此使用 CONFIG RCU 中存储的实际设备 IP 作为接口地址。
 fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io::Error> {
     use std::os::fd::AsRawFd;
     // ip_mreq { imr_multiaddr: in_addr, imr_interface: in_addr }
@@ -239,12 +250,23 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
         imr_multiaddr: u32,
         imr_interface: u32,
     }
+
+    // 从 CONFIG RCU 读取设备 IP 作为接口地址 (INADDR_ANY 在 ESP-IDF LwIP 上不可靠)
+    let if_ip = crate::bus::config_state::config_read()
+        .map(|cs| cs.cfg.ip)
+        .unwrap_or([0, 0, 0, 0]);
+    log::info!(
+        "[udp-mcast] join group={}.{}.{}.{} iface={}.{}.{}.{}",
+        group[0], group[1], group[2], group[3],
+        if_ip[0], if_ip[1], if_ip[2], if_ip[3]
+    );
+
     let mreq = IpMreq {
+        // s_addr = network byte order: group/if_ip 是主机序 octet 数组, 用 from_be_bytes 转 BE
         imr_multiaddr: u32::from_be_bytes(group),
-        imr_interface: u32::from_be_bytes([0, 0, 0, 0]), // INADDR_ANY
+        imr_interface: u32::from_be_bytes(if_ip),
     };
     const IPPROTO_IP: i32 = 0;
-    // IP_ADD_MEMBERSHIP = 35 (Linux/LwIP) — 用 esp_idf_sys 常量更稳妥
     let ip_add_membership = esp_idf_sys::IP_ADD_MEMBERSHIP as i32;
     let fd = sock.as_raw_fd();
     let ret = unsafe {
@@ -273,7 +295,8 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
 pub fn read_switch_status(word_idx: u16) -> Option<u16> {
     let idx = word_idx as usize;
     let total_words = (regs::MULTICAST_BUF_SIZE + 1) / 2;
-    if idx >= total_words as usize && idx as u16 >= regs::INREG_SWITCH_STATUS_COUNT {
+    // LOOP9: 修复 && → || (AND 恒真 → 所有地址返回 Some; OR 正确拒绝越界)
+    if idx >= total_words as usize || word_idx >= regs::INREG_SWITCH_STATUS_COUNT {
         return None;
     }
     let guard = RECV_BUF.lock();

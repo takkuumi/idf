@@ -39,6 +39,8 @@ pub struct TaskHb {
     pub max_stall: AtomicU32,
     /// 连续停滞次数累积 (check_all 维护, 心跳变化时清零)
     stall_count: AtomicU32,
+    /// 一次性任务完成后设为 true, check_all 跳过 (避免误报停滞)
+    completed: core::sync::atomic::AtomicBool,
 }
 
 impl TaskHb {
@@ -50,6 +52,7 @@ impl TaskHb {
             last_check: AtomicU32::new(0),
             max_stall: AtomicU32::new(3),
             stall_count: AtomicU32::new(0),
+            completed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -62,11 +65,20 @@ impl TaskHb {
             last_check: AtomicU32::new(0),
             max_stall: AtomicU32::new(stall),
             stall_count: AtomicU32::new(0),
+            completed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// 任务 loop 中调用, 递增心跳计数
     pub fn tick(&self) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 一次性任务完成后调用, 标记该任务为已完成.
+    /// 已完成任务不再被 check_all 检查 (避免误报停滞).
+    pub fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
+        // 最后再 tick 一次, 保证 check_all 的 last_check 更新
         self.counter.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -122,6 +134,10 @@ pub fn check_all() -> heapless::Vec<&'static str, MAX_TASKS> {
         }
         // SAFETY: 指针由 register() 的 &'static TaskHb 存入, 生命周期 = 程序.
         let t: &'static TaskHb = unsafe { &*ptr };
+        // LOOP9: 一次性任务完成后跳过, 避免误报停滞触发强制重启
+        if t.completed.load(Ordering::Acquire) {
+            continue;
+        }
         let cur = t.counter.load(Ordering::Relaxed);
         let last = t.last_check.load(Ordering::Relaxed);
         let threshold = t.max_stall.load(Ordering::Relaxed);
@@ -170,13 +186,15 @@ pub fn snapshot() {
 ///
 /// 必须在任务上下文内调用 (会绑定当前 task handle)。
 /// 加入后必须在 CONFIG_ESP_TASK_WDT_TIMEOUT_S (10s) 内调用 `feed_wdt()`。
+/// LOOP9: 幂等 — 重复订阅同一任务返回 ESP_ERR_INVALID_STATE, 视为成功 (已订阅).
 pub fn subscribe_wdt() {
     // esp_task_wdt_add(NULL) 表示添加当前任务
     let r = unsafe { esp_idf_sys::esp_task_wdt_add(std::ptr::null_mut()) };
-    if r != 0 {
-        log::warn!("[health] esp_task_wdt_add failed: 0x{:08X}", r);
+    if r == 0 || r == esp_idf_sys::ESP_ERR_INVALID_STATE {
+        // 0 = 新订阅成功; INVALID_STATE = 已订阅 (幂等)
+        log::debug!("[health] current task subscribed to WDT (r=0x{:08X})", r);
     } else {
-        log::debug!("[health] current task subscribed to WDT");
+        log::warn!("[health] esp_task_wdt_add failed: 0x{:08X}", r);
     }
 }
 

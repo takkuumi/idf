@@ -244,7 +244,25 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
     }
     // 2. CFG / device_config / holding_buf (0x0880..=0x107F)
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
-        // 2a. device_config 子区 (2300..<2400): 来自 CONFIG.device_config
+        // 2a. 错误环日志 (0x0887..=0x08A6, 在 CFG 区内但语义独立, 需在 SystemConfig 前拦截)
+        if addr >= regs::INREG_RINGLOG_BASE && addr < regs::INREG_RINGLOG_BASE + 32 {
+            let entry_idx = ((addr - regs::INREG_RINGLOG_BASE) / 4) as usize;
+            let field_idx = (addr - regs::INREG_RINGLOG_BASE) % 4;
+            let ring = crate::error::ringlog::RING_LOG.lock();
+            let entries = ring.entries();
+            if entry_idx < entries.len() {
+                let entry = &entries[entry_idx];
+                return Some(match field_idx {
+                    0 => (entry.timestamp_s & 0xFFFF) as u16,
+                    1 => ((entry.timestamp_s >> 16) & 0xFFFF) as u16,
+                    2 => entry.code,
+                    3 => (entry.context & 0xFFFF) as u16,
+                    _ => 0,
+                });
+            }
+            return Some(0);
+        }
+        // 2b. device_config 子区 (2300..<2400): 来自 CONFIG.device_config
         if addr >= 2300 && addr < 2400 {
             // 先尝试 CONFIG 快照内的 device_config 表
             if let Some(cs) = config_read() {
@@ -253,13 +271,13 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
                 }
             }
         }
-        // 2b. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
+        // 2c. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
         if let Some(cs) = config_read() {
             if let Some(v) = cs.cfg.read_reg(addr) {
                 return Some(v);
             }
         }
-        // 2c. HOLD_PXX 残余 (0x0880..=0x107F 中 CFG 未覆盖部分): 来自 STORAGE.holding_buf
+        // 2d. HOLD_PXX 残余 (0x0880..=0x107F 中 CFG 未覆盖部分): 来自 STORAGE.holding_buf
         let idx = (addr - regs::HOLD_PXX_BASE) as usize;
         if idx < regs::HOLD_PXX_COUNT {
             return storage_read().map(|s| s.holding_buf[idx]);
@@ -271,26 +289,8 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         let idx = (addr - regs::PROTO_BASE) as usize;
         return storage_read().map(|s| s.proto.data[idx]);
     }
-    // 4. 错误环日志最近 8 条 (0x0887..=0x08A6): 来自 ringlog
-    if addr >= regs::INREG_RINGLOG_BASE && addr < regs::INREG_RINGLOG_BASE + 32 {
-        let entry_idx = ((addr - regs::INREG_RINGLOG_BASE) / 4) as usize;
-        let field_idx = (addr - regs::INREG_RINGLOG_BASE) % 4;
-        let ring = crate::error::ringlog::RING_LOG.lock();
-        let entries = ring.entries();
-        if entry_idx < entries.len() {
-            let entry = &entries[entry_idx];
-            return Some(match field_idx {
-                // LOOP8: timestamp_ms → timestamp_s (秒级, ~136 年不 wrap)
-                0 => (entry.timestamp_s & 0xFFFF) as u16,
-                1 => ((entry.timestamp_s >> 16) & 0xFFFF) as u16,
-                2 => entry.code,
-                3 => (entry.context & 0xFFFF) as u16,
-                _ => 0,
-            });
-        }
-        return Some(0);
-    }
-    // 5. Proto 控制字 (PROTO_COMMIT..=PROTO_MAGIC)
+    // 4. Proto 控制字 (PROTO_COMMIT..=PROTO_MAGIC)
+    // (ringlog 0x0887-0x08A6 已在 CFG 块内 2a 处理, 此处不再重复)
     match addr {
         regs::PROTO_COMMIT => Some(0),
         regs::PROTO_RELOAD => Some(0),

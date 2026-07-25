@@ -397,6 +397,9 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// NFC 备份数据字数 (NFC_BLOB_DATA_BYTES / 2)
+const NFC_BLOB_DATA_WORDS: usize = NFC_BLOB_DATA_BYTES / 2;
+
 // ============================================================================
 // 启动入口
 // ============================================================================
@@ -424,6 +427,8 @@ pub fn start() -> AppResult<()> {
 /// NFC 后台轮询循环
 fn nfc_loop() {
     let mut present = false;
+    // LOOP9: 订阅硬件 WDT, 否则 feed_wdt() 高频报 "task not found" 刷屏
+    health::subscribe_wdt();
 
     loop {
         TASK_HB.tick();
@@ -478,18 +483,21 @@ fn nfc_loop() {
             Err(_) => None,
         };
 
-        let regbuf = storage_read().map(|s| s.holding_buf.clone());
+        // LOOP9: 避免 clone 整个 holding_buf (~4KB heap), 持 Arc 引用即可
+        let regbuf_arc = storage_read();
+        let regbuf: Option<&[u16]> = regbuf_arc.as_ref().map(|s| s.holding_buf.as_ref());
 
-        match (header, &regbuf) {
+        match (header, regbuf) {
             (Some(h), Some(rb)) if h.is_valid() => {
-                // 校验 CRC
-                let mut data_buf = vec![0u8; NFC_BLOB_DATA_BYTES];
+                // 校验 CRC — LOOP9: 栈数组替代 vec![] (1760B, 8KB 栈足够)
+                let mut data_buf = [0u8; NFC_BLOB_DATA_BYTES];
                 match dev.read_eeprom(NDEF_TEXT_END + 1 + NFC_HEADER_BYTES as u16, &mut data_buf) {
                     Ok(_) => {
                         let calc_crc = crc32(&data_buf);
                         if calc_crc == h.crc32 {
-                            // 比较 holding_buf 与 NFC 数据
-                            let nfc_words = bytes_to_words(&data_buf);
+                            // 比较 holding_buf 与 NFC 数据 — LOOP9: 栈数组替代 Vec
+                            let mut nfc_words = [0u16; NFC_BLOB_DATA_WORDS];
+                            bytes_to_words(&data_buf, &mut nfc_words);
                             if regbuf_equal(rb, &nfc_words) {
                                 log::debug!("[nfc] snapshot matches, no sync needed");
                             } else {
@@ -542,8 +550,9 @@ fn nfc_loop() {
 /// 然后分批写入 (RFID_READ_NUMBER=30 字节/次)
 fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
     // 1. 把 holding_buf 转为字节 (LE, 与 MCA PRegBuf 内存布局一致)
-    let mut data = vec![0u8; NFC_BLOB_DATA_BYTES];
-    let words = (NFC_BLOB_DATA_BYTES / 2).min(holding_buf.len());
+    //    LOOP9: 栈数组替代 vec![] (1760B, 8KB 栈足够), 避免 pthread 堆分配
+    let mut data = [0u8; NFC_BLOB_DATA_BYTES];
+    let words = NFC_BLOB_DATA_WORDS.min(holding_buf.len());
     for i in 0..words {
         data[i * 2] = (holding_buf[i] & 0xFF) as u8;
         data[i * 2 + 1] = (holding_buf[i] >> 8) as u8;
@@ -618,15 +627,27 @@ fn restore_from_nfc(nfc_words: &[u16]) {
 // ============================================================================
 
 /// 字节数组 → U16 数组 (LE, 与 MCA PRegBuf 内存布局一致)
-fn bytes_to_words(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect()
+///
+/// LOOP9: 写入调用方提供的栈缓冲 `out`, 避免 pthread 中 `Vec` 堆分配。
+/// `out` 至少需容纳 `(data.len() / 2)` 个 u16; 多余字节填 0。
+fn bytes_to_words(data: &[u8], out: &mut [u16]) {
+    let n = (data.len() / 2).min(out.len());
+    for i in 0..n {
+        out[i] = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+    }
+    // 剩余清零 (调用方传入固定大小数组时, 未填充部分保持 0)
+    for v in &mut out[n..] {
+        *v = 0;
+    }
 }
 
-/// 比较两个 regbuf 是否一致
+/// 比较 holding_buf 与 NFC 备份数据是否一致 (仅比较 NFC 覆盖的前 N words)
+///
+/// LOOP9: 旧实现 `a.len() == b.len()` 恒 false (holding_buf=2048 vs nfc=880),
+/// 导致每次轮询都触发不必要的 restore。改为比较前 min(len) 个 word。
 fn regbuf_equal(a: &[u16], b: &[u16]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+    let n = a.len().min(b.len());
+    a[..n].iter().zip(b[..n].iter()).all(|(x, y)| x == y)
 }
 
 // ============================================================================
@@ -707,8 +728,10 @@ mod tests {
     #[test]
     fn test_bytes_to_words() {
         let data = [0x01, 0x02, 0x03, 0x04];
-        let words = bytes_to_words(&data);
-        assert_eq!(words, vec![0x0201, 0x0403]);
+        let mut words = [0u16; 2];
+        bytes_to_words(&data, &mut words);
+        assert_eq!(words[0], 0x0201);
+        assert_eq!(words[1], 0x0403);
     }
 
     #[test]
@@ -720,8 +743,15 @@ mod tests {
 
     #[test]
     fn test_regbuf_equal() {
+        // LOOP9: regbuf_equal 比较前 min(len) 个 word (不再要求长度完全一致)
         assert!(regbuf_equal(&[1, 2, 3], &[1, 2, 3]));
         assert!(!regbuf_equal(&[1, 2, 3], &[1, 2, 4]));
-        assert!(!regbuf_equal(&[1, 2], &[1, 2, 3]));
+        // 短数组是长数组前缀 → 相等 (NFC 880 words vs holding_buf 2048 words 场景)
+        assert!(regbuf_equal(&[1, 2], &[1, 2, 3]));
+        // 完全不同长度
+        assert!(!regbuf_equal(&[1, 2, 3], &[9, 2, 3]));
+        assert!(!regbuf_equal(&[], &[1, 2, 3]));
+        // 空数组 vs 空数组
+        assert!(regbuf_equal(&[], &[]));
     }
 }

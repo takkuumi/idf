@@ -1170,10 +1170,11 @@ fn handle_mca_custom_command(
             let _ = rsp.push(0xC2);
             let _ = rsp.push(0);
             // SN 9 个 U16 (大端) → 18 字节 ASCII
+            // LOOP9: push 顺序应为 BE [hi, lo], 而非 LE [lo, hi]
             for i in 0..9usize {
                 let w = u16::from_be_bytes([sn[i * 2], sn[i * 2 + 1]]);
-                let _ = rsp.push(w as u8);
-                let _ = rsp.push((w >> 8) as u8);
+                let _ = rsp.push((w >> 8) as u8); // hi byte first (BE)
+                let _ = rsp.push(w as u8); // lo byte second
             }
             log::info!("[ble_at] GET_SN_CODE: {} bytes", rsp.len());
             send_ble_frame(tx_id, proto_id, &rsp, conn_id);
@@ -2295,6 +2296,7 @@ mod tests {
 //
 #[cfg(test)]
 mod tests_ble_cmd {
+    #[allow(unused_imports)]
     use super::*;
 
     /// 构建 Android 兼容的 BLE 请求帧 (与 CommandBuilderUtil.buildCMD 一致)

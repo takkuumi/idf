@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-24 (LOOP8: 架构彻底无锁化 + RCU 多写者修复 + 7×24 可靠性加固)
+> 最后更新: 2026-07-25 (LOOP9: 全链路审计 + 关键 bug 全面修复)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -371,6 +371,63 @@ StorageSnapshot 到 Arc, 每次 device_text 写入都产生 11KB heap churn。
 3. heap 使用量稳定 (无持续增长, 碎片缓解生效)
 4. ble-at 心跳正常 (不再误报停滞)
 5. 以太网网线拔出 → heartbeat_once 返回 false → 降级路径激活
+
+### 烧录命令
+```bash
+cargo build --bin gateway
+espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    target/xtensa-esp32s3-espidf/debug/gateway
+espflash reset --port /dev/cu.usbserial-1430
+```
+
+## LOOP9 全链路审计 + 关键 bug 全面修复 (2026-07-25) - COMPLETE
+
+### 审计方法
+4 个并行审计 agent 分别覆盖: pthread 堆分配、Modbus 全链路、BLE/网络/IO 链路、Web 服务器。
+审计后逐一修复 P0/P1 问题，补充回归测试，最终 **0 error / 0 warning** 编译通过。
+
+### 修复清单 (14 项)
+
+| # | 严重度 | 文件 | 问题 | 修复 |
+|---|--------|------|------|------|
+| 1 | P0 | `web/mod.rs` | OTA body 一次性 `vec![content_length]` → OOM panic | 流式 4KB chunk 读取 + `MAX_OTA_SIZE=2MB` 上限 |
+| 2 | P0 | `web/mod.rs` | HTTP header/body 无长度上限 → DoS OOM | `MAX_HEADER_LINE=1024`, `MAX_BODY_SIZE=512KB` |
+| 3 | P0 | `udp_multicast/mod.rs` | `from_ne_bytes` 字节序错误 (LOOP9 旧版方向反) | 改回 `from_be_bytes` (网络字节序) |
+| 4 | P0 | `udp_multicast/mod.rs` | `read_switch_status` 边界检查 `&&` 应为 `||` | 修正为 `||` |
+| 5 | P0 | `bus/backends.rs` | ringlog 地址 0x0887-0x08A6 被 CFG_BASE catch-all 遮蔽, FC=03 恒返回 0 | ringlog 检查提前到 CFG 块内 SystemConfig 之前 |
+| 6 | P1 | `modbus/shared.rs` | FC=0F/FC=10 缺少 count 范围校验 (count=0 返回成功) | 添加 `count==0 \|\| count>MAX` → ILLEGAL_DATA_VALUE |
+| 7 | P1 | `nfc/mod.rs` | `vec![0u8;1760]` 每次轮询堆分配 (违反 AGENTS.md) | 改为栈数组 `[0u8; NFC_BLOB_DATA_BYTES]` |
+| 8 | P1 | `nfc/mod.rs` | `regbuf_equal` 长度不匹配 (2048 vs 880) 恒 false → 每次轮询都 restore | 改为比较前 min(len) 个 word |
+| 9 | P1 | `nfc/mod.rs` | `bytes_to_words` 返回 `Vec<u16>` (堆分配) | 改为写入调用方栈缓冲 `&mut [u16]` |
+| 10 | P1 | `ble_at/logic_handlers.rs` | D1 未配置响应 cmd=0xD0 (应为 0xD1, 复制粘贴错误) | 修正为 `build_ack(0xD1, sub, 0x84)` |
+| 11 | P1 | `ble_at/mod.rs` | 0xC2 GET_SN_CODE push 顺序 [lo,hi]=LE (应 BE) | 修正为 [hi,lo] 大端 |
+| 12 | P1 | `io/di.rs` | read_di_all 失败时用旧 candidate 推进去抖计数 → 误报 DI 变化 | 失败时直接 return, 不推进计数 |
+| 13 | P1 | `channel/ai.rs` | scaled 未使用 calib 校准值 (SENSOR_MIN/MAX 从不读取) | 读取 holding_buf 校准值, 用 `map_range` 映射; 无校准时回退 4-20mA |
+| 14 | P2 | `ethernet/w5500.rs` | eth-heartbeat stall 阈值 6 与 5s 周期不匹配 | 调整为 8 (留 3s 余量) |
+
+### 附加修复 (编译警告清零)
+- `src/sync.rs:528`: `for i in 0..1000` → `for _ in 0..1000` (unused variable)
+- `src/bus/buffer_pool.rs:163`: `assert!(p.available() >= 0)` → `let _ = p.available()` (usize 恒 >=0)
+- `src/ble_at/mod.rs:2298`: `use super::*` → `#[allow(unused_imports)]` (测试模块)
+- `src/web/mod.rs:369`: `mut stream` → `stream` (不需要 mut)
+
+### 新增回归测试 (9 个)
+- `test_map_range_basic` / `test_map_range_clamp` / `test_map_range_div_zero` / `test_map_range_inverted_output` — AI 校准映射
+- `test_write_multi_coils_count_zero_rejected` / `test_write_multi_coils_count_too_large_rejected` — FC=0F 校验
+- `test_write_multi_regs_count_zero_rejected` / `test_write_multi_regs_count_too_large_rejected` — FC=10 校验
+- `test_regbuf_equal` 更新 — NFC 前缀比较语义
+
+### 编译验证
+- `cargo build --bin gateway`: **0 error, 0 warning**
+- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 167 个单元测试编译通过
+- 测试用例: 167 个 (较 LOOP8 的 127+ 新增 40 个)
+
+### 已知限制 (不在本 LOOP 范围)
+- Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
+- BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析)
+- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份)
+- AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
+- eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
 
 ### 烧录命令
 ```bash

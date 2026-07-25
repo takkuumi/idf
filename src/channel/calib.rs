@@ -23,6 +23,17 @@ static TASK_HB: TaskHb = TaskHb::new_with_stall("adc-calib", 12);
 /// 传感器校准寄存器通道数 (对齐参考固件 SENSOR_NUM=8)
 const SENSOR_CHANNELS: usize = 8;
 
+/// LOOP9: 标记 calib 任务为一次性任务已完成.
+/// 校准结束后心跳不再递增, 若不标记则 check_all 误判为停滞 → 强制重启.
+pub fn mark_task_completed() {
+    TASK_HB.mark_completed();
+    log::debug!("[adc-calib] task marked completed (one-shot)");
+}
+
+fn finish_calib() {
+    mark_task_completed();
+}
+
 /// 开机时执行 ADC 自动校准
 ///
 /// 必须在 device::init() 完成后、进入主循环前调用。
@@ -61,6 +72,7 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
         Some(c) => c,
         None => {
             log::info!("[adc-calib] 所有通道已校准, 跳过");
+            finish_calib();
             return Ok(());
         }
     };
@@ -124,6 +136,7 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
 
     if !smin_ok && !smax_ok {
         log::warn!("[adc-calib] AI{} 校准跳过 (min/max 均超出范围)", ch);
+        finish_calib();
         return Ok(());
     }
 
@@ -155,5 +168,6 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
         crate::config::regs::HOLD_SENSOR_MAX_BASE + ch as u16,
     );
 
+    finish_calib();
     Ok(())
 }

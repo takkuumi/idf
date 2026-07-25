@@ -76,8 +76,10 @@ pub fn tick_di_scan(hal: &Hal) {
     let bits: u64 = match hal.dio().read_di_all() {
         Ok(v) => v,
         Err(e) => {
+            // LOOP9: 读取失败时不应推进去抖计数 (旧实现用 state.candidate 作为 bits,
+            // 导致 bits==candidate 恒成立, 错误 candidate 被快速确认为 stable, 误报 DI 变化)
             log::warn!("[di] read_di_all failed: {}", e);
-            state.candidate
+            return;
         }
     };
 

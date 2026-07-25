@@ -160,6 +160,7 @@ mod tests {
             x.join().unwrap();
         }
         // 池内 4 槽, 8 线程, 必然有 acquire 返回 None, 但不 panic.
-        assert!(p.available() >= 0);
+        // available() 返回 usize, 恒 >= 0; 仅验证不 panic 即可.
+        let _ = p.available();
     }
 }
