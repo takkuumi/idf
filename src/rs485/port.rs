@@ -16,6 +16,7 @@ use crate::rs485::config::Rs485Config;
 
 const RX_BUF_SIZE: i32 = 256;
 const RX_TIMEOUT_MS: u32 = 200;
+#[allow(non_upper_case_globals)]
 const portTICK_PERIOD_MS: u32 = 1000 / configTICK_RATE_HZ;
 
 /// 单路 RS485 端口

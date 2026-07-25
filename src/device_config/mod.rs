@@ -19,7 +19,7 @@ use crate::error::AppResult;
 mod types;
 mod store;
 
-pub use types::{DeviceType, DeviceFunction, DeviceFunctionMeta};
+pub use types::DeviceType;
 
 /// 设备配置表 (对齐参考固件 2300+ 寄存器区域)
 #[derive(Clone)]

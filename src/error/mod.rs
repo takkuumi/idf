@@ -8,7 +8,7 @@
 pub mod recovery;
 pub mod ringlog;
 
-pub use ringlog::{log_error, log_warn, log_critical, module_id, LogEntry, RING_LOG};
+pub use ringlog::{log_warn, module_id};
 
 use core::fmt;
 use std::io;

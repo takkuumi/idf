@@ -41,18 +41,17 @@ pub mod handlers;
 pub mod ota_handlers;
 pub mod parser;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use std::sync::LazyLock;
 
 use crate::sync::Spin;
 
-use crate::config::modbus::rtu_slave::ADDR as MODBUS_ADDR;
 use crate::error::AppResult;
 use crate::modbus::shared::modbus_crc16;
 use std::ffi::CString;
 
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 
 /// 与原 C++ 固件及手持机 1.0.78 完全一致的 GATT UUID。
 pub const SERVICE_UUID: &str = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -71,14 +70,25 @@ const IDX_CHAR_CCCD: usize = 3;
 const ATTR_TABLE_LEN: usize = 4;
 
 /// 运行时分配的 GATT handle 表 (CREAT_ATTR_TAB_EVT 中填充)
-/// 0 = 尚未分配
-static HANDLE_TABLE: Spin<[u16; ATTR_TABLE_LEN]> = Spin::new([0u16; ATTR_TABLE_LEN]);
+/// 0 = 尚未分配. 用 AtomicU16 数组替代 Spin<[u16; 4]>:
+/// - 写: CREAT_ATTR_TAB_EVT 中一次性填入, 之后只读
+/// - 读: 每 GATT 回调 + 每 process_tick (100ms) → 真无锁
+static HANDLE_TABLE: [AtomicU16; ATTR_TABLE_LEN] = [
+    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
+];
 
-/// Bluedord 分配的 GATT 接口号 (REG_EVT 中填充, -1 = 未注册)
-static GATTS_IF: Spin<Option<esp_idf_sys::esp_gatt_if_t>> = Spin::new(None);
+/// Bluedord 分配的 GATT 接口号. 用 AtomicU8:
+/// - 0xFF = 未注册 (sentinel, ESP_GATT_IF_NONE 在 ESP-IDF 头文件定义)
+/// - 0..=0xFE = 已注册接口号
+/// 替代 Spin<Option<esp_gatt_if_t>>, 真无锁 (原 Spin 在每回调+每 tick 都竞争)
+// 注: ESP-IDF esp_gatt_if_t 实际为 u8 (绑定确认). 0xFF = 未注册.
+static GATTS_IF: AtomicU8 = AtomicU8::new(0xFF);
 
-/// 当前 GATT 连接 ID (None = 无客户端连接)
-static CONN_ID: Spin<Option<u16>> = Spin::new(None);
+/// 当前 GATT 连接 ID. 用 AtomicU16:
+/// - 0xFFFF = 无客户端连接 (sentinel, ESP-IDF conn_id 最大 0x7FFF 远小于此)
+/// - 其他 = 有效连接 ID
+/// 替代 Spin<Option<u16>>, 真无锁
+static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
 
 /// TX Characteristic CCCD 使能标志 (主机写 0x0001 启用 notify)
 static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -307,7 +317,7 @@ unsafe extern "C" fn gatts_event_cb(
                 log::error!("[ble_at] GATT app registration failed: {}", reg.status);
                 return;
             }
-            *GATTS_IF.lock() = Some(gatts_if);
+            GATTS_IF.store(gatts_if as u8, Ordering::Release);
             log::info!("[ble_at] calling create_attr_tab(gatts_if={}, n_attr={})", gatts_if, ATTR_TABLE_LEN);
             let ret = unsafe {
                 esp_idf_sys::esp_ble_gatts_create_attr_tab(
@@ -341,18 +351,16 @@ unsafe extern "C" fn gatts_event_cb(
                 );
                 return;
             }
-            // 拷贝 handle 表到本地存储
+            // 拷贝 handle 表到本地存储 (原子 store)
             let n = (p.num_handle as usize).min(ATTR_TABLE_LEN);
             // SAFETY: p.handles 指向 Bluedord 内部 u16 数组, 长度 = num_handle
             let src = unsafe { std::slice::from_raw_parts(p.handles, n) };
-            let mut table = HANDLE_TABLE.lock();
             for (i, &h) in src.iter().enumerate() {
-                if i < table.len() {
-                    table[i] = h;
+                if i < ATTR_TABLE_LEN {
+                    HANDLE_TABLE[i].store(h, Ordering::Release);
                 }
             }
-            let svc_handle = table[IDX_SVC];
-            drop(table);
+            let svc_handle = HANDLE_TABLE[IDX_SVC].load(Ordering::Acquire);
             log::info!(
                 "[ble_at] attr_tab created (handles={}, svc={}, status={})",
                 n,
@@ -403,54 +411,54 @@ unsafe extern "C" fn gatts_event_cb(
             }
             let p = unsafe { &(*param).write };
 
-            let handles = HANDLE_TABLE.lock();
+            // LOOP8: HANDLE_TABLE 改为 AtomicU16 数组, 用 load 直接读
+            let cccd_handle = HANDLE_TABLE[IDX_CHAR_CCCD].load(Ordering::Acquire);
+            let value_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
+            let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
 
             // CCCD 写入 (TX notify enable/disable)
-            // 注意: CCCD 分支必须先发送 write response，再处理 CCCD，
+            // 注意: CCCD 分支必须先发送写响应，再处理 CCCD，
             // 否则 Android BLE 栈收不到响应会进入异常状态。
-            if p.handle == handles[IDX_CHAR_CCCD] && p.len == 2 && !p.value.is_null() {
+            if p.handle == cccd_handle && p.len == 2 && !p.value.is_null() {
                 // SAFETY: p.value 指向主机写入的 2 字节数据
                 let v = unsafe { std::slice::from_raw_parts(p.value, 2) };
                 let cccd = u16::from_le_bytes([v[0], v[1]]);
                 let enabled = cccd & 0x0001 != 0;
                 TX_NOTIFY_ENABLED.store(enabled, Ordering::SeqCst);
                 log::info!(
-                    "[ble_at] TX notify {}, gatts_if={:?}, conn_id={}",
+                    "[ble_at] TX notify {}, gatts_if={}, conn_id={}",
                     if enabled { "enabled" } else { "disabled" },
-                    *GATTS_IF.lock(),
+                    gatts_if_raw,
                     p.conn_id
                 );
                 // 发写响应 — Android 端需要收到 CCCD write response 才能继续通信
-                if p.need_rsp {
-                    if let Some(gatts_if) = *GATTS_IF.lock() {
-                        let _ = unsafe {
-                            esp_idf_sys::esp_ble_gatts_send_response(
-                                gatts_if,
-                                p.conn_id,
-                                p.trans_id,
-                                esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
-                                std::ptr::null_mut(),
-                            )
-                        };
-                    }
+                if p.need_rsp && gatts_if_raw != 0xFF {
+                    let _ = unsafe {
+                        esp_idf_sys::esp_ble_gatts_send_response(
+                            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
+                            p.conn_id,
+                            p.trans_id,
+                            esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
+                            std::ptr::null_mut(),
+                        )
+                    };
                 }
-            } else if p.handle == handles[IDX_CHAR_VALUE] && !p.value.is_null() && p.len > 0 {
+            } else if p.handle == value_handle && !p.value.is_null() && p.len > 0 {
                 // RX characteristic 写入 — 优先尝试二进制协议, 否则按文本 AT 处理
                 // 关键修复: 必须先发送写响应, 然后再处理数据发送通知
                 // 否则 Android BLE 栈可能在收到通知前就进入下一状态
                 let data = unsafe { std::slice::from_raw_parts(p.value, p.len as usize) };
                 let data_vec: Vec<u8> = data.to_vec();
-                // handles already dropped implicitly
 
                 // 1. 先发送写响应 (GATT 协议要求先响应 write request)
                 if p.need_rsp {
-                    let Some(gatts_if) = *GATTS_IF.lock() else {
+                    if gatts_if_raw == 0xFF {
                         log::error!("[ble_at] cannot respond: GATT interface is unavailable");
                         return;
-                    };
+                    }
                     let _ = unsafe {
                         esp_idf_sys::esp_ble_gatts_send_response(
-                            gatts_if,
+                            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
                             p.conn_id,
                             p.trans_id,
                             esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
@@ -466,15 +474,11 @@ unsafe extern "C" fn gatts_event_cb(
                     feed_data(&data_vec);
                 }
             } else {
-                // handles already dropped implicitly
                 // 其他情况 (例如 CCCD 写入) 仍需发送响应
-                if p.need_rsp {
-                    let Some(gatts_if) = *GATTS_IF.lock() else {
-                        return;
-                    };
+                if p.need_rsp && gatts_if_raw != 0xFF {
                     let _ = unsafe {
                         esp_idf_sys::esp_ble_gatts_send_response(
-                            gatts_if,
+                            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
                             p.conn_id,
                             p.trans_id,
                             esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK,
@@ -489,8 +493,9 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).connect };
-            *CONN_ID.lock() = Some(p.conn_id);
-            *GATTS_IF.lock() = Some(gatts_if);
+            // LOOP8: 原子写入替代 Spin<Option>
+            CONN_ID.store(p.conn_id, Ordering::Release);
+            GATTS_IF.store(gatts_if as u8, Ordering::Release);
             log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
             
             // MCA 兼容: 连接后立即产一个心跳通知到 BINARY_TX 队列
@@ -526,7 +531,7 @@ unsafe extern "C" fn gatts_event_cb(
             let p = unsafe { &(*param).disconnect };
             log::warn!("[ble_at] GATT disconnect conn_id={} reason={:#x}",
                 p.conn_id, p.reason);
-            *CONN_ID.lock() = None;
+            CONN_ID.store(0xFFFF, Ordering::Release);  // LOOP8: 原子 sentinel = None
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
             // 清空 BINARY_TX 残留数据，防止旧帧在新连接时被发送
             if let Some(mut btx) = BINARY_TX.try_lock() {
@@ -760,16 +765,18 @@ pub fn update_gap_device_name() {
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
 /// 有则调用 parser::process 处理, 响应写入 TX_BUFFER 等待 notify。
 pub fn process_tick() {
+    // LOOP8: 心跳 — 之前从未 tick, 导致 ble-at 总被误判停滞
+    TASK_HB.tick();
     // LOOP7: 处理待更新的 GAP 设备名 (Metuory 写完 0x08E2 后)
     if PENDING_GAP_NAME_UPDATE.swap(false, std::sync::atomic::Ordering::SeqCst) {
         update_gap_device_name();
     }
-    if !TX_NOTIFY_ENABLED.load(std::sync::atomic::Ordering::SeqCst) { return; }
-    let Some(conn_id) = *CONN_ID.lock() else { return; };
-    let Some(gatts_if) = *GATTS_IF.lock() else { return; };
-    let h = HANDLE_TABLE.lock();
-    let tx_handle = h[IDX_CHAR_VALUE];
-    drop(h);
+    // LOOP8: 原子读取替代 Spin lock — 真无锁
+    let conn_id_raw = CONN_ID.load(Ordering::Acquire);
+    if conn_id_raw == 0xFFFF { return; }  // sentinel = None
+    let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
+    if gatts_if_raw == 0xFF { return; }  // sentinel = 未注册
+    let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     if tx_handle == 0 { return; }
     
     // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
@@ -817,9 +824,12 @@ pub fn process_tick() {
             let data_len = data.len();
             btx.clear();
             drop(btx);
+            // LOOP8: gatts_if_raw/conn_id_raw 是原子读出的原始值 (已校验非 sentinel)
             let ret = unsafe {
                 esp_idf_sys::esp_ble_gatts_send_indicate(
-                    gatts_if, conn_id, tx_handle,
+                    gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
+                    conn_id_raw,
+                    tx_handle,
                     data.len() as u16, data.as_ptr() as *mut u8, false,
                 )
             };
@@ -831,7 +841,7 @@ pub fn process_tick() {
             return;
         }
     }
-    
+
     // 2. 每 100 次主循环 (~10s) 发一次心跳
     use std::sync::atomic::{AtomicU16, Ordering};
     static HB_DIV: AtomicU16 = AtomicU16::new(0);
@@ -839,7 +849,7 @@ pub fn process_tick() {
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
     if n % 100 != 0 { return; }
     let seq = HB_SEQ.fetch_add(1, Ordering::Relaxed);
-    
+
     let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
     let _ = frame.extend_from_slice(&[0u8, 0, 0, 0, 0, 4]);
     let _ = frame.push(1);
@@ -849,11 +859,12 @@ pub fn process_tick() {
     let crc = crate::modbus::shared::modbus_crc16(&frame[..frame.len()]);
     let _ = frame.push(crc as u8);
     let _ = frame.push((crc >> 8) as u8);
-    
+
     log::info!("[ble_at] heartbeat #{} ({} bytes)", seq, frame.len());
     let ret = unsafe {
         esp_idf_sys::esp_ble_gatts_send_indicate(
-            gatts_if, conn_id, tx_handle,
+            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
+            conn_id_raw, tx_handle,
             frame.len() as u16, frame.as_ptr() as *mut u8, false,
         )
     };
@@ -871,11 +882,13 @@ pub fn process_tick() {
 ///
 /// 任一条件不满足时静默回退 (数据保留在 TX_BUFFER, 等下次重试)。
 fn try_send_notify() {
-    // 入口日志: 确认此函数被调用
-    log::info!("[ble_at] try_send_notify called, enabled={}, conn={:?}, gatts_if={:?}",
+    // LOOP8: 原子读取替代 Spin lock
+    let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
+    let conn_id_raw = CONN_ID.load(Ordering::Acquire);
+    log::info!("[ble_at] try_send_notify called, enabled={}, conn={:#06x}, gatts_if={}",
         TX_NOTIFY_ENABLED.load(Ordering::SeqCst),
-        *CONN_ID.lock(),
-        *GATTS_IF.lock()
+        conn_id_raw,
+        gatts_if_raw
     );
     // 检查 CCCD 是否使能
     if !TX_NOTIFY_ENABLED.load(Ordering::SeqCst) {
@@ -883,10 +896,9 @@ fn try_send_notify() {
     }
 
     // 检查是否有客户端连接
-    let conn_id = match *CONN_ID.lock() {
-        Some(c) => c,
-        None => return,
-    };
+    if conn_id_raw == 0xFFFF {
+        return;
+    }
 
     // 取出待发送数据
     let data = match take_response() {
@@ -898,9 +910,7 @@ fn try_send_notify() {
     }
 
     // 检查 GATT 服务是否已注册
-    let handles = HANDLE_TABLE.lock();
-    let tx_handle = handles[IDX_CHAR_VALUE];
-    // handles already dropped implicitly
+    let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     if tx_handle == 0 {
         // GATT 服务尚未注册, 数据放回 TX_BUFFER 等下次重试
         let mut tx = TX_BUFFER.lock();
@@ -908,16 +918,16 @@ fn try_send_notify() {
         return;
     }
 
-    let Some(gatts_if) = *GATTS_IF.lock() else {
+    if gatts_if_raw == 0xFF {
         let mut tx = TX_BUFFER.lock();
         let _ = tx.push_str(&data);
         return;
-    };
+    }
     // SAFETY: gatts_if / conn_id / tx_handle 来源可靠 (Bluedroid 分配)
     let ret = unsafe {
         esp_idf_sys::esp_ble_gatts_send_indicate(
-            gatts_if,
-            conn_id,
+            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
+            conn_id_raw,
             tx_handle,
             data.len() as u16,
             data.as_ptr() as *mut u8,
@@ -963,11 +973,13 @@ fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> b
     let backend = crate::modbus::shared::BusBackend;
     // pdu = slave/func 之后的所有数据, handle_pdu 会自行判断长度
     let pdu = if frame.len() > 2 { &frame[2..] } else { &[] };
-    let body = crate::modbus::shared::handle_pdu(&backend, func, pdu);
+    // 无堆分配: handle_pdu 写入栈缓冲区
+    let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
+    let pdu_len = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
     // 构造 Modbus RTU 响应: slave + func + body + crc
     let mut rtu_rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = rtu_rsp.push(slave);
-    let _ = rtu_rsp.extend_from_slice(&body);
+    let _ = rtu_rsp.extend_from_slice(&pdu_buf[..pdu_len]);
     let crc = modbus_crc16(&rtu_rsp[..rtu_rsp.len()]);
     let _ = rtu_rsp.push(crc as u8);
     let _ = rtu_rsp.push((crc >> 8) as u8);
@@ -1118,7 +1130,7 @@ fn handle_mca_custom_command(
     tx_id: u16,
     proto_id: u16,
     conn_id: u16,
-    unit: u8,
+    _unit: u8,
 ) -> bool {
     log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={}", 
         data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "));
@@ -1162,7 +1174,7 @@ fn handle_mca_custom_command(
         }
         0xCF => {
             // GET_FIRMWARE_VER
-            let fw = crate::config::APP_VERSION;
+            let _fw = crate::config::APP_VERSION;
             let mut rsp: heapless::Vec<u8, 8> = heapless::Vec::new();
             let _ = rsp.push(0xCF);
             let _ = rsp.push(0);
@@ -1381,9 +1393,8 @@ fn handle_ble_android_read_command(
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(n_bytes as u8); // length = N bytes of packed I/O
             // 读 coil/disc 状态并打包
-            let mut acc: u8 = 0;
             for i in 0..n_bytes {
-                acc = 0;
+                let mut acc: u8 = 0;
                 for j in 0..8 {
                     let bit_idx = i * 8 + j;
                     if bit_idx >= reg_cnt as usize { break; }
@@ -2081,7 +2092,7 @@ pub fn send_di_status_report(conn_id: u16) {
         di_bits, bitmap_bytes);
 }
 
-fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
+fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
     let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
     let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
@@ -2129,12 +2140,15 @@ pub fn binary_tx_drops() -> u32 {
 /// 发送 BLE notification (只由 process_loop 线程调用)
 /// 不在 GATT 回调中直接调用!
 fn send_notify(data: &[u8]) {
-    let Some(gatts_if) = *GATTS_IF.lock() else { return; };
-    let Some(conn_id) = *CONN_ID.lock() else { return; };
-    let handle = HANDLE_TABLE.lock()[IDX_CHAR_VALUE];
+    // LOOP8: 原子读取替代 Spin lock
+    let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
+    if gatts_if_raw == 0xFF { return; }
+    let conn_id_raw = CONN_ID.load(Ordering::Acquire);
+    if conn_id_raw == 0xFFFF { return; }
+    let handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     unsafe {
         let rc = esp_idf_sys::esp_ble_gatts_send_indicate(
-            gatts_if, conn_id, handle,
+            gatts_if_raw as esp_idf_sys::esp_gatt_if_t, conn_id_raw, handle,
             data.len() as u16, data.as_ptr() as *mut u8,
             false,
         );

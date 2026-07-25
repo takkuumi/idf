@@ -23,7 +23,7 @@
 //!   AT+CFGWRITE=<addr>,<value>        按 Modbus 地址写 U16
 
 use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16};
-use crate::device::{self, parse_ipv4, parse_mac, SystemConfig};
+use crate::device::{self, parse_ipv4, SystemConfig};
 use crate::config::regs;
 
 // ----------------------------------------------------------------------------

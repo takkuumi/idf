@@ -106,9 +106,12 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
     let type_name = core::any::type_name::<A>();
     let short = type_name.split("::").last().unwrap_or(type_name);
     let name = format!("actor-{short}");
-    std::thread::Builder::new()
+    // 栈 32KB: DeviceActor commit/reload 会序列化 11KB StorageSnapshot + 递归
+    // clone DeviceConfigTable (32 entry × 32 param), 实测需 >12KB (LOOP5 panic 根因).
+    // 预留 32KB 给序列化栈分配, 避免 Guru Meditation (Unhandled debug exception).
+    match std::thread::Builder::new()
         .name(name)
-        .stack_size(8 * 1024)  // 32KB, 防止 commit/reload 序列化 11KB snapshot 时栈溢出
+        .stack_size(32 * 1024)
         .spawn(move || {
             actor.init();
             loop {
@@ -124,10 +127,14 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
                     std::thread::yield_now();
                 }
             }
-        })
-        .expect("failed to spawn actor thread");
-
-    (actor_ref, actor_handle)
+        }) {
+        Ok(_) => (actor_ref, actor_handle),
+        Err(e) => {
+            // spawn 失败属致命错误 (无 DeviceActor 则 NVS 持久化全停).
+            // panic=abort 配置下触发整机 reset, 由分级 recovery 机制兜底.
+            panic!("actor spawn failed: {e}");
+        }
+    }
 }
 
 // ============================================================================

@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::config::modbus::tcp as cfg;
 use crate::error::{AppError, AppResult};
 use crate::health::{self, TaskHb};
-use crate::modbus::shared::{exc, BusBackend, ModbusBackend};
+use crate::modbus::shared::BusBackend;
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -62,20 +62,49 @@ fn spawn_listener(port: u16) -> AppResult<()> {
                     drop(stream);
                     continue;
                 }
-                CONN_COUNT.fetch_add(1, Ordering::SeqCst);
-                let id = CONN_COUNT.load(Ordering::SeqCst);
+                // LOOP8: 用 CAS 防止 TOCTOU 竞态 (4+ 并发 accept 同时通过 cur < MAX 检查导致超额)
+                match CONN_COUNT.compare_exchange(
+                    cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst,
+                ) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        // 别的线程抢先占用了名额, 拒绝连接
+                        log::debug!("[mb-tcp] CAS lost, rejecting connection");
+                        drop(stream);
+                        continue;
+                    }
+                }
+                let id = cur + 1;
                 log::info!("[mb-tcp] conn_id={} start", id);
                 health::set_next_thread_core(health::CORE_NET);
-                std::thread::Builder::new()
+                match std::thread::Builder::new()
                     .name(format!("mb-tcp-conn-{id}"))
                     .stack_size(20 * 1024) // LOOP5 修复: 12KB 不足以容纳 config_clone 递归克隆 DeviceConfigTable (3KB) 触发 Guru Meditation (Unhandled debug exception)
                     .spawn(move || {
-                        if let Err(e) = handle_conn(stream) {
-                            log::debug!("[mb-tcp-conn-{id}] closed: {}", e);
+                        // LOOP8: 订阅硬件 WDT, 防止连接线程死锁/挂起无法被恢复
+                        health::subscribe_wdt();
+                        // LOOP8: 捕获取所有 panic, 保证 CONN_COUNT 总是减少
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_conn(stream)
+                        }));
+                        if let Err(e) = result {
+                            log::error!("[mb-tcp-conn-{id}] panicked: {:?}", e);
+                            crate::error::recovery::record_failure(
+                                crate::error::recovery::Severity::Severe,
+                                "mb-tcp-conn",
+                                &format!("conn-{id} thread panicked"),
+                            );
                         }
                         CONN_COUNT.fetch_sub(1, Ordering::SeqCst);
                     })
-                    .ok();
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // LOOP8: spawn 失败回滚计数, 防止永久泄漏 CONN_COUNT 名额
+                        log::error!("[mb-tcp] spawn conn-{id} failed: {}", e);
+                        CONN_COUNT.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
                 health::reset_thread_core();
             }
         });
@@ -95,6 +124,8 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
     let mut pdu = [0u8; 253]; // PDU 最大 253 字节
 
     loop {
+        // LOOP8: 每次循环喂狗 (WDT 超时 10s, 读超时 RX_TIMEOUT_MS 通常 5s)
+        health::feed_wdt();
         // 读 MBAP header
         // 区分: Ok = 继续, WouldBlock = keepalive 超时, 其他错误 = 关闭
         match stream.read_exact(&mut header) {
@@ -143,13 +174,13 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
         let unit_id = header[6];
         if pdu_len < 1 { return Ok(()); }
         let func = pdu[0];  // PDU 首字节 = 功能码
-        let resp_pdu = build_pdu(&backend, func, &pdu[1..pdu_len]);
+        // 无堆分配: handle_pdu 直接写入栈缓冲区
+        let mut pdu_buf = [0u8; super::shared::PDU_BUF_SIZE];
+        let pdu_len = super::shared::handle_pdu(&backend, func, &pdu[1..pdu_len], &mut pdu_buf);
+        let resp_pdu = &pdu_buf[..pdu_len];
         // MBAP.length 标准约定 (Modbus_Application_Protocol_V1_1b3 §4.1):
         //   length = unit_id(1) + func(1) + data(N) = 2 + N
         // 这是 pymodbus 3.x / libmodbus 的标准期望.
-        // 旧实现: mbap_len = resp_pdu.len() (= func + data = 1+N)
-        //   → pymodbus 3.8.6 解析时将 func 误认为 unit_id, 报错:
-        //     "Unable to decode frame: byte_count N > length of packet N"
         let mbap_len = 1 + resp_pdu.len();
         let mut mbap = [0u8; 7];
         mbap[..2].copy_from_slice(&header[..2]); // echo tx_id
@@ -169,6 +200,3 @@ fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
     }
 }
 
-fn build_pdu(backend: &BusBackend, func: u8, payload: &[u8]) -> Vec<u8> {
-    super::shared::handle_pdu(backend, func, payload)
-}

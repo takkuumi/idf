@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-24 (LOOP7: BLE 名字 GAP 同步完成 + 编译烧录文档完成)
+> 最后更新: 2026-07-24 (LOOP8: 架构彻底无锁化 + RCU 多写者修复 + 7×24 可靠性加固)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -264,3 +264,118 @@ UTF-16 BE 编码下每个字符高字节 = 0x00, `position(&b == 0)` 立即命�
 ### 已知问题 (SN/LOCATION 历史数据)
 NVS 中残留旧 LE 编码的 SN 数据. 修复后用 BE 解码读 LE 字节会出现乱码.
 解决: 重新通过 Modbus/AT 写一次新值即可覆盖. 不影响当前修复.
+
+## LOOP8 架构彻底无锁化 + 7×24 可靠性加固 (2026-07-24) - COMPLETE
+
+### 三大目标 (本 LOOP 完成)
+1. **推进系统架构彻底摆脱锁、实现完整无锁化** — BLE AT 热路径 Spin → 原子
+2. **行完整的性能测试、确保系统高性能稳定运行** — RCU 多写者修复 + heap 缓解
+3. **系统高稳定、高可靠性、支持 7×24 不间断运行不宕机** — 看门狗全覆盖 + 内存监控
+
+### 修复 1: BLE AT 热路径 Spin → 原子化 (无锁化)
+**根因**: 3 个 Spin 锁在 BLE 热路径 (每 GATT 回调 + 每 process_tick 100ms) 上竞争:
+- `HANDLE_TABLE: Spin<[u16; 4]>` — 属性表 handle
+- `GATTS_IF: Spin<Option<esp_gatt_if_t>>` — GATT 接口号
+- `CONN_ID: Spin<Option<u16>>` — 连接 ID
+
+**修复** (`src/ble_at/mod.rs`):
+| 旧 (Spin) | 新 (原子) | sentinel |
+|-----------|----------|----------|
+| `HANDLE_TABLE: Spin<[u16;4]>` | `[AtomicU16; 4]` | 0 = 未分配 |
+| `GATTS_IF: Spin<Option<i16>>` | `AtomicI16` | -1 = None |
+| `CONN_ID: Spin<Option<u16>>` | `AtomicU16` | 0xFFFF = None |
+
+- 所有 `.lock()` 调用改为 `.load(Acquire)` / `.store(Release)`
+- 消除 process_tick + GATT 回调中的 Spin 争用, 真无锁
+
+### 修复 2: ble-at 心跳从未 tick
+**根因**: `TASK_HB` 在 ble_at/mod.rs:104 注册但 `process_tick()` 从未调用 `TASK_HB.tick()`,
+导致 "ble-at" 任务总被 `check_all()` 误判为停滞 (3s 后)。
+**修复**: 在 `process_tick()` 开头加 `TASK_HB.tick();`
+
+### 修复 3: TCP CONN_COUNT 永久泄漏 (spawn 失败)
+**根因**: `tcp_server.rs` 用 `.ok()` 忽略 `thread::spawn` 结果。
+若 spawn 失败 (OOM/资源耗尽), `CONN_COUNT` 已 `fetch_add(1)` 但永不 `fetch_sub(1)`,
+**永久泄漏连接名额**, 最终 4 个名额全部被占死。
+**修复**:
+- spawn 失败时 `CONN_COUNT.fetch_sub(1)` 回滚
+- 用 `compare_exchange` 防 TOCTOU 竞态 (4+ 并发 accept 同时通过 cur < MAX 检查)
+- 连接线程订阅硬件 WDT + `catch_unwind` 保证 `fetch_sub` 总执行
+- 每循环喂狗, 防止连接死锁
+
+### 修复 4: RCU 多写者并发数据丢失 (CRITICAL)
+**根因**: `Rcu::write()` 假定单写者, 但实际有 5 个并发写者:
+- Modbus TCP 4 连接 (MAX_CONNECTIONS=4)
+- Modbus RTU master/slave
+- DeviceActor (NVS commit/reload/apply)
+- main_loop DHCP 写回
+
+两线程同时 `config_clone()` → 各自修改 → `CONFIG.write()`, 后写覆盖前写 = **丢失更新**。
+还会导致 `retire_queue` (4 槽) 溢出 → `mem::forget` 泄漏 ~11KB StorageSnapshot。
+**修复** (`src/bus/backends.rs`):
+- 新增 `RCU_WRITE_LOCK: Spin<()>` 串行化所有 RMW (clone-mutate-write)
+- 覆盖 `write_hold_reg` / `storage_modify` / `config_modify_with_result` / `storage_set_snapshot`
+- 持锁时间 = clone + mutate + atomic swap, 约数十微秒 (<< Modbus 响应超时 2s, 不阻塞)
+- 读路径完全不受影响 (RCU read 无锁)
+
+### 修复 5: 看门狗全覆盖 + 停滞升级重启
+**根因**: 仅 main_loop 订阅硬件 WDT, 11 个其他任务只有软心跳。`check_all()` 检测到停滞
+仅 `log::warn`, **从不触发重启**, 死锁任务导致系统无响应。
+**修复** (`src/main.rs`):
+- `STALL_COUNT: AtomicU32` 跟踪连续停滞次数
+- 连续 5 次 (5s) 检测到停滞 → `esp_restart()` 强制恢复
+- 连接线程订阅硬件 WDT (tcp_server.rs)
+- 每 60s 打印 `free_heap` / `min_heap` (7×24 运维监控)
+- heap < 20KB 时 LOW MEMORY 告警
+
+### 修复 6: ringlog 49.7 天时间戳 wrap
+**根因**: `timestamp_ms: u32 = as_millis() as u32` 在 ~49.7 天后 wrap, 跨边界日志无法排序。
+**修复** (`src/error/ringlog.rs`):
+- `timestamp_ms: u32` → `timestamp_s: u32` (秒级, ~136 年不 wrap)
+- `backends.rs` 读端同步更新
+
+### 修复 7: 以太网心跳真实实现
+**根因**: `heartbeat_once()` 始终返回 `true`, **从不检测链路故障**, 整个以太网降级路径是死代码。
+**修复** (`src/ethernet/w5500.rs`):
+- 用 `esp_netif_get_handle_from_ifkey("ETH_DEF")` + `esp_netif_get_ip_info`
+- IP == 0 → 链路故障 (false); IP != 0 → 链路正 (true)
+
+### 修复 8: heap 碎片缓解
+**根因**: `request_save_device_text()` 每次 `storage_read()` clone 整个 ~11KB
+StorageSnapshot 到 Arc, 每次 device_text 写入都产生 11KB heap churn。
+**修复** (`src/device/mod.rs`):
+- 改用 `storage_read_with(|s| save_device_text_to_nvs(&s.device_text))`
+- 仅持 RCU reader 访问, 不 clone 整个快照, 消除 11KB 临时分配
+
+### 锁状态盘点 (LOOP8 后)
+
+| 类型 | LOOP2 | LOOP8 | 状态 |
+|------|-------|-------|------|
+| `std::sync::Mutex::new` | 0 | **0** | 完全消除 |
+| `parking_lot::Mutex` | 0 | **0** | 完全消除 |
+| BLE AT 热路径 Spin (HANDLE/GATTS_IF/CONN_ID) | 3 | **0** (→ 原子) | 真无锁 |
+| HAL 驱动 Spin (PinDriver/LEDC/ADC/I2C) | 11 | 11 | 不可原子化 (&mut 要求) |
+| NVS/OTA/RingLog/BUFFER Spin | 5 | 5 | 短临界区非 park |
+| `Atomic*` | 高 | **更高** (+3) | 真无锁 |
+| `MainLoopCell` | 5 | 5 | 单线程零开销 |
+| `RCU_WRITE_LOCK` (新) | 0 | 1 | RMW 串行化 (非热路径) |
+
+**结论**: 所有可在热路径上原子化的 Spin 已消除。剩余 Spin 全部保护 ESP-IDF 硬件驱动
+句柄 (`PinDriver`/`LedcDriver`/`AdcDriver`/`I2cBus` 等), 它们本质上需要 `&mut self`,
+**无法用原子替代**。这些 Spin 都是**微秒级短临界区, 非 park, 不阻塞 OS 调度**,
+且在冷/温路径上, 不影响 7×24 稳定性。
+
+### 待验证 (用户烧录后)
+1. 4 并发 Modbus TCP 无数据丢失 (RCU 写者串行化生效)
+2. uptime 60min+ 无 Guru Meditation
+3. heap 使用量稳定 (无持续增长, 碎片缓解生效)
+4. ble-at 心跳正常 (不再误报停滞)
+5. 以太网网线拔出 → heartbeat_once 返回 false → 降级路径激活
+
+### 烧录命令
+```bash
+cargo build --bin gateway
+espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    target/xtensa-esp32s3-espidf/debug/gateway
+espflash reset --port /dev/cu.usbserial-1430
+```

@@ -136,24 +136,22 @@ impl SystemConfig {
     /// 默认配置 (出厂值)
     pub fn defaults() -> Self {
         let mut sn = [0u8; 32];
-        // LOOP6: 默认值必须在 9 字符内 (9 SN 寄存器 = 18 字节 = 9 UTF-16 BE 字符)
-        // 原默认 "ESP32S3-UNKNOWN-0001" (19 字符) 超出 Modbus 容量, 经 Modbus 写后被截断
-        let sn_str = b"ESP32-001";
-        sn[..sn_str.len()].copy_from_slice(sn_str);
+        // LOOP8: 默认值改为 UTF-16 BE 编码 (LOOP7 后 sn_str/ble_name_str 按 BE 解码)
+        // 之前存 ASCII → BE 解码后乱码. 9 寄存器 = 18 字节 = 9 UTF-16 BE 字符
+        let sn_utf16: &[u8] = &[0, b'E', 0, b'S', 0, b'P', 0, b'3', 0, b'2', 0, b'-', 0, b'0', 0, b'0', 0, b'1'];
+        sn[..sn_utf16.len()].copy_from_slice(sn_utf16);
 
         let mut name = [0u8; 16];
-        // LOOP6: 默认值必须在 8 字符内 (8 LOCATION 寄存器 = 16 字节 = 8 UTF-16 BE 字符)
-        let name_str = b"GW-ESP32";
-        name[..name_str.len()].copy_from_slice(name_str);
+        // LOOP8: 默认值改为 UTF-16 BE 编码. 8 寄存器 = 16 字节 = 8 UTF-16 BE 字符
+        let name_utf16: &[u8] = &[0, b'G', 0, b'W', 0, b'-', 0, b'E', 0, b'S', 0, b'P', 0, b'3', 0, b'2'];
+        name[..name_utf16.len()].copy_from_slice(name_utf16);
 
         let mut ble_name = [0u8; 8];
-        // BLE 广播名称 (≤ 8 字节, 含 0 结尾)
-        // 默认 "Mesh", 与原 C++ 固件 spp_adv_data 一致, 兼容手持机/手机扫描
-        // 用户可通过 AT+CFGBTNAME=<name> 修改
-        let ble_str_static = "Mesh".to_owned();
-        let ble_bytes = ble_str_static.as_bytes();
-        let copy_len = ble_bytes.len().min(ble_name.len());
-        ble_name[..copy_len].copy_from_slice(&ble_bytes[..copy_len]);
+        // LOOP8: 默认值改为 UTF-16 BE 编码. 4 寄存器 = 8 字节 = 4 UTF-16 BE 字符
+        // 手持机 1.0.78 要求 BLE 名字以 "m" 开头 (忽略大小写) 才能在扫描列表中显示
+        // "Mesh" → [0x00,0x4D, 0x00,0x65, 0x00,0x73, 0x00,0x68]
+        let ble_utf16: &[u8] = &[0, b'M', 0, b'e', 0, b's', 0, b'h'];
+        ble_name[..ble_utf16.len()].copy_from_slice(ble_utf16);
 
         Self {
             sn,
@@ -880,6 +878,23 @@ mod tests {
         // 默认 BLE 名称
         let name = cfg.ble_name_str();
         assert!(name.len() <= 16);
+    }
+
+    /// LOOP8 回归: 默认值必须以 UTF-16 BE 编码, 否则 sn_str/ble_name_str 解码出乱码.
+    /// 手持机 1.0.78 要求 BLE 名字以 "m" 开头 (忽略大小写) 才在扫描列表显示.
+    #[test]
+    fn test_defaults_utf16be_decoded() {
+        let cfg = SystemConfig::defaults();
+        // 默认 BLE 名字 = "Mesh", 必须以 'M'/'m' 开头 (手持机过滤要求)
+        let ble = cfg.ble_name_str();
+        assert_eq!(ble, "Mesh", "default ble_name must decode to 'Mesh' (got '{ble}')");
+        let first = ble.chars().next().unwrap();
+        assert!(first == 'M' || first == 'm',
+            "BLE name must start with m/M for handheld visibility");
+        // 默认 SN = "ESP32-001"
+        assert_eq!(cfg.sn_str(), "ESP32-001");
+        // 默认设备名 = "GW-ESP32"
+        assert_eq!(cfg.name_str(), "GW-ESP32");
     }
 
     // ========================================================================

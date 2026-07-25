@@ -22,8 +22,9 @@ use crate::sync::Spin;
 /// 单条日志
 #[derive(Clone, Copy)]
 pub struct LogEntry {
-    /// 时间戳 (ms since boot, mod 2^32)
-    pub timestamp_ms: u32,
+    /// 时间戳 (秒 since boot, 用 u32 存储可运行 ~136 年不 wrap)
+    /// LOOP8: 从 ms 改为 s 解决 49.7 天 wrap 问题
+    pub timestamp_s: u32,
     /// 严重等级 (0=Info 1=Warn 2=Error 3=Critical)
     pub level: u8,
     /// 模块名 hash (用第一个字节标识, 避免字符串)
@@ -37,7 +38,7 @@ pub struct LogEntry {
 impl LogEntry {
     pub const fn empty() -> Self {
         Self {
-            timestamp_ms: 0,
+            timestamp_s: 0,
             level: 0,
             module_id: 0,
             code: 0,
@@ -75,10 +76,13 @@ impl RingLog {
     }
 
     /// 记录一条日志
+    /// LOOP8: 使用 esp_timer_get_time() 获取秒级时间戳, 避免 49.7 天 wrap
     pub fn record(&mut self, level: u8, module_id: u8, code: u16, context: u32) {
         self.ensure_boot();
+        // 使用秒级时间戳: u32 可运行 ~136 年不 wrap (vs ms 仅 49.7 天)
+        let timestamp_s = self.boot_time.elapsed().as_secs() as u32;
         let entry = LogEntry {
-            timestamp_ms: self.boot_time.elapsed().as_millis() as u32,
+            timestamp_s,
             level,
             module_id,
             code,

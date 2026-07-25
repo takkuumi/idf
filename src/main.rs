@@ -43,6 +43,7 @@ mod protocol;
 #[cfg(feature = "wifi")]
 mod wifi;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -214,6 +215,10 @@ fn main() -> AppResult<()> {
 // ----------------------------------------------------------------------------
 // 主循环：周期性更新系统状态、复位计数、喂狗、健康检查
 // ----------------------------------------------------------------------------
+/// LOOP8: 任务停滞连续计数 (连续 N 次 check_all 检测到停滞 → 重启)
+/// 用 AtomicU32 而非 static mut (edition 2024 禁止 static mut 直接访问)
+static STALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
     let mut tick: u32 = 0;
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
@@ -312,6 +317,32 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
             let stalled = health::check_all();
             if !stalled.is_empty() {
                 log::warn!("[main] stalled tasks: {:?}", stalled.as_slice());
+                let count = STALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                // LOOP8: 连续 5 次 (5s) 检测到滞 → 重启 (防止任务死锁导致系统无响应)
+                if count >= 5 {
+                    log::error!(
+                        "[main] CRITICAL: tasks stalled for {}s ({}), forcing restart",
+                        count,
+                        stalled.as_slice().iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    unsafe { esp_idf_sys::esp_restart() };
+                }
+            } else {
+                STALL_COUNT.store(0, Ordering::Relaxed);
+            }
+
+            // LOOP8: 每 60s 打印内存使用 (7×24 运维监控)
+            if tick % (60000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+                let free_heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
+                let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };
+                log::info!(
+                    "[mem] free_heap={}KB min_heap={}KB uptime={}s",
+                    free_heap / 1024, min_heap / 1024, uptime
+                );
+                if free_heap < 20 * 1024 {
+                    log::error!("[mem] LOW MEMORY WARNING: free_heap < 20KB!");
+                }
             }
 
             log::info!("[main] uptime={}s tick={}", uptime, tick);

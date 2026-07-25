@@ -20,6 +20,29 @@ use super::storage_state::{storage_read, proto_status, StorageSnapshot, STORAGE}
 use super::config_state::{config_read, ConfigSnapshot};
 
 // ----------------------------------------------------------------------------
+// LOOP8: RCU 写者串行化锁
+// ----------------------------------------------------------------------------
+//
+// Rcu::write 假定串行写者 (单 Modbus 任务串 / 单 DeviceActor)。但实际架构有
+// 多个并发写者: Modbus TCP 4 连接 + RTU + DeviceActor + RS485 master + DHCP。
+// 并发写者会导致:
+//   1. RMW 竞争丢写 (两个线程同时 clone 同一快照, 各自修改, 后写覆盖前写)
+//   2. retire_queue 溢出 (4 槽, 超过即 leak ~11KB StorageSnapshot)
+//
+// 修复: 用 Spin<()> 短锁保护 clone-mutate-write 序列。持锁时间 = clone + mutate +
+// Rcu::write, 约数十微秒 (clone 走 heap, write 走 atomic swap)。远小于 Modbus
+// 响应超时 (2s), 不会阻塞 Modbus TCP 线程。
+//
+// 注意: 这把锁是"写者串行化"锁, 与读者无关 (读者仍走 RCU 无锁读路径)。
+// 它保护的是 RMW 序列的原子性, 而非单个字段的并发安全 (字段并发由 RCU 保证)。
+
+/// 串行化 STORAGE + CONFIG RCU 写者 (单锁覆盖两域)
+///
+/// 同时保护 STORAGE 和 CONFIG 的 clone-mutate-write 序列. 单一锁简化分析:
+/// 即使写者在 STORAGE 与 CONFIG 之间切换, 整段都是单线程执行, 避免跨域 race.
+static RCU_WRITE_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
+
+// ----------------------------------------------------------------------------
 // DI / DO (AtomicBits64 via IO)
 // ----------------------------------------------------------------------------
 
@@ -250,8 +273,9 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         if entry_idx < entries.len() {
             let entry = &entries[entry_idx];
             return Some(match field_idx {
-                0 => (entry.timestamp_ms & 0xFFFF) as u16,
-                1 => ((entry.timestamp_ms >> 16) & 0xFFFF) as u16,
+                // LOOP8: timestamp_ms → timestamp_s (秒级, ~136 年不 wrap)
+                0 => (entry.timestamp_s & 0xFFFF) as u16,
+                1 => ((entry.timestamp_s >> 16) & 0xFFFF) as u16,
                 2 => entry.code,
                 3 => (entry.context & 0xFFFF) as u16,
                 _ => 0,
@@ -315,7 +339,16 @@ fn sync_proto_status(snap: &mut StorageSnapshot) {
 }
 
 /// 写保持寄存器 (FC=06/16), 等价 `Bus::write_hold_reg` 但走 RCU RMW + atomics, 无 `Spin`.
+///
+/// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化整个 RMW 序列
+/// (clone → modify → atomic swap), 防止 lost update. 读路径不受影响.
 pub fn write_hold_reg(addr: u16, value: u16) -> bool {
+    let _guard = RCU_WRITE_LOCK.lock();
+    write_hold_reg_locked(addr, value)
+}
+
+/// write_hold_reg 的内部实现, 调用方必须持有 RCU_WRITE_LOCK
+fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
     //    Android 1.0.78 WRITE_DEVICE_TEXT_COUNT (0xB5) + WRITE_DEVICE_TEXT_DATA (0xB7)
     //    通过 Modbus FC=10 写入, 我们写后立即持久化以保证工业可靠性.
@@ -440,16 +473,21 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
 }
 
 /// 修改 SystemConfig 部分字段后回写 CONFIG RCU. 用于 w5500 DHCP 写回等单写者场景.
+///
+/// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化 RMW.
 pub fn config_modify<F: FnOnce(&mut SystemConfig)>(f: F) {
     config_modify_with_result(|cfg| f(cfg));
 }
 
 /// 同 `config_modify`, 但把 closure 的返回值传出 (用于 AT 命令需要拿到
 /// `WriteResult` 等场景). RCU RMW: clone 快照 → mutate cfg → 原子替换.
+///
+/// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化 RMW, 防止 lost update.
 pub fn config_modify_with_result<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SystemConfig) -> R,
 {
+    let _guard = RCU_WRITE_LOCK.lock();
     let mut cs = config_clone();
     let r = f(&mut cs.cfg);
     super::config_state::CONFIG.write(cs);
@@ -457,13 +495,19 @@ where
 }
 
 /// 完整设置 STORAGE 快照 (用于 init/reload). 同时把 proto.status 同步到 atomic.
+///
+/// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化.
 pub fn storage_set_snapshot(snap: StorageSnapshot) {
+    let _guard = RCU_WRITE_LOCK.lock();
     super::storage_state::proto_status_set(snap.proto.status);
     STORAGE.write(snap);
 }
 
 /// 修改 STORAGE 快照. 用 closure 在 clone 出的快照上做任意修改, 然后 RCU 替换.
+///
+/// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化 RMW, 防止 lost update.
 pub fn storage_modify<F: FnOnce(&mut StorageSnapshot)>(f: F) {
+    let _guard = RCU_WRITE_LOCK.lock();
     let mut snap = storage_clone();
     f(&mut snap);
     sync_proto_status(&mut snap);

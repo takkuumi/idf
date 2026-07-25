@@ -12,7 +12,7 @@ use crate::config::modbus::rtu_slave as cfg;
 use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
-use crate::modbus::shared::{exc, modbus_crc16, BusBackend, ModbusBackend};
+use crate::modbus::shared::{modbus_crc16, BusBackend};
 use crate::rs485::{Rs485Config, Rs485Port};
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
@@ -87,12 +87,18 @@ fn handle_request(port: &mut Rs485Port, backend: &BusBackend, req: &[u8]) -> App
     Ok(())
 }
 
-fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    out.push(slave);
-    let body = crate::modbus::shared::handle_pdu(backend, func, pdu);
-    out.extend_from_slice(&body);
+fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> heapless::Vec<u8, 256> {
+    let mut out: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let _ = out.push(slave);
+    // 无堆分配: handle_pdu 写入栈缓冲区
+    let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
+    let pdu_len = crate::modbus::shared::handle_pdu(backend, func, pdu, &mut pdu_buf);
+    if pdu_len >= 2 {
+        // handle_pdu 写完整 PDU: [func, body...] 或 [func|0x80, code]
+        let _ = out.extend_from_slice(&pdu_buf[..pdu_len]);
+    }
     let crc = modbus_crc16(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
+    let _ = out.push(crc as u8);
+    let _ = out.push((crc >> 8) as u8);
     out
 }

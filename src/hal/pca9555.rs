@@ -238,8 +238,7 @@ impl DigitalIo for Pca9555Duo {
 
         // Invert: input is active-low (pull-up → LOW=active → 1 in Modbus)
         let di0 = (!raw0) as u64;
-        let di1 = (!raw1) as u64;
-        // Reference also bit-reverses port1: EXchg_ByteHl then invert
+        // Reference bit-reverses port1: EXchg_ByteHl then invert
         let di1_rev = bit_reverse(raw1) as u64;
         Ok(((di1_rev ^ 0xFF) << 8) | di0)
     }

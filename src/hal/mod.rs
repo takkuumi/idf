@@ -17,6 +17,8 @@
 
 use esp_idf_hal::peripherals::Peripherals;
 
+// AppError 仅在默认版本 (8 DI + 8 DO) 实际用到; f3/f4 版本下未引用, 抑制警告
+#[allow(unused_imports)]
 use crate::error::{AppError, AppResult};
 
 pub mod pins;

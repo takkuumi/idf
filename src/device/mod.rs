@@ -138,7 +138,7 @@ use crate::error::{AppError, AppResult};
 use crate::health::{self, TaskHb};
 use crate::config::regs;
 
-pub use system_config::{SystemConfig, parse_ipv4, parse_mac};
+pub use system_config::{SystemConfig, parse_ipv4};
 
 /// device-store 监听任务心跳 (静态分配)
 static WATCH_HB: TaskHb = TaskHb::new("device-store");
@@ -510,10 +510,12 @@ fn commit() -> AppResult<()> {
         Ok(())
     });
 
-    if write_result.is_none() {
+    if let Some(result) = write_result {
+        if let Err(e) = result {
+            return Err(e);
+        }
+    } else {
         log::warn!("[device] NVS unavailable, proto commit skipped");
-    } else if let Err(e) = write_result.unwrap() {
-        return Err(e);
     }
 
     // 7. 更新状态: atomic 复位 + RCU RMW 把 dirty 清零 (快照镜像也会被同步)
@@ -676,19 +678,22 @@ pub fn save_device_text_to_nvs(text: &[u16]) -> AppResult<()> {
 
 /// 请求持久化设备文本区 (走 Actor mailbox, 异步执行)
 /// 由 backends::write_hold_reg 在 DEVICE_TEXT_BASE 写后调用
+///
+/// LOOP8: 使用 storage_read_with 避免 clone 整个 StorageSnapshot (~11KB),
+/// 减少 heap 碎片. 仅提取 device_text 字段.
 pub fn request_save_device_text() {
-    use crate::bus::storage_state::storage_read;
-    let snapshot = storage_read();
-    if let Some(snap) = snapshot {
-        // 同步写入, 不走 Actor (device_text 写频率低, 同步可接受)
-        if let Err(e) = save_device_text_to_nvs(&snap.device_text) {
-            log::warn!("[device] dev_text persist failed: {e}");
-        }
+    use crate::bus::storage_state::storage_read_with;
+    // 直接持 RCU reader 读 device_text, 不 clone 整个快照
+    let result = storage_read_with(|snap| {
+        save_device_text_to_nvs(&snap.device_text)
+    });
+    if let Some(Err(e)) = result {
+        log::warn!("[device] dev_text persist failed: {e}");
     }
 }
 
 fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<([u16; PROTO_WORDS], u16, u16)> {
-    let mut data = [0u16; PROTO_WORDS];
+    let data = [0u16; PROTO_WORDS];
 
     // 尝试读取双 blob
     let active = nvs

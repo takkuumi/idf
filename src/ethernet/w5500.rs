@@ -280,7 +280,6 @@ extern "C" fn ip_event_cb(
         let ip_raw = data.ip_info.ip.addr;
         let mask_raw = data.ip_info.netmask.addr;
         let gw_raw = data.ip_info.gw.addr;
-        let mut b = [0u8; 4];
         crate::bus::send_event(crate::bus::IoEvent::IpAssigned(
             [
                 ip_raw as u8, (ip_raw >> 8) as u8, (ip_raw >> 16) as u8, (ip_raw >> 24) as u8,
@@ -292,8 +291,6 @@ extern "C" fn ip_event_cb(
                 gw_raw as u8, (gw_raw >> 8) as u8, (gw_raw >> 16) as u8, (gw_raw >> 24) as u8,
             ],
         ));
-        // 这两个 b[] 是未使用的占位, 但编译器可能优化掉. 用 core::mem::forget 阻止优化
-        core::mem::forget(b);
         log::info!("[eth] IP event posted to main loop");
     }
 }
@@ -356,8 +353,31 @@ pub fn tick_eth_heartbeat() {
     }
 }
 
+/// LOOP8: 真实心跳检测 — 检查以太网 netif 是否有 IP 地址
+///
+/// 通过 `esp_netif_get_ip_info` 读取当前 netif 的 IP 配置:
+/// - IP != 0.0.0.0 → 链路正常 (true)
+/// - IP == 0.0.0.0 → 无 IP 分配, 链路故障或 DHCP 未完成 (false)
+///
+/// 注意: 这不是 ICMP ping (ESP-IDF 标准 API 没有简单 ping 接口),
+/// 但 IP 存在性是链路可用的最低要求, 足以检测网线拔出 / DHCP 失败等场景.
 fn heartbeat_once() -> bool {
-    // TODO: 实现真正的心跳检测
+    let netif = unsafe { esp_idf_sys::esp_netif_get_handle_from_ifkey(b"ETH_DEF\x00".as_ptr()) };
+    if netif.is_null() {
+        log::debug!("[eth-heartbeat] netif not found");
+        return false;
+    }
+    let mut ip_info: esp_idf_sys::esp_netif_ip_info_t = unsafe { std::mem::zeroed() };
+    let ret = unsafe { esp_idf_sys::esp_netif_get_ip_info(netif, &mut ip_info) };
+    if ret != 0 {
+        log::debug!("[eth-heartbeat] get_ip_info failed: 0x{:x}", ret);
+        return false;
+    }
+    let ip = ip_info.ip.addr;
+    if ip == 0 {
+        log::debug!("[eth-heartbeat] no IP assigned (link down or DHCP pending)");
+        return false;
+    }
     true
 }
 
