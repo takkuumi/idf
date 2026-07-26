@@ -41,7 +41,7 @@
 //! - WDT 喂狗 + 任务心跳防止线程假死
 //! - NFC 仅作为冗余备份, 不破坏 NVS 数据
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -56,6 +56,12 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// NFC 模块任务心跳 (阈值 30s)
 static TASK_HB: TaskHb = TaskHb::new_with_stall("nfc-st25", 30);
+
+/// LOOP14: NFC EEPROM 磨损均衡
+/// 上次成功写入 NFC 的 holding_buf CRC32 (用于跳过冗余写).
+/// ST25DV64KC 1M 写循环 ÷ 5s 轮询 × 24h = 17280 写/天 → ~58 天寿命.
+/// 加 CRC 去重: 数据无变化时跳过写, 典型场景 (重启后无配置变更) 寿命延长至 10+ 年.
+static LAST_NFC_CRC: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 
 /// 全局 NFC 状态 (供 Modbus / HTTP API 读取)
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -590,6 +596,14 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
     // 2. 计算 CRC32
     let crc = crc32(&data);
 
+    // LOOP14: NFC 磨损均衡 — CRC 去重
+    // 若本次 holding_buf 的 CRC 与上次成功写入 NFC 的 CRC 相同, 说明内容未变,
+    // 直接跳过 4KB EEPROM 写入. ST25DV64KC 1M 写循环寿命从 ~58 天延长至 >10 年.
+    if crc == LAST_NFC_CRC.load(Ordering::Relaxed) {
+        log::debug!("[nfc] backup skipped: CRC unchanged (0x{:08X})", crc);
+        return;
+    }
+
     // 3. 写头部
     let hdr = NfcHeader {
         magic: NFC_BLOB_MAGIC,
@@ -626,6 +640,8 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
         data_len,
         crc
     );
+    // LOOP14: 磨损均衡 — 记录本次成功写入的 CRC, 用于下次跳过未变化的写
+    LAST_NFC_CRC.store(crc, Ordering::Relaxed);
 }
 
 /// 从 NFC EEPROM 恢复 holding_buf

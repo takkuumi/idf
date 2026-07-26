@@ -35,10 +35,15 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("mb-rtu-port2".into())
+        .stack_size(8 * 1024)  // LOOP15: 8KB 足够 (256B buf + handle_request, 节省 4KB heap)
         .spawn(move || {
+            // LOOP14: 所有长期运行 pthread 必须订阅 WDT
+            health::subscribe_wdt();
             let mut buf = [0u8; 256];
             loop {
                 TASK_HB.tick();
+                // LOOP15: 必须周期喂 WDT — UART0 可能与其他任务共享, port.read 期间也须被保护
+                health::feed_wdt();
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,
                     Ok(n) => {

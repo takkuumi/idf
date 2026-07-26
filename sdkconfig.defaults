@@ -236,10 +236,17 @@ CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288
 
 # 减小 BLE host 栈 (默认 4096 → 3072) 释放 SRAM
-CONFIG_BT_BLE_HOST_TASK_STACK_SIZE=3072
+# 注意: ESP-IDF v5.5 Bluedroid 不存在 CONFIG_BT_BLE_HOST_TASK_STACK_SIZE 选项.
+# 实际可配置项为 BT_BTC_TASK_STACK_SIZE (默认 3072) + BT_BTU_TASK_STACK_SIZE (默认 4352),
+# 两者已在上面显式设为 12288. LOOP15: 删除无效配置行, 避免误导.
 
 # I2C: 旧驱动弃用警告抑制 (LOOP6)
 # 我们只用 sw_i2c (软件 I2C, src/hal/sw_i2c.rs) 和新 I2C master 框架
 # i2c_bus.rs (MCP23017/F3/F4) 走 esp_idf_hal::i2c 旧 API, 但本项目只用 PCA9555 (sw_i2c)
 # 旧驱动被链接但不被调用, 启动时 abort_check 触发弃用警告
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# SPI Master ISR in IRAM: LOOP14 确保 SPI DMA 中断处理函数在 IRAM 中运行,
+# 避免 cache miss 导致 SPI DMA 完成中断延迟 (BLE+ETH 共存场景).
+# 与 ethernet/w5500.rs max_transfer_sz=16384 配合, 减少 W5500 SPI burst descriptor 数.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y

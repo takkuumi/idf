@@ -65,6 +65,19 @@ impl AdcHandle {
     pub fn sample(&self, idx: usize) -> u16 {
         self.inner.sample(idx)
     }
+
+    /// LOOP14: 将 raw ADC 原始值转换为 mV (eFuse 工厂校准)
+    /// Continuous 模式下用 esp_adc_cal_raw_to_voltage; OneShot fallback 返回 raw 不校准.
+    #[inline]
+    #[cfg(feature = "adc-continuous")]
+    pub fn raw_to_mv(&self, raw: u16) -> u32 {
+        self.inner.raw_to_mv(raw)
+    }
+    #[cfg(not(feature = "adc-continuous"))]
+    #[inline]
+    pub fn raw_to_mv(&self, raw: u16) -> u32 {
+        raw as u32
+    }
 }
 
 // ============================================================================
@@ -82,6 +95,8 @@ mod adc_continuous {
     /// 返回 6 个 12-bit 平均值。
     pub struct AdcContinuous {
         handle: esp_idf_sys::adc_continuous_handle_t,
+        // LOOP14: eFuse ADC 校准系数 (由 esp_adc_cal_characterize 初始化)
+        efuse_chars: esp_idf_sys::esp_adc_cal_characteristics_t,
     }
 
     // ADC handle is only used from the AI sampling task; safe to share.
@@ -90,6 +105,29 @@ mod adc_continuous {
 
     impl AdcContinuous {
         pub fn init(cfg: Adc1Cfg) -> AppResult<Self> {
+            // LOOP14: eFuse 工厂校准 — 在 DMA raw 上叠加 batch-specific gain/offset.
+            // esp_adc_cal_characterize 从 eFuse 读出 ADC 校准系数, 修正 ±1% 的批间漂移.
+            // 此处只初始化一个共享 characteristics_t (ADC1 全通道共用 vref + 11dB 衰减),
+            // 后续 raw_to_mv() 仅做一次乘加 (chip 内置多项式), 用于诊断日志输出 mV;
+            // 业务侧 4-20mA 映射仍走 holding_buf SENSOR_MIN/MAX 手工零点/满度.
+            let mut efuse_chars = esp_idf_sys::esp_adc_cal_characteristics_t::default();
+            // SAFETY: esp_adc_cal_characterize 是 ESP-IDF 提供的只读 eFuse API,
+            // 参数 (ADC1, 11dB 衰减, 12-bit 宽度) 来自编译期常量, efuse_chars
+            // 是栈上局部 &mut, 调用期间无别名访问. 无副作用, 不操作任何硬件寄存器.
+            unsafe {
+                esp_idf_sys::esp_adc_cal_characterize(
+                    esp_idf_sys::adc_unit_t_ADC_UNIT_1,
+                    esp_idf_sys::adc_atten_t_ADC_ATTEN_DB_11,
+                    esp_idf_sys::adc_bits_width_t_ADC_WIDTH_BIT_12,
+                    0,
+                    &mut efuse_chars,
+                );
+            }
+            log::info!(
+                "[adc] eFuse cal loaded: vref={}mV coeff_a={} coeff_b={}",
+                efuse_chars.vref, efuse_chars.coeff_a, efuse_chars.coeff_b
+            );
+
             // 1. 创建 Continuous handle
             let frame_cfg = esp_idf_sys::adc_continuous_handle_cfg_t {
                 max_store_buf_size: 1024,  // 内部环形缓冲区 1KB
@@ -97,6 +135,9 @@ mod adc_continuous {
                 flags: Default::default(),
             };
             let mut handle: esp_idf_sys::adc_continuous_handle_t = std::ptr::null_mut();
+            // SAFETY: frame_cfg 是栈上局部 &, handle 是 &mut null 初始化.
+            // adc_continuous_new_handle 是 ESP-IDF 提供的 handle 分配 API,
+            // 仅读写调用方提供的指针, 无全局副作用.
             let r = unsafe {
                 esp_idf_sys::adc_continuous_new_handle(&frame_cfg, &mut handle)
             };
@@ -156,7 +197,22 @@ mod adc_continuous {
                 "[adc] Continuous+DMA mode started: 6 ch, 10kHz/ch, 12-bit, 0-3.1V"
             );
 
-            Ok(Self { handle })
+            Ok(Self { handle, efuse_chars })
+        }
+
+        /// 将 raw ADC 原始值转换为 mV (eFuse 工厂校准)
+        ///
+        /// 使用 ESP-IDF 内置 esp_adc_cal_raw_to_voltage, 从 eFuse 读出批间漂移校准系数,
+        /// 修正增益误差. 业务侧 4-20mA 映射仍走 holding_buf SENSOR_MIN/MAX.
+        pub fn raw_to_mv(&self, raw: u16) -> u32 {
+            // SAFETY: esp_adc_cal_raw_to_voltage 是纯函数 (内部多项式计算),
+            // efuse_chars 来自 self 不可变借用, 调用期间不被修改. 无副作用.
+            unsafe {
+                esp_idf_sys::esp_adc_cal_raw_to_voltage(
+                    raw as u32,
+                    &self.efuse_chars,
+                )
+            }
         }
 
         /// 从 DMA 缓冲区读取并按通道平均
@@ -226,6 +282,8 @@ mod adc_continuous {
     impl Drop for AdcContinuous {
         fn drop(&mut self) {
             if !self.handle.is_null() {
+                // SAFETY: handle 来自 init 成功时的非 null 分配, drop 时独占访问,
+                // ESP-IDF 保证 stop/deinit 后 handle 不再有效. 二次 drop 会被 null 检查拦截.
                 unsafe {
                     let _ = esp_idf_sys::adc_continuous_stop(self.handle);
                     let _ = esp_idf_sys::adc_continuous_deinit(self.handle);

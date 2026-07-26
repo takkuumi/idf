@@ -119,8 +119,15 @@ static BINARY_TX: LazyLock<Spin<heapless::Vec<u8, 2048>>> =
 /// BLE notify 丢弃帧计数器 (Modbus 寄存器 0x0108 暴露)
 static BINARY_TX_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// 有待发送的 BLE 通知 (由 CONNECT_EVT 或 Modbus 响应设置, main loop 消费)
-static PENDING_NOTIFY: std::sync::atomic::AtomicBool = 
+static PENDING_NOTIFY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// LOOP15: 广播启动完成标志 (ADV_START_COMPLETE_EVT 成功后置位).
+/// 用于 process_tick 周期自检 — 若启动后仍 false, 重新触发 config_adv_data → 广播.
+/// 防止启动期任意一步静默失败导致设备永久不可发现 (手持机搜不到蓝牙).
+static ADV_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// LOOP15: GATT 服务是否已启动 (CREAT_ATTR_TAB_EVT 后 start_service 成功)
+static SVC_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ============================================================================
 // Bluedroid GATT C API 绑定
@@ -287,8 +294,12 @@ unsafe extern "C" fn gap_event_cb(
             let status = unsafe { (*param).adv_start_cmpl.status };
             if status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS {
                 log::info!("[ble_at] BLE advertising active (svc={})", SERVICE_UUID);
+                // LOOP15: 标记广播已成功启动, 供 process_tick 自检
+                ADV_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
             } else {
                 log::error!("[ble_at] advertising start failed: {}", status);
+                // LOOP15: 失败时清零, process_tick 下个周期会重试
+                ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
         _ => {}
@@ -377,6 +388,8 @@ unsafe extern "C" fn gatts_event_cb(
                 log::warn!("[ble_at] start_service failed: 0x{:x}", ret);
             } else {
                 log::info!("[ble_at] GATT service started (uuid={})", SERVICE_UUID);
+                // LOOP15: 标记服务已启动, process_tick 据此判定是否需要重试广播
+                SVC_STARTED.store(true, std::sync::atomic::Ordering::Release);
                 // 配置广播数据 (触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising)
                 // 配置广播数据 (ADV) - 包含 name + UUID + flags
                 // 这是最广泛兼容的方案, 所有 BLE 扫描器都能看到
@@ -504,7 +517,14 @@ unsafe extern "C" fn gatts_event_cb(
             // Android BLEDataSyncManager.onStateConnected 会发心跳命令,
             // 但有时 Service 未发现, 写入失败, 导致数据流卡死。
             // 我们主动发心跳, 触发 Android 的 onHeartbeatChanged → readHardwareInfo
-            // 这个通知由 process_loop 的 try_send_notify 在 CCCD 使能后发送
+            //
+            // ---- LOOP14 P3-3 已知限制: BLE 心跳 CONNECT_EVT 帧丢失 ----
+            // 此处构造的 frame 仅设置 PENDING_NOTIFY=true, **未推入 BINARY_TX 队列**.
+            // try_send_notify() 从 TX_BUFFER 读取待发帧, 而非 PENDING_NOTIFY 标记的临时帧.
+            // 周期心跳 (~10s process_tick 调用 BLEHeartBeat) 弥补此缺陷.
+            // 影响: Android 端首次 connect 后需等待 ~10s 收到首次心跳, 略延迟 UI 刷新.
+            // 修复方向: 把 frame 推到 BINARY_TX 后置 PENDING_NOTIFY, 或 try_send_notify
+            //          优先消费 PENDING_NOTIFY 标记的临时帧.
             let hb = {
                 use std::sync::atomic::{AtomicU16, Ordering};
                 static HB: AtomicU16 = AtomicU16::new(0);
@@ -522,9 +542,18 @@ unsafe extern "C" fn gatts_event_cb(
             let crc = modbus_crc16(&frame[..frame.len()]);
             let _ = frame.push(crc as u8);
             let _ = frame.push((crc >> 8) as u8);
-            // 标记有待发送的通知 (main loop 通过 process_tick 发送)
-            PENDING_NOTIFY.store(true, std::sync::atomic::Ordering::Release);
-            log::info!("[ble_at] connect heartbeat pending");
+            // LOOP15: 修复 P3-3 — 把 CONNECT 心跳帧实际推入 BINARY_TX 队列,
+            // Android 首次 connect 后能立即收到心跳, 不用等 ~10s 周期心跳.
+            // (原代码仅 set PENDING_NOTIFY=true, frame 未入队 → 丢失)
+            if let Some(mut btx) = BINARY_TX.try_lock() {
+                if btx.len() + frame.len() <= 2048 {
+                    let _ = btx.extend_from_slice(&frame);
+                    PENDING_NOTIFY.store(true, std::sync::atomic::Ordering::Release);
+                    log::info!("[ble_at] connect heartbeat queued ({} bytes)", frame.len());
+                } else {
+                    log::warn!("[ble_at] BINARY_TX full, connect heartbeat dropped");
+                }
+            }
         }
         ESP_GATTS_DISCONNECT_EVT => {
             if param.is_null() {
@@ -680,6 +709,7 @@ pub fn start() -> AppResult<()> {
 
     // device::init() 已在本函数之前加载配置；广播使用可配置的短名称（最多 8 字节）
     // LOOP11: 零拷贝, 闭包内构造最终 String
+    // LOOP15: 统一 fallback 为 "GW-S3" (与 update_gap_device_name 一致, 避免启动与运行期名字不同)
     let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "GW-S3".to_owned());
@@ -769,6 +799,61 @@ pub fn update_gap_device_name() {
 pub fn process_tick() {
     // LOOP8: 心跳 — 之前从未 tick, 导致 ble-at 总被误判停滞
     TASK_HB.tick();
+    // LOOP15: BLE 广播健康自检 — 两层策略:
+    //
+    // 1. **主动重置 (每 ~15s)**: 调 stop_advertising() + 清 ADV_ACTIVE, 强制下个 tick 走
+    //    config_adv_data → start_advertising 完整链路, 重刷 BLE controller 状态.
+    //    解决: 广播静默死亡 (controller 缓冲区耗尽/堆压力) 后 ADV_ACTIVE 卡 true →
+    //    重试逻辑永不触发 → 设备永久不可发现.
+    //
+    // 2. **被动重试 (启动后 ADV_ACTIVE 仍 false)**: config_adv_data 重新配置.
+    //    解决: 启动期 config_adv_data/start_advertising 静默失败.
+    //
+    // 仅在未连接时 (CONN_ID=0xFFFF) 触发, 避免干扰已有连接.
+    if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire)
+        && CONN_ID.load(Ordering::Acquire) == 0xFFFF
+    {
+        static TICK_DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let tick = TICK_DIV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 每 ~15s 主动重置一次广播 (150 ticks × 100ms = 15s)
+        // stop_advertising() → controller 立即停止广播 → 无回调.
+        // 置 ADV_ACTIVE=false → 下个 tick (%50==0) 走 config_adv_data 重新启动.
+        if tick % 150 == 0 && ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+            log::info!("[ble_at] periodic advertising reset (tick={})", tick);
+            unsafe { esp_idf_sys::esp_ble_gap_stop_advertising(); }
+            ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data
+        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+            && tick % 50 == 0
+        {
+            log::warn!("[ble_at] advertising not active, retrying config_adv_data");
+            let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
+                set_scan_rsp: false,
+                include_name: true,
+                include_txpower: false,
+                min_interval: 0i32,
+                max_interval: 0i32,
+                appearance: 0i32,
+                manufacturer_len: 0u16,
+                p_manufacturer_data: core::ptr::null_mut(),
+                service_data_len: 0u16,
+                p_service_data: core::ptr::null_mut(),
+                service_uuid_len: SERVICE_UUID_128.len() as u16,
+                p_service_uuid: SERVICE_UUID_128.as_ptr() as *mut u8,
+                flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
+                    | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) as u8,
+            };
+            let ret = unsafe {
+                esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _)
+            };
+            if ret != 0 {
+                log::warn!("[ble_at] retry config_adv_data failed: 0x{:x}", ret);
+            }
+        }
+    }
     // LOOP7: 处理待更新的 GAP 设备名 (Metuory 写完 0x08E2 后)
     if PENDING_GAP_NAME_UPDATE.swap(false, std::sync::atomic::Ordering::SeqCst) {
         update_gap_device_name();
@@ -1096,6 +1181,15 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // ---- DEVICE_FUNCTION_COUNT (LOOP12: 0xB0/0xB1, 映射到 Modbus 0x08FC) ----
     // Android 1.0.78 通过自定义 opcodes 读写 FUNC_COUNT 寄存器, 走自定义子协议不走 Modbus FC.
     // 原 fall through 路径把 0xB0 当作 Modbus FC=176 (illegal function), Android 报 "无自定义功能".
+    //
+    // ---- LOOP14 P3-2 已知限制: 0xB2/0xB3 DEVICE_FUNCTION_CONFIG 未实现 ----
+    // metuory 0xB2 READ_DEVICE_FUNCTION_CONFIG (地址 0x08FC+offset, 任意长度)
+    // metuory 0xB3 WRITE_DEVICE_FUNCTION_CONFIG (地址 0x08FC+offset, TLV 格式)
+    //
+    // TLV 单 entry 包含 13 个嵌套字段 (index, deviceAttribution, imagePath,
+    // sectionNamePath, deviceNamePath, Q-output list, I-input list, operate addresses,
+    // delay, pulse, lockset, backgrounds). 完整实现为多日工程量, 当前 Android 端读
+    // FUNC_COUNT=0 时退化为基础 IO 界面, 不影响基础功能.
     if func == 0xB0 || func == 0xB1 {
         let mut rsp: heapless::Vec<u8, 32> = heapless::Vec::new();
         let _ = rsp.push(unit);
@@ -1116,6 +1210,17 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
+    // ---- LOOP14 P3-1 已知限制: 0xB4-B7 DEVICE_TEXT 多 chunk 限制 ----
+    // metuory 0xB4 READ_DEVICE_TEXT_COUNT (0x1388)
+    // metuory 0xB5 WRITE_DEVICE_TEXT_COUNT (0x1388, 4 words)
+    // metuory 0xB6 READ_DEVICE_TEXT_DATA (0x138A+offset, n)
+    // metuory 0xB7 WRITE_DEVICE_TEXT_DATA (0x138A+offset, n, 分 180B/chunk)
+    //
+    // 单 chunk 路径可工作 (BLE MTU=500B, 一次写入 < 500B 字节时).
+    // 多 chunk 路径未实现: metuory 端分 180B/chunk 多包发送, 当前实现只接收首个 chunk,
+    // 后续 chunk 被丢弃. 待 Android BLE write trace 逆向完整协议后实施.
+    // 当前 metuory UI 文本配置功能受限 (基础 IO 配置仍正常).
+
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
     if func >= 0xC0 && func <= 0xCF {

@@ -35,11 +35,16 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("mb-rtu-slave".into())
+        .stack_size(8 * 1024)  // LOOP15: 8KB 足够 (256B buf + handle_request, 节省 4KB heap)
         .spawn(move || {
+            // LOOP14: 所有长期运行 pthread 必须订阅 WDT
+            health::subscribe_wdt();
             let mut buf = [0u8; 256];
             loop {
                 // 心跳: 每次循环 (即使无请求也 1s 返回一次)
                 TASK_HB.tick();
+                // LOOP15: 必须喂 WDT — port.read(1000ms) + retry 累计可能 > 10s 触发系统复位
+                health::feed_wdt();
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,
                     Ok(n) => {
@@ -68,6 +73,8 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
 fn handle_request(port: &mut Rs485Port, backend: &BusBackend, req: &[u8], addr: u8) -> AppResult<()> {
     // 最小帧: slave(1) + func(1) + crc(2) = 4
     if req.len() < 4 {
+        // LOOP14: 帧过短 → 累加从站通信错误
+        crate::modbus::shared::RS485_STATS.inc_slave_comerr();
         return Ok(());
     }
 
@@ -83,6 +90,8 @@ fn handle_request(port: &mut Rs485Port, backend: &BusBackend, req: &[u8], addr: 
     let recv_crc = u16::from_le_bytes([req[n - 2], req[n - 1]]);
     if crc != recv_crc {
         log::debug!("[mb-rtu-slave] crc mismatch: {:#06x}!={:#06x}", crc, recv_crc);
+        // LOOP14: CRC 错 → 累加从站通信错误
+        crate::modbus::shared::RS485_STATS.inc_slave_comerr();
         return Ok(());
     }
 

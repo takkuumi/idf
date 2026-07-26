@@ -136,19 +136,20 @@ impl DoState {
 
 impl AiState {
     pub fn set_raw(&self, ch: usize, value: u16) {
-        if ch < 6 { self.raw[ch].store(value, Ordering::Release); }
+        // LOOP14: ch < self.raw.len() 替代硬编码 ch < 6 — F4 有 8 通道 AI
+        if ch < self.raw.len() { self.raw[ch].store(value, Ordering::Release); }
     }
 
     pub fn get_raw(&self, ch: usize) -> u16 {
-        if ch < 6 { self.raw[ch].load(Ordering::Acquire) } else { 0 }
+        if ch < self.raw.len() { self.raw[ch].load(Ordering::Acquire) } else { 0 }
     }
 
     pub fn set_scaled(&self, ch: usize, value: u16) {
-        if ch < 6 { self.scaled[ch].store(value, Ordering::Release); }
+        if ch < self.scaled.len() { self.scaled[ch].store(value, Ordering::Release); }
     }
 
     pub fn get_scaled(&self, ch: usize) -> u16 {
-        if ch < 6 { self.scaled[ch].load(Ordering::Acquire) } else { 0 }
+        if ch < self.scaled.len() { self.scaled[ch].load(Ordering::Acquire) } else { 0 }
     }
 
     pub fn read_all_raw(&self, buf: &mut [u16]) {

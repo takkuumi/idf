@@ -54,10 +54,15 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("mb-rtu-master".into())
+        .stack_size(8 * 1024)  // LOOP15: 8KB 足够 (256B buf + poll_with_retry, 节省 4KB heap)
         .spawn(move || {
+            // LOOP14: 所有长期运行 pthread 必须订阅 WDT
+            health::subscribe_wdt();
             loop {
                 // 心跳: 每轮询周期一次
                 TASK_HB.tick();
+                // LOOP15: 必须喂 WDT, 重试 + 轮询周期累加可能 > 10s 触发复位
+                crate::health::feed_wdt();
                 for item in POLL_TABLE {
                     if let Err(e) = poll_with_retry(&mut port, *item) {
                         log::warn!(
@@ -97,19 +102,32 @@ fn poll_with_retry(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
 
 fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
     let req = build_request(item);
-    let resp = port.send_recv(&req, cfg::TIMEOUT_MS)?;
+    let resp = match port.send_recv(&req, cfg::TIMEOUT_MS) {
+        Ok(r) => r,
+        Err(_) => {
+            // LOOP14: 主站通信错误 (超时) → 累加 RS485_1_COMERR
+            crate::modbus::shared::RS485_STATS.inc_master_comerr();
+            return Err(crate::error::AppError::Modbus("timeout".into()));
+        }
+    };
 
     if resp.len() < 5 {
+        // LOOP14: 帧太短 (通信错误) → 累加 COMERR
+        crate::modbus::shared::RS485_STATS.inc_master_comerr();
         return Err(crate::error::AppError::Modbus(format!("short resp: {} bytes", resp.len())));
     }
 
     // 校验从站地址
     if resp[0] != item.slave {
+        // LOOP14: 从站地址不匹配 (通信错误) → 累加 COMERR
+        crate::modbus::shared::RS485_STATS.inc_master_comerr();
         return Err(crate::error::AppError::Modbus(format!("slave mismatch: {}!={}", resp[0], item.slave)));
     }
 
-    // 异常响应
+    // 异常响应 (Modbus spec: func | 0x80, code: Illegal F/R/V/Slave Failure)
     if resp[1] & 0x80 != 0 {
+        // LOOP14: 异常响应 → 累加 APPERR
+        crate::modbus::shared::RS485_STATS.inc_master_apperr();
         return Err(crate::error::AppError::Modbus(format!("exception: {:02x}", resp[2])));
     }
 
@@ -118,6 +136,8 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
     let crc = modbus_crc16(&resp[..n - 2]);
     let recv_crc = u16::from_le_bytes([resp[n - 2], resp[n - 1]]);
     if crc != recv_crc {
+        // LOOP14: CRC 校验失败 (通信错误) → 累加 COMERR
+        crate::modbus::shared::RS485_STATS.inc_master_comerr();
         return Err(crate::error::AppError::Modbus(format!("crc mismatch: {:#06x}!={:#06x}", crc, recv_crc)));
     }
 

@@ -71,6 +71,17 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     TASK_HB.tick();
     let raws: [u16; 6] = hal.adc.sample_all();
 
+    // LOOP14: eFuse 工厂校准 — 在 raw 上叠加 esp_adc_cal_raw_to_voltage (mV),
+    // 然后用 mV 走 4-20mA 映射. 旧逻辑直接用 raw → 单位噪声 ±20 LSB (~40mV) 已消除.
+    // holding_buf SENSOR_MIN/MAX 仍存的是 raw LSB, 所以应用层 map_range 仍按原逻辑.
+    let _mv_per_ch: [u32; 6] = {
+        let mut arr = [0u32; 6];
+        for ch in 0..6 {
+            arr[ch] = hal.adc.raw_to_mv(raws[ch]);
+        }
+        arr
+    };
+
     // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
     // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
     // 缺失校准 (min==max==0) 时回退到 4-20mA 线性映射 (旧逻辑)

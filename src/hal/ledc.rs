@@ -67,6 +67,14 @@ impl LedcHandle {
     /// - `channels`: `[(ledc_channel, gpio_num); 4]`
     pub fn init(timer_cfg: LedcTimerCfg, channels: [(u8, u8); AO_CHANNEL_COUNT]) -> AppResult<Self> {
         let resolution = resolution_from_bits(timer_cfg.resolution_bits)?;
+        // LOOP14: LEDC 时钟源选择
+        // esp-idf-hal TimerConfig::default() 隐式选 LEDC_USE_XTAL_CLK (40MHz 晶振),
+        // 相比 LEDC_USE_RC_FAST_CLK (~8MHz, 受温度漂移 ±5%) 更精确, 对工业
+        // 4-20mA 输出至关重要 (RC 漂移会偏置满度输出). 不显式覆盖 = 显式选 XTAL.
+        //
+        // 12-bit @ 5kHz 分辨率: 周期 = 4096 ticks × 200ns/tick = 819.2µs, 频率精确
+        // 5kHz. AO 通道 4 路, RC 滤波后输出 0-10V. ESP32-S3 LEDC 支持到 20-bit,
+        // 但 5kHz × 2^20 = 5GHz 远超时钟, 因此 12-bit 是 AO 工业级最佳折衷.
         let config = TimerConfig::default()
             .frequency(Hertz(timer_cfg.freq_hz))
             .resolution(resolution);

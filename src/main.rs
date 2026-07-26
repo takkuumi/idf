@@ -269,8 +269,11 @@ fn main() -> AppResult<()> {
         );
         // 短暂等待, 给系统机会继续响应
         std::thread::sleep(Duration::from_secs(1));
-        // 注: 不直接重启, 让系统尝试在降级模式下继续
+        // LOOP14: 喂狗 + 健康检查, 防止 WDT 10s 超时导致系统卡死
+        // (原代码不喂狗 → WDT panic → 与注释 "降级运行" 矛盾)
         loop {
+            health::feed_wdt();
+            let _ = health::check_all();
             std::thread::sleep(Duration::from_millis(100));
         }
     }

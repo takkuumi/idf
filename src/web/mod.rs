@@ -44,6 +44,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::bus::storage_state::storage_read_with;
 use crate::bus::{config_state::config_read_with, IO};
 use crate::config::regs;
 use crate::error::AppResult;
@@ -572,6 +573,11 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
                 "/iocontrol" => handle_io_control(&mut stream, &req),
                 "/getnetworkconfig" => handle_get_network_config(&mut stream, &req),
                 "/updatenetworkconfig" => handle_update_network_config(&mut stream, &req),
+                "/getbleconfig" => handle_get_ble_config(&mut stream, &req),
+                "/updatebleconfig" => handle_update_ble_config(&mut stream, &req),
+                "/getsensorconfig" => handle_get_sensor_config(&mut stream, &req),
+                "/updatesensorconfig" => handle_update_sensor_config(&mut stream, &req),
+                "/reboot" => handle_reboot(&mut stream, &req),
                 "/updatepwd" => handle_update_password(&mut stream, &req),
                 _ => send_json(&mut stream, 404, &json_response("error", "404")),
             }
@@ -766,17 +772,21 @@ fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io
             if i < cfg.rs485.len() {
                 let r = &cfg.rs485[i];
                 format!(
-                    r#""baud_{}":{},"mode_{}":{},"databits_{}":{},"stopbits_{}":{},"parity_{}":{}"#,
+                    r#""baud_{}":{},"mode_{}":{},"databits_{}":{},"stopbits_{}":{},"parity_{}":{},"slaveaddr_{}":{},"retry_{}":{},"timeout_{}":{},"interval_{}":{}"#,
                     i, r.baudrate,
                     i, r.mode,
                     i, r.data_bits,
                     i, r.stop_bits,
                     i, r.parity,
+                    i, r.slave_addr,
+                    i, r.retry_count,
+                    i, r.timeout_ms,
+                    i, r.interval_ms,
                 )
             } else {
                 format!(
-                    r#""baud_{}":9600,"mode_{}":0,"databits_{}":8,"stopbits_{}":1,"parity_{}":0"#,
-                    i, i, i, i, i
+                    r#""baud_{}":9600,"mode_{}":0,"databits_{}":8,"stopbits_{}":1,"parity_{}":0,"slaveaddr_{}":1,"retry_{}":3,"timeout_{}":1000,"interval_{}":20"#,
+                    i, i, i, i, i, i, i, i, i
                 )
             }
         };
@@ -827,6 +837,18 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         .form_field("checkmode")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let retry: u16 = req
+        .form_field("retry")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let timeout: u16 = req
+        .form_field("timeout")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let interval: u16 = req
+        .form_field("interval")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     if index < 3 {
         crate::bus::backends::config_modify(|cfg| {
@@ -837,11 +859,14 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
                 cfg.rs485[index].data_bits = databits;
                 cfg.rs485[index].stop_bits = stopbits;
                 cfg.rs485[index].parity = parity;
+                cfg.rs485[index].retry_count = retry;
+                cfg.rs485[index].timeout_ms = timeout;
+                cfg.rs485[index].interval_ms = interval;
             }
         });
         log::info!(
-            "[http] update RS485 port {}: baud={} mode={} slave={}",
-            index, baud, mode, slave_addr
+            "[http] update RS485 port {}: baud={} mode={} slave={} retry={} timeout={} interval={}",
+            index, baud, mode, slave_addr, retry, timeout, interval
         );
     }
 
@@ -922,6 +947,125 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
 
     log::info!("[http] IO control: addr={} value={}", addr, value);
     send_json(stream, 200, &json_response("iocontrol", "0"))
+}
+
+/// GET /getbleconfig — BLE 名称 + MAC (现场识别用)
+fn handle_get_ble_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
+    let json = match config_read_with(|cs| {
+        let cfg = &cs.cfg;
+        let name_bytes: Vec<u8> = cfg.ble_name.iter()
+            .take_while(|&&b| b != 0)
+            .copied().collect();
+        let name = String::from_utf8_lossy(&name_bytes);
+        format!(
+            r#"{{"type":"getbleconfig","code":"0","data":{{"blename":"{}","mac":"{}"}}}}"#,
+            escape_json(&name),
+            escape_json(&format!(
+                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                cfg.ble_mac[0], cfg.ble_mac[1], cfg.ble_mac[2],
+                cfg.ble_mac[3], cfg.ble_mac[4], cfg.ble_mac[5]
+            )),
+        )
+    }) {
+        Some(j) => j,
+        None => return send_json(stream, 500, &json_response("getbleconfig", "500")),
+    };
+    send_json(stream, 200, &json)
+}
+
+/// POST /updatebleconfig — 更新 BLE 名称 (≤8 字节 ASCII)
+fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    if req.method != "POST" {
+        return send_json(stream, 405, &json_response("updatebleconfig", "405"));
+    }
+    let name = req.form_field("blename").unwrap_or_default();
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > 8 {
+        return send_json(stream, 200, &json_response("updatebleconfig", "0x01000004"));
+    }
+    crate::bus::backends::config_modify(|cfg| {
+        for b in &mut cfg.ble_name { *b = 0; }
+        let take = name_bytes.len().min(8);
+        cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
+    });
+    // 立即触发 GAP 名更新 (无需重启)
+    crate::ble_at::notify_ble_name_changed();
+    log::info!("[http] update BLE name: {:?}", name);
+    crate::device::request_save_device_text();
+    send_json(stream, 200, &json_response("updatebleconfig", "0"))
+}
+
+/// GET /getsensorconfig — AI 传感器零点/满度 (2280-2295, 8 通道×2)
+fn handle_get_sensor_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
+    let ai_count = crate::config::hw_version::AI_COUNT as usize;
+    let json = match storage_read_with(|s| {
+        let base_min = regs::HOLD_SENSOR_MIN_BASE as usize;
+        let base_max = regs::HOLD_SENSOR_MAX_BASE as usize;
+        let cfg_base = regs::HOLD_CFG_BASE as usize;
+        let mut sensor_data = String::new();
+        for i in 0..ai_count {
+            if i > 0 { sensor_data.push(','); }
+            let min_v = s.holding_buf.get(base_min - cfg_base + i).copied().unwrap_or(605);
+            let max_v = s.holding_buf.get(base_max - cfg_base + i).copied().unwrap_or(3016);
+            sensor_data.push_str(&format!(
+                r#""ai_{}":{{"min":{},"max":{}}}"#,
+                i, min_v, max_v
+            ));
+        }
+        format!(
+            r#"{{"type":"getsensorconfig","code":"0","data":{{{}}}}}"#,
+            sensor_data
+        )
+    }) {
+        Some(j) => j,
+        None => return send_json(stream, 500, &json_response("getsensorconfig", "500")),
+    };
+    send_json(stream, 200, &json)
+}
+
+/// POST /updatesensorconfig — 写入 AI 零点/满度 (单字 FC=06 风格)
+fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    if req.method != "POST" {
+        return send_json(stream, 405, &json_response("updatesensorconfig", "405"));
+    }
+    let ch: usize = req.form_field("ch").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min_v: u16 = req.form_field("min").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max_v: u16 = req.form_field("max").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ai_count = crate::config::hw_version::AI_COUNT as usize;
+    if ch >= ai_count {
+        return send_json(stream, 200, &json_response("updatesensorconfig", "0x01000003"));
+    }
+    let base_min = regs::HOLD_SENSOR_MIN_BASE as usize;
+    let base_max = regs::HOLD_SENSOR_MAX_BASE as usize;
+    let cfg_base = regs::HOLD_CFG_BASE as usize;
+    let base_min_idx = base_min - cfg_base + ch;
+    let base_max_idx = base_max - cfg_base + ch;
+    crate::bus::backends::storage_modify(|snap| {
+        if base_min_idx < snap.holding_buf.len() {
+            snap.holding_buf[base_min_idx] = min_v;
+        }
+        if base_max_idx < snap.holding_buf.len() {
+            snap.holding_buf[base_max_idx] = max_v;
+        }
+        snap.proto.dirty = true;
+    });
+    crate::device::request_save_device_text();
+    log::info!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);
+    send_json(stream, 200, &json_response("updatesensorconfig", "0"))
+}
+
+/// POST /reboot — Web UI 触发设备重启 (Apply 配置后需要)
+fn handle_reboot(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    if req.method != "POST" {
+        return send_json(stream, 405, &json_response("reboot", "405"));
+    }
+    send_json(stream, 200, &json_response("reboot", "0"))?;
+    // 异步触发, 给 HTTP 响应一点时间 flush 后再复位
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe { esp_idf_sys::esp_restart() };
+    });
+    Ok(())
 }
 
 /// POST /updatepwd

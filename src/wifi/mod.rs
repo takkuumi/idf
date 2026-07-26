@@ -106,9 +106,13 @@ fn spawn_heartbeat() -> AppResult<()> {
     let result = std::thread::Builder::new()
         .name("wifi-heartbeat".into())
         .spawn(move || {
+            // LOOP14: 长期运行 pthread 必须订阅 WDT
+            health::subscribe_wdt();
             let period = std::time::Duration::from_secs(cfg::HEARTBEAT_PERIOD_S);
             loop {
                 WIFI_HB.tick();
+                // LOOP15: WDT 必须周期喂, 仅 subscribe 不 feed 10s 内触发系统复位
+                health::feed_wdt();
                 // TODO: 检查 wifi 链路状态 (netif_is_up / ip 是否丢失)
                 // 当前仅周期上报心跳, 实际链路检测待实现
                 std::thread::sleep(period);

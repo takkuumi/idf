@@ -113,11 +113,16 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
         .name(name)
         .stack_size(32 * 1024)
         .spawn(move || {
+            // LOOP14: Actor 线程订阅 WDT — 任何 actor 卡死都触发系统重启
+            crate::health::subscribe_wdt();
             actor.init();
             loop {
                 // 先尽量排空 mailbox (生产者在此期间仍可入队)
                 while let Some(msg) = mailbox.dequeue() {
                     actor.handle(msg);
+                    // LOOP15: 长消息处理 (NVS commit / 序列化 11KB 快照) 可能 > 10s,
+                    // 每条消息后喂 WDT 避免触发系统复位
+                    crate::health::feed_wdt();
                 }
                 // 空闲: 调用 idle() 做周期性工作, 然后 sleep (不阻塞生产者入队)
                 let nap = actor.idle();
@@ -126,6 +131,7 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
                 } else {
                     std::thread::yield_now();
                 }
+                crate::health::feed_wdt();
             }
         }) {
         Ok(_) => (actor_ref, actor_handle),

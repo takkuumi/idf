@@ -32,7 +32,9 @@ static LISTEN_HB: TaskHb = TaskHb::new_with_stall("mb-tcp-listen", 60);
 
 /// 启动 Modbus TCP 服务器: 单线程 poll 复用所有端口.
 pub fn start() -> AppResult<()> {
-    health::register(&LISTEN_HB);
+    // LOOP15: 注意顺序 — 必须在 spawn 成功后再 register 心跳, 否则 spawn 失败时
+    // check_all() 会因 task[12] 永远不 tick (max_stall=60) 触发强制重启.
+    // 历史上 nb-tcp-listen spawn 失败后又被强制重启, 形成 "重启→spawn失败→再重启" 死循环.
 
     // 绑定所有端口 (任一失败则整体失败 — 端口被占用属致命错误)
     let mut listeners: Vec<TcpListener> = Vec::with_capacity(cfg::PORTS.len());
@@ -51,13 +53,20 @@ pub fn start() -> AppResult<()> {
     );
 
     // 单监听线程: 轮询所有端口的 accept
+    // LOOP15: 显式 16KB 栈 (默认 12KB 在 BLE+ETH+Modbus RTU 全部启用后已触顶),
+    // 监听循环体调用 accept_one() → spawn 20KB 连接线程 (间接增加本线程栈深度).
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("mb-tcp-listen".into())
+        .stack_size(6 * 1024)  // LOOP15: 仅做 poll accept(), 6KB 足够, 节省 6KB heap
         .spawn(move || {
             poll_loop(listeners);
         });
     health::reset_thread_core();
+    // LOOP15: spawn 成功后再注册心跳, 避免失败时残留注册项触发强制重启
+    if result.is_ok() {
+        health::register(&LISTEN_HB);
+    }
     result.map_err(|e| AppError::Modbus(format!("spawn listener: {e}")))?;
     Ok(())
 }
@@ -148,6 +157,9 @@ fn accept_one(stream: TcpStream, addr: std::net::SocketAddr) {
 fn handle_conn(mut stream: TcpStream) -> AppResult<()> {
     stream.set_read_timeout(Some(Duration::from_millis(cfg::RX_TIMEOUT_MS)))?;
     stream.set_write_timeout(Some(Duration::from_millis(cfg::TX_TIMEOUT_MS)))?;
+    // LOOP14: TCP_NODELAY — 禁用 Nagle, 小包立即发送 (Modbus TCP PDU 8-12B),
+    // 消除 ACK 延迟 (~40ms), SCADA 100ms 轮询周期下至关重要.
+    stream.set_nodelay(true)?;
     // keepalive: 空闲超过 RX_TIMEOUT_MS 的连接由 set_read_timeout 触发 WouldBlock,
     // 下次循环返回 WouldBlock 时主动关闭, 释放 MAX_CONNECTIONS 名额
 

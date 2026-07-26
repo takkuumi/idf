@@ -24,6 +24,8 @@ impl SwI2c {
         // Configure both pins as push-pull OUTPUT initially
         // Matching reference: pinMode(pin, OUTPUT)
         unsafe {
+            // SAFETY: sda/scl 来自 config.rs::pins 编译期常量, 与其它驱动互斥.
+            // mask 是 u64 GPIO 位掩码, cfg 是栈局部 &, 无别名访问, 调用后立即 ret 检查.
             let mask = (1u64 << sda) | (1u64 << scl);
             let cfg = esp_idf_sys::gpio_config_t {
                 pin_bit_mask: mask,
@@ -53,24 +55,29 @@ impl SwI2c {
     // ---- low-level pin access ----
 
     fn delay_half(&self) {
+        // SAFETY: ets_delay_us 是 ROM 提供的 CPU 空转, 无内存访问, 无副作用.
         unsafe { esp_idf_sys::ets_delay_us(T_HALF_US) };
     }
 
     fn delay_1us(&self) {
+        // SAFETY: 同 delay_half.
         unsafe { esp_idf_sys::ets_delay_us(1) };
     }
 
     fn sda_write(&self, high: bool) {
         self.sda_set_output();
+        // SAFETY: self.sda 是 init 时的 cfg 常量 GPIO 号, gpio_set_level 仅写该引脚.
         unsafe { esp_idf_sys::gpio_set_level(self.sda, high as u32) };
     }
 
     fn sda_read(&self) -> bool {
         self.sda_set_input();
+        // SAFETY: 同 sda_write, 仅读 GPIO 电平寄存器.
         unsafe { esp_idf_sys::gpio_get_level(self.sda) != 0 }
     }
 
     fn scl_write(&self, high: bool) {
+        // SAFETY: self.scl 同 self.sda.
         unsafe { esp_idf_sys::gpio_set_level(self.scl, high as u32) };
     }
 

@@ -123,6 +123,92 @@ pub fn modbus_crc16(data: &[u8]) -> u16 {
     crc
 }
 
+// ----------------------------------------------------------------------------
+// LOOP14: RS485 错误计数器 (0x0880-0x0883)
+// ----------------------------------------------------------------------------
+//
+// metuory 仪表盘显示这 4 个寄存器诊断 RS485 通信健康:
+//   0x0880 RS485_1_COMERR: 主站通信错误 (超时/CRC 错/从站不匹配), 累加.
+//   0x0881 RS485_1_APPERR: 主站收到异常响应 (Illegal F/R/V/Slave Failure), 累加.
+//   0x0882 RS485_2_COMERR: 从站通信错误 (CRC 错/帧截断), 累加.
+//   0x0883 RS485_2_APPERR: 从站请求解析错误 (功能码非法/寄存器非法), 累加.
+//
+// 对齐 MCA modbus_master.cpp 的错误计数语义, metuory 端按此显示诊断值.
+// 实现: 4 个 AtomicU32 无锁累加, 在 rtu_master/slave 异常点调用.
+// read_hold_reg(0x0880..=0x0883) 前置拦截读取 RS485_STATS, 不走 holding_buf 兜底.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// RS485 通信/应用错误计数器 (无锁原子, 全局静态)
+pub struct Rs485Stats {
+    pub master_comerr: AtomicU32, // 0x0880
+    pub master_apperr: AtomicU32, // 0x0881
+    pub slave_comerr: AtomicU32,  // 0x0882
+    pub slave_apperr: AtomicU32,  // 0x0883
+}
+
+impl Rs485Stats {
+    pub const fn new() -> Self {
+        Self {
+            master_comerr: AtomicU32::new(0),
+            master_apperr: AtomicU32::new(0),
+            slave_comerr: AtomicU32::new(0),
+            slave_apperr: AtomicU32::new(0),
+        }
+    }
+
+    /// 读 RS485 主站通信错误 (0x0880)
+    #[inline]
+    pub fn master_comerr(&self) -> u16 {
+        self.master_comerr.load(Ordering::Relaxed) as u16
+    }
+
+    /// 读 RS485 主站应用错误 (0x0881)
+    #[inline]
+    pub fn master_apperr(&self) -> u16 {
+        self.master_apperr.load(Ordering::Relaxed) as u16
+    }
+
+    /// 读 RS485 从站通信错误 (0x0882)
+    #[inline]
+    pub fn slave_comerr(&self) -> u16 {
+        self.slave_comerr.load(Ordering::Relaxed) as u16
+    }
+
+    /// 读 RS485 从站应用错误 (0x0883)
+    #[inline]
+    pub fn slave_apperr(&self) -> u16 {
+        self.slave_apperr.load(Ordering::Relaxed) as u16
+    }
+
+    /// 累加主站通信错误 (timeout/CRC/slave mismatch)
+    #[inline]
+    pub fn inc_master_comerr(&self) {
+        self.master_comerr.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累加主站应用错误 (Illegal F/R/V/Slave Failure)
+    #[inline]
+    pub fn inc_master_apperr(&self) {
+        self.master_apperr.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累加从站通信错误 (CRC 错/帧截断)
+    #[inline]
+    pub fn inc_slave_comerr(&self) {
+        self.slave_comerr.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 累加从站应用错误 (非法功能码/非法寄存器)
+    #[inline]
+    pub fn inc_slave_apperr(&self) {
+        self.slave_apperr.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 全局 RS485 错误计数静态实例
+pub static RS485_STATS: Rs485Stats = Rs485Stats::new();
+
 /// Modbus 异常码
 pub mod exc {
     pub const ILLEGAL_FUNCTION: u8 = 0x01;
@@ -191,6 +277,9 @@ pub fn handle_pdu<B: ModbusBackend>(
             1 + body_len
         }
         PduResult::Err(code) => {
+            // LOOP14: 从站发送异常响应 → 累加从站应用错误
+            // (RTU slave 接收方在收到非法 F/R/V 请求时累加, 表示上层语义错误)
+            RS485_STATS.inc_slave_apperr();
             out[0] = func | 0x80;
             out[1] = code;
             2

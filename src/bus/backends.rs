@@ -226,6 +226,15 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
 
 /// 读保持寄存器 (FC=03). 等价 `Bus::read_hold_reg`, 但走 `STORAGE`/`CONFIG` RCU.
 pub fn read_hold_reg(addr: u16) -> Option<u16> {
+    // LOOP14: RS485 错误计数器 (0x0880-0x0883) 前置拦截 — 必须早于 SystemConfig 兜底,
+    // 否则 read_hold_reg 落入 holding_buf 返回陈旧 NVS 值. metuory 仪表盘读取此值做诊断.
+    match addr {
+        regs::HOLD_485_1_COMERR => return Some(crate::modbus::shared::RS485_STATS.master_comerr()),
+        regs::HOLD_485_1_APPERR => return Some(crate::modbus::shared::RS485_STATS.master_apperr()),
+        regs::HOLD_485_2_COMERR => return Some(crate::modbus::shared::RS485_STATS.slave_comerr()),
+        regs::HOLD_485_2_APPERR => return Some(crate::modbus::shared::RS485_STATS.slave_apperr()),
+        _ => {}
+    }
     // 1. device_text (5000..=6999): 来自 STORAGE (Rcu 主存)
     if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
@@ -471,16 +480,13 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 return true;
             }
             WriteResult::NotFound => {
-                drop(cs);
-                let mut snap = storage_clone();
+                // LOOP14: storage_modify_holding 替代 storage_clone — 不再 4KB Box 全拷贝,
+                // 单字写从 ~50µs 降至 ~2µs (无 heap alloc)
                 let idx = (addr - regs::HOLD_PXX_BASE) as usize;
                 if idx < regs::HOLD_PXX_COUNT {
-                    snap.holding_buf[idx] = value;
-                    sync_proto_status(&mut snap);
-                    STORAGE.write(snap);
-                    // LOOP13: 标记 holding_buf 已脏, 通知 DeviceActor 异步写 NVS
-                    super::storage_state::HOLDING_DIRTY
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    storage_modify_holding(|buf| {
+                        buf[idx] = value;
+                    });
                     return true;
                 }
                 return false;
@@ -501,13 +507,11 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         }
         let user_idx = (idx - 48) as u16;
         if user_idx < regs::HOLD_USER_COUNT {
-            let mut snap = storage_clone();
-            snap.holding_buf[(regs::HOLD_USER_BASE as usize) + (user_idx as usize)] = value;
-            sync_proto_status(&mut snap);
-            STORAGE.write(snap);
-            // LOOP13: 标记 holding_buf 已脏
-            super::storage_state::HOLDING_DIRTY
-                .store(true, std::sync::atomic::Ordering::Release);
+            // LOOP14: storage_modify_holding 替代 storage_clone (性能优化)
+            let holding_idx = (regs::HOLD_USER_BASE as usize) + (user_idx as usize);
+            storage_modify_holding(|buf| {
+                buf[holding_idx] = value;
+            });
             return true;
         }
         return false;

@@ -183,7 +183,11 @@ fn spi_bus_config_default(mosi: u8, miso: u8, sclk: u8) -> esp_idf_sys::spi_bus_
         },
         data4_io_num: -1, data5_io_num: -1, data6_io_num: -1, data7_io_num: -1,
         data_io_default_level: false,
-        max_transfer_sz: 0,
+        // LOOP16: 降到 2048 (W5500 单帧 MTU=1536, 2048 有余量).
+        // 16384 过大导致 setup_dma_priv_buffer 需要从内部 SRAM 分配大块 DMA-capable 内存,
+        // 在 BLE+Bluedroid 堆满内部 SRAM 后反复 "Failed to allocate priv TX buffer".
+        // 降到 2048 显著降低 SPI DMA 缓冲需求, 缓解内部 SRAM 竞争.
+        max_transfer_sz: 2048,
         flags: 0,
         isr_cpu_id: esp_idf_sys::esp_intr_cpu_affinity_t_ESP_INTR_CPU_AFFINITY_AUTO,
         intr_flags: 0,

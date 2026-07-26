@@ -632,11 +632,11 @@ impl SystemConfig {
         {
             return WriteResult::Ok;
         }
-        // TCP COM 端口 (2243-2246, 可写)
+        // TCP COM 端口 (2243-2246) — 运行时可写, Persist 落盘 (对齐参考固件)
         if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
             .contains(&addr)
         {
-            return WriteResult::Ok;
+            return WriteResult::Persist;
         }
         WriteResult::NotFound
     }
