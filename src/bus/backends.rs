@@ -489,6 +489,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         if idx < 48 {
             // DO bit write
             super::io_global::IO.do_.set_bit(idx, value != 0);
+            // LOOP13: 触发 DO 刷新 (老 SCADA PLC 区路径曾忘记 notify, 继电器不动)
+            #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+            crate::io::do_::notify();
             return true;
         }
         let user_idx = (idx - 48) as u16;
@@ -546,10 +549,16 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
 }
 
 /// 写线圈 (FC=05/0F): DO 段原子 IO.do_, 其它 (DI) 不可写, false.
+///
+/// LOOP13: notify() 内化 — 所有调用方 (Modbus/web/BLE/AT) 自动获得 DO 刷新通知,
+/// 避免历史上 web `/iocontrol` 与 CONTROL_PLC 等路径忘记调用 notify 导致硬件不刷新的 bug
+/// (详见 docs/LOOP.md LOOP13 章节). notify 内部是 AtomicBool::store(true) 幂等.
 pub fn write_coil(addr: u16, value: bool) -> bool {
     if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         super::io_global::IO.do_.set_bit(ch, value);
+        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+        crate::io::do_::notify();
         return true;
     }
     false

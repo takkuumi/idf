@@ -71,12 +71,8 @@ impl ModbusBackend for BusBackend {
 
     fn write_single_coil(&self, addr: u16, value: bool) -> bool {
         // 阶段 B: 写 DO 走无锁 bus::backends::write_coil
-        let ok = crate::bus::backends::write_coil(addr, value);
-        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
-        if ok {
-            crate::io::do_::notify();
-        }
-        ok
+        // LOOP13: notify() 已在 backends::write_coil 内部内化, 无需显式调用
+        crate::bus::backends::write_coil(addr, value)
     }
 
     fn write_single_register(&self, addr: u16, value: u16) -> bool {
@@ -86,15 +82,12 @@ impl ModbusBackend for BusBackend {
 
     fn write_multiple_coils(&self, addr: u16, values: &[bool]) -> bool {
         // 阶段 B: 循环 backends::write_coil; DI 段不可写
+        // LOOP13: notify() 已在 backends::write_coil 内部内化, 每次成功写都触发
         let mut ok = true;
         for (i, &v) in values.iter().enumerate() {
             if !crate::bus::backends::write_coil(addr + i as u16, v) {
                 ok = false;
             }
-        }
-        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
-        if ok {
-            crate::io::do_::notify();
         }
         ok
     }

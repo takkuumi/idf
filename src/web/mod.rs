@@ -910,7 +910,13 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
         .map(|v| v != 0)
         .unwrap_or(false);
 
+    // LOOP13: 校验 addr 范围, 越界返回错误码 (0x01000003 = addr 超限)
+    if addr >= crate::config::hw_version::DO_COUNT as u16 {
+        return send_json(stream, 200, &json_response("iocontrol", "0x01000003"));
+    }
+
     // 通过 Modbus coil 写入接口控制 DO (addr 为 DO 编号 0..N)
+    // LOOP13: write_coil 内部已内化 notify(), 不需要在此显式调用
     let coil_addr = regs::COIL_DO_BASE + addr;
     let _ = crate::bus::backends::write_coil(coil_addr, value);
 

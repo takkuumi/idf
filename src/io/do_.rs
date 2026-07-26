@@ -11,12 +11,12 @@ use crate::hal::Hal;
 use crate::health::{self, TaskHb};
 use crate::sync::MainLoopCell;
 
-/// 输出刷新间隔 (ms) — 细粒度检查, 配合 notify 实现亚 ms 级响应
+/// 输出刷新间隔 (ms) — 配合 notify 实现亚 ms 级响应
 const TICK_MS: u64 = 1;
-/// 最大轮询间隔 (ms) — notify 未触发时也在此时间内刷新
-const MAX_POLL_MS: u64 = 10;
 /// 心跳节流: 每 100ms 上报一次
 const HB_DIV: u32 = 100;
+/// 10s 兜底轮询: 即使 dirty 未触发, 也每 10s 检查一次硬件同步
+const FALLBACK_TICKS: u32 = 100;
 
 static TASK_HB: TaskHb = TaskHb::new("do-output");
 
@@ -36,6 +36,8 @@ pub fn notify() {
 struct DoState {
     last: u64,
     tick_div: u32,
+    /// 主循环 tick 计数器, 用于 10s 兜底定时
+    tick_count: u32,
 }
 
 static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
@@ -46,16 +48,17 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
     DO_STATE.init(DoState {
         last: u64::MAX,
         tick_div: 0,
+        tick_count: 0,
     });
     let _ = _hal;
     log::info!(
-        "[do] output task registered in main_loop (max_poll={}ms, channels={} version {})",
-        MAX_POLL_MS, hw_version::DO_COUNT, hw_version::NAME
+        "[do] output task registered in main_loop (fallback={} ticks version {})",
+        FALLBACK_TICKS, hw_version::NAME
     );
     Ok(())
 }
 
-/// main_loop 每 100ms 调用一次 (事件驱动由 DOChanged 事件触发额外 tick)
+/// main_loop 每 100ms 调用一次 (事件驱动由 notify() 触发额外 tick)
 pub fn tick_do_output(hal: &Hal) {
     let state = match DO_STATE.get_mut() {
         Some(s) => s,
@@ -64,11 +67,15 @@ pub fn tick_do_output(hal: &Hal) {
     TASK_HB.tick();
 
     let dirty = DO_DIRTY.swap(false, Ordering::Acquire);
-    if !dirty {
-        // 100ms 兜底检查 (确保 MAX_POLL_MS 10s 内写一次, 但 100ms 太频繁, 用 10s)
-        // 实际 notify 由 Modbus 写入触发, 100ms poll 已足够
+    state.tick_count = state.tick_count.wrapping_add(1);
+
+    // LOOP13: 两路触发: dirty=事件驱动, tick_count 溢出=10s 兜底
+    // dirty=true 立即写并重置计数器; dirty=false 时若计数器满 100 (10s), 也强制同步一次
+    if !dirty && state.tick_count < FALLBACK_TICKS {
         return;
     }
+    // 进入写路径: 重置计数器 (兜底或 dirty 二选一)
+    state.tick_count = 0;
 
     let bits = crate::bus::IO.do_.load_bits();
     if bits != state.last {
