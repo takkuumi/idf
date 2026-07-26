@@ -269,6 +269,47 @@ fn start_advertising() {
     }
 }
 
+/// LOOP17: 统一的 ADV data 配置入口.
+///
+/// 关键点 (手持机搜不到蓝牙的根因):
+/// - **必须先调 `esp_ble_gap_set_device_name` 再调本函数**. ESP-IDF Bluedroid 在
+///   `btm_ble_build_adv_data` 中从 `btm_cb.cfg.ble_bd_name` 读取设备名放进 ADV 包.
+///   若调用顺序颠倒, ADV 包里名字为空 → metuory `onScanning` 的 `getName()` 返回 null
+///   → `startsWith("m")` 失败 → 设备不在扫描列表.
+/// - **改名后必须重新调本函数**: `esp_ble_gap_set_device_name` 只更新内部 BD name,
+///   不会自动重建已发出的 ADV 包. 必须重新 config_adv_data → ADV_DATA_SET_COMPLETE_EVT
+///   → start_advertising 才能让新名字进入空口.
+/// - **31 字节限制**: flags(3) + 128bit UUID(18) + name(2+len). "Mesh"(4) → 3+18+6=27B 安全.
+///   若用户改名 > 9 字节, Bluedroid 会截断为 `BTM_BLE_AD_TYPE_NAME_SHORT`,
+///   只要首字符仍是 m/M, metuory 过滤仍能命中.
+fn config_adv_data() {
+    let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
+        set_scan_rsp: false,      // LOOP17: 不用 scan_rsp, 名字+UUID 同放 ADV (size=27B<31)
+        include_name: true,       // name 放 ADV data, 兼容所有扫描器 (含旧 startLeScan)
+        include_txpower: false,
+        min_interval: 0i32,
+        max_interval: 0i32,
+        appearance: 0i32,
+        manufacturer_len: 0u16,
+        p_manufacturer_data: core::ptr::null_mut(),
+        service_data_len: 0u16,
+        p_service_data: core::ptr::null_mut(),
+        service_uuid_len: SERVICE_UUID_128.len() as u16,
+        p_service_uuid: SERVICE_UUID_128.as_ptr() as *mut u8,
+        flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
+            | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) as u8,
+    };
+    // config_adv_data 异步: 成功后触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising
+    let ret = unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _) };
+    if ret != 0 {
+        log::error!("[ble_at] config_adv_data failed: 0x{:x}", ret);
+        // 失败时清 ADV_ACTIVE, process_tick 下个周期会重试
+        ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    } else {
+        log::info!("[ble_at] config_adv_data queued (name + UUID + flags)");
+    }
+}
+
 unsafe extern "C" fn gap_event_cb(
     event: esp_idf_sys::esp_gap_ble_cb_event_t,
     param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
@@ -390,34 +431,11 @@ unsafe extern "C" fn gatts_event_cb(
                 log::info!("[ble_at] GATT service started (uuid={})", SERVICE_UUID);
                 // LOOP15: 标记服务已启动, process_tick 据此判定是否需要重试广播
                 SVC_STARTED.store(true, std::sync::atomic::Ordering::Release);
-                // 配置广播数据 (触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising)
-                // 配置广播数据 (ADV) - 包含 name + UUID + flags
-                // 这是最广泛兼容的方案, 所有 BLE 扫描器都能看到
-                // 31字节限制: flags(3) + name(10 含 length/type) + 16字节 UUID(18) = 31 字节 (刚好)
-                let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
-                    set_scan_rsp: false,
-                    include_name: true,  // name 放 ADV data, 兼容所有扫描器
-                    include_txpower: false,
-                    min_interval: 0i32,
-                    max_interval: 0i32,
-                    appearance: 0i32,
-                    manufacturer_len: 0u16,
-                    p_manufacturer_data: core::ptr::null_mut(),
-                    service_data_len: 0u16,
-                    p_service_data: core::ptr::null_mut(),
-                    service_uuid_len: SERVICE_UUID_128.len() as u16,
-                    p_service_uuid: SERVICE_UUID_128.as_ptr() as *mut u8,
-                    flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
-                        | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT)
-                        as u8,
-                };
-                let ret =
-                    unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _) };
-                if ret != 0 {
-                    log::warn!("[ble_at] config_adv_data failed: 0x{:x}", ret);
-                } else {
-                    log::info!("[ble_at] ADV_DATA configured (name + UUID + flags)");
-                }
+                // LOOP17: 配置广播数据 (触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising)
+                // 必须在 set_device_name 之后调用 (start() 已先 set_device_name).
+                // 设备名从 btm_cb.cfg.ble_bd_name 读取, 已在 start() 中通过
+                // esp_ble_gap_set_device_name 设置为 "Mesh" (m 前缀, 匹配 metuory 扫描过滤器).
+                config_adv_data();
             }
         }
         ESP_GATTS_WRITE_EVT => {
@@ -709,10 +727,13 @@ pub fn start() -> AppResult<()> {
 
     // device::init() 已在本函数之前加载配置；广播使用可配置的短名称（最多 8 字节）
     // LOOP11: 零拷贝, 闭包内构造最终 String
-    // LOOP15: 统一 fallback 为 "GW-S3" (与 update_gap_device_name 一致, 避免启动与运行期名字不同)
+    // LOOP17: 统一 fallback 为 "Mesh" (与 system_config.rs 默认值 + update_gap_device_name 一致).
+    //   metuory 1.0.78 SearchDeviceActivity.onScanning 过滤 name.startsWith("m") (忽略大小写),
+    //   非 m 前缀的设备名 (如旧 fallback "GW-S3") 不会出现在扫描列表 → 手持机搜不到蓝牙.
+    //   必须保证任意路径 (NVS 空 / ble_name_str 返回空) 下设备名都以 m/M 开头.
     let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "GW-S3".to_owned());
+        .unwrap_or_else(|| "Mesh".to_owned());
     let name = CString::new(configured_name.as_str())
         .map_err(|_| crate::error::AppError::BleMesh("BLE name contains NUL".into()))?;
     let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(name.as_ptr()) };
@@ -780,15 +801,32 @@ pub fn start() -> AppResult<()> {
 /// AT 命令处理循环
 ///
 /// LOOP7: 写完 BLE 名字后立即同步 GAP 设备名
-/// 不重启广播 — esp_ble_gap_set_device_name 后下次广播自动用新名字
+/// LOOP17: 关键修复 — `esp_ble_gap_set_device_name` 仅更新 controller 内部 BD name,
+/// **不会**自动重建已经发出的 ADV 包. 若不重新 `config_adv_data`, 新名字仍在 BD name
+/// 缓存里但 ADV data 里仍是旧名字 → 手持机用 `device.getName()` 读到旧名 → 改名无效.
+///
+/// 修复: 改名后立即调 `config_adv_data()` 触发 ADV_DATA_SET_COMPLETE_EVT → start_advertising,
+/// 让新名字真正进入空口. 这是 LOOP17 的核心 bug 修复.
 pub fn update_gap_device_name() {
     // LOOP11: 零拷贝, 闭包内返回 String (ble_name_str() 返回 String, 不含借用)
+    // LOOP17: 统一 fallback 为 "Mesh" (与 start() 完全一致), 防止空名导致 metuory 过滤失败.
     let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Mesh".to_owned());
     log::warn!("[ble_at] update_gap_device_name: cfg.ble_name='{}'", configured_name);
     if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
         let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
         log::warn!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
+        if ret == esp_idf_sys::ESP_OK {
+            // 关键: set_device_name 后必须重发 config_adv_data 让新名字进入 ADV 包
+            // 仅在服务已启动时重发, 否则首次启动链仍由 CREAT_ATTR_TAB_EVT 负责
+            if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+                log::info!("[ble_at] re-trigger config_adv_data after rename");
+                // 清 ADV_ACTIVE 触发被动重试逻辑 (避免快速连续 config_adv_data)
+                ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+                config_adv_data();
+            }
+        }
     } else {
         log::warn!("[ble_at] CString::new failed (NUL in name?)");
     }
@@ -826,32 +864,12 @@ pub fn process_tick() {
         }
 
         // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data
+        // LOOP17: 统一使用 config_adv_data() 入口 (与 start/update_gap_device_name 一致)
         if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
             && tick % 50 == 0
         {
             log::warn!("[ble_at] advertising not active, retrying config_adv_data");
-            let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
-                set_scan_rsp: false,
-                include_name: true,
-                include_txpower: false,
-                min_interval: 0i32,
-                max_interval: 0i32,
-                appearance: 0i32,
-                manufacturer_len: 0u16,
-                p_manufacturer_data: core::ptr::null_mut(),
-                service_data_len: 0u16,
-                p_service_data: core::ptr::null_mut(),
-                service_uuid_len: SERVICE_UUID_128.len() as u16,
-                p_service_uuid: SERVICE_UUID_128.as_ptr() as *mut u8,
-                flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
-                    | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) as u8,
-            };
-            let ret = unsafe {
-                esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _)
-            };
-            if ret != 0 {
-                log::warn!("[ble_at] retry config_adv_data failed: 0x{:x}", ret);
-            }
+            config_adv_data();
         }
     }
     // LOOP7: 处理待更新的 GAP 设备名 (Metuory 写完 0x08E2 后)
