@@ -234,6 +234,7 @@ pub mod io_ext {
     // ---- MCP23017 寄存器地址 (Byte mode, IOCON.BANK=0) ----
     pub const REG_IODIRA: u8 = 0x00; // PORTA 方向 (1=输入, 0=输出)
     pub const REG_IODIRB: u8 = 0x01; // PORTB 方向
+    pub const REG_IOCON: u8 = 0x0A;  // 配置寄存器 (BANK=0 模式, LOOP13: 强制写 0x00)
     pub const REG_GPPUA: u8 = 0x0C; // PORTA 上拉 (1=使能)
     pub const REG_GPPUB: u8 = 0x0D; // PORTB 上拉
     pub const REG_GPIOA: u8 = 0x12; // PORTA 数据 (读=输入电平, 写=输出锁存)

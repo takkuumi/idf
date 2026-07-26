@@ -34,7 +34,11 @@ impl Mcp23017 {
     ///
     /// - PORTA + PORTB 全部配置为输入
     /// - 内部上拉使能 (光耦/按钮无外部上拉时必需)
+    /// - LOOP13: 强制 IOCON.BANK=0 (写 0x00), 防止 I2C 噪声翻转后寄存器错位
+    ///         (MCP23017 上电默认 BANK=0, 但 I2C 噪声可能导致意外翻转)
     pub fn init_as_input(&self, bus: &mut I2cBus) -> AppResult<()> {
+        // IOCON (0x0A): 写 0x00 强制 BANK=0, SEQOP=0 (与其他读写寄存器连续访问一致)
+        bus.write_reg_byte(self.addr, cfg::REG_IOCON, 0x00)?;
         // IODIRA = 0xFF, IODIRB = 0xFF (全部输入)
         bus.write_reg_byte(self.addr, cfg::REG_IODIRA, 0xFF)?;
         bus.write_reg_byte(self.addr, cfg::REG_IODIRB, 0xFF)?;
@@ -49,7 +53,10 @@ impl Mcp23017 {
     ///
     /// - PORTA + PORTB 全部配置为输出
     /// - 初始输出 0 (低电平)
+    /// - LOOP13: 强制 IOCON.BANK=0 (防 I2C 噪声翻转后寄存器错位)
     pub fn init_as_output(&self, bus: &mut I2cBus) -> AppResult<()> {
+        // IOCON: 强制 BANK=0
+        bus.write_reg_byte(self.addr, cfg::REG_IOCON, 0x00)?;
         // IODIRA = 0, IODIRB = 0 (全部输出)
         bus.write_reg_byte(self.addr, cfg::REG_IODIRA, 0x00)?;
         bus.write_reg_byte(self.addr, cfg::REG_IODIRB, 0x00)?;
