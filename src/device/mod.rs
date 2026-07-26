@@ -28,6 +28,7 @@
 //! - 兼容旧格式: 若 `proto_act` 不存在但 `proto_data` 存在, 迁移到 A
 
 pub mod system_config;
+pub mod holding_store;
 
 use std::time::Duration;
 
@@ -61,6 +62,10 @@ pub enum DeviceCmd {
     PersistResetCount(u16),
     /// 异步持久化 BLE Mesh net_idx / app_idx 到 NVS
     PersistMeshKeys { net_idx: u16, app_idx: u16 },
+    /// LOOP13: 异步持久化 holding_buf 到 NVS (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
+    PersistHolding,
+    /// LOOP13: 异步持久化 DeviceConfigTable (2300+ 设备配置表) 到 NVS
+    PersistDeviceConfig,
 }
 
 /// DeviceActor: 单线程消费 DeviceCmd, 独占 NVS/commit/reload 状态.
@@ -116,6 +121,18 @@ impl Actor for DeviceActor {
                     Some(Ok(())) => log::debug!("[device] mesh_keys=({net_idx},{app_idx}) persisted"),
                     Some(Err(e)) => log::error!("[device] mesh_keys persist failed: {e}"),
                     None => log::warn!("[device] NVS unavailable, mesh_keys not persisted"),
+                }
+            }
+            DeviceCmd::PersistHolding => {
+                if let Err(e) = holding_store::save_to_nvs() {
+                    log::error!("[device] holding persist failed: {e}");
+                }
+            }
+            DeviceCmd::PersistDeviceConfig => {
+                match crate::bus::config_state::config_read_with(|cs| cs.device_config.save()) {
+                    Some(Ok(())) => log::debug!("[device] device_config persisted"),
+                    Some(Err(e)) => log::error!("[device] device_config persist failed: {e}"),
+                    None => log::warn!("[device] CONFIG unavailable, device_config not persisted"),
                 }
             }
         }
@@ -181,6 +198,13 @@ const NVS_KEY_RESET_CNT: &str = "rst_cnt";
 const NVS_KEY_MESH_NET_IDX: &str = "mesh_nidx";
 /// BLE Mesh app_idx NVS key (配网后由 BLE Mesh 回调写入)
 const NVS_KEY_MESH_APP_IDX: &str = "mesh_aidx";
+
+// LOOP13: DO NVS 持久化 keys
+/// DO 位图 NVS key (blob 8B LE), 与 magic key 配对, magic 不匹配视为首次启动(=0)
+const NVS_KEY_DO_BITS: &str = "do_bits";
+/// DO NVS magic (0xD05D = "DO")
+const NVS_KEY_DO_MAGIC: &str = "do_magic";
+const DO_NVS_MAGIC: u16 = 0xD05D;
 
 /// 协议数据字数 (U16)
 const PROTO_WORDS: usize = 1500;
@@ -274,6 +298,16 @@ pub fn init() -> AppResult<()> {
         use crate::bus::io_global::IO;
 
         proto_status_set(0);
+
+        // LOOP13: 从 NVS 加载 holding_buf (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
+        //         永久丢失的 bug 修复. NVS 不可用时回退全 0.
+        let holding_buf = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+            holding_store::load_from_nvs(nvs)?
+        } else {
+            log::warn!("[device] NVS unavailable, using empty holding_buf");
+            vec![0u16; holding_store::HOLDING_WORDS]
+        };
+
         let snap = StorageSnapshot {
             proto: ProtoStore {
                 data: data.to_vec().into_boxed_slice(),
@@ -283,15 +317,39 @@ pub fn init() -> AppResult<()> {
                 status: 0,
             },
             device_text: device_text.into_boxed_slice(),
-            holding_buf: vec![0u16; 2048].into_boxed_slice(),
+            holding_buf: holding_buf.into_boxed_slice(),
         };
         storage_write(snap);
 
+        // LOOP13: 加载 DeviceConfigTable (2300+ 设备功能配置表).
+        //         修复: load()/save() 已存在但从未被调用, 导致重启后设备配置全丢.
+        let mut device_config = crate::device_config::DeviceConfigTable::default();
+        if LazyLock::force(&NVS).lock().is_some() {
+            if let Err(e) = device_config.load() {
+                log::warn!("[device] device_config load failed: {e}");
+            }
+        } else {
+            log::warn!("[device] NVS unavailable, device_config empty");
+        }
+
         let cs = ConfigSnapshot {
             cfg: cfg.clone(),
-            device_config: Arc::new(crate::device_config::DeviceConfigTable::default()),
+            device_config: Arc::new(device_config),
         };
         config_write(cs);
+
+        // LOOP13: 加载 DO 位图到 IO.do_. 安全优先: init 默认 0 (DO 全断),
+        //         加载后才覆盖为持久值, 上电期间硬件上电保护先于 DO 加载生效.
+        if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+            let do_bits = load_do_bits_from_nvs(nvs);
+            IO.do_.store_bits(do_bits);
+            // 触发 main_loop 立即同步到硬件 (notify 已在 write_coil 内化)
+            #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+            crate::io::do_::notify();
+            log::info!("[device] DO bits loaded: {:#018x}", do_bits);
+        } else {
+            log::warn!("[device] NVS unavailable, DO remains 0");
+        }
 
         // Modbus 读 INREG_FW_VER 走 IO.sys 原子; legacy Bus 既有同步点已退役,
         // 显式把 fw_version 镜像到 IO.sys 确保 RCU 读者与 Modbus 读端一致.
@@ -693,6 +751,85 @@ pub fn request_save_device_text() {
     }
 }
 
+/// LOOP13: 异步持久化 holding_buf (走 Actor mailbox)
+pub fn request_persist_holding() {
+    DEVICE_ACTOR.send(DeviceCmd::PersistHolding);
+}
+
+/// LOOP13: 异步持久化 DeviceConfigTable (2300+ 设备配置表)
+pub fn request_persist_device_config() {
+    DEVICE_ACTOR.send(DeviceCmd::PersistDeviceConfig);
+}
+
+/// LOOP13: 同步加载 DO 位图 (init 调用). NVS 不存在或 magic 错误返回 0.
+fn load_do_bits_from_nvs(nvs: &EspDefaultNvs) -> u64 {
+    let magic = nvs.get_u16(NVS_KEY_DO_MAGIC).ok().flatten().unwrap_or(0);
+    if magic != DO_NVS_MAGIC {
+        log::info!("[device] do_bits magic not found or wrong ({magic:#x}), default 0");
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    let blob = match nvs.get_blob(NVS_KEY_DO_BITS, &mut buf) {
+        Ok(Some(b)) if b.len() == 8 => b,
+        Ok(_) => {
+            log::warn!("[device] do_bits blob missing/wrong size, default 0");
+            return 0;
+        }
+        Err(e) => {
+            log::warn!("[device] do_bits read failed: {e:?}, default 0");
+            return 0;
+        }
+    };
+    u64::from_le_bytes([blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7]])
+}
+
+/// LOOP13: 同步保存 DO 位图到 NVS. main_loop 节流调用 (1s + 值去重).
+pub fn save_do_bits_to_nvs(bits: u64) -> AppResult<()> {
+    let bytes = bits.to_le_bytes();
+    crate::device::try_with_nvs_mut(|nvs| -> AppResult<()> {
+        nvs.set_blob(NVS_KEY_DO_BITS, &bytes)
+            .map_err(|e| AppError::Config(format!("nvs set do_bits: {e:?}")))?;
+        nvs.set_u16(NVS_KEY_DO_MAGIC, DO_NVS_MAGIC)
+            .map_err(|e| AppError::Config(format!("nvs set do_magic: {e:?}")))?;
+        Ok(())
+    })
+    .unwrap_or_else(|| {
+        log::warn!("[device] NVS unavailable, do_bits persist skipped");
+        Ok(())
+    })
+}
+
+/// LOOP13: 节流持久化 DO (main_loop 每 tick 调用, 内部 1s 节流 + 值去重).
+///
+/// `now_ms` 为 monotonic 毫秒数 (`esp_timer_get_time() / 1000`).
+/// - 距上次写 < THROTTLE_MS: 跳过
+/// - DO 位图与上次一致: 跳过 (避免重复写)
+pub fn persist_do_bits_throttled(now_ms: u32) {
+    use crate::bus::io_global::{DO_PERSIST_LAST, DO_PERSIST_LAST_MS};
+    use std::sync::atomic::Ordering;
+
+    const THROTTLE_MS: u32 = 1000;
+
+    let bits = crate::bus::io_global::IO.do_.load_bits();
+    let last_bits = DO_PERSIST_LAST.load_bits();
+    let last_ms = DO_PERSIST_LAST_MS.load(Ordering::Acquire);
+
+    // 1. 节流
+    if now_ms.wrapping_sub(last_ms) < THROTTLE_MS {
+        return;
+    }
+    // 2. 去重
+    if bits == last_bits {
+        return;
+    }
+
+    if save_do_bits_to_nvs(bits).is_ok() {
+        DO_PERSIST_LAST.store_bits(bits);
+        DO_PERSIST_LAST_MS.store(now_ms, Ordering::Release);
+        log::debug!("[device] do_bits {:#018x} persisted (throttled)", bits);
+    }
+}
+
 fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<([u16; PROTO_WORDS], u16, u16)> {
     let data = [0u16; PROTO_WORDS];
 
@@ -824,7 +961,8 @@ fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<([u16; PROTO_WORDS]
 /// CRC32 (IEEE 802.3, 多项式 0xEDB88320)
 ///
 /// 用于 blob 完整性校验。标准实现, 无外部依赖。
-fn crc32(data: &[u8]) -> u32 {
+/// LOOP13: 改为 pub(crate) 供 holding_store 复用同一实现.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
         crc ^= b as u32;

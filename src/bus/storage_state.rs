@@ -15,6 +15,7 @@
 //! - 完全没有锁竞争
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::LazyLock;
 
@@ -96,6 +97,21 @@ where F: FnOnce(&StorageSnapshot) -> R
     STORAGE.read_with(f)
 }
 
+/// holding_buf NVS 持久化 dirty 标志 (LOOP13).
+///
+/// Modbus/AT/NFC 写 holding_buf 后置 true, DeviceActor 异步写入 NVS 后清 false.
+/// 使用独立 AtomicBool 而非在 StorageSnapshot 里加 bool, 原因:
+/// - holding_buf 高频写 (FC=10 一次可改 100 words), 每次 clone 11KB 快照只为翻
+///   1 个 bool 太奢侈
+/// - NFC 仅读不写此标志, RCU 读者 (Modbus FC=03/04) 不需要它, 仅 DeviceActor 使用
+pub static HOLDING_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// DO NVS 持久化 dirty 标志 (LOOP13).
+///
+/// `tick_do_output` 写硬件后同步置 true; main_loop 每 1s 节流检查并写 NVS.
+/// 用于避免 DO 写频次 (~Hz 量级) 过高导致 NVS flash 过写.
+pub static DO_NVS_DIRTY: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +157,7 @@ mod tests {
 // 快照内的 `proto.status` 字段保留 (snapshot.version 兼容), 但其读端改由 `proto_status()`
 // 取最新 atomic 值; 写端通过 `proto_status_set` 落 atomic, 写 snapshot 时同步镜像.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
 
 /// 全局 ProtoStore.status (权威): 0=idle, 1=committing, 2=loading, 3=failed.
 pub static PROTO_STATUS_ATOMIC: AtomicU8 = AtomicU8::new(0);

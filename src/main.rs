@@ -312,6 +312,12 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
         // DO notify 由 modbus 写入触发 (见 bus::backends::write_coil), tick_do_output 在 100ms poll 中调用
         #[cfg(feature = "io-di-do")]
         crate::io::do_::tick_do_output(&hal);
+        // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
+        #[cfg(feature = "io-di-do")]
+        {
+            let now_ms = unsafe { esp_idf_sys::esp_timer_get_time() } as u64 / 1000;
+            crate::device::persist_do_bits_throttled(now_ms as u32);
+        }
 
         // ETH 心跳 (50 tick = 5s, 架构合并 Phase 2: 取消独立 pthread)
         if tick % 50 == 0 {

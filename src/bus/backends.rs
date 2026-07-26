@@ -431,6 +431,8 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         // LOOP11: Arc<DeviceConfigTable> → 用 Arc::make_mut 获取 &mut (COW)
         if Arc::make_mut(&mut cs.device_config).write_reg(addr, value) {
             super::config_state::CONFIG.write(cs);
+            // LOOP13: 触发 device_config NVS 持久化 (修复 store::save() 从未被调用)
+            crate::device::request_persist_device_config();
             return true;
         }
         return false;
@@ -476,6 +478,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                     snap.holding_buf[idx] = value;
                     sync_proto_status(&mut snap);
                     STORAGE.write(snap);
+                    // LOOP13: 标记 holding_buf 已脏, 通知 DeviceActor 异步写 NVS
+                    super::storage_state::HOLDING_DIRTY
+                        .store(true, std::sync::atomic::Ordering::Release);
                     return true;
                 }
                 return false;
@@ -500,6 +505,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
             snap.holding_buf[(regs::HOLD_USER_BASE as usize) + (user_idx as usize)] = value;
             sync_proto_status(&mut snap);
             STORAGE.write(snap);
+            // LOOP13: 标记 holding_buf 已脏
+            super::storage_state::HOLDING_DIRTY
+                .store(true, std::sync::atomic::Ordering::Release);
             return true;
         }
         return false;
@@ -604,4 +612,19 @@ pub fn storage_modify<F: FnOnce(&mut StorageSnapshot)>(f: F) {
     f(&mut snap);
     sync_proto_status(&mut snap);
     STORAGE.write(snap);
+}
+
+/// 修改 holding_buf 数据. 与 `storage_modify` 等价, 但末尾置位 `HOLDING_DIRTY`
+/// 通知 DeviceActor 异步落盘 NVS.
+///
+/// LOOP13: 修复 holding_buf 永久丢失 bug. 在 `write_hold_reg_locked` 写 holding_buf
+/// 的两个分支 (CFG NotFound + CONTROL_PLC user area) 以及 NFC restore 中使用,
+/// 避免 NVS 写路径与业务写入分散.
+pub fn storage_modify_holding<F: FnOnce(&mut Box<[u16]>)>(f: F) {
+    let _guard = RCU_WRITE_LOCK.lock();
+    let mut snap = storage_clone();
+    f(&mut snap.holding_buf);
+    sync_proto_status(&mut snap);
+    STORAGE.write(snap);
+    super::storage_state::HOLDING_DIRTY.store(true, std::sync::atomic::Ordering::Release);
 }
