@@ -24,10 +24,11 @@ pub struct DoState {
 }
 
 
-/// AI 状态 (6 通道: 原始 ADC + 工程量)
+/// AI 状态 (LOOP12: 容量扩至 8 通道, F48=F4 设备需要).
+/// F16 设备只填 0..5 (6 通道), F48/F4 设备填 0..7 (8 通道, 对齐 MCA `REG_A08`).
 pub struct AiState {
-    pub raw: [AtomicU16; 6],
-    pub scaled: [AtomicU16; 6],
+    pub raw: [AtomicU16; 8],
+    pub scaled: [AtomicU16; 8],
 }
 
 /// AO 状态 (4 通道: 工程量 + LEDC duty)
@@ -61,8 +62,8 @@ impl Default for DoState {
 impl Default for AiState {
     fn default() -> Self {
         Self {
-            raw: [const { AtomicU16::new(0) }; 6],
-            scaled: [const { AtomicU16::new(0) }; 6],
+            raw: [const { AtomicU16::new(0) }; 8],
+            scaled: [const { AtomicU16::new(0) }; 8],
         }
     }
 }

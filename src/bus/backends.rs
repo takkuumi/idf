@@ -202,6 +202,20 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             let word_idx = (addr - regs::INREG_SWITCH_STATUS_BASE) as u16;
             crate::udp_multicast::read_switch_status(word_idx)
         }
+        // ---- MONITOR_PLC 别名区 (30001-30128, LOOP12) ----
+        // 老 SCADA 系统通过 FC=04 轮询 3xxxx 区. 映射: 30001-30048→DI 状态, 30049-30056→AI scaled.
+        addr if addr >= regs::MONITOR_PLC_BASE && addr <= regs::MONITOR_PLC_END => {
+            let idx = (addr - regs::MONITOR_PLC_BASE) as usize;
+            if idx < 48 {
+                // DI status (bit 0..47)
+                Some(IO.di.get_bit(idx) as u16)
+            } else if idx < 48 + hw_version::AI_COUNT as usize {
+                // AI scaled channels (0..7)
+                Some(IO.ai.get_scaled(idx - 48))
+            } else {
+                Some(0)
+            }
+        }
         _ => None,
     }
 }
@@ -241,6 +255,22 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
             return storage_read_with(|s| s.holding_buf[idx]);
         }
         return Some(0);
+    }
+    // ---- CONTROL_PLC 别名区 (40001-40300, LOOP12) ----
+    // 老 SCADA 通过 FC=03 读 4xxxx 区. 映射: 40001-40048→DO 状态, 40049+→HOLD_USER_BASE 区.
+    if addr >= regs::CONTROL_PLC_BASE && addr <= regs::CONTROL_PLC_END {
+        let idx = (addr - regs::CONTROL_PLC_BASE) as usize;
+        return if idx < 48 {
+            // DO status (bit 0..47)
+            Some(IO.do_.get_bit(idx) as u16)
+        } else {
+            let user_idx = (idx - 48) as u16;
+            if user_idx < regs::HOLD_USER_COUNT {
+                storage_read_with(|s| s.holding_buf[(regs::HOLD_USER_BASE as usize) + (user_idx as usize)])
+            } else {
+                Some(0)
+            }
+        };
     }
     // 3. PROTO 区 (0x4000..<PROTO_END): 来自 STORAGE.proto
     if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
@@ -301,6 +331,41 @@ mod tests {
         assert!(place.is_some(), "FC=03 读取 PLACE base 0x089D 必须返回 Some");
         let hwver = read_hold_reg(regs::HOLD_HW_VER);
         assert!(hwver.is_some(), "FC=03 读取 HW_VER 0x08A5 必须返回 Some");
+    }
+
+    // ---- LOOP12 回归测试 ----
+
+    /// PLC 别名区: MONITOR_PLC (30001-30128) 通过 FC=04 应返回 Some (DI 状态, 初始 0)
+    #[test]
+    fn test_monitor_plc_readable_via_fc04() {
+        let v = read_input_reg(regs::MONITOR_PLC_BASE);
+        assert!(v.is_some(), "FC=04 读取 MONITOR_PLC_BASE 0x7531 必须返回 Some");
+        // 越界边界: 30128 = MONITOR_PLC_END
+        let v_end = read_input_reg(regs::MONITOR_PLC_END);
+        assert!(v_end.is_some(), "FC=04 读取 MONITOR_PLC_END 0x75B0 必须返回 Some");
+        // 越界地址: 30129 = MONITOR_PLC_END + 1
+        let v_oob = read_input_reg(regs::MONITOR_PLC_END + 1);
+        assert!(v_oob.is_none(), "FC=04 读取越界 0x75B1 必须返回 None");
+    }
+
+    /// PLC 别名区: CONTROL_PLC (40001-40300) 通过 FC=03 应返回 Some (DO 状态, 初始 0)
+    #[test]
+    fn test_control_plc_readable_via_fc03() {
+        let v = read_hold_reg(regs::CONTROL_PLC_BASE);
+        assert!(v.is_some(), "FC=03 读取 CONTROL_PLC_BASE 0x9C41 必须返回 Some");
+        // 越界边界: 40300 = CONTROL_PLC_END
+        let v_end = read_hold_reg(regs::CONTROL_PLC_END);
+        assert!(v_end.is_some(), "FC=03 读取 CONTROL_PLC_END 0x9D6C 必须返回 Some");
+        // 越界地址: 40301
+        let v_oob = read_hold_reg(regs::CONTROL_PLC_END + 1);
+        assert!(v_oob.is_none(), "FC=03 读取越界 0x9D6D 必须返回 None");
+    }
+
+    /// FUNC_COUNT 寄存器 (0x08FC) 必须通过 FC=03 读取, 用于 0xB0 BLE arm
+    #[test]
+    fn test_func_count_via_fc03() {
+        let v = read_hold_reg(regs::FUNC_COUNT);
+        assert!(v.is_some(), "FC=03 读取 FUNC_COUNT 0x08FC 必须返回 Some");
     }
 }
 
@@ -416,6 +481,25 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 return false;
             }
         }
+    }
+    // ---- CONTROL_PLC 别名区 (40001-40300, LOOP12) ----
+    // 老 SCADA FC=06/10 写入 4xxxx. 映射: 40001-40048→DO 状态, 40049+→HOLD_USER_BASE 区.
+    if addr >= regs::CONTROL_PLC_BASE && addr <= regs::CONTROL_PLC_END {
+        let idx = (addr - regs::CONTROL_PLC_BASE) as usize;
+        if idx < 48 {
+            // DO bit write
+            super::io_global::IO.do_.set_bit(idx, value != 0);
+            return true;
+        }
+        let user_idx = (idx - 48) as u16;
+        if user_idx < regs::HOLD_USER_COUNT {
+            let mut snap = storage_clone();
+            snap.holding_buf[(regs::HOLD_USER_BASE as usize) + (user_idx as usize)] = value;
+            sync_proto_status(&mut snap);
+            STORAGE.write(snap);
+            return true;
+        }
+        return false;
     } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
         let mut snap = storage_clone();
         let idx = (addr - regs::PROTO_BASE) as usize;

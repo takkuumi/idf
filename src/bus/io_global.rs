@@ -37,8 +37,12 @@ impl IoBundle {
                     std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),
+                    std::sync::atomic::AtomicU16::new(0),
+                    std::sync::atomic::AtomicU16::new(0),
                 ],
                 scaled: [
+                    std::sync::atomic::AtomicU16::new(0),
+                    std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),

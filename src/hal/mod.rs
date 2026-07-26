@@ -33,9 +33,10 @@ pub mod i2c_bus;
 pub mod mcp23017;
 #[cfg(any(feature = "f3", feature = "f4"))]
 pub mod io_ext;
-/// Software I2C + PCA9555 (default version: 8 DI + 8 DO via NCA9555)
-#[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
+/// Software I2C bit-bang (LOOP12: 任何 feature 下都需保留, 因为 NFC ST25DV64KC
+/// 通过 bit-bang 访问 LED/IO 总线引脚, 不依赖硬件 I2C0).
 pub mod sw_i2c;
+/// PCA9555 IO 扩展芯片驱动 (默认版本 8 DI + 8 DO, F3/F4 走 MCP23017)
 #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
 pub mod pca9555;
 

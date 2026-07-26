@@ -155,7 +155,10 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 9) IP 事件 watch
     spawn_ip_watch(eth_handle)?;
 
-    // 10) 心跳任务
+    // 10) 链路事件 watch — LOOP12: 实时检测拔线 (DHCP lease 过期前数小时内 IP 不归零)
+    spawn_eth_link_watch(eth_handle)?;
+
+    // 11) 心跳任务
     spawn_heartbeat()?;
 
     log::info!("[eth] W5500 startup complete");
@@ -304,6 +307,59 @@ fn fmt_ip(addr: &u32) -> heapless::String<15> {
     s
 }
 
+// ---- ETH 链路事件 watch ----
+//
+// LOOP12: 原 heartbeat_once() 仅查 `ip != 0`, 但 LwIP 在 DHCP lease 到期前 (默认数小时)
+// 都保留非零 IP, 拔线后检测延迟可达数小时. 改为订阅 ETH_EVENT 的 CONNECTED/DISCONNECTED,
+// 用 AtomicBool 缓存链路状态; heartbeat_once 顶部优先查 link, link down 直接 false.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 链路状态缓存 (true = 已连接). 由 eth_event_cb 维护, heartbeat_once 读取.
+/// 启动时假定为 true, 避免首次 IP 分配前误报 fail (后续事件会修正).
+static ETH_LINK_UP: AtomicBool = AtomicBool::new(true);
+
+fn spawn_eth_link_watch(_eth_handle: esp_idf_sys::esp_eth_handle_t) -> AppResult<()> {
+    let base = unsafe { esp_idf_sys::ETH_EVENT };
+    check(unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            base,
+            esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32,
+            Some(eth_event_cb),
+            std::ptr::null_mut(),
+        )
+    }, "esp_event_handler_register(ETHERNET_EVENT_CONNECTED)")?;
+    check(unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            base,
+            esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32,
+            Some(eth_event_cb),
+            std::ptr::null_mut(),
+        )
+    }, "esp_event_handler_register(ETHERNET_EVENT_DISCONNECTED)")?;
+    log::info!("[eth] ETH_EVENT CONNECTED/DISCONNECTED handlers registered");
+    Ok(())
+}
+
+extern "C" fn eth_event_cb(
+    _arg: *mut c_void,
+    _event_base: esp_idf_sys::esp_event_base_t,
+    event_id: i32,
+    _event_data: *mut c_void,
+) {
+    // 极简: 仅翻转 AtomicBool, 重活由 heartbeat tick 在 main_loop 内处理.
+    // sys_evt 任务栈仅 2KB, 不能在这里做重活.
+    let connected = event_id == esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32;
+    let disconnected = event_id == esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32;
+    if connected {
+        ETH_LINK_UP.store(true, Ordering::Release);
+        log::info!("[eth] link UP (ETHERNET_EVENT_CONNECTED)");
+    } else if disconnected {
+        ETH_LINK_UP.store(false, Ordering::Release);
+        log::warn!("[eth] link DOWN (ETHERNET_EVENT_DISCONNECTED)");
+    }
+}
+
 // ---- 心跳任务：每 5s 检测网关连通性；连续失败 >= 3 次触发 esp_restart ----
 // 架构改造 Phase 2: eth-heartbeat 合并到 main_loop
 // 状态用 MainLoopCell 保护 (单线程访问, 零开销)
@@ -357,13 +413,18 @@ pub fn tick_eth_heartbeat() {
 
 /// LOOP8: 真实心跳检测 — 检查以太网 netif 是否有 IP 地址
 ///
-/// 通过 `esp_netif_get_ip_info` 读取当前 netif 的 IP 配置:
-/// - IP != 0.0.0.0 → 链路正常 (true)
-/// - IP == 0.0.0.0 → 无 IP 分配, 链路故障或 DHCP 未完成 (false)
+/// LOOP12: 优先检查 PHY 链路状态 (ETH_EVENT_DISCONNECTED 触发后立即报 failure),
+/// 再回退到 IP 检测; 两者任一为 false 均报告链路故障.
 ///
-/// 注意: 这不是 ICMP ping (ESP-IDF 标准 API 没有简单 ping 接口),
-/// 但 IP 存在性是链路可用的最低要求, 足以检测网线拔出 / DHCP 失败等场景.
+/// 注意: DHCP lease 过期前 (默认数小时) LwIP 仍返回非零 IP,
+/// 故仅查 `ip != 0` 无法及时检测拔线; 现在 PHY 层事件才是主要信号.
 fn heartbeat_once() -> bool {
+    // 优先查 PHY 链路状态 — ETH_EVENT_DISCONNECTED → false (拔线秒级检测)
+    if !ETH_LINK_UP.load(Ordering::Acquire) {
+        log::debug!("[eth-heartbeat] link DOWN (PHY disconnected)");
+        return false;
+    }
+
     let netif = unsafe { esp_idf_sys::esp_netif_get_handle_from_ifkey(b"ETH_DEF\x00".as_ptr()) };
     if netif.is_null() {
         log::debug!("[eth-heartbeat] netif not found");
@@ -377,7 +438,7 @@ fn heartbeat_once() -> bool {
     }
     let ip = ip_info.ip.addr;
     if ip == 0 {
-        log::debug!("[eth-heartbeat] no IP assigned (link down or DHCP pending)");
+        log::debug!("[eth-heartbeat] no IP assigned (link up but DHCP pending)");
         return false;
     }
     true

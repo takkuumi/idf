@@ -22,8 +22,8 @@
 //!    - 记录 8: 设备型号
 //!    - 记录 9: 固件版本 (V2.2.1.1557)
 //!
-//! 2. **二进制配置快照** (Area 2, 0x0120..=0x07FF = 1760 字节):
-//!    - `isModify=1` (backup): holding_buf → NFC EEPROM
+//! 2. **二进制配置快照** (Area 2, 0x0120..=0x1FFF = 7648 字节, LOOP12 扩容):
+//!    - `isModify=1` (backup): holding_buf → NFC EEPROM (实际写 4096B)
 //!    - `isModify=2` (restore): NFC EEPROM → holding_buf
 //!
 //! ## 启动时机
@@ -103,8 +103,12 @@ const REG_I2C_SSO: u16 = 0x0908;
 
 /// 用户内存 NDEF 区结束地址 (Area 1)
 const NDEF_TEXT_END: u16 = 0x011F;
-/// 用户内存结束地址 (ST25DV64KC: 0x07FF)
-const MEMORY_END: u16 = 0x07FF;
+/// 用户内存结束地址 (ST25DV64KC: 0x1FFF, 8KB 全用户区)
+///
+/// LOOP12: 原 MCA 遗留值 0x07FF (仅 2KB), 现改为 0x1FFF 释放 6KB 余量.
+/// 备份容量: 880 words → 3824 words, 完全覆盖 holding_buf 2048 words.
+/// 写入耗时: 4096B / 30B-chunk / 6ms ≈ 0.82s, 在 5s 轮询窗口内.
+const MEMORY_END: u16 = 0x1FFF;
 /// 每次 I2C 读写最大字节数 (对齐参考固件 RFID_READ_NUMBER=30)
 const RFID_CHUNK: usize = 30;
 
@@ -116,8 +120,8 @@ const NFC_BLOB_MAGIC: u16 = 0xDEED;
 /// NFC 备份数据 version
 const NFC_BLOB_VERSION: u16 = 1;
 /// NFC 备份有效区域大小
-/// MCA: ADDRESS_MEMORY_END - ADDRESS_NDEFTEXT_END - 1 = 0x07FF - 0x011F = 1760 字节
-const NFC_BLOB_DATA_BYTES: usize = (MEMORY_END - NDEF_TEXT_END) as usize; // 1760
+/// LOOP12: 0x1FFF - 0x011F = 7648 字节 (380% ↑, 容量足以覆盖 4096B holding_buf)
+const NFC_BLOB_DATA_BYTES: usize = (MEMORY_END - NDEF_TEXT_END) as usize; // 7648
 /// NFC 备份头部大小: magic(2) + version(2) + crc32(4) = 8 字节
 const NFC_HEADER_BYTES: usize = 8;
 
@@ -489,14 +493,19 @@ fn nfc_loop() {
 
         match (header, regbuf) {
             (Some(h), Some(rb)) if h.is_valid() => {
-                // 校验 CRC — LOOP9: 栈数组替代 vec![] (1760B, 8KB 栈足够)
-                let mut data_buf = [0u8; NFC_BLOB_DATA_BYTES];
+                // 校验 CRC
+                // LOOP12: NFC_BLOB_DATA_BYTES=7648, 8KB 栈不够直接装数组,
+                // 改为只读 holding_buf 实际长度 (max 4096B) 以对齐 EEPROM 写入
+                let max_bytes = NFC_BLOB_DATA_BYTES.min(rb.len() * 2);
+                let mut data_buf = vec![0u8; max_bytes];
                 match dev.read_eeprom(NDEF_TEXT_END + 1 + NFC_HEADER_BYTES as u16, &mut data_buf) {
                     Ok(_) => {
                         let calc_crc = crc32(&data_buf);
                         if calc_crc == h.crc32 {
-                            // 比较 holding_buf 与 NFC 数据 — LOOP9: 栈数组替代 Vec
-                            let mut nfc_words = [0u16; NFC_BLOB_DATA_WORDS];
+                            // 比较 holding_buf 与 NFC 数据 — LOOP12: NFC_BLOB_DATA_WORDS=3824,
+                            // 8KB 栈放不下, 改为 Box<[u16]> (一次性 alloc, 5s 一次轮询开销可忽略)
+                            let n_words = max_bytes / 2;
+                            let mut nfc_words: Box<[u16]> = vec![0u16; n_words].into_boxed_slice();
                             bytes_to_words(&data_buf, &mut nfc_words);
                             if regbuf_equal(rb, &nfc_words) {
                                 log::debug!("[nfc] snapshot matches, no sync needed");
@@ -550,9 +559,11 @@ fn nfc_loop() {
 /// 然后分批写入 (RFID_READ_NUMBER=30 字节/次)
 fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
     // 1. 把 holding_buf 转为字节 (LE, 与 MCA PRegBuf 内存布局一致)
-    //    LOOP9: 栈数组替代 vec![] (1760B, 8KB 栈足够), 避免 pthread 堆分配
-    let mut data = [0u8; NFC_BLOB_DATA_BYTES];
+    //    LOOP12: NFC_BLOB_DATA_BYTES=7648, 8KB 栈放不下栈数组, 改为 Vec
+    //    实际数据量: words = min(3824, 2048) = 2048 words = 4096 bytes
     let words = NFC_BLOB_DATA_WORDS.min(holding_buf.len());
+    let data_len = words * 2;
+    let mut data = vec![0u8; data_len];
     for i in 0..words {
         data[i * 2] = (holding_buf[i] & 0xFF) as u8;
         data[i * 2 + 1] = (holding_buf[i] >> 8) as u8;
@@ -575,8 +586,8 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
 
     // 4. 分批写数据 (RFID_CHUNK=30 字节/次, 对齐参考固件)
     let base = NDEF_TEXT_END + 1 + NFC_HEADER_BYTES as u16;
-    for chunk_start in (0..NFC_BLOB_DATA_BYTES).step_by(RFID_CHUNK) {
-        let chunk_end = (chunk_start + RFID_CHUNK).min(NFC_BLOB_DATA_BYTES);
+    for chunk_start in (0..data_len).step_by(RFID_CHUNK) {
+        let chunk_end = (chunk_start + RFID_CHUNK).min(data_len);
         let chunk = &data[chunk_start..chunk_end];
         if dev
             .write_eeprom(base + chunk_start as u16, chunk)
@@ -594,7 +605,7 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16]) {
 
     log::info!(
         "[nfc] backup complete: {} bytes, CRC=0x{:08X}",
-        NFC_BLOB_DATA_BYTES,
+        data_len,
         crc
     );
 }
@@ -644,7 +655,8 @@ fn bytes_to_words(data: &[u8], out: &mut [u16]) {
 /// 比较 holding_buf 与 NFC 备份数据是否一致 (仅比较 NFC 覆盖的前 N words)
 ///
 /// LOOP9: 旧实现 `a.len() == b.len()` 恒 false (holding_buf=2048 vs nfc=880),
-/// 导致每次轮询都触发不必要的 restore。改为比较前 min(len) 个 word。
+/// 改为比较前 min(len) 个 word。
+/// LOOP12: NFC 扩容后 holding_buf=2048 == nfc 备份前 2048 words, 行为不变但不再需要保留长度差异.
 fn regbuf_equal(a: &[u16], b: &[u16]) -> bool {
     let n = a.len().min(b.len());
     a[..n].iter().zip(b[..n].iter()).all(|(x, y)| x == y)
@@ -682,9 +694,10 @@ mod tests {
         assert_eq!(NFC_BLOB_MAGIC, 0xDEED);
         assert_eq!(NFC_BLOB_VERSION, 1);
         assert_eq!(NDEF_TEXT_END, 0x011F);
-        assert_eq!(MEMORY_END, 0x07FF);
-        // 与 MCA 一致: 0x07FF - 0x011F = 1760
-        assert_eq!(NFC_BLOB_DATA_BYTES, 1760);
+        assert_eq!(MEMORY_END, 0x1FFF);
+        // LOOP12: 0x1FFF - 0x011F = 7648 字节 (扩容 4×, 覆盖 holding_buf 4096B)
+        assert_eq!(NFC_BLOB_DATA_BYTES, 7648);
+        assert_eq!(NFC_BLOB_DATA_WORDS, 3824);
         assert_eq!(NFC_HEADER_BYTES, 8);
     }
 
@@ -746,7 +759,7 @@ mod tests {
         // LOOP9: regbuf_equal 比较前 min(len) 个 word (不再要求长度完全一致)
         assert!(regbuf_equal(&[1, 2, 3], &[1, 2, 3]));
         assert!(!regbuf_equal(&[1, 2, 3], &[1, 2, 4]));
-        // 短数组是长数组前缀 → 相等 (NFC 880 words vs holding_buf 2048 words 场景)
+        // 短数组是长数组前缀 → 相等 (NFC backing up holding_buf[0..2048], regbuf is holding_buf)
         assert!(regbuf_equal(&[1, 2], &[1, 2, 3]));
         // 完全不同长度
         assert!(!regbuf_equal(&[1, 2, 3], &[9, 2, 3]));

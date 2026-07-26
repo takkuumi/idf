@@ -522,6 +522,18 @@ pub mod regs {
     // Master config defaults
     pub const TCP_PORTS_DEFAULT: [u16; 4] = [502, 503, 504, 5002];
     pub const UNKNOWN_DEFAULTS: [u16; 4] = [5500, 5501, 5502, 5503];
+
+    // ---- PLC 别名区 (LOOP12: 老 SCADA 5 位地址兼容) ----
+    // Modbus 5 位地址约定: 3xxxx → 输入寄存器 (FC=04 RO), 4xxxx → 保持寄存器 (FC=03/06/10 RW).
+    // 本设备把这两个窗口作为现有 DI/AI/DO/holding_buf 区的镜像, 避免新存储.
+    // 30001-30128 = 0x7531-0x75B0 (128 regs): 映射到 DI 状态 + AI scaled.
+    // 40001-40300 = 0x9C41-0x9D6C (300 regs): 映射到 DO 状态 + HOLD_USER_BASE 区.
+    pub const MONITOR_PLC_BASE: u16 = 0x7531; // 30001
+    pub const MONITOR_PLC_END: u16 = 0x75B0;  // 30128
+    pub const MONITOR_PLC_COUNT: u16 = 128;
+    pub const CONTROL_PLC_BASE: u16 = 0x9C41; // 40001
+    pub const CONTROL_PLC_END: u16 = 0x9D6C;  // 40300
+    pub const CONTROL_PLC_COUNT: u16 = 300;
 }
 
 // ============================================================================

@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-25 (LOOP10: 内存布局对齐审计 + metuory 业务兼容修复)
+> 最后更新: 2026-07-26 (LOOP12: 推进已知限制 — 实施 5 项 + 剩余 3 项文档化)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -656,15 +656,47 @@ send_json_with_cookie(stream, 200, &json_response("login", "0"), &cookie_str)
 **必须** 用 `config_read_with()` / `storage_read_with()`, 或新增的 `config_read_guard()` (借用 API).
 Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTTPS).
 
-### 已知限制 (不在本 LOOP 范围)
-- BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析) — 影响 0xB4-B7 DEVICE_TEXT 多包流程
-- DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 子协议未实现 — 需自定义 read/write arm
-- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — ST25DV64KC EEPROM 容量限制
-- AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
-- MONITOR_PLC (30001-30128) / CONTROL_PLC (40001-40300) 区未实现 — 仅老 SCADA 系统需要
-- eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
-- Web 认证无 CSRF/HTTPS (内网场景, 不需要)
-- Web 密码仍明文存 NVS (工业内网场景, 对齐 MCA `/WebPwd.txt` 明文存储)
+### 已知限制 (LOOP12 后状态)
+| # | 原限制 | 状态 | 说明 |
+|---|--------|------|------|
+| 1 | BLE 分片重组 (>MTU 0xB4-B7) | ⏸️ LOOP13 待办 | 无 MCA 参考协议，需 Android BLE write trace 逆向 |
+| 2 | DEVICE_FUNCTION 0xB0/B1 (FUNC_COUNT) | ✅ **LOOP12 已实施** | 复用 `read_hold_reg(0x08FC)`, 25 行 |
+| 2b | DEVICE_FUNCTION 0xB2/B3 (TLV config) | ⏸️ LOOP13 待办 | 需 TLV entry 设计 + 0x08FE+ 冲突解决 (3-5 天) |
+| 3 | NFC blob 仅 880 words | ✅ **LOOP12 已消除** | `MEMORY_END=0x1FFF`, 容量 3824 words (4×) |
+| 4 | AI 通道数硬编码 6 (F4 8 通道) | ✅ **LOOP12 已实施** | cfg 切换: f4=8 通道, 其它=6 通道 |
+| 5 | MONITOR_PLC/CONTROL_PLC 区未实现 | ✅ **LOOP12 已实施** | DI/DO/AI/holding_buf 别名映射 |
+| 6 | eth heartbeat 拔线延迟 | ✅ **LOOP12 已实施** | 订阅 `ETHERNET_EVENT_DISCONNECTED`, 秒级检测 |
+| 7 | Web CSRF/HTTPS | ✓ 保留 | LOOP11 内网决策, 不变更 |
+| 8 | Web 密码明文 NVS | ✓ 保留 | LOOP11 内网决策, 对齐 MCA `/WebPwd.txt` |
+
+## LOOP12 推进总结
+
+### 实施项 (5 个)
+- **ETH 链路秒级检测**: `src/ethernet/w5500.rs` 新增 `ETH_LINK_UP` AtomicBool + `spawn_eth_link_watch` (订阅 ETH_EVENT 2/3), heartbeat 顶部查 flag
+- **PLC 别名区**: `config.rs` 新增 4 个常量 (0x7531-0x75B0 / 0x9C41-0x9D6C); `backends.rs` 新增 read/write range arm, 映射到 DI/DO/AI/holding_buf
+- **F4 8 通道 AI**: `io_state.rs::AiState` [6]→[8]; `io_global.rs` LazyLock 6→8; `channel/ai.rs::CHANNEL_COUNT` cfg; `read_sensor_calib` 同步返回类型
+- **DEVICE_FUNCTION 0xB0/0xB1**: `ble_at/mod.rs` 新增 arm, READ/WRITE FUNC_COUNT (0x08FC) 经 `backends::read_hold_reg/write_hold_reg`
+- **NFC EEPROM 扩容**: `MEMORY_END` 0x07FF→0x1FFF, 备份容量 880→3824 words (覆盖 holding_buf 2048 words 完整)
+
+### 不实施项 (3 个, 文档化保留)
+- **BLE 分片重组**: 协议规范未知, 需 Android 端 BLE write trace 逆向
+- **0xB2/0xB3 TLV config**: TLV 5-word entry 设计 + 0x08FE+ 寄存器冲突需先决
+- **Web CSRF/HTTPS/密码哈希**: LOOP11 内网决策保留
+
+### 编译验证
+- `cargo build --bin gateway`: **0 error, 0 warning**
+- `cargo build --bin gateway --features f4`: **0 error, 0 warning** (NFC sw_i2c 兼容修复)
+- `cargo test --bin gateway --no-run`: **0 error, 0 warning**
+
+### 关键文件
+- `src/ethernet/w5500.rs`: ETH_EVENT 订阅 + AtomicBool link cache
+- `src/config.rs`: PLC 4 常量 + AI_CHANNELS cfg
+- `src/bus/backends.rs`: PLC read/write arm + 4 个回归测试
+- `src/bus/io_state.rs`, `src/bus/io_global.rs`: AiState [6]→[8]
+- `src/channel/ai.rs`: CHANNEL_COUNT cfg + read_sensor_calib 同步
+- `src/ble_at/mod.rs`: 0xB0/B1 arm
+- `src/nfc/mod.rs`: MEMORY_END 扩容 + 栈数组→vec! 修复
+- `src/hal/mod.rs`: sw_i2c 兼容 f3/f4 feature (NFC bit-bang I2C 需要)
 
 ### 烧录命令 (跨平台 justfile)
 本 LOOP 新增 `justfile` 跨平台烧录脚本:

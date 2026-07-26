@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::LazyLock;
 
 use crate::sync::Spin;
+use crate::config::regs;
 
 use crate::error::AppResult;
 use crate::modbus::shared::modbus_crc16;
@@ -1091,6 +1092,29 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         if handle_ble_android_read_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit) {
             return true;
         }
+    }
+    // ---- DEVICE_FUNCTION_COUNT (LOOP12: 0xB0/0xB1, 映射到 Modbus 0x08FC) ----
+    // Android 1.0.78 通过自定义 opcodes 读写 FUNC_COUNT 寄存器, 走自定义子协议不走 Modbus FC.
+    // 原 fall through 路径把 0xB0 当作 Modbus FC=176 (illegal function), Android 报 "无自定义功能".
+    if func == 0xB0 || func == 0xB1 {
+        let mut rsp: heapless::Vec<u8, 32> = heapless::Vec::new();
+        let _ = rsp.push(unit);
+        let _ = rsp.push(func);
+        if func == 0xB0 {
+            // READ 0x08FC
+            let val = crate::bus::backends::read_hold_reg(regs::FUNC_COUNT).unwrap_or(0);
+            let _ = rsp.extend_from_slice(&val.to_be_bytes());
+        } else {
+            // WRITE 0x08FC: data[8..10] = 16-bit BE value
+            if data.len() < 10 {
+                return false;
+            }
+            let val = u16::from_be_bytes([data[8], data[9]]);
+            let _ = crate::bus::backends::write_hold_reg(regs::FUNC_COUNT, val);
+            // WRITE 应答: 不带数据
+        }
+        send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+        return true;
     }
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息

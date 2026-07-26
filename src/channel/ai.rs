@@ -21,8 +21,13 @@ const SAMPLE_PERIOD_MS: u64 = 100;
 const AVG_WINDOW: usize = 8;
 /// 位移数 (log2(AVG_WINDOW))
 const AVG_SHIFT: u32 = 3;
-/// AI 通道数
-const CHANNEL_COUNT: usize = 6;
+/// AI 通道数 (LOOP12: F4/F48 设备 8 通道, F16/F3 保持 6 通道).
+/// 物理 ADC 仍只采集 6 路 (ESP32-S3 ADC1_CH0..5), F4 模式下 ch[6]/ch[7] 由软件填 0.
+/// 未来硬件扩展 (MCP3424 ADC2) 真正补齐 8 路硬件采样时, 只需替换 hal/adc.rs 的 DMA buffer.
+#[cfg(feature = "f4")]
+pub const CHANNEL_COUNT: usize = 8;
+#[cfg(not(feature = "f4"))]
+pub const CHANNEL_COUNT: usize = 6;
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("ai-sample");
@@ -73,7 +78,11 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     let sensor_max = read_sensor_calib(false);
 
     for ch in 0..CHANNEL_COUNT {
-        let raw: u16 = raws[ch];
+        let raw: u16 = if ch < raws.len() {
+            raws[ch]
+        } else {
+            0 // F4/F48 设备 ch6/ch7: 硬件暂未接线, 返回 0 (后续扩展 HAL 驱动时替换)
+        };
         state.buf[ch][state.pos % AVG_WINDOW] = raw;
         let sum: u32 = state.buf[ch].iter().map(|&v| v as u32).sum();
         let avg = if state.filled >= AVG_WINDOW {
@@ -99,11 +108,11 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     crate::bus::send_event(crate::bus::IoEvent::AiSampled);
 }
 
-/// 读取 SENSOR_MIN/MAX 校准值数组 (8 通道, 对齐 HOLD_SENSOR_MIN/MAX_BASE)
+/// 读取 SENSOR_MIN/MAX 校准值数组 (LOOP12: 返回 [u16; CHANNEL_COUNT] 同步 cfg 切换).
 ///
-/// 返回 [u16; 6] (仅取前 6 通道, 与 CHANNEL_COUNT 一致).
+/// F4 设备返回 8 个值, F16/F3 设备返回 6 个值, 对齐 HOLD_SENSOR_MIN/MAX_BASE 区长度.
 /// LOOP9: 校准值由 calib::run_auto_calibration 写入 holding_buf (2280..2288 / 2288..2296).
-fn read_sensor_calib(is_min: bool) -> [u16; 6] {
+fn read_sensor_calib(is_min: bool) -> [u16; CHANNEL_COUNT] {
     use crate::config::regs;
     let base = if is_min {
         regs::HOLD_SENSOR_MIN_BASE
@@ -111,10 +120,10 @@ fn read_sensor_calib(is_min: bool) -> [u16; 6] {
         regs::HOLD_SENSOR_MAX_BASE
     };
     // LOOP11: 零拷贝 (避免 AI 高频采样时 storage_read() 触发 Box alloc)
-    let mut out = [0u16; 6];
+    let mut out = [0u16; CHANNEL_COUNT];
     let idx_base = (base as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
     crate::bus::storage_state::storage_read_with(|snap| {
-        for ch in 0..6 {
+        for ch in 0..CHANNEL_COUNT {
             let i = idx_base + ch;
             if i < snap.holding_buf.len() {
                 out[ch] = snap.holding_buf[i];
