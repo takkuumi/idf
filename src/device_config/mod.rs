@@ -134,7 +134,14 @@ impl DeviceConfigTable {
                     }
                     2 => entry.reg_addr = value,
                     3 => entry.reg_count = value,
-                    4 => { /* param count — resize handled elsewhere */ }
+                    4 => {
+                        // 参数数量字段同时调整 params 长度，后续 params 写入才不会被静默丢弃.
+                        let wanted = (value as usize).min(32);
+                        entry.params.truncate(wanted);
+                        while entry.params.len() < wanted {
+                            let _ = entry.params.push(0);
+                        }
+                    }
                     _ => {
                         let pi = i - 5;
                         if pi < entry.params.len() {

@@ -17,7 +17,8 @@ pub fn load(table: &mut DeviceConfigTable) -> AppResult<()> {
     if magic != MAGIC { return Ok(()); }
 
     let mut pos = 4;
-    while pos + 5 <= len {
+    // 严格边界: 每个条目固定头部 6B (dev_type/port/slave_id/func/reg_addr_lo/reg_addr_hi)
+    while pos + 6 <= len {
         let dev_type = super::types::DeviceType::from_u8(buf[pos]);
         let rs485_port = buf[pos + 1];
         let slave_id = buf[pos + 2];
@@ -62,7 +63,9 @@ pub fn save(table: &DeviceConfigTable) -> AppResult<()> {
     buf[pos] = ((MAGIC >> 24) & 0xFF) as u8; pos += 1;
 
     for entry in &table.devices {
-        if pos + 8 > buf.len() { break; }
+        // 最小条目大小: dev_type(1) + port(1) + slave_id(1) + func(1)
+        //              + reg_addr(2) + reg_count(2) + param_count(1) = 9B
+        if pos + 9 > buf.len() { break; }
         buf[pos] = entry.dev_type.as_u8(); pos += 1;
         buf[pos] = entry.rs485_port; pos += 1;
         buf[pos] = entry.slave_id; pos += 1;

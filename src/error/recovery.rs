@@ -15,7 +15,7 @@
 //! | Severe | 延迟重启 | NVS 损坏、OTA 失败 |
 //! | Fatal | 立即重启 | panic、内存耗尽 |
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use std::sync::LazyLock;
@@ -63,6 +63,8 @@ static LAST_SEVERE_MS: AtomicU32 = AtomicU32::new(0);
 
 // === 当前降级模式 (原子无锁) ===
 static DEGRADED_MODE: AtomicU32 = AtomicU32::new(0);  // 0=Normal
+/// 只允许一个延迟重启调度器存在，避免多个故障同时创建竞争性的 esp_restart 线程.
+static RESTART_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// 记录一次故障
 pub fn record_failure(severity: Severity, module: &str, msg: &str) {
@@ -234,8 +236,15 @@ pub fn apply_action(action: RecoveryAction, module: &str) {
             enter_mode(m);
         }
         RecoveryAction::DelayedRestart(d) => {
+            if RESTART_ARMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                log::warn!("[recovery] {}: restart already scheduled", module);
+                return;
+            }
             log::error!("[recovery] {}: DELAYED RESTART in {:?}", module, d);
-            // 用独立线程延迟重启, 不阻塞当前调用
+            // 用独立线程延迟重启, 不阻塞当前调用; guard 防止重复创建重启线程.
             std::thread::spawn(move || {
                 std::thread::sleep(d);
                 unsafe { esp_idf_sys::esp_restart() };

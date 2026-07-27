@@ -39,32 +39,52 @@ pub struct BusBackend;
 impl ModbusBackend for BusBackend {
     fn read_coils(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
         let mut v = heapless::Vec::new();
+        if count == 0 {
+            return v;
+        }
+        // count=0 时 addr + 0 = addr 不溢出；count>0 时 last = addr + count - 1
+        let last = (addr as u32) + (count as u32) - 1;
+        if last > u16::MAX as u32 {
+            return v;
+        }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_coil(addr + i).unwrap_or(false));
+            let _ = v.push(crate::bus::backends::read_coil(addr.wrapping_add(i)).unwrap_or(false));
         }
         v
     }
 
     fn read_discrete_inputs(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
         let mut v = heapless::Vec::new();
+        let last = (addr as u32) + (count as u32) - 1;
+        if last > u16::MAX as u32 {
+            return v;
+        }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_disc(addr + i).unwrap_or(false));
+            let _ = v.push(crate::bus::backends::read_disc(addr.wrapping_add(i)).unwrap_or(false));
         }
         v
     }
 
     fn read_holding_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
         let mut v = heapless::Vec::new();
+        let last = (addr as u32) + (count as u32) - 1;
+        if last > u16::MAX as u32 {
+            return v;
+        }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_hold_reg(addr + i).unwrap_or(0));
+            let _ = v.push(crate::bus::backends::read_hold_reg(addr.wrapping_add(i)).unwrap_or(0));
         }
         v
     }
 
     fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
         let mut v = heapless::Vec::new();
+        let last = (addr as u32) + (count as u32) - 1;
+        if last > u16::MAX as u32 {
+            return v;
+        }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_input_reg(addr + i).unwrap_or(0));
+            let _ = v.push(crate::bus::backends::read_input_reg(addr.wrapping_add(i)).unwrap_or(0));
         }
         v
     }
@@ -83,9 +103,14 @@ impl ModbusBackend for BusBackend {
     fn write_multiple_coils(&self, addr: u16, values: &[bool]) -> bool {
         // 阶段 B: 循环 backends::write_coil; DI 段不可写
         // LOOP13: notify() 已在 backends::write_coil 内部内化, 每次成功写都触发
+        // 地址范围校验: addr + len 不能跨越 u16 边界 (addr+i 用 wrapping_add 即可)
+        let last = (addr as u32) + (values.len() as u32);
+        if last > (u16::MAX as u32) + 1 {
+            return false;
+        }
         let mut ok = true;
         for (i, &v) in values.iter().enumerate() {
-            if !crate::bus::backends::write_coil(addr + i as u16, v) {
+            if !crate::bus::backends::write_coil(addr.wrapping_add(i as u16), v) {
                 ok = false;
             }
         }
@@ -94,9 +119,13 @@ impl ModbusBackend for BusBackend {
 
     fn write_multiple_registers(&self, addr: u16, values: &[u16]) -> bool {
         // 阶段 B: 循环 backends::write_hold_reg (RCU RMW)
+        let last = (addr as u32) + (values.len() as u32);
+        if last > (u16::MAX as u32) + 1 {
+            return false;
+        }
         let mut ok = true;
         for (i, &v) in values.iter().enumerate() {
-            if !crate::bus::backends::write_hold_reg(addr + i as u16, v) {
+            if !crate::bus::backends::write_hold_reg(addr.wrapping_add(i as u16), v) {
                 ok = false;
                 break;
             }
@@ -297,8 +326,8 @@ where
     B: ModbusBackend,
     F: Fn(&B, u16, u16) -> heapless::Vec<bool, MAX_BITS_PER_READ>,
 {
-    if pdu.len() < 4 {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 4 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let count = u16::from_be_bytes([pdu[2], pdu[3]]);
@@ -338,8 +367,8 @@ where
     B: ModbusBackend,
     F: Fn(&B, u16, u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>,
 {
-    if pdu.len() < 4 {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 4 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let count = u16::from_be_bytes([pdu[2], pdu[3]]);
@@ -363,8 +392,8 @@ fn write_single_coil_pdu<B: ModbusBackend>(
     pdu: &[u8],
     out: &mut [u8; PDU_BUF_SIZE],
 ) -> PduResult {
-    if pdu.len() < 4 {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 4 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let value = u16::from_be_bytes([pdu[2], pdu[3]]);
@@ -389,8 +418,8 @@ fn write_single_reg_pdu<B: ModbusBackend>(
     pdu: &[u8],
     out: &mut [u8; PDU_BUF_SIZE],
 ) -> PduResult {
-    if pdu.len() < 4 {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 4 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let value = u16::from_be_bytes([pdu[2], pdu[3]]);
@@ -421,8 +450,8 @@ fn write_multi_coils_pdu<B: ModbusBackend>(
     if count == 0 || count as usize > MAX_BITS_PER_READ {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
-    if pdu.len() < 5 + byte_count {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 5 + byte_count || byte_count != (count as usize + 7) / 8 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     // 用栈上固定数组替代 Vec::with_capacity
     let mut bits: heapless::Vec<bool, MAX_BITS_PER_READ> = heapless::Vec::new();
@@ -457,8 +486,8 @@ fn write_multi_regs_pdu<B: ModbusBackend>(
     if count == 0 || count as usize > MAX_REGS_PER_READ {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
-    if pdu.len() < 5 + byte_count || byte_count != count as usize * 2 {
-        return PduResult::Err(exc::SLAVE_DEVICE_FAILURE);
+    if pdu.len() != 5 + byte_count || byte_count != count as usize * 2 {
+        return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     // 用栈上固定数组替代 Vec::with_capacity
     let mut regs: heapless::Vec<u16, MAX_REGS_PER_READ> = heapless::Vec::new();

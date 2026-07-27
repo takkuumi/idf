@@ -398,10 +398,11 @@ fn send_redirect(stream: &mut TcpStream, location: &str) -> std::io::Result<()> 
     Ok(())
 }
 
-/// 构建标准 JSON 响应 (对齐参考固件 returnResponseJson)
+/// 构建标准 JSON 响应 (对齐参考固件 returnResponseJson,
+/// 包含 `msg` 字段以兼容旧前端 WebIndex.cpp error 提示)
 fn json_response(response_type: &str, code: &str) -> String {
     format!(
-        r#"{{"type":"{}","code":"{}","data":{{}}}}"#,
+        r#"{{"type":"{}","code":"{}","msg":"","data":{{}}}}"#,
         response_type, code
     )
 }
@@ -612,19 +613,17 @@ fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()
     send_json_with_cookie(stream, 200, &json_response("login", "0"), &cookie)
 }
 
-/// GET /getsysteminfo
+/// GET /getsysteminfo — 对齐 C++ handleGetSystemInfo: devicename/manufacturer/model/version
 fn handle_get_system_info(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
     let json = match config_read_with(|cs| {
         let cfg = &cs.cfg;
         let device_name = cfg.name_str();
-        let sn = cfg.sn_str();
         let fw_ver = cfg.fw_version;
         let hw_ver = cfg.hw_version;
         let fw_date = cfg.fw_date;
         format!(
-            r#"{{"type":"getsysteminfo","code":"0","data":{{"devicename":"{}","sn":"{}","model":"F16","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}","addressinfo":"{}"}}}}"#,
+            r#"{{"type":"getsysteminfo","code":"0","msg":"","data":{{"devicename":"{}","manufacturer":"","model":"F16","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}","addressinfo":"{}"}}}}"#,
             escape_json(&device_name),
-            escape_json(&sn),
             fw_ver / 100,
             (fw_ver % 100) / 10,
             fw_ver % 10,
@@ -645,25 +644,29 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
         return send_json(stream, 405, &json_response("updatesysteminfoconfig", "405"));
     }
     let devicename = req.form_field("devicename");
+    let manufacturer = req.form_field("manufacturer");
+    let model = req.form_field("model");
     let addressinfo = req.form_field("addressinfo");
 
-    // 更新 location/name 到 CONFIG RCU
-    if let Some(name) = addressinfo {
-        let name_bytes: Vec<u8> = name.as_bytes().to_vec();
-        crate::bus::backends::config_modify(|cfg| {
-            let take = name_bytes.len().min(cfg.name.len());
-            cfg.name[..take].copy_from_slice(&name_bytes[..take]);
-            for b in &mut cfg.name[take..] {
-                *b = 0;
-            }
-        });
+    // C++ WebServer 要求 devicename/manufacturer/model 三字段；Rust 当前
+    // SystemConfig 没有独立 manufacturer/model 存储槽，仍接受并保留协议兼容，
+    // devicename/addressinfo 映射到原有 name 字段.
+    if devicename.is_none() && addressinfo.is_none() {
+        return send_json(stream, 200, &json_response("updatesysteminfoconfig", "0x01000001"));
     }
-
     log::info!(
-        "[http] update system info: devicename={:?}",
-        devicename
+        "[http] update system info: devicename={:?}, manufacturer={:?}, model={:?}",
+        devicename, manufacturer, model
     );
-    crate::device::request_save_device_text();
+    let name = addressinfo.or(devicename).unwrap_or_default();
+    let name_bytes: Vec<u8> = name.as_bytes().to_vec();
+    crate::bus::backends::config_modify(|cfg| {
+        let take = name_bytes.len().min(cfg.name.len());
+        cfg.name[..take].copy_from_slice(&name_bytes[..take]);
+        for b in &mut cfg.name[take..] {
+            *b = 0;
+        }
+    });
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
 }
 
@@ -683,7 +686,7 @@ fn handle_get_network_config(stream: &mut TcpStream, _req: &HttpRequest) -> std:
         let sn = cfg.sn_str();
         let name = cfg.name_str();
         format!(
-            r#"{{"type":"getnetworkconfig","code":"0","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{}}}}}"#,
+            r#"{{"type":"getnetworkconfig","code":"0","msg":"","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{},"version":"F16","bloothaddress":""}}}}"#,
             ip, mask, gw, dns, mac, escape_json(&sn), escape_json(&name), if cfg.dhcp { 1 } else { 0 },
         )
     }) {
@@ -764,28 +767,27 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
 }
 
-/// GET /getportconfig
+/// GET /getportconfig — 对齐 C++ handleGetPortConfig 字段格式
+/// C++ 字段: datalen/checkmode/stopbit/baud/masterslaveport/slaveaddress/retrycount/responeinteval/tti
+/// C++ baud 是索引 (0-10), datalen 是 0=8bit/1=7bit, stopbit 是 0=1bit/1=2bit
 fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
+    const BAUD_TABLE: [u32; 11] = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
     let json = match config_read_with(|cs| {
         let cfg = &cs.cfg;
         let port_fields = |i: usize| -> String {
             if i < cfg.rs485.len() {
                 let r = &cfg.rs485[i];
+                let baud_idx = BAUD_TABLE.iter().position(|&b| b == r.baudrate).unwrap_or(3) as u16;
+                let datalen = if r.data_bits == 7 { 1 } else { 0 };
+                let checkmode = r.parity;
+                let stopbit = r.stop_bits.saturating_sub(1);
                 format!(
-                    r#""baud_{}":{},"mode_{}":{},"databits_{}":{},"stopbits_{}":{},"parity_{}":{},"slaveaddr_{}":{},"retry_{}":{},"timeout_{}":{},"interval_{}":{}"#,
-                    i, r.baudrate,
-                    i, r.mode,
-                    i, r.data_bits,
-                    i, r.stop_bits,
-                    i, r.parity,
-                    i, r.slave_addr,
-                    i, r.retry_count,
-                    i, r.timeout_ms,
-                    i, r.interval_ms,
+                    r#""datalen_{}":{},"checkmode_{}":{},"stopbit_{}":{},"baud_{}":{},"masterslaveport_{}":{},"slaveaddress_{}":{},"retrycount_{}":{},"responeinteval_{}":{},"tti_{}":{}"#,
+                    i, datalen, i, checkmode, i, stopbit, i, baud_idx, i, r.mode, i, r.slave_addr, i, r.retry_count, i, r.timeout_ms, i, r.interval_ms,
                 )
             } else {
                 format!(
-                    r#""baud_{}":9600,"mode_{}":0,"databits_{}":8,"stopbits_{}":1,"parity_{}":0,"slaveaddr_{}":1,"retry_{}":3,"timeout_{}":1000,"interval_{}":20"#,
+                    r#""datalen_{}":0,"checkmode_{}":0,"stopbit_{}":0,"baud_{}":3,"masterslaveport_{}":0,"slaveaddress_{}":1,"retrycount_{}":3,"responeinteval_{}":1000,"tti_{}":20"#,
                     i, i, i, i, i, i, i, i, i
                 )
             }
@@ -813,6 +815,8 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         .form_field("index")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // C++ 字段名为 retrycount/responeinteval/tti，新前端 index.html 用 retry/timeout/interval；
+    // 同时兼容两套命名 (旧前端优先，C++ 兼容)
     let baud: u32 = req
         .form_field("baud")
         .and_then(|s| s.parse().ok())
@@ -838,15 +842,18 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let retry: u16 = req
-        .form_field("retry")
+        .form_field("retrycount")
+        .or_else(|| req.form_field("retry"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
     let timeout: u16 = req
-        .form_field("timeout")
+        .form_field("responeinteval")
+        .or_else(|| req.form_field("timeout"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
     let interval: u16 = req
-        .form_field("interval")
+        .form_field("tti")
+        .or_else(|| req.form_field("interval"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
@@ -870,7 +877,8 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         );
     }
 
-    crate::device::request_save_device_text();
+    // 配置类写入应通过 SystemConfig 持久化 (走 ApplyConfig), 而非 device_text (那只是文本快照).
+    crate::device::request_apply_config();
     let _ = crate::nfc::backup_now();
     send_json(stream, 200, &json_response("updateportconfig", "0"))
 }
@@ -904,17 +912,26 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     // AI 值
     let ai_count = crate::config::hw_version::AI_COUNT as u16;
     let mut ai_data = String::new();
+    let mut ai_max = String::new();
+    let mut ai_min = String::new();
     for i in 0..ai_count {
         if i > 0 {
             ai_data.push(',');
+            ai_max.push(',');
+            ai_min.push(',');
         }
         let val = crate::bus::backends::read_input_reg(regs::INREG_AI_BASE + i).unwrap_or(0);
         ai_data.push_str(&format!("\"ai_addr_{}\":{}", i, val));
+        // C++ 在 getiodata 同时返回 ai_data_max / ai_data_min (校准值), 来自 holding_buf 2288+/2280+
+        let max_v = crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MAX_BASE + i).unwrap_or(0);
+        let min_v = crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MIN_BASE + i).unwrap_or(0);
+        ai_max.push_str(&format!("\"ai_addr_max_{}\":{}", i, max_v));
+        ai_min.push_str(&format!("\"ai_addr_min_{}\":{}", i, min_v));
     }
 
     let json = format!(
-        r#"{{"type":"getiodata","code":"0","data":{{"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}}}}}}"#,
-        di_data, do_data, ai_data,
+        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}}}}}}"#,
+        di_data, do_data, ai_data, ai_max, ai_min,
     );
     send_json(stream, 200, &json)
 }

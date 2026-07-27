@@ -110,12 +110,19 @@ pub fn save_to_nvs() -> AppResult<()> {
         Ok(())
     });
 
-    // 4. 仅在 NVS 写成功时清 dirty; 失败时保留等下次重试
-    if write_result.is_some() {
-        HOLDING_DIRTY.store(false, Ordering::Release);
-        log::debug!("[holding] persisted {} words to NVS", HOLDING_WORDS);
-    } else {
-        log::warn!("[holding] NVS write failed, dirty retained for retry");
+    // 4. 仅在 NVS 写入明确成功时清 dirty; Some(Err) 和 None 都保留,
+    //    否则一次 flash/NVS 瞬态错误会让未落盘数据永久失去重试机会.
+    match &write_result {
+        Some(Ok(())) => {
+            HOLDING_DIRTY.store(false, Ordering::Release);
+            log::debug!("[holding] persisted {} words to NVS", HOLDING_WORDS);
+        }
+        Some(Err(e)) => {
+            log::warn!("[holding] NVS write failed: {e}, dirty retained for retry");
+        }
+        None => {
+            log::warn!("[holding] NVS unavailable, dirty retained for retry");
+        }
     }
     write_result.unwrap_or(Ok(()))
 }

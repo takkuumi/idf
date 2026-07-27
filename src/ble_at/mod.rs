@@ -1239,6 +1239,12 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // 后续 chunk 被丢弃. 待 Android BLE write trace 逆向完整协议后实施.
     // 当前 metuory UI 文本配置功能受限 (基础 IO 配置仍正常).
 
+    // B2/B3/B4-B7 使用标准 BLE 外层帧 + Modbus FC03/FC06/FC16 载荷。
+    // 这些命令必须在通用 Modbus fallback 之前处理，否则会被当作非法功能码。
+    if matches!(func, 0xB2..=0xB7) {
+        return handle_handheld_config_text(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit);
+    }
+
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
     if func >= 0xC0 && func <= 0xCF {
@@ -1262,6 +1268,64 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
 /// 帧格式: tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | pdu_data(N) | crc(2 LE)
 /// 其中 length 字段 = pdu_data.len() (含 slave/func/data/CRC, 不含 BLE 帧头尾)
 /// CRC 计算范围 = 整个帧除最后 2 字节
+
+fn handle_handheld_config_text(
+    func: u8,
+    pdu: &[u8],
+    tx_id: u16,
+    proto_id: u16,
+    conn_id: u16,
+    unit: u8,
+) -> bool {
+    if pdu.len() < 4 {
+        return false;
+    }
+    let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
+    let count = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
+    let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let _ = rsp.push(unit);
+    let _ = rsp.push(func);
+
+    match func {
+        0xB2 | 0xB4 | 0xB6 => {
+            let read_addr = if func == 0xB4 { regs::DEVICE_TEXT_BASE } else { addr };
+            let words = count.min(120);
+            let mut bytes: heapless::Vec<u8, 240> = heapless::Vec::new();
+            for i in 0..words {
+                let a = read_addr.saturating_add(i as u16);
+                let v = if func == 0xB2 {
+                    crate::bus::backends::read_hold_reg(a).unwrap_or(0)
+                } else {
+                    crate::bus::backends::read_hold_reg(a).unwrap_or(0)
+                };
+                let _ = bytes.extend_from_slice(&v.to_be_bytes());
+            }
+            let _ = rsp.push(bytes.len() as u8);
+            let _ = rsp.extend_from_slice(&bytes);
+        }
+        0xB3 | 0xB5 | 0xB7 => {
+            if pdu.len() < 5 {
+                return false;
+            }
+            let byte_count = pdu[4] as usize;
+            if byte_count > 240 || pdu.len() != 5 + byte_count || byte_count != count.saturating_mul(2) {
+                return false;
+            }
+            let write_addr = if func == 0xB5 { regs::DEVICE_TEXT_BASE } else { addr };
+            for i in 0..count {
+                let off = 5 + i * 2;
+                let value = u16::from_be_bytes([pdu[off], pdu[off + 1]]);
+                let target = if func == 0xB3 { write_addr.saturating_add(i as u16) } else { write_addr.saturating_add(i as u16) };
+                if !crate::bus::backends::write_hold_reg(target, value) {
+                    return false;
+                }
+            }
+        }
+        _ => return false,
+    }
+    send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+    true
+}
 
 /// 处理 MCA 自定义协议命令 (0xC0-0xCF)
 ///

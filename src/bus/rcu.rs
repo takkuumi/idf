@@ -42,7 +42,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU8, Ordering};
 const RETIRE_QUEUE_LEN: usize = 4;
 const EPOCH_COUNT: u8 = 4;
 
-/// Rcu 容器 (无 leak, 多读单/串行写 安全)
+/// Rcu 容器 (多读单/串行写 安全, 内置写者串行化)
 pub struct Rcu<T> {
     ptr: AtomicPtr<T>,
     /// 当前 epoch 号 (写者递增 mod 4)
@@ -53,6 +53,8 @@ pub struct Rcu<T> {
     retire_queue: [RetireSlot<T>; RETIRE_QUEUE_LEN],
     /// 下一个写入的 retire 槽 (AtomicU8 → 避免 mut self)
     retire_idx: AtomicU8,
+    /// 写者串行化门卫 — 保护 sweep+swap 整个序列, 即使多个调用方不共享外部锁.
+    writer_gate: core::sync::atomic::AtomicBool,
 }
 
 /// 一个待回收槽 (旧指针 + 它被替换时的 epoch)
@@ -93,6 +95,7 @@ impl<T> Rcu<T> {
                 RetireSlot::empty_const(),
             ],
             retire_idx: AtomicU8::new(0),
+            writer_gate: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -104,7 +107,15 @@ impl<T> Rcu<T> {
     }
 
     /// 写: 原子替换为新值; 旧值按 epoch 延迟回收.
+    /// 多写者并发时内部自旋串行化, 无需外部 Spin 保护.
     pub fn write(&self, new_value: T) {
+        // 写者串行化门卫: 自旋等待获取独占权, 避免两个写者同时 sweep+swap 导致 UAF.
+        while self.writer_gate.compare_exchange_weak(
+            false, true, Ordering::Acquire, Ordering::Relaxed
+        ).is_err() {
+            core::hint::spin_loop();
+        }
+
         let new_ptr = Box::into_raw(Box::new(new_value));
 
         // 1. 惰性回收 — swap 之前先扫一遍 (用旧 epoch 数据依然成立)
@@ -133,6 +144,9 @@ impl<T> Rcu<T> {
 
         // 5. 再次尝试回收 (前一代读者可能已退)
         self.sweep_unsafe();
+
+        // 释放写者锁
+        self.writer_gate.store(false, Ordering::Release);
     }
 
     /// 读: 在 epoch 槽登记 fetch_add, 然后 load 当前 ptr.

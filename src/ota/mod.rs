@@ -67,6 +67,8 @@ impl OtaStatus {
 /// OTA 会话 (运行中持有 handle)
 struct OtaSession {
     handle: esp_idf_sys::esp_ota_handle_t,
+    /// BEGIN 时选中的 OTA 分区地址，END 时复用同一槽位.
+    partition_addr: usize,
     total_size: u32,
     written: u32,
     /// 上次错误状态 (写入失败时设置, 用于 STATUS 读取)
@@ -156,6 +158,7 @@ pub fn begin(total_size: u32) -> AppResult<()> {
 
     *s = Some(OtaSession {
         handle,
+        partition_addr: partition as usize,
         total_size,
         written: 0,
         last_status: OtaStatus::Receiving,
@@ -192,6 +195,17 @@ pub fn write_chunk(data: &[u8]) -> AppResult<usize> {
             "ota not in receiving state: {:?}",
             sess.last_status
         )));
+    }
+
+    // 累计写入量防溢: 超过 total_size 直接拒绝，防止越界写 OTA 分区
+    if sess.total_size > 0 {
+        let remaining = sess.total_size.saturating_sub(sess.written);
+        if (data.len() as u32) > remaining {
+            return Err(AppError::Ota(format!(
+                "write would overflow: written={}, chunk={}, total={}",
+                sess.written, data.len(), sess.total_size
+            )));
+        }
     }
 
     let r = unsafe {
@@ -239,11 +253,16 @@ pub fn end() -> AppResult<()> {
         )));
     }
 
-    // 设置启动分区 (esp_ota_get_next_update_partition 返回的就是下一个分区)
-    let partition =
-        unsafe { esp_idf_sys::esp_ota_get_next_update_partition(std::ptr::null()) };
+    // 保留 BEGIN 时选中的分区，不能在 end 阶段重新查询目标槽
+    let partition = sess.partition_addr as *const esp_idf_sys::esp_partition_t;
+    if partition.is_null() {
+        *s = None;
+        return Err(AppError::Ota("ota target partition unavailable after end".into()));
+    }
     let r = unsafe { esp_idf_sys::esp_ota_set_boot_partition(partition) };
     if r != 0 {
+        // esp_ota_end 已结束句柄，不能再 abort；清理会话避免卡死在 Receiving.
+        *s = None;
         return Err(AppError::Ota(format!(
             "esp_ota_set_boot_partition failed: 0x{:08X}",
             r
