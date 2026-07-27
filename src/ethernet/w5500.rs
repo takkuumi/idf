@@ -183,11 +183,10 @@ fn spi_bus_config_default(mosi: u8, miso: u8, sclk: u8) -> esp_idf_sys::spi_bus_
         },
         data4_io_num: -1, data5_io_num: -1, data6_io_num: -1, data7_io_num: -1,
         data_io_default_level: false,
-        // LOOP16: 降到 2048 (W5500 单帧 MTU=1536, 2048 有余量).
-        // 16384 过大导致 setup_dma_priv_buffer 需要从内部 SRAM 分配大块 DMA-capable 内存,
-        // 在 BLE+Bluedroid 堆满内部 SRAM 后反复 "Failed to allocate priv TX buffer".
-        // 降到 2048 显著降低 SPI DMA 缓冲需求, 缓解内部 SRAM 竞争.
-        max_transfer_sz: 2048,
+        // W5500 最大以太网帧约 1536B, 加 3B SPI header 留 1600B 足够.
+        // 2048/更大的 transfer size 会让 SPI DMA 为每个挂起事务申请较大的
+        // internal DMA-capable priv buffer; BLE/Bluedroid 同时运行时容易耗尽内部 SRAM.
+        max_transfer_sz: 1600,
         flags: 0,
         isr_cpu_id: esp_idf_sys::esp_intr_cpu_affinity_t_ESP_INTR_CPU_AFFINITY_AUTO,
         intr_flags: 0,
@@ -378,6 +377,11 @@ fn spawn_heartbeat() -> AppResult<()> {
     ETH_HB_STATE.init(EthHbState { fail_count: 0 });
     log::info!("[eth] heartbeat registered in main_loop (period={}s)", HEARTBEAT_PERIOD_S);
     Ok(())
+}
+
+/// 当前 PHY 链路状态，供 Web/诊断页面读取.
+pub fn link_up() -> bool {
+    ETH_LINK_UP.load(Ordering::Acquire)
 }
 
 /// main_loop 每 5s 调用一次

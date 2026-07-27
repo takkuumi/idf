@@ -578,6 +578,7 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
                 "/updatebleconfig" => handle_update_ble_config(&mut stream, &req),
                 "/getsensorconfig" => handle_get_sensor_config(&mut stream, &req),
                 "/updatesensorconfig" => handle_update_sensor_config(&mut stream, &req),
+                "/getsystemstatus" => handle_get_system_status(&mut stream, &req),
                 "/reboot" => handle_reboot(&mut stream, &req),
                 "/updatepwd" => handle_update_password(&mut stream, &req),
                 _ => send_json(&mut stream, 404, &json_response("error", "404")),
@@ -896,6 +897,40 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
     crate::device::request_apply_config();
     let _ = crate::nfc::backup_now();
     send_json(stream, 200, &json_response("updateportconfig", "0"))
+}
+
+fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
+    let stats = crate::error::recovery::stats();
+    let mode = match stats.mode {
+        crate::error::recovery::DegradedMode::Normal => "Normal",
+        crate::error::recovery::DegradedMode::BleOnly => "BleOnly",
+        crate::error::recovery::DegradedMode::LocalOnly => "LocalOnly",
+        crate::error::recovery::DegradedMode::Minimal => "Minimal",
+    };
+    let eth = {
+        #[cfg(feature = "ethernet-w5500")]
+        { crate::ethernet::w5500::link_up() }
+        #[cfg(not(feature = "ethernet-w5500"))]
+        { false }
+    };
+    let ble = {
+        #[cfg(feature = "ble-at")]
+        { crate::ble_at::has_client() }
+        #[cfg(not(feature = "ble-at"))]
+        { false }
+    };
+    let udp = crate::udp_multicast::is_receiving();
+    let json = format!(
+        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{}}}}}"#,
+        IO.sys.get_uptime(), eth, ble,
+        { #[cfg(feature = "ble-at")] { crate::ble_at::notify_enabled() } #[cfg(not(feature = "ble-at"))] { false } },
+        udp, crate::udp_multicast::received_len(),
+        crate::modbus::shared::RS485_STATS.master_comerr(), crate::modbus::shared::RS485_STATS.master_apperr(),
+        crate::modbus::shared::RS485_STATS.slave_comerr(), crate::modbus::shared::RS485_STATS.slave_apperr(),
+        mode, stats.recoverable, stats.degradable, stats.severe,
+        unsafe { esp_idf_sys::esp_get_free_heap_size() }, IO.sys.get_reset_count(), IO.sys.get_reset_reason(),
+    );
+    send_json(stream, 200, &json)
 }
 
 /// GET /getiodata

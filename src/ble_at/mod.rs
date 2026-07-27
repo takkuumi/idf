@@ -2322,7 +2322,22 @@ mod android_compat_tests {
 /// DI bitmap 字节序 = BE (大端, MSB first), DI0 在最高位字节的 LSB.
 /// 字节数 = ceil(DI_COUNT / 8). F16/F3=2 bytes (16 DI), F4=6 bytes (48 DI).
 ///
-/// 调用时机: main_loop 消费 IoEvent::DiChanged 时调用. conn_id 取 0 (任意活跃连接).
+/// 当前是否有客户端连接 (用于 Web/诊断页面).
+pub fn has_client() -> bool {
+    CONN_ID.load(Ordering::Acquire) != 0xFFFF
+}
+
+/// 当前是否允许 BLE 通知.
+pub fn notify_enabled() -> bool {
+    TX_NOTIFY_ENABLED.load(Ordering::Acquire)
+}
+
+/// 当前 GATTS 接口值 (0xFF 表示尚未注册).
+pub fn gatts_if_value() -> u8 {
+    GATTS_IF.load(Ordering::Acquire)
+}
+
+/// BLE 状态报告实现.
 pub fn send_di_status_report(conn_id: u16) {
     use crate::config::hw_version;
     // 1. 读 DI 当前状态 (无锁, AtomicBits64)

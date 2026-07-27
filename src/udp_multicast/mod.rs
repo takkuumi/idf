@@ -239,35 +239,60 @@ fn src_ip_matches(src: &SocketAddr, filter: [u8; 4]) -> bool {
 /// (前一个 LOOP9 错误版本用 `from_ne_bytes` — 在 ESP32-S3 LE 平台上等价
 /// `from_le_bytes`, 产生 `0x010000EF` 而非 `0xEF000001`, 组播加入失败。)
 ///
-/// 同时, LwIP 中 `imr_interface=INADDR_ANY` 可能因无默认 netif 而失败 (errno=125),
-/// 因此使用 CONFIG RCU 中存储的实际设备 IP 作为接口地址。
+/// 同时, LwIP 中 `imr_interface=设备 IP` 在以太网 DHCP 尚未完成或 netif 短暂脱绑
+/// 时会返回 ENOTSUP/125 (`Address not available`)。优先尝试 INADDR_ANY (=0),
+/// LwIP 会自动选取当前活动的 netif; 失败时再回退到配置中的设备 IP。
+///
+/// 历史: LOOP11 全部用设备 IP 解决了初次运行无 netif 的问题, 但 DHCP 重连/
+/// 拔线/W5500 重启后, 静态 IP 可能与新分配的 IP 不一致, 造成持续 ENOTSUP 125。
 fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io::Error> {
     use std::os::fd::AsRawFd;
-    // ip_mreq { imr_multiaddr: in_addr, imr_interface: in_addr }
-    // in_addr { s_addr: u32 (network byte order) }
     #[repr(C)]
     struct IpMreq {
         imr_multiaddr: u32,
         imr_interface: u32,
     }
 
-    // LOOP11: 零拷贝读设备 IP (避免 udp-mcast 6KB 栈上 clone ~2.5KB)
     let if_ip = config_read_with(|cs| cs.cfg.ip)
         .unwrap_or([0, 0, 0, 0]);
+
     log::info!(
-        "[udp-mcast] join group={}.{}.{}.{} iface={}.{}.{}.{}",
-        group[0], group[1], group[2], group[3],
-        if_ip[0], if_ip[1], if_ip[2], if_ip[3]
+        "[udp-mcast] join group={}.{}.{}.{}",
+        group[0], group[1], group[2], group[3]
     );
 
-    let mreq = IpMreq {
-        // s_addr = network byte order: group/if_ip 是主机序 octet 数组, 用 from_be_bytes 转 BE
-        imr_multiaddr: u32::from_be_bytes(group),
-        imr_interface: u32::from_be_bytes(if_ip),
-    };
     const IPPROTO_IP: i32 = 0;
     let ip_add_membership = esp_idf_sys::IP_ADD_MEMBERSHIP as i32;
     let fd = sock.as_raw_fd();
+
+    // 1) 优先 INADDR_ANY, 让 LwIP 自动选取当前活动的 netif.
+    let mreq_any = IpMreq {
+        imr_multiaddr: u32::from_be_bytes(group),
+        imr_interface: 0,
+    };
+    let ret_any = unsafe {
+        esp_idf_sys::lwip_setsockopt(
+            fd, IPPROTO_IP, ip_add_membership,
+            &mreq_any as *const _ as *mut _,
+            std::mem::size_of::<IpMreq>() as u32,
+        )
+    };
+    if ret_any == 0 {
+        log::info!("[udp-mcast] joined via INADDR_ANY");
+        return Ok(());
+    }
+    let errno_any = std::io::Error::last_os_error();
+    log::debug!("[udp-mcast] INADDR_ANY join failed: {:?}", errno_any);
+
+    // 2) 回退到设备 IP (主机序字节转 BE u32). 与原 LOOP11 行为一致.
+    log::info!(
+        "[udp-mcast] retry with iface={}.{}.{}.{}",
+        if_ip[0], if_ip[1], if_ip[2], if_ip[3]
+    );
+    let mreq = IpMreq {
+        imr_multiaddr: u32::from_be_bytes(group),
+        imr_interface: u32::from_be_bytes(if_ip),
+    };
     let ret = unsafe {
         esp_idf_sys::lwip_setsockopt(
             fd,
@@ -278,7 +303,8 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
         )
     };
     if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+        let errno = std::io::Error::last_os_error();
+        return Err(errno);
     }
     Ok(())
 }
@@ -286,6 +312,16 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
 // ----------------------------------------------------------------------------
 // 公开 API (供 Modbus FC=04 读取)
 // ----------------------------------------------------------------------------
+
+/// 当前组播接收状态 (用于 Web/诊断页面).
+pub fn is_receiving() -> bool {
+    RECV_LEN.load(Ordering::Acquire) != 0
+}
+
+/// 当前组播接收字节数.
+pub fn received_len() -> usize {
+    RECV_LEN.load(Ordering::Acquire) as usize
+}
 
 /// 读取组播接收缓冲区指定偏移 (相对 0x0090 基址的 U16 索引)
 ///

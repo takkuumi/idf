@@ -89,6 +89,23 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <div class="do-list" id="do_list"></div>
     </div>
     <div class="card">
+      <h2>运行状态</h2>
+      <div class="row" id="runtime_status">
+        <div class="field"><label for="st_uptime">运行时间</label><input id="st_uptime" disabled></div>
+        <div class="field"><label for="st_eth">以太网链路</label><input id="st_eth" disabled></div>
+        <div class="field"><label for="st_ble">BLE 连接</label><input id="st_ble" disabled></div>
+        <div class="field"><label for="st_udp">UDP 组播</label><input id="st_udp" disabled></div>
+        <div class="field"><label for="st_rtu1_com">RS485-1 通信错误</label><input id="st_rtu1_com" disabled></div>
+        <div class="field"><label for="st_rtu1_app">RS485-1 应用错误</label><input id="st_rtu1_app" disabled></div>
+        <div class="field"><label for="st_rtu2_com">RS485-2 通信错误</label><input id="st_rtu2_com" disabled></div>
+        <div class="field"><label for="st_rtu2_app">RS485-2 应用错误</label><input id="st_rtu2_app" disabled></div>
+        <div class="field"><label for="st_recovery">恢复模式</label><input id="st_recovery" disabled></div>
+        <div class="field"><label for="st_heap">剩余堆内存</label><input id="st_heap" disabled></div>
+        <div class="field"><label for="st_reset">复位次数</label><input id="st_reset" disabled></div>
+        <div class="field"><label for="st_reason">复位原因</label><input id="st_reason" disabled></div>
+      </div>
+    </div>
+    <div class="card">
       <h2>模拟输入 (AI)</h2>
       <div id="ai_list"></div>
     </div>
@@ -362,6 +379,33 @@ async function pollIO() {
   } catch(e) { console.error('poll', e); }
 }
 
+// Poll system status
+async function pollStatus() {
+  try {
+    const r = await fetch('/getsystemstatus');
+    const j = await r.json();
+    if (!j.data) return;
+    const d = j.data;
+    const fmtSec = s => {
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      return `${h}h ${m}m ${sec}s`;
+    };
+    const resetReason = ['POWERON','SW','RTC_WDT','WDT','DEEP_SLEEP','RESTART','EXT_CPU','BOD','USB_UART','JTAG','EFUSE','PWR_GLITCH','RTC_STORE','SPI_FLASH','SYSCPU','BROWNOUT'];
+    $('#st_uptime').value = fmtSec(d.uptime || 0);
+    $('#st_eth').value = d.ethernet_link ? 'PHY UP' : 'PHY DOWN';
+    $('#st_ble').value = d.ble_connected ? '已连接' : (d.ble_notify ? '通知已开' : '未连接');
+    $('#st_udp').value = d.udp_multicast ? `已收 ${d.udp_received_bytes || 0} 字节` : '未接收';
+    $('#st_rtu1_com').value = d.rs485_1_comerr || 0;
+    $('#st_rtu1_app').value = d.rs485_1_apperr || 0;
+    $('#st_rtu2_com').value = d.rs485_2_comerr || 0;
+    $('#st_rtu2_app').value = d.rs485_2_apperr || 0;
+    $('#st_recovery').value = `${d.recovery_mode} (R:${d.recoverable} D:${d.degradable} S:${d.severe})`;
+    $('#st_heap').value = `${d.free_heap || 0} 字节`;
+    $('#st_reset').value = d.reset_count || 0;
+    $('#st_reason').value = resetReason[d.reset_reason] || ('0x' + (d.reset_reason || 0).toString(16));
+  } catch(e) { console.error('status', e); }
+}
+
 // Toggle DO
 async function toggleDO(addr, val) {
   try {
@@ -434,5 +478,7 @@ loadNet();
 loadPorts();
 pollIO();
 pollTimer = setInterval(pollIO, 1500);
+pollStatus();
+const statusTimer = setInterval(pollStatus, 2000);
 </script>
 </body></html>
