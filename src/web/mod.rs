@@ -767,17 +767,25 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
 }
 
+/// C++ 固件波特率索引表（与 handleGetPortConfig 中 (PRegBuf[reg] >> 12) & 0x0F 完全一致，
+/// 0/4=9600, 1=1200, 2=2400, 3=4800, 5=14400, 6=19200, 7=38400, 8=57600, 9=115200,
+/// 10=128000, 11=153600, 12=230400, 13=256000, 14=460800, 15=921600)
+const C_BAUD_TABLE: [u32; 16] = [
+    9600, 1200, 2400, 4800, 9600, 14400, 19200, 38400,
+    57600, 115200, 128000, 153600, 230400, 256000, 460800, 921600,
+];
+
 /// GET /getportconfig — 对齐 C++ handleGetPortConfig 字段格式
 /// C++ 字段: datalen/checkmode/stopbit/baud/masterslaveport/slaveaddress/retrycount/responeinteval/tti
-/// C++ baud 是索引 (0-10), datalen 是 0=8bit/1=7bit, stopbit 是 0=1bit/1=2bit
+/// C++ baud 是 4 位索引 (0..15)，datalen 是 0=8bit/1=7bit, stopbit 是 0=1bit/1=2bit
 fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
-    const BAUD_TABLE: [u32; 11] = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
     let json = match config_read_with(|cs| {
         let cfg = &cs.cfg;
         let port_fields = |i: usize| -> String {
             if i < cfg.rs485.len() {
                 let r = &cfg.rs485[i];
-                let baud_idx = BAUD_TABLE.iter().position(|&b| b == r.baudrate).unwrap_or(3) as u16;
+                // 把实际波特率反查成 C++ 索引（不匹配时落到 0=9600）
+                let baud_idx = C_BAUD_TABLE.iter().position(|&b| b == r.baudrate).unwrap_or(0) as u16;
                 let datalen = if r.data_bits == 7 { 1 } else { 0 };
                 let checkmode = r.parity;
                 let stopbit = r.stop_bits.saturating_sub(1);
@@ -787,7 +795,7 @@ fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io
                 )
             } else {
                 format!(
-                    r#""datalen_{}":0,"checkmode_{}":0,"stopbit_{}":0,"baud_{}":3,"masterslaveport_{}":0,"slaveaddress_{}":1,"retrycount_{}":3,"responeinteval_{}":1000,"tti_{}":20"#,
+                    r#""datalen_{}":0,"checkmode_{}":0,"stopbit_{}":0,"baud_{}":0,"masterslaveport_{}":0,"slaveaddress_{}":1,"retrycount_{}":3,"responeinteval_{}":1000,"tti_{}":20"#,
                     i, i, i, i, i, i, i, i, i
                 )
             }
@@ -817,10 +825,15 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         .unwrap_or(0);
     // C++ 字段名为 retrycount/responeinteval/tti，新前端 index.html 用 retry/timeout/interval；
     // 同时兼容两套命名 (旧前端优先，C++ 兼容)
-    let baud: u32 = req
+    let baud_idx: u32 = req
         .form_field("baud")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(9600);
+        .unwrap_or(0);
+    let baud: u32 = if (baud_idx as usize) < C_BAUD_TABLE.len() {
+        C_BAUD_TABLE[baud_idx as usize]
+    } else {
+        9600
+    };
     let mode: u8 = req
         .form_field("masterslaveport")
         .and_then(|s| s.parse().ok())
@@ -832,10 +845,12 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
     let databits: u8 = req
         .form_field("datalen")
         .and_then(|s| s.parse().ok())
+        .map(|v: u16| if v == 1 { 7 } else { 8 })
         .unwrap_or(8);
     let stopbits: u8 = req
         .form_field("stopbit")
         .and_then(|s| s.parse().ok())
+        .map(|v: u16| if v == 1 { 2 } else { 1 })
         .unwrap_or(1);
     let parity: u8 = req
         .form_field("checkmode")

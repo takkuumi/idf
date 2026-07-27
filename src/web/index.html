@@ -233,51 +233,80 @@ async function saveSys() {
   } catch(e) { toast('保存失败: ' + e, false); }
 }
 
-// Load RS485 port config
+// Load RS485 port config — 与原 C++ WebIndex 的 9 个参数完全对应
 async function loadPorts() {
   try {
     const r = await fetch('/getportconfig');
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
+    // 原 C++ WebIndex 的 baud 编号，不能改成实际波特率值，否则旧页面选择项错位
+    const baudOptions = [
+      [0, '9600'], [1, '1200'], [2, '2400'], [3, '4800'],
+      [4, '9600'], [5, '14400'], [6, '19200'], [7, '38400'],
+      [8, '57600'], [9, '115200'], [10, '128000'], [11, '153600'],
+      [12, '230400'], [13, '256000'], [14, '460800'], [15, '921600']
+    ];
+    const modes = ['从站', '主站(客户端)', '从站(服务端)'];
     let html = '<h2>RS485 端口配置</h2>';
     for (let i = 0; i < 3; i++) {
-      const modes = ['主机(Master)','从机(Slave)','网关(Gateway)'];
-      html += `<div style="margin-bottom:16px">
-        <h3 style="font-size:13px;margin-bottom:10px;color:var(--accent)">端口 ${i+1}</h3>
+      const v = (key, fallback) => d[key + i] === undefined ? fallback : d[key + i];
+      html += `<div class="port-card">
+        <h3>端口 ${i + 1}</h3>
         <div class="row">
-          <div class="field"><label>波特率</label>
-            <select id="p_baud_${i}">
-              ${[2400,4800,9600,19200,38400,57600,115200].map(b =>
-                `<option value="${b}" ${b==d['baud_'+i]?'selected':''}>${b}</option>`).join('')}
-            </select></div>
-          <div class="field"><label>模式</label>
-            <select id="p_mode_${i}">
-              ${modes.map((m,mi) =>
-                `<option value="${mi}" ${mi==d['mode_'+i]?'selected':''}>${m}</option>`).join('')}
-            </select></div>
-          <div class="field"><label>从机地址</label><input id="p_addr_${i}" value="${d['databits_'+i]||8}"></div>
-        </div></div>`;
+          <div class="field"><label>数据长度</label><select id="p_datalen_${i}">
+            <option value="0" ${v('datalen_',0)===0?'selected':''}>8位</option>
+            <option value="1" ${v('datalen_',0)===1?'selected':''}>7位</option>
+          </select></div>
+          <div class="field"><label>校验方式</label><select id="p_checkmode_${i}">
+            <option value="0" ${v('checkmode_',0)===0?'selected':''}>无校验</option>
+            <option value="1" ${v('checkmode_',0)===1?'selected':''}>奇校验</option>
+            <option value="2" ${v('checkmode_',0)===2?'selected':''}>偶校验</option>
+          </select></div>
+          <div class="field"><label>停止位</label><select id="p_stopbit_${i}">
+            <option value="0" ${v('stopbit_',0)===0?'selected':''}>1位</option>
+            <option value="1" ${v('stopbit_',0)===1?'selected':''}>2位</option>
+          </select></div>
+          <div class="field"><label>波特率</label><select id="p_baud_${i}">
+            ${baudOptions.map(([n,label]) => `<option value="${n}" ${n===v('baud_',3)?'selected':''}>${label} (${n})</option>`).join('')}
+          </select></div>
+          <div class="field"><label>端口主从</label><select id="p_mode_${i}">
+            ${modes.map((m,n) => `<option value="${n}" ${n===v('masterslaveport_',0)?'selected':''}>${m}</option>`).join('')}
+          </select></div>
+          <div class="field"><label>从站地址</label><input id="p_addr_${i}" type="number" min="0" max="247" value="${v('slaveaddress_',1)}"></div>
+          <div class="field"><label>重试次数</label><input id="p_retry_${i}" type="number" min="0" max="65535" value="${v('retrycount_',3)}"></div>
+          <div class="field"><label>发送响应间隔(ms)</label><input id="p_timeout_${i}" type="number" min="0" max="65535" value="${v('responeinteval_',1000)}"></div>
+          <div class="field"><label>通信间隔(ms)</label><input id="p_tti_${i}" type="number" min="0" max="65535" value="${v('tti_',20)}"></div>
+        </div>
+      </div>`;
     }
     html += '<div class="nav"><button class="btn btn-p" onclick="savePorts()">保存端口配置</button></div>';
     $('#port_cards').innerHTML = html;
   } catch(e) { console.error('port', e); }
 }
 
-// Save RS485 port config
+// Save RS485 port config — 9 个字段全部提交，不使用隐式默认值覆盖用户设置
 async function savePorts() {
   try {
     for (let i = 0; i < 3; i++) {
       const fd = new URLSearchParams({
         index: i,
+        datalen: $(`#p_datalen_${i}`).value,
+        checkmode: $(`#p_checkmode_${i}`).value,
+        stopbit: $(`#p_stopbit_${i}`).value,
         baud: $(`#p_baud_${i}`).value,
         masterslaveport: $(`#p_mode_${i}`).value,
         slaveaddress: $(`#p_addr_${i}`).value,
-        datalen: 8, stopbit: 1, checkmode: 0,
+        retrycount: $(`#p_retry_${i}`).value,
+        responeinteval: $(`#p_timeout_${i}`).value,
+        tti: $(`#p_tti_${i}`).value,
       });
-      await fetch('/updateportconfig', { method: 'POST', body: fd });
+      const response = await fetch('/updateportconfig', { method: 'POST', body: fd });
+      const result = await response.json();
+      if (result.code !== '0') throw new Error(`端口${i+1}: ${result.code}`);
     }
     toast('端口配置已保存', true);
+    await loadPorts();
   } catch(e) { toast('保存失败: ' + e, false); }
 }
 
