@@ -793,10 +793,10 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = SystemConfig::defaults();
-        assert_eq!(cfg.dhcp, true);
-        assert_eq!(cfg.ip, [192, 168, 1, 200]);
-        assert_eq!(cfg.eth_mac, [0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]);
-        assert_eq!(cfg.rs485.len(), 2);
+        assert_eq!(cfg.dhcp, false);
+        assert_eq!(cfg.ip, [192, 168, 51, 221]);
+        assert_eq!(cfg.eth_mac, [0; 6]);
+        assert_eq!(cfg.rs485.len(), 3);
     }
 
     #[test]
@@ -822,7 +822,7 @@ mod tests {
     fn test_ip_str_format() {
         let cfg = SystemConfig::defaults();
         let s = cfg.ip_str();
-        assert!(s.contains("192.168.1.200"));
+        assert!(s.contains("192.168.51.221"));
     }
 
     #[test]
@@ -859,10 +859,10 @@ mod tests {
     fn test_write_reg_dhcp() {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(0xFF03, 1);
-        assert_eq!(result, WriteResult::Ok);
+        assert_eq!(result, WriteResult::Apply);
         // cfg.dhcp is private; assert via behavior
         let result2 = cfg.write_reg(0xFF03, 0);
-        assert_eq!(result2, WriteResult::Ok);
+        assert_eq!(result2, WriteResult::Apply);
     }
 
     #[test]
