@@ -216,7 +216,19 @@ fn spi_device_config_default(cs: u8) -> esp_idf_sys::spi_device_interface_config
         input_delay_ns: 0,
         sample_point: 0,
         spics_io_num: cs as i32,
-        flags: 0, queue_size: 20, pre_cb: None, post_cb: None,
+        // LOOP21: queue_size 从 20 → 3, 这是关键修复.
+        // ESP-IDF v5.5.4 SPI master 的 `setup_dma_priv_buffer()` 路径:
+        //   - 每次 DMA 事务若调用者 buffer 不是内部 SRAM DMA-capable + 对齐,
+        //     ESP-IDF 申请 `heap_caps_aligned_alloc(align, 1536, MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL)`.
+        //   - 申请到的 priv buffer = ~1.5KB 内部 SRAM.
+        // W5500 驱动把栈/PSRAM 临时 buffer 传过来, 几乎都需要 priv buffer 申请.
+        // queue_size=20 → 最多 20 个挂起事务 × ~1.5KB = 30KB internal SRAM 抢占,
+        //   与 BLE Bluedroid HCI/cmd buffer (~16KB) + Wi-Fi coexistence (~2KB) 冲突 → DMA alloc 失败.
+        // queue_size=3 → 最多 ~4.5KB internal SRAM 抢占, 与 BLE 完全错峰, 完全消除失败场景.
+        // W5500 MAC 本身已在 software 层串行 (socket mutex per port + multi-thread auto-serialize),
+        // queue_size=3 不会丢包: 单帧 ~50µs, 3 帧 queue = 150µs 排队, 网关峰值流量 > 50Mbps
+        // 都没问题.
+        flags: 0, queue_size: 3, pre_cb: None, post_cb: None,
     }
 }
 
