@@ -243,43 +243,42 @@ fn eth_mac_config_default() -> esp_idf_sys::eth_mac_config_t {
 }
 
 // ============================================================================
-// LOOP22: Custom SPI driver for W5500 with pre-allocated PSRAM DMA staging buffers.
+// LOOP24: Static internal-SRAM DMA staging buffers for W5500.
 //
-// Root cause of "Failed to allocate priv TX buffer":
-//   W5500 driver calls spi_device_polling_transmit() with the caller's TX buffer.
-//   ESP-IDF's setup_dma_priv_buffer() checks if the buffer is DMA-capable.
-//   If not (e.g., PSRAM pbuf payload, unaligned malloc, or non-internal-SRAM
-//   pointer), it tries to heap_caps_aligned_alloc(align, ~1536, MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL).
-//   Under BLE+WiFi+ETH pressure the internal SRAM is fragmented → aligned
-//   alloc fails → "Failed to allocate priv TX buffer" → w5500_spi_write returns ESP_FAIL.
+// ROOT CAUSE (finally):
+//   setup_dma_priv_buffer checks: is_ptr_ext = esp_ptr_external_ram(buffer)
+//   For PSRAM pointers (0x3C000000-0x3FFFFFFF): is_ptr_ext = true
+//   Then: use_psram = is_ptr_ext && (flags & SPI_TRANS_DMA_USE_PSRAM)
+//   Since we never set SPI_TRANS_DMA_USE_PSRAM flag: use_psram = false
+//   Then: need_malloc = !use_psram || !esp_ptr_dma_ext_capable(buffer)
+//         = true (because use_psram is false)
+//   → allocates from MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL → fails under pressure
 //
-// Fix: pre-allocate two DMA-capable PSRAM staging buffers (TX + RX) at init.
-//   Every W5500 SPI transaction:
-//     - copy caller's data into our pre-allocated TX staging buffer (DMA-capable)
-//     - spi_device_polling_transmit() with that staging buffer
-//   setup_dma_priv_buffer sees the staging buffer is already DMA-capable
-//   → need_malloc=false → no internal SRAM allocation needed.
+//   So PSRAM staging buffers DON'T solve the problem! The buffer MUST be in
+//   internal SRAM DMA range (0x3FC88000-0x3FD00000) for esp_ptr_dma_capable
+//   to return true, which makes need_malloc = false.
 //
-// LOOP23 also bumps CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL 16KB → 64KB
-// to reserve a contiguous DMA-capable internal SRAM region for any
-// pathological cases where the staging buffer logic is bypassed.
+// FIX: Static arrays in .bss section. On ESP32-S3, .bss is mapped to
+//   internal SRAM (0x3FC88000-0x3FD00000 DMA range). 64-byte alignment
+//   satisfies GDMA alignment constraints. No runtime allocation needed.
 // ============================================================================
-use std::sync::OnceLock;
 
-const STAGING_BUF_BYTES: usize = 1600;
-const STAGING_BUF_ALIGN: usize = 64;
-
-struct W5500StagingBufs {
-    tx: *mut u8,
-    rx: *mut u8,
-    tx_len: usize,
-    rx_len: usize,
+/// W5500 staging buffers in .bss (internal SRAM, DMA range, 64-byte aligned).
+/// 1600 bytes covers max Ethernet frame (1536B) + SPI header (3B) + margin.
+#[repr(C, align(64))]
+struct W5500DmaStaging {
+    tx: [u8; 1600],
+    rx: [u8; 1600],
 }
-// SAFETY: staging buffers live for program lifetime; mutexed in callbacks.
-unsafe impl Send for W5500StagingBufs {}
-unsafe impl Sync for W5500StagingBufs {}
 
-static STAGING_BUFS: OnceLock<W5500StagingBufs> = OnceLock::new();
+// SAFETY: Accessed only from custom SPI read/write callbacks, protected by SPI mutex.
+unsafe impl Send for W5500DmaStaging {}
+unsafe impl Sync for W5500DmaStaging {}
+
+static STAGING: W5500DmaStaging = W5500DmaStaging {
+    tx: [0u8; 1600],
+    rx: [0u8; 1600],
+};
 
 /// Custom SPI driver config (passed via `custom_spi_driver.config`).
 #[derive(Clone)]
@@ -293,28 +292,9 @@ struct CustomSpiCtx {
     handle: esp_idf_sys::spi_device_handle_t,
     lock: esp_idf_sys::QueueHandle_t,
 }
+// SAFETY: handle is freed by SPI driver; lock is mutex.
 unsafe impl Send for CustomSpiCtx {}
 unsafe impl Sync for CustomSpiCtx {}
-
-/// Allocate DMA-capable staging buffer (prefer PSRAM, fall back to internal SRAM).
-fn alloc_staging_buf() -> *mut u8 {
-    unsafe {
-        let ptr = esp_idf_sys::heap_caps_aligned_alloc(
-            STAGING_BUF_ALIGN,
-            STAGING_BUF_BYTES,
-            esp_idf_sys::MALLOC_CAP_SPIRAM | esp_idf_sys::MALLOC_CAP_DMA,
-        );
-        if !ptr.is_null() {
-            return ptr as *mut u8;
-        }
-        log::warn!("[eth] PSRAM staging buf failed, using internal SRAM");
-        esp_idf_sys::heap_caps_aligned_alloc(
-            STAGING_BUF_ALIGN,
-            STAGING_BUF_BYTES,
-            esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_DMA,
-        ) as *mut u8
-    }
-}
 
 /// W5500 calls init(config) where config is `custom_spi_driver.config` pointer.
 unsafe extern "C" fn w5500_custom_spi_init(
@@ -328,37 +308,14 @@ unsafe extern "C" fn w5500_custom_spi_init(
         return std::ptr::null_mut();
     }
 
-    // One-time staging buffer allocation
-    let _ = STAGING_BUFS.get_or_init(|| {
-        let tx = alloc_staging_buf();
-        let rx = alloc_staging_buf();
-        if tx.is_null() || rx.is_null() {
-            log::error!("[eth] custom_spi: staging buffer alloc failed");
-            return W5500StagingBufs {
-                tx: std::ptr::null_mut(),
-                rx: std::ptr::null_mut(),
-                tx_len: 0,
-                rx_len: 0,
-            };
-        }
-        log::info!(
-            "[eth] custom_spi: {}B TX+RX staging DMA bufs ready (PSRAM)",
-            STAGING_BUF_BYTES
-        );
-        W5500StagingBufs {
-            tx,
-            rx,
-            tx_len: STAGING_BUF_BYTES,
-            rx_len: STAGING_BUF_BYTES,
-        }
-    });
-
-    // Serialize SPI access (non-recursive mutex, only W5500 internal threads use it)
+    // Serialize SPI access. Note: W5500 rx_task and any tx caller all run
+    // through this lock. Non-recursive mutex (only one caller at a time).
     let lock = esp_idf_sys::xQueueCreateMutex(0);
     if lock.is_null() {
         esp_idf_sys::spi_bus_remove_device(handle);
         return std::ptr::null_mut();
     }
+    log::info!("[eth] LOOP24: static 1600B TX+RX DMA staging bufs in .bss (internal SRAM)");
 
     let ctx = Box::new(CustomSpiCtx { handle, lock });
     Box::into_raw(ctx) as *mut std::ffi::c_void
@@ -386,21 +343,21 @@ unsafe extern "C" fn w5500_custom_spi_read(
     data_len: u32,
 ) -> i32 {
     let ctx = &*(spi_ctx as *const CustomSpiCtx);
-    let bufs = match STAGING_BUFS.get() {
-        Some(b) => b,
-        None => return 0x1201,
-    };
-    if data_len as usize > bufs.rx_len || bufs.rx.is_null() {
+    let data_len_us = data_len as usize;
+    if data_len_us > STAGING.rx.len() {
         return 0x1202;
     }
     if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
         return 0x1203;
     }
+    // SAFETY: STAGING.rx is a static array in .bss (internal SRAM DMA range),
+    // 64-byte aligned via #[repr(C, align(64))].
+    let rx_ptr = STAGING.rx.as_ptr() as *mut u8;
     let mut trans = esp_idf_sys::spi_transaction_t {
         cmd: cmd as u16,
         addr: addr as u64,
-        length: data_len as usize * 8,
-        rxlength: data_len as usize * 8,
+        length: data_len_us * 8,
+        rxlength: data_len_us * 8,
         flags: 0,
         override_freq_hz: 0,
         user: std::ptr::null_mut(),
@@ -408,12 +365,12 @@ unsafe extern "C" fn w5500_custom_spi_read(
             tx_buffer: std::ptr::null(),
         },
         __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
-            rx_buffer: bufs.rx as *mut std::ffi::c_void,
+            rx_buffer: rx_ptr as *mut std::ffi::c_void,
         },
     };
     let ret = esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _);
     if ret == 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(bufs.rx, data as *mut u8, data_len as usize);
+        core::ptr::copy_nonoverlapping(rx_ptr, data as *mut u8, data_len_us);
     }
     let _ = esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0);
     ret
@@ -427,29 +384,31 @@ unsafe extern "C" fn w5500_custom_spi_write(
     data_len: u32,
 ) -> i32 {
     let ctx = &*(spi_ctx as *const CustomSpiCtx);
-    let bufs = match STAGING_BUFS.get() {
-        Some(b) => b,
-        None => return 0x1201,
-    };
-    if data_len as usize > bufs.tx_len || bufs.tx.is_null() {
+    let data_len_us = data_len as usize;
+    if data_len_us > STAGING.tx.len() {
         return 0x1202;
     }
     if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
         return 0x1203;
     }
+    // SAFETY: STAGING.tx is static array in .bss (internal SRAM DMA range).
+    // Both reads (read function) and writes (write function) are guarded
+    // by the SPI mutex (ctx.lock). The as_mut_ptr() call only returns a
+    // raw pointer; actual mutation happens via copy_nonoverlapping.
+    let tx_ptr = STAGING.tx.as_ptr() as *mut u8;
     if !data.is_null() {
-        core::ptr::copy_nonoverlapping(data as *const u8, bufs.tx, data_len as usize);
+        core::ptr::copy_nonoverlapping(data as *const u8, tx_ptr, data_len_us);
     }
     let mut trans = esp_idf_sys::spi_transaction_t {
         cmd: cmd as u16,
         addr: addr as u64,
-        length: data_len as usize * 8,
+        length: data_len_us * 8,
         rxlength: 0,
         flags: 0,
         override_freq_hz: 0,
         user: std::ptr::null_mut(),
         __bindgen_anon_1: esp_idf_sys::spi_transaction_t__bindgen_ty_1 {
-            tx_buffer: bufs.tx as *const std::ffi::c_void,
+            tx_buffer: tx_ptr as *const std::ffi::c_void,
         },
         __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
             rx_buffer: std::ptr::null_mut(),
