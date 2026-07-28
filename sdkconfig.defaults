@@ -108,9 +108,15 @@ CONFIG_LWIP_TCP_KEEPALIVE=y
 CONFIG_ETH_ENABLED=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
+# LOOP20: ETH TX DMA buffer 从 10 → 4 保持 (减少 ~12KB internal SRAM 压力),
+# DMA BUFFER SIZE 1536B 保持 (W5500 标准以太网帧 = 1536B + header).
+# 注意: ESP-IDF v5.5.4 SPI Master DMA 路径下, max_transfer_sz 由 bus_config 设定的
+# 值决定 DMA descriptor pool 大小 (`dma_desc_ct = max/4092`). 改小 max_transfer_sz
+# 即减少 DMA descriptor. 1k descriptor = 1 帧, 1.5k = 2 帧. 我们 max=1536 = 1 desc
+# (兼容 1 帧,足够 1536B 标准帧). W5500 ETH 帧最大 1536B 完全 OK.
 CONFIG_ETH_DMA_BUFFER_SIZE=1536
-CONFIG_ETH_DMA_TX_BUFFER_NUM=10
-CONFIG_ETH_DMA_RX_BUFFER_NUM=20
+CONFIG_ETH_DMA_TX_BUFFER_NUM=4
+CONFIG_ETH_DMA_RX_BUFFER_NUM=8
 
 # ---- Wi-Fi (ESP32-S3 内置, 作为以太网冗余/配置入口) ----
 # 与 BLE 共存: ESP32-S3 内置 coexistence, 软件分时调度

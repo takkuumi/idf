@@ -184,8 +184,14 @@ fn spi_bus_config_default(mosi: u8, miso: u8, sclk: u8) -> esp_idf_sys::spi_bus_
         data4_io_num: -1, data5_io_num: -1, data6_io_num: -1, data7_io_num: -1,
         data_io_default_level: false,
         // W5500 最大以太网帧约 1536B, 加 3B SPI header 留 1600B 足够.
-        // 2048/更大的 transfer size 会让 SPI DMA 为每个挂起事务申请较大的
-        // internal DMA-capable priv buffer; BLE/Bluedroid 同时运行时容易耗尽内部 SRAM.
+        // LOOP20: max_transfer_sz 决定 SPI DMA descriptor pool 大小
+        // (dma_desc_ct = ceil(max_transfer_sz / 4092)). 1 个 descriptor 可传 4092B,
+        // 但 ESP-IDF W5500 驱动每次 w5500_spi_write/read 的 trans.length = 8*len,
+        // 其中 len = 实际帧字节数. 1536B 帧 → 1 个 DMA desc 足够.
+        // 设为 1600 时: 1 个 DMA desc = 4092B, descriptor pool 仅 1 组,
+        // 每次 SPI 事务的 DMA priv buffer 分配压力最低 (~1.5KB 而非 ~8KB).
+        // 之前 2048/4096 的 max_transfer_sz 导致 pool 中预分配 2 个 desc → 每个挂起
+        // 事务的 priv buffer 依次翻倍, BLE/Bluedroid 同时运行时容易耗尽 internal SRAM.
         max_transfer_sz: 1600,
         flags: 0,
         isr_cpu_id: esp_idf_sys::esp_intr_cpu_affinity_t_ESP_INTR_CPU_AFFINITY_AUTO,
