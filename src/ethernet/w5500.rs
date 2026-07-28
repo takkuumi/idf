@@ -300,9 +300,14 @@ unsafe impl Sync for CustomSpiCtx {}
 unsafe extern "C" fn w5500_custom_spi_init(
     spi_config: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
-    let cfg = &*(spi_config as *const CustomSpiInitCfg);
+    if spi_config.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: ESP-IDF invokes this callback with the long-lived configuration
+    // pointer installed by eth_w5500_config_default().
+    let cfg = unsafe { &*(spi_config as *const CustomSpiInitCfg) };
     let mut handle: esp_idf_sys::spi_device_handle_t = std::ptr::null_mut();
-    let ret = esp_idf_sys::spi_bus_add_device(cfg.host_id, &cfg.dev_cfg, &mut handle);
+    let ret = unsafe { esp_idf_sys::spi_bus_add_device(cfg.host_id, &cfg.dev_cfg, &mut handle) };
     if ret != 0 {
         log::error!("[eth] custom_spi: spi_bus_add_device failed: 0x{:x}", ret);
         return std::ptr::null_mut();
@@ -310,9 +315,9 @@ unsafe extern "C" fn w5500_custom_spi_init(
 
     // Serialize SPI access. Note: W5500 rx_task and any tx caller all run
     // through this lock. Non-recursive mutex (only one caller at a time).
-    let lock = esp_idf_sys::xQueueCreateMutex(0);
+    let lock = unsafe { esp_idf_sys::xQueueCreateMutex(0) };
     if lock.is_null() {
-        esp_idf_sys::spi_bus_remove_device(handle);
+        unsafe { esp_idf_sys::spi_bus_remove_device(handle) };
         return std::ptr::null_mut();
     }
     log::info!("[eth] LOOP24: static 1600B TX+RX DMA staging bufs in .bss (internal SRAM)");
@@ -325,12 +330,13 @@ unsafe extern "C" fn w5500_custom_spi_deinit(spi_ctx: *mut std::ffi::c_void) -> 
     if spi_ctx.is_null() {
         return 0;
     }
-    let ctx = Box::from_raw(spi_ctx as *mut CustomSpiCtx);
+    // SAFETY: init allocated this context and ESP-IDF calls deinit exactly once.
+    let ctx = unsafe { Box::from_raw(spi_ctx as *mut CustomSpiCtx) };
     if !ctx.lock.is_null() {
-        esp_idf_sys::vQueueDelete(ctx.lock);
+        unsafe { esp_idf_sys::vQueueDelete(ctx.lock) };
     }
     if !ctx.handle.is_null() {
-        esp_idf_sys::spi_bus_remove_device(ctx.handle);
+        unsafe { esp_idf_sys::spi_bus_remove_device(ctx.handle) };
     }
     0
 }
@@ -342,12 +348,16 @@ unsafe extern "C" fn w5500_custom_spi_read(
     data: *mut std::ffi::c_void,
     data_len: u32,
 ) -> i32 {
-    let ctx = &*(spi_ctx as *const CustomSpiCtx);
+    if spi_ctx.is_null() {
+        return 0x1201;
+    }
+    // SAFETY: ESP-IDF retains the context returned by init until deinit.
+    let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
     let data_len_us = data_len as usize;
     if data_len_us > STAGING.rx.len() {
         return 0x1202;
     }
-    if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
+    if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
         return 0x1203;
     }
     // SAFETY: STAGING.rx is a static array in .bss (internal SRAM DMA range),
@@ -368,11 +378,12 @@ unsafe extern "C" fn w5500_custom_spi_read(
             rx_buffer: rx_ptr as *mut std::ffi::c_void,
         },
     };
-    let ret = esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _);
+    let ret = unsafe { esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _) };
     if ret == 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(rx_ptr, data as *mut u8, data_len_us);
+        // SAFETY: `data` is the caller-provided RX buffer for data_len_us bytes.
+        unsafe { core::ptr::copy_nonoverlapping(rx_ptr, data as *mut u8, data_len_us) };
     }
-    let _ = esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0);
+    let _ = unsafe { esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0) };
     ret
 }
 
@@ -383,12 +394,16 @@ unsafe extern "C" fn w5500_custom_spi_write(
     data: *const std::ffi::c_void,
     data_len: u32,
 ) -> i32 {
-    let ctx = &*(spi_ctx as *const CustomSpiCtx);
+    if spi_ctx.is_null() {
+        return 0x1201;
+    }
+    // SAFETY: ESP-IDF retains the context returned by init until deinit.
+    let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
     let data_len_us = data_len as usize;
     if data_len_us > STAGING.tx.len() {
         return 0x1202;
     }
-    if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
+    if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
         return 0x1203;
     }
     // SAFETY: STAGING.tx is static array in .bss (internal SRAM DMA range).
@@ -397,7 +412,8 @@ unsafe extern "C" fn w5500_custom_spi_write(
     // raw pointer; actual mutation happens via copy_nonoverlapping.
     let tx_ptr = STAGING.tx.as_ptr() as *mut u8;
     if !data.is_null() {
-        core::ptr::copy_nonoverlapping(data as *const u8, tx_ptr, data_len_us);
+        // SAFETY: `data` is the caller-provided TX buffer for data_len_us bytes.
+        unsafe { core::ptr::copy_nonoverlapping(data as *const u8, tx_ptr, data_len_us) };
     }
     let mut trans = esp_idf_sys::spi_transaction_t {
         cmd: cmd as u16,
@@ -414,8 +430,8 @@ unsafe extern "C" fn w5500_custom_spi_write(
             rx_buffer: std::ptr::null_mut(),
         },
     };
-    let ret = esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _);
-    let _ = esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0);
+    let ret = unsafe { esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _) };
+    let _ = unsafe { esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0) };
     ret
 }
 

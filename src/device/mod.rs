@@ -219,23 +219,27 @@ const BLOB_TOTAL_BYTES: usize = BLOB_HEADER_BYTES + PROTO_DATA_BYTES; // 3010
 // 全局状态
 // ----------------------------------------------------------------------------
 
-/// NVS 分区句柄 (单例, take 一次)
-/// 取失败时使用 PLACEHOLDER (后续所有 NVS 操作会返回错误, 但不 panic)
-pub static NVS_PARTITION: LazyLock<EspDefaultNvsPartition> = LazyLock::new(|| {
-    EspNvsPartition::<NvsDefault>::take().unwrap_or_else(|e| {
-        log::error!("[device] NVS partition take failed: {e:?}");
-        log::error!("[device] system will run in degraded mode (no persistence)");
-        // 构造一个 dummy 分区 - 实际 NVS 操作都会失败但不会 panic
-        // (这里用 expect() 是因为分区是必需的, 失败后只能 reset)
-        panic!("NVS partition unavailable: {e:?}");
-    })
+/// NVS 分区句柄 (单例, take 一次)。获取失败后继续以无持久化模式运行，
+/// 不允许因 Flash/NVS 故障触发 panic 或非计划复位。
+pub static NVS_PARTITION: LazyLock<Option<EspDefaultNvsPartition>> = LazyLock::new(|| {
+    match EspNvsPartition::<NvsDefault>::take() {
+        Ok(partition) => Some(partition),
+        Err(e) => {
+            log::error!("[device] NVS partition take failed: {e:?}; persistence disabled");
+            None
+        }
+    }
 });
 
 /// NVS 句柄 (gateway namespace)
 /// 注意 esp_idf_svc 0.50: EspDefaultNvs::new 第三参数 read_write: bool
 /// 使用 Option 内部存储, 初始化失败时设为 None, 后续操作 graceful fail
 pub static NVS: LazyLock<Spin<Option<EspDefaultNvs>>> = LazyLock::new(|| {
-    let inner = match EspDefaultNvs::new(NVS_PARTITION.clone(), NVS_NAMESPACE, true) {
+    let partition = match NVS_PARTITION.as_ref() {
+        Some(partition) => partition.clone(),
+        None => return Spin::new(None),
+    };
+    let inner = match EspDefaultNvs::new(partition, NVS_NAMESPACE, true) {
         Ok(nvs) => {
             log::info!("[device] NVS namespace '{NVS_NAMESPACE}' opened");
             Some(nvs)
@@ -381,7 +385,7 @@ pub fn init() -> AppResult<()> {
 }
 
 /// 借用 NVS 分区句柄 (供其它模块如 blemesh 复用, 避免重复 take)
-pub fn nvs_partition() -> EspDefaultNvsPartition {
+pub fn nvs_partition() -> Option<EspDefaultNvsPartition> {
     NVS_PARTITION.clone()
 }
 

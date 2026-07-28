@@ -3,7 +3,7 @@
 //! ## 设计原则
 //! - 任何故障先尝试恢复, 绝不直接重启
 //! - 故障计数器分级别: 轻 → 重 → 严重
-//! - 严重故障才考虑重启 (例如 NVS 损坏)
+//! - 严重故障进入更严格的降级模式，保留可用业务
 //! - 网络/外设故障 → 降级模式 (关闭相关功能)
 //! - 数据故障 → 仅记录日志, 重置默认值
 //!
@@ -12,10 +12,10 @@
 //! |------|---------|------|
 //! | Recoverable | 重试 N 次 | BLE 通知失败、Modbus CRC 错误 |
 //! | Degradable | 关闭相关功能 | 网线断开 (降级为 BLE-only) |
-//! | Severe | 延迟重启 | NVS 损坏、OTA 失败 |
-//! | Fatal | 立即重启 | panic、内存耗尽 |
+//! | Severe | 本地降级 | NVS 损坏、OTA 失败 |
+//! | Fatal | 最小功能降级 | panic、内存耗尽 |
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use std::sync::LazyLock;
@@ -27,9 +27,9 @@ pub enum Severity {
     Recoverable,
     /// 可降级 (关闭相关功能)
     Degradable,
-    /// 严重 (考虑重启)
+    /// 严重 (进入本地降级)
     Severe,
-    /// 致命 (panic/内存耗尽)
+    /// 致命 (最小功能降级)
     Fatal,
 }
 
@@ -63,9 +63,6 @@ static LAST_SEVERE_MS: AtomicU32 = AtomicU32::new(0);
 
 // === 当前降级模式 (原子无锁) ===
 static DEGRADED_MODE: AtomicU32 = AtomicU32::new(0);  // 0=Normal
-/// 只允许一个延迟重启调度器存在，避免多个故障同时创建竞争性的 esp_restart 线程.
-static RESTART_ARMED: AtomicBool = AtomicBool::new(false);
-
 /// 记录一次故障
 pub fn record_failure(severity: Severity, module: &str, msg: &str) {
     let now = elapsed_ms();
@@ -185,14 +182,12 @@ pub enum RecoveryAction {
     Retry(std::time::Duration),
     /// 切换到降级模式 (持续运行, 关闭部分功能)
     Degrade(DegradedMode),
-    /// 延迟后重启 (严重故障, 已用尽其他恢复手段)
-    DelayedRestart(std::time::Duration),
 }
 
 /// 决定故障恢复策略 (核心决策函数)
 ///
 /// 根据故障类型、发生频率、当前模式决定下一步行动。
-/// 设计目标: 永远不要立刻重启, 总是先尝试降级运行。
+/// 设计目标: 故障不触发软件重启，保留仍可工作的业务并等待运维处理。
 pub fn decide_action(
     severity: Severity,
     consecutive_failures: u32,
@@ -215,12 +210,10 @@ pub fn decide_action(
             }
         }
         Severity::Severe => {
-            // 严重: 30 秒延迟才重启, 给运维人员介入机会
-            RecoveryAction::DelayedRestart(std::time::Duration::from_secs(30))
+            RecoveryAction::Degrade(DegradedMode::LocalOnly)
         }
         Severity::Fatal => {
-            // 致命: 立即重启
-            RecoveryAction::DelayedRestart(std::time::Duration::from_secs(0))
+            RecoveryAction::Degrade(DegradedMode::Minimal)
         }
     }
 }
@@ -234,21 +227,6 @@ pub fn apply_action(action: RecoveryAction, module: &str) {
         }
         RecoveryAction::Degrade(m) => {
             enter_mode(m);
-        }
-        RecoveryAction::DelayedRestart(d) => {
-            if RESTART_ARMED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                log::warn!("[recovery] {}: restart already scheduled", module);
-                return;
-            }
-            log::error!("[recovery] {}: DELAYED RESTART in {:?}", module, d);
-            // 用独立线程延迟重启, 不阻塞当前调用; guard 防止重复创建重启线程.
-            std::thread::spawn(move || {
-                std::thread::sleep(d);
-                unsafe { esp_idf_sys::esp_restart() };
-            });
         }
     }
 }
@@ -306,25 +284,15 @@ mod tests {
     }
 
     #[test]
-    fn test_severe_never_immediate_restart() {
-        // Severe 故障: 30 秒延迟重启, 不会立刻
+    fn test_severe_degrades_without_restart() {
         let action = decide_action(Severity::Severe, 1);
-        if let RecoveryAction::DelayedRestart(d) = action {
-            assert!(d >= std::time::Duration::from_secs(30));
-        } else {
-            panic!("Severe should be DelayedRestart, got {:?}", action);
-        }
+        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::LocalOnly)));
     }
 
     #[test]
-    fn test_fatal_immediate() {
-        // Fatal 故障: 立即重启
+    fn test_fatal_degrades_without_restart() {
         let action = decide_action(Severity::Fatal, 0);
-        if let RecoveryAction::DelayedRestart(d) = action {
-            assert_eq!(d, std::time::Duration::from_secs(0));
-        } else {
-            panic!("Fatal should be DelayedRestart(0)");
-        }
+        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::Minimal)));
     }
 
     #[test]

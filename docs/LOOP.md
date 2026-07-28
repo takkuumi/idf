@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-26 (LOOP12: 推进已知限制 — 实施 5 项 + 剩余 3 项文档化)
+> 最后更新: 2026-07-28 (LOOP25: 非计划重启路径收敛 + BLE 长帧兼容)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -722,3 +722,24 @@ just test-compile    # 仅编译测试 binary
 | BTU_TASK 栈 | 12288 bytes |
 | ConfigSnapshot 栈大小 | 2700B → 152B (Layer 1) |
 | BLE 回调链 ConfigSnapshot clone | **0B** (Layer 2 全 _with) |
+
+## LOOP25 稳定性与手持机兼容审计 (2026-07-28)
+
+### 已修复
+
+- 健康心跳停滞不再触发 `esp_restart()`；记录故障并保持可用业务运行。
+- `recovery` 的 Severe/Fatal 策略改为本地/最小功能降级，移除延迟软件重启调度器。
+- NVS 分区获取失败不再 `panic!`，设备在无持久化模式下继续提供通信与本地控制。
+- BLE 二进制响应容量由 32 字节扩大到完整 Modbus PDU 上限；SN、位置及 RS485 读取的长度字段不再与实际负载不一致。
+- BLE GATT Write 新增固定 512-byte 无堆分配重组缓冲，兼容 ATT 分片后的 Android 配置/文本命令。
+- W5500 自定义 SPI 回调补齐 Rust 2024 必需的 unsafe 边界和空指针检查，编译警告归零。
+
+### 验证
+
+- `cargo check`: 通过，0 warning。
+- `cargo test --bin gateway --no-run`: 通过，测试二进制成功生成。
+- 新增 Android 兼容边界回归：32-byte SN length-prefix 与 ATT 分片帧长度校验。
+
+### 必须继续的实机验证
+
+静态检查不能证明 7x24 可靠性或 Android 端到端兼容。烧录后需执行至少 72 小时浸泡测试，并覆盖：反复 BLE 连接/断开、低 MTU 配置写、W5500 拔插、RS485 无从站、NVS 写失败注入和 Modbus TCP 持续读写。记录格式见 `log/ble/compat_stability_2026-07-28.md`。
