@@ -52,8 +52,17 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_MODE_QUAD=y
 # <4KB 走内部 SRAM (栈/小型 struct/Mutex 等), >=4KB 走 PSRAM
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
-# 保留 16KB 内部 SRAM 不被 PSRAM 分配占用 (给 DMA 描述符/中断栈)
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
+# LOOP23: 保留 64KB 内部 SRAM 不被 PSRAM 分配占用.
+# 原值 16384 (16KB) 在 BLE+WiFi+ETH 同时运行时, 内部 SRAM 高度碎片化,
+# 导致 ESP-IDF SPI master 的 setup_dma_priv_buffer() 在申请 1536B 临时
+# DMA 缓冲 (MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL) 时找不到连续的 64 字节对齐
+# 块 → 'Failed to allocate priv TX buffer' 错误持续循环.
+# 64KB 保留块保证 DMA 申请始终有连续内部 SRAM 可用, BLE HCI buffer (16KB) +
+# W5500 SPI priv buffer (4.5KB × queue_size=3) + ETH DMA (12KB) +
+# LwIP PBUF (8KB) + 中断栈 (4KB) 全部在保留区内, 互不干扰.
+# ESP32-S3R2 内部 SRAM 总计 ~294KB, 64KB 保留后剩 ~230KB 给一般堆,
+# 仍足够 FreeRTOS/任务栈/ProtoStore(3KB)/NVS 缓存等使用.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # 允许 PSRAM 分配的内存用 malloc 后备 (大缓冲区优先 PSRAM)
 CONFIG_SPIRAM_MALLOC_FAIL_INTERNAL=y
 
@@ -108,15 +117,18 @@ CONFIG_LWIP_TCP_KEEPALIVE=y
 CONFIG_ETH_ENABLED=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
-# LOOP20: ETH TX DMA buffer 从 10 → 4 保持 (减少 ~12KB internal SRAM 压力),
-# DMA BUFFER SIZE 1536B 保持 (W5500 标准以太网帧 = 1536B + header).
-# 注意: ESP-IDF v5.5.4 SPI Master DMA 路径下, max_transfer_sz 由 bus_config 设定的
-# 值决定 DMA descriptor pool 大小 (`dma_desc_ct = max/4092`). 改小 max_transfer_sz
-# 即减少 DMA descriptor. 1k descriptor = 1 帧, 1.5k = 2 帧. 我们 max=1536 = 1 desc
-# (兼容 1 帧,足够 1536B 标准帧). W5500 ETH 帧最大 1536B 完全 OK.
+# LOOP23: ETH DMA buffer 数量降到 sdkconfig 最小值 (3 = sdkconfig Kconfig 下限).
+# LOOP20/21 已减到 4TX+8RX, 仍偶尔失败 → LOOP23 进一步减到下限, 节省 ~12KB.
+# LOOP23 配合 SPIRAM_MALLOC_RESERVE_INTERNAL=64KB 保留区:
+#   - W5500 SPI priv buffer (1.5KB × 3 queue) = ~4.5KB 在保留区
+#   - ETH TX DMA buffer (1536B × 3) = ~4.6KB 在保留区
+#   - ETH RX DMA buffer (1536B × 3) = ~4.6KB 在保留区
+#   - BLE HCI buffer ~16KB 在保留区
+#   - LwIP PBUF pool ~6KB 在保留区
+#   总共 ~36KB, 64KB 保留区完全容纳, 不再与一般堆冲突.
 CONFIG_ETH_DMA_BUFFER_SIZE=1536
-CONFIG_ETH_DMA_TX_BUFFER_NUM=4
-CONFIG_ETH_DMA_RX_BUFFER_NUM=8
+CONFIG_ETH_DMA_TX_BUFFER_NUM=3
+CONFIG_ETH_DMA_RX_BUFFER_NUM=3
 
 # ---- Wi-Fi (ESP32-S3 内置, 作为以太网冗余/配置入口) ----
 # 与 BLE 共存: ESP32-S3 内置 coexistence, 软件分时调度

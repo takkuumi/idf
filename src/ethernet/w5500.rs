@@ -216,6 +216,10 @@ fn spi_device_config_default(cs: u8) -> esp_idf_sys::spi_device_interface_config
         input_delay_ns: 0,
         sample_point: 0,
         spics_io_num: cs as i32,
+        // LOOP23: queue_size=3 (保持 LOOP21 设置), 但现在配合
+        //   - sdkconfig SPIRAM_MALLOC_RESERVE_INTERNAL=64KB 保留区
+        //   - ETH DMA TX/RX buffer 各 3 个 (LOOP23 sdkconfig 改动)
+        //   这确保 W5500 SPI priv buffer 申请永远落到保留区, 与 BLE 共存不再冲突.
         // LOOP21: queue_size 从 20 → 3, 这是关键修复.
         // ESP-IDF v5.5.4 SPI master 的 `setup_dma_priv_buffer()` 路径:
         //   - 每次 DMA 事务若调用者 buffer 不是内部 SRAM DMA-capable + 对齐,
@@ -238,23 +242,248 @@ fn eth_mac_config_default() -> esp_idf_sys::eth_mac_config_t {
     }
 }
 
+// ============================================================================
+// LOOP22: Custom SPI driver for W5500 with pre-allocated PSRAM DMA staging buffers.
+//
+// Root cause of "Failed to allocate priv TX buffer":
+//   W5500 driver calls spi_device_polling_transmit() with the caller's TX buffer.
+//   ESP-IDF's setup_dma_priv_buffer() checks if the buffer is DMA-capable.
+//   If not (e.g., PSRAM pbuf payload, unaligned malloc, or non-internal-SRAM
+//   pointer), it tries to heap_caps_aligned_alloc(align, ~1536, MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL).
+//   Under BLE+WiFi+ETH pressure the internal SRAM is fragmented → aligned
+//   alloc fails → "Failed to allocate priv TX buffer" → w5500_spi_write returns ESP_FAIL.
+//
+// Fix: pre-allocate two DMA-capable PSRAM staging buffers (TX + RX) at init.
+//   Every W5500 SPI transaction:
+//     - copy caller's data into our pre-allocated TX staging buffer (DMA-capable)
+//     - spi_device_polling_transmit() with that staging buffer
+//   setup_dma_priv_buffer sees the staging buffer is already DMA-capable
+//   → need_malloc=false → no internal SRAM allocation needed.
+//
+// LOOP23 also bumps CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL 16KB → 64KB
+// to reserve a contiguous DMA-capable internal SRAM region for any
+// pathological cases where the staging buffer logic is bypassed.
+// ============================================================================
+use std::sync::OnceLock;
+
+const STAGING_BUF_BYTES: usize = 1600;
+const STAGING_BUF_ALIGN: usize = 64;
+
+struct W5500StagingBufs {
+    tx: *mut u8,
+    rx: *mut u8,
+    tx_len: usize,
+    rx_len: usize,
+}
+// SAFETY: staging buffers live for program lifetime; mutexed in callbacks.
+unsafe impl Send for W5500StagingBufs {}
+unsafe impl Sync for W5500StagingBufs {}
+
+static STAGING_BUFS: OnceLock<W5500StagingBufs> = OnceLock::new();
+
+/// Custom SPI driver config (passed via `custom_spi_driver.config`).
+#[derive(Clone)]
+struct CustomSpiInitCfg {
+    host_id: esp_idf_sys::spi_host_device_t,
+    dev_cfg: esp_idf_sys::spi_device_interface_config_t,
+}
+
+/// Per-driver context (allocated in init, freed in deinit).
+struct CustomSpiCtx {
+    handle: esp_idf_sys::spi_device_handle_t,
+    lock: esp_idf_sys::QueueHandle_t,
+}
+unsafe impl Send for CustomSpiCtx {}
+unsafe impl Sync for CustomSpiCtx {}
+
+/// Allocate DMA-capable staging buffer (prefer PSRAM, fall back to internal SRAM).
+fn alloc_staging_buf() -> *mut u8 {
+    unsafe {
+        let ptr = esp_idf_sys::heap_caps_aligned_alloc(
+            STAGING_BUF_ALIGN,
+            STAGING_BUF_BYTES,
+            esp_idf_sys::MALLOC_CAP_SPIRAM | esp_idf_sys::MALLOC_CAP_DMA,
+        );
+        if !ptr.is_null() {
+            return ptr as *mut u8;
+        }
+        log::warn!("[eth] PSRAM staging buf failed, using internal SRAM");
+        esp_idf_sys::heap_caps_aligned_alloc(
+            STAGING_BUF_ALIGN,
+            STAGING_BUF_BYTES,
+            esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_DMA,
+        ) as *mut u8
+    }
+}
+
+/// W5500 calls init(config) where config is `custom_spi_driver.config` pointer.
+unsafe extern "C" fn w5500_custom_spi_init(
+    spi_config: *const std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let cfg = &*(spi_config as *const CustomSpiInitCfg);
+    let mut handle: esp_idf_sys::spi_device_handle_t = std::ptr::null_mut();
+    let ret = esp_idf_sys::spi_bus_add_device(cfg.host_id, &cfg.dev_cfg, &mut handle);
+    if ret != 0 {
+        log::error!("[eth] custom_spi: spi_bus_add_device failed: 0x{:x}", ret);
+        return std::ptr::null_mut();
+    }
+
+    // One-time staging buffer allocation
+    let _ = STAGING_BUFS.get_or_init(|| {
+        let tx = alloc_staging_buf();
+        let rx = alloc_staging_buf();
+        if tx.is_null() || rx.is_null() {
+            log::error!("[eth] custom_spi: staging buffer alloc failed");
+            return W5500StagingBufs {
+                tx: std::ptr::null_mut(),
+                rx: std::ptr::null_mut(),
+                tx_len: 0,
+                rx_len: 0,
+            };
+        }
+        log::info!(
+            "[eth] custom_spi: {}B TX+RX staging DMA bufs ready (PSRAM)",
+            STAGING_BUF_BYTES
+        );
+        W5500StagingBufs {
+            tx,
+            rx,
+            tx_len: STAGING_BUF_BYTES,
+            rx_len: STAGING_BUF_BYTES,
+        }
+    });
+
+    // Serialize SPI access (non-recursive mutex, only W5500 internal threads use it)
+    let lock = esp_idf_sys::xQueueCreateMutex(0);
+    if lock.is_null() {
+        esp_idf_sys::spi_bus_remove_device(handle);
+        return std::ptr::null_mut();
+    }
+
+    let ctx = Box::new(CustomSpiCtx { handle, lock });
+    Box::into_raw(ctx) as *mut std::ffi::c_void
+}
+
+unsafe extern "C" fn w5500_custom_spi_deinit(spi_ctx: *mut std::ffi::c_void) -> i32 {
+    if spi_ctx.is_null() {
+        return 0;
+    }
+    let ctx = Box::from_raw(spi_ctx as *mut CustomSpiCtx);
+    if !ctx.lock.is_null() {
+        esp_idf_sys::vQueueDelete(ctx.lock);
+    }
+    if !ctx.handle.is_null() {
+        esp_idf_sys::spi_bus_remove_device(ctx.handle);
+    }
+    0
+}
+
+unsafe extern "C" fn w5500_custom_spi_read(
+    spi_ctx: *mut std::ffi::c_void,
+    cmd: u32,
+    addr: u32,
+    data: *mut std::ffi::c_void,
+    data_len: u32,
+) -> i32 {
+    let ctx = &*(spi_ctx as *const CustomSpiCtx);
+    let bufs = match STAGING_BUFS.get() {
+        Some(b) => b,
+        None => return 0x1201,
+    };
+    if data_len as usize > bufs.rx_len || bufs.rx.is_null() {
+        return 0x1202;
+    }
+    if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
+        return 0x1203;
+    }
+    let mut trans = esp_idf_sys::spi_transaction_t {
+        cmd: cmd as u16,
+        addr: addr as u64,
+        length: data_len as usize * 8,
+        rxlength: data_len as usize * 8,
+        flags: 0,
+        override_freq_hz: 0,
+        user: std::ptr::null_mut(),
+        __bindgen_anon_1: esp_idf_sys::spi_transaction_t__bindgen_ty_1 {
+            tx_buffer: std::ptr::null(),
+        },
+        __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
+            rx_buffer: bufs.rx as *mut std::ffi::c_void,
+        },
+    };
+    let ret = esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _);
+    if ret == 0 && !data.is_null() {
+        core::ptr::copy_nonoverlapping(bufs.rx, data as *mut u8, data_len as usize);
+    }
+    let _ = esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0);
+    ret
+}
+
+unsafe extern "C" fn w5500_custom_spi_write(
+    spi_ctx: *mut std::ffi::c_void,
+    cmd: u32,
+    addr: u32,
+    data: *const std::ffi::c_void,
+    data_len: u32,
+) -> i32 {
+    let ctx = &*(spi_ctx as *const CustomSpiCtx);
+    let bufs = match STAGING_BUFS.get() {
+        Some(b) => b,
+        None => return 0x1201,
+    };
+    if data_len as usize > bufs.tx_len || bufs.tx.is_null() {
+        return 0x1202;
+    }
+    if esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) != 1 {
+        return 0x1203;
+    }
+    if !data.is_null() {
+        core::ptr::copy_nonoverlapping(data as *const u8, bufs.tx, data_len as usize);
+    }
+    let mut trans = esp_idf_sys::spi_transaction_t {
+        cmd: cmd as u16,
+        addr: addr as u64,
+        length: data_len as usize * 8,
+        rxlength: 0,
+        flags: 0,
+        override_freq_hz: 0,
+        user: std::ptr::null_mut(),
+        __bindgen_anon_1: esp_idf_sys::spi_transaction_t__bindgen_ty_1 {
+            tx_buffer: bufs.tx as *const std::ffi::c_void,
+        },
+        __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
+            rx_buffer: std::ptr::null_mut(),
+        },
+    };
+    let ret = esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _);
+    let _ = esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0);
+    ret
+}
+
 /// W5500 配置: SPI 主机 + 设备配置 + 中断引脚
 /// ESP-IDF v5.5.4: eth_w5500_config_t 不再接受 spi_device_handle_t,
 /// 而是接受 spi_host_id + spi_devcfg 指针, MAC 驱动内部调用 spi_bus_add_device
+///
+/// LOOP22: 使用 custom_spi_driver 注入预分配 PSRAM DMA buffer 包装.
 fn eth_w5500_config_default(spi_host: esp_idf_sys::spi_host_device_t,
                              dev_cfg: &esp_idf_sys::spi_device_interface_config_t,
                              int_gpio: u8) -> esp_idf_sys::eth_w5500_config_t {
+    let init_cfg = Box::new(CustomSpiInitCfg {
+        host_id: spi_host,
+        dev_cfg: *dev_cfg,
+    });
+    let init_cfg_ptr = Box::into_raw(init_cfg) as *const std::ffi::c_void;
     esp_idf_sys::eth_w5500_config_t {
         int_gpio_num: int_gpio as i32,
         poll_period_ms: 0,
         spi_host_id: spi_host,
         spi_devcfg: dev_cfg as *const _ as *mut _,
         custom_spi_driver: esp_idf_sys::eth_spi_custom_driver_config_t {
-            config: std::ptr::null_mut(),
-            init: None,
-            deinit: None,
-            read: None,
-            write: None,
+            config: init_cfg_ptr as *mut std::ffi::c_void,
+            init: Some(w5500_custom_spi_init),
+            deinit: Some(w5500_custom_spi_deinit),
+            read: Some(w5500_custom_spi_read),
+            write: Some(w5500_custom_spi_write),
         },
     }
 }
