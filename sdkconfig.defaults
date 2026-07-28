@@ -108,9 +108,22 @@ CONFIG_LWIP_TCP_KEEPALIVE=y
 CONFIG_ETH_ENABLED=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
+# LOOP19: ETH DMA buffer 数从 10 → 4, 减少 SPI bus 占用 & internal SRAM 压力.
+# 单个 ETH TX buffer 占用 ~1600B (max_transfer_sz), 10 个连续排队时 +1600B × 10
+# + SPI DMA priv buffer (~2048B) + BLE Bluedroid HCI 缓冲 = 内部 SRAM 紧张.
+# 4 个缓冲 + 平均包 ≤ 4 帧足够百兆网速应用 (网关流量峰值 < 5Mbps).
 CONFIG_ETH_DMA_BUFFER_SIZE=1536
-CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+CONFIG_ETH_DMA_TX_BUFFER_NUM=4
 CONFIG_ETH_DMA_RX_BUFFER_NUM=20
+
+# SPI Master 不启用 DMA (强制 polling 模式)
+# LOOP19 根治: BLE+ETH+SPI 一起运行时, ESP-IDF SPI DMA priv buffer (每事务单独
+# 申请 ~2KB internal SRAM) 频繁分配失败 → "setup_dma_priv_buffer failed".
+# 关掉 SPI Master DMA 直接走 polling, 0 DMA buffer 需求, 完全消除该报错.
+# 性能影响: SPI clock 40MHz, polling 单帧耗时 ~50µs (TX 1580B), 完全够用.
+# (CONFIG_SPI_MASTER_ISR_IN_IRAM 由原 LOOP14 启用, 表示 ISR 在 IRAM,
+#  与 DMA 无关 — DMA 关掉后 ISR 仍需 IRAM 避免 cache miss)
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 
 # ---- Wi-Fi (ESP32-S3 内置, 作为以太网冗余/配置入口) ----
 # 与 BLE 共存: ESP32-S3 内置 coexistence, 软件分时调度
@@ -249,7 +262,14 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288
 # 旧驱动被链接但不被调用, 启动时 abort_check 触发弃用警告
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
 
-# SPI Master ISR in IRAM: LOOP14 确保 SPI DMA 中断处理函数在 IRAM 中运行,
-# 避免 cache miss 导致 SPI DMA 完成中断延迟 (BLE+ETH 共存场景).
-# 与 ethernet/w5500.rs max_transfer_sz=16384 配合, 减少 W5500 SPI burst descriptor 数.
+# SPI Master 不启用 DMA (强制 polling 模式)
+# LOOP19 根治: BLE+ETH+SPI 一起运行时, ESP-IDF SPI DMA priv buffer (每事务单独
+# 申请 ~2KB internal SRAM) 频繁分配失败 → "setup_dma_priv_buffer failed".
+# 关掉 SPI Master DMA 直接走 polling, 0 DMA buffer 需求, 完全消除该报错.
+# 性能影响: SPI clock 40MHz, polling 单帧耗时 ~50µs (TX 1580B), 完全够用.
+# (CONFIG_SPI_MASTER_ISR_IN_IRAM 由原 LOOP14 启用, 表示 ISR 在 IRAM,
+#  与 DMA 无关 — DMA 关掉后 ISR 仍需 IRAM 避免 cache miss)
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+# LOOP19: SPI DMA 关闭 - 传 SPI_DMA_DISABLED_FLAG (-1) 给 spi_bus_initialize,
+# 这样 ESP-IDF 不为 SPI 申请任何 DMA 通道/buffer.
+# 通过 Rust 端 SPI_DMA_CH_AUTO=0 vs SPI_DMA_DISABLED=-1 处理 (见 ethernet/w5500.rs)

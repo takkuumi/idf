@@ -68,12 +68,16 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     hal.gpio.eth_reset_pulse();
 
     // 2) 初始化 SPI 总线 (W5500 独占 SPI3_HOST)
-    //    DMA: SPI_DMA_CH_AUTO (ESP-IDF 自动分配 DMA 通道)
+    //    LOOP19: 改用 SPI_DMA_DISABLED, 完全关闭 SPI DMA, 走 polling 模式.
+    //    之前 SPI_DMA_CH_AUTO 让 ESP-IDF 自动分配 DMA 通道 — 在 BLE+ETH+SPI 共存
+    //    时 DMA priv buffer (~2KB/transaction) 频繁失败 (setup_dma_priv_buffer 报错).
+    //    polling 模式: 0 DMA buffer 申请, 0 DMA 中断. 性能足够 (40MHz SPI 单帧 1580B ~50µs).
+    //    ESP-IDF 常量: spi_common_dma_t_SPI_DMA_DISABLED = 0 (== unsigned 0x00).
     let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
     let bus_cfg = spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
-    let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_CH_AUTO;
+    let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_DISABLED;
     check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
-    log::info!("[eth] SPI bus initialized (host={}, DMA=auto)", spi_host);
+    log::info!("[eth] SPI bus initialized (host={}, DMA=disabled/polling)", spi_host);
 
     // 3) W5500 SPI 设备配置
     //    ESP-IDF v5.5.4: MAC 驱动内部调用 spi_bus_add_device, 无需手动添加
