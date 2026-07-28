@@ -179,7 +179,14 @@ pub fn start() -> AppResult<()> {
     crate::health::register(&TASK_HB);
     std::thread::Builder::new()
         .name("http-srv".into())
-        .stack_size(8 * 1024)
+        // LOOP18: http-srv 栈从 8KB 提到 12KB.
+        //  - OTA 上传期间单帧 buf 已缩到 2048B (见 handle_ota_upload_stream)
+        //  - 但 handle_get_io_data + handle_get_system_status 等长路径
+        //    单次请求会构造 ~30+ format! 临时字符串, 加上 BufReader 内部状态
+        //    + LwIP socket 状态, 实测峰值接近 7KB. 8KB 边界易触发 Stack canary.
+        //  - 与 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288 对齐, 移除
+        //    BLE/ETH/Modbus 同时启动时的栈压力来源.
+        .stack_size(12 * 1024)
         .spawn(server_loop)
         .map_err(|e| crate::error::AppError::Sys(format!("spawn http: {e}")))?;
     log::info!("[http] web server started on port {}", HTTP_PORT);
@@ -1205,10 +1212,13 @@ fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io
     }
 
     let mut reader = BufReader::new(stream);
-    let mut buf = [0u8; BUF_SIZE];
+    // LOOP18: OTA 上传单帧最大 4096B 过大, 在 8KB http-srv 栈上占用 50% 预算.
+    // 缩小到 2048B (仍是合理块大小, OTA::write_chunk 处理任意长度), 给 stack
+    // 溢出风险预留余量. BufReader 内部仍有 8KB heap 缓冲, 不影响吞吐.
+    let mut buf = [0u8; 2048];
     let mut received = 0usize;
     while received < content_length {
-        let want = (content_length - received).min(BUF_SIZE);
+        let want = (content_length - received).min(buf.len());
         if let Err(e) = reader.read_exact(&mut buf[..want]) {
             log::error!("[http] OTA read failed at {}: {}", received, e);
             let _ = crate::ota::abort();

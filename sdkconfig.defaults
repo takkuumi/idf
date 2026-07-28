@@ -223,10 +223,13 @@ CONFIG_VFS_SUPPORT_SELECT=y
 CONFIG_FMB_MASTER_TIMEOUT_MS_RESPOND=200
 CONFIG_FMB_SERIAL_BUFFER_SIZE=256
 
-# ---- System Event Task 栈大小 (IP_EVENT_ETH_GOT_IP 回调栈) ----
-# 默认 2304 (2KB), ip_event_cb 内 log::info! + 多个 array 撑爆栈
-# 增大到 8KB 避免 Stack canary watchpoint 触发
-CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2304
+# ---- System Event Task 栈大小 (IP_EVENT_ETH_GOT_IP / ETHERNET_EVENT 回调栈) ----
+# 默认 2304 (2KB). ip_event_cb/eth_event_cb 在事件任务上运行, 调用 log::info! 会
+# 在栈上构造 core::fmt::Arguments (~200B) + 临时字符串 buffer. 历史曾发生
+# Stack canary watchpoint 触发 (2KB 不足以容纳 log 缓冲 + 多 IP 地址数组).
+# 增大到 4096 (4KB): 既容纳所有回调栈深度 (实测峰值 ~600B), 也为 ESP-IDF 内核
+# 的事件入队/分发留余量, 从根源杜绝栈溢出崩溃.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
 
 # ---- pthread 任务栈大小 (根本修复: 解决 ENOMEM 与 Stack canary) ----

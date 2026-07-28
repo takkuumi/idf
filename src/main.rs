@@ -29,6 +29,7 @@ mod config;
 mod bus;
 mod device;
 mod device_config;
+mod safety;
 #[cfg(feature = "ble-at")]
 mod ble_at;
 mod hal;

@@ -278,8 +278,12 @@ extern "C" fn ip_event_cb(
     event_id: i32,
     event_data: *mut c_void,
 ) {
-    // 极简实现: 只 log + post 事件, 把重活 (RCU clone, 字节转换) 推迟到 main loop
-    // 这样 sys_evt 任务栈 (2KB) 就够了, 避免 Stack canary watchpoint
+    // LOOP18: 此回调运行在 sys_evt 任务栈 (sdkconfig: ESP_SYSTEM_EVENT_TASK_STACK_SIZE)
+    // 1. 不要在这里调用 log::info! — 虽然 ESP-IDF log 实现使用静态缓冲,
+    //    但 Rust log crate 的 log::Log::log() 方法会构造 core::fmt::Arguments
+    //    (~200B) 与 log::Record (~150B), 在 2KB 任务栈上累积易触发 Stack canary.
+    // 2. 不要 RCU 读 / 字节转换 — 推迟到 main_loop 处理.
+    // 只做一件事: 把 3 个 IPv4 地址打包成 12 字节, 通过 MpscRing 无锁入队.
     if event_id != esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32 || event_data.is_null() {
         return;
     }
@@ -299,7 +303,6 @@ extern "C" fn ip_event_cb(
                 gw_raw as u8, (gw_raw >> 8) as u8, (gw_raw >> 16) as u8, (gw_raw >> 24) as u8,
             ],
         ));
-        log::info!("[eth] IP event posted to main loop");
     }
 }
 
@@ -350,16 +353,15 @@ extern "C" fn eth_event_cb(
     event_id: i32,
     _event_data: *mut c_void,
 ) {
-    // 极简: 仅翻转 AtomicBool, 重活由 heartbeat tick 在 main_loop 内处理.
-    // sys_evt 任务栈仅 2KB, 不能在这里做重活.
+    // LOOP18: 此回调运行在 sys_evt 任务栈 (sdkconfig: ESP_SYSTEM_EVENT_TASK_STACK_SIZE)
+    // 只做一件事: 翻转 AtomicBool, 不调 log (log 会构造 ~200B Arguments 在栈上).
+    // 链路状态变化在 main_loop 的 heartbeat tick 中记录日志.
     let connected = event_id == esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32;
     let disconnected = event_id == esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32;
     if connected {
         ETH_LINK_UP.store(true, Ordering::Release);
-        log::info!("[eth] link UP (ETHERNET_EVENT_CONNECTED)");
     } else if disconnected {
         ETH_LINK_UP.store(false, Ordering::Release);
-        log::warn!("[eth] link DOWN (ETHERNET_EVENT_DISCONNECTED)");
     }
 }
 

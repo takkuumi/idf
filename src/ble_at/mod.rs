@@ -480,8 +480,20 @@ unsafe extern "C" fn gatts_event_cb(
                 // RX characteristic 写入 — 优先尝试二进制协议, 否则按文本 AT 处理
                 // 关键修复: 必须先发送写响应, 然后再处理数据发送通知
                 // 否则 Android BLE 栈可能在收到通知前就进入下一状态
-                let data = unsafe { std::slice::from_raw_parts(p.value, p.len as usize) };
-                let data_vec: Vec<u8> = data.to_vec();
+                //
+                // LOOP18: 此回调在 Bluedroid BTC 任务栈 (12KB) 上执行.
+                //   - 不要 `Vec::new()`: 12KB 栈下 Vec heap 分配没问题,
+                //     但 0 字节拷贝时 BLE stack 可能复用同一指针 → Vec 析构
+                //     释放后原指针失效. 改用 slice 引用直接传入.
+                //   - 不要 `format!("{:02X}", b)`: format! 每次调用构造 ~24B
+                //     String + 走 heap 分配, 在 BTC 栈上累积易触发 Stack canary.
+                let data: &[u8] = unsafe {
+                    if p.value.is_null() || p.len == 0 {
+                        &[]
+                    } else {
+                        std::slice::from_raw_parts(p.value, p.len as usize)
+                    }
+                };
 
                 // 1. 先发送写响应 (GATT 协议要求先响应 write request)
                 if p.need_rsp {
@@ -501,10 +513,17 @@ unsafe extern "C" fn gatts_event_cb(
                 }
 
                 // 2. 写响应后, 处理数据并发送通知
-                log::info!("[ble_at] GATT write RX: {} bytes, hex={}", data_vec.len(),
-                    data_vec.iter().take(20).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "));
-                if !try_handle_binary_protocol(&data_vec, p.conn_id, p.trans_id) {
-                    feed_data(&data_vec);
+                //    LOOP18: 用零分配 hex 格式化 (heapless::String<64>), 避免 BTC 栈上
+                //    构造 Vec<String> (每 format!("{:02X}") 一次 heap 分配, 累积可触发 Stack canary)
+                if !data.is_empty() {
+                    let mut hex = heapless::String::<64>::new();
+                    for &b in data.iter().take(20) {
+                        let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
+                    }
+                    log::info!("[ble_at] GATT write RX: {} bytes, hex={}", data.len(), hex);
+                    if !try_handle_binary_protocol(data, p.conn_id, p.trans_id) {
+                        feed_data(data);
+                    }
                 }
             } else {
                 // 其他情况 (例如 CCCD 写入) 仍需发送响应
@@ -1128,10 +1147,20 @@ fn heartbeat_counter() -> u16 {
 }
 
 fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
-    log::info!("[ble_at] binary rx: {} bytes, hex={}",
-        data.len(),
-        data.iter().take(20).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
-    );
+    // LOOP18: 零分配 hex 格式化, 避免 BTC 任务栈上累积 Vec<String>
+    if data.len() > 20 {
+        let mut hex = heapless::String::<64>::new();
+        for &b in data.iter().take(20) {
+            let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
+        }
+        log::info!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
+    } else {
+        let mut hex = heapless::String::<64>::new();
+        for &b in data.iter() {
+            let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
+        }
+        log::info!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
+    }
     // 最小帧: tx_id(2) + proto_id(2) + length(2) + unit(1) + func(1) + crc(2) = 10
     if data.len() < 10 {
         log::debug!("[ble_at] binary rx: too short ({} < 10), skip", data.len());
