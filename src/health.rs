@@ -16,13 +16,13 @@
 //!
 //! - 静态分配, 无堆分配 (适合工业实时场景)
 //! - 心跳用 AtomicU32, 无锁
-//! - 任务表用固定数组 (最多 16 个任务)
+//! - 任务表用固定数组 (最多 24 个任务)
 //! - 不依赖 panic=unwind, 不用 catch_unwind
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// 最大监控任务数
-const MAX_TASKS: usize = 16;
+const MAX_TASKS: usize = 24;
 
 /// 单个任务的心跳记录
 ///
@@ -41,6 +41,10 @@ pub struct TaskHb {
     stall_count: AtomicU32,
     /// 一次性任务完成后设为 true, check_all 跳过 (避免误报停滞)
     completed: core::sync::atomic::AtomicBool,
+    /// 配置的任务栈字节数；0 表示该心跳不代表独立任务。
+    stack_size: AtomicU32,
+    /// 任务首次 tick 时捕获的 FreeRTOS TaskHandle_t。
+    task_handle: AtomicUsize,
 }
 
 impl TaskHb {
@@ -53,6 +57,8 @@ impl TaskHb {
             max_stall: AtomicU32::new(3),
             stall_count: AtomicU32::new(0),
             completed: core::sync::atomic::AtomicBool::new(false),
+            stack_size: AtomicU32::new(0),
+            task_handle: AtomicUsize::new(0),
         }
     }
 
@@ -66,11 +72,21 @@ impl TaskHb {
             max_stall: AtomicU32::new(stall),
             stall_count: AtomicU32::new(0),
             completed: core::sync::atomic::AtomicBool::new(false),
+            stack_size: AtomicU32::new(0),
+            task_handle: AtomicUsize::new(0),
         }
     }
 
     /// 任务 loop 中调用, 递增心跳计数
     pub fn tick(&self) {
+        if self.stack_size.load(Ordering::Relaxed) != 0
+            && self.task_handle.load(Ordering::Relaxed) == 0
+        {
+            let handle = unsafe { esp_idf_sys::xTaskGetCurrentTaskHandle() } as usize;
+            if handle != 0 {
+                self.task_handle.store(handle, Ordering::Release);
+            }
+        }
         self.counter.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -118,6 +134,12 @@ pub fn register(task: &'static TaskHb) {
     // SAFETY: task 为 &'static TaskHb, 存为 AtomicPtr 长期有效.
     REGISTRY.tasks[idx].store(task as *const TaskHb as *mut TaskHb, Ordering::Release);
     log::debug!("[health] registered task '{}' (slot {})", task.name, idx);
+}
+
+/// 注册真实常驻任务并绑定其配置栈大小，供运行时高水位采样。
+pub fn register_with_stack(task: &'static TaskHb, stack_size: usize) {
+    task.stack_size.store(stack_size as u32, Ordering::Release);
+    register(task);
 }
 
 /// 检查所有已注册任务的心跳
@@ -288,5 +310,47 @@ pub fn print_core_assignment() {
             "  [{:2}] {} (max_stall={})",
             i, t.name, t.max_stall.load(Ordering::Relaxed)
         );
+    }
+}
+
+/// 打印所有真实用户任务的历史最小剩余栈。
+///
+/// ESP-IDF 的 `uxTaskGetStackHighWaterMark2` 返回字节，不是标准 FreeRTOS 文档中的 word。
+/// 只告警和记录，绝不因低水位主动重启设备。
+pub fn print_stack_watermarks() {
+    let n = REGISTRY.count.load(Ordering::Acquire);
+    log::info!("=== Task Stack Watermarks ===");
+    for i in 0..n {
+        let ptr = REGISTRY.tasks[i].load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        let task: &'static TaskHb = unsafe { &*ptr };
+        let size = task.stack_size.load(Ordering::Acquire);
+        let handle = task.task_handle.load(Ordering::Acquire);
+        if size == 0 || handle == 0 {
+            continue;
+        }
+        let free = unsafe {
+            esp_idf_sys::uxTaskGetStackHighWaterMark2(handle as esp_idf_sys::TaskHandle_t) as u32
+        };
+        let used_pct = size.saturating_sub(free).saturating_mul(100) / size;
+        if free < 1024 || used_pct >= 90 {
+            log::error!(
+                "[stack] LOW task={} size={}B min_free={}B used={}%",
+                task.name,
+                size,
+                free,
+                used_pct
+            );
+        } else {
+            log::info!(
+                "[stack] task={} size={}B min_free={}B used={}%",
+                task.name,
+                size,
+                free,
+                used_pct
+            );
+        }
     }
 }

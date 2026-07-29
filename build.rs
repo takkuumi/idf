@@ -81,10 +81,5 @@ fn check_feature_compatibility() {
              建议 `--features f3` 或 `--features f4` (单选)"
         );
     }
-    if has_f3 {
-        println!("cargo:warning=info: 编译 F3 版本 (16 DI + 16 DO, I2C MCP23017 扩展)");
-    }
-    if has_f4 {
-        println!("cargo:warning=info: 编译 F4 版本 (48 DI + 16 DO, I2C MCP23017 扩展)");
-    }
+    // 具体硬件版本已由 feature_f3/feature_f4 cfg 表达，不用 cargo:warning 输出普通信息。
 }

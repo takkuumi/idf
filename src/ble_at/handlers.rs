@@ -2,8 +2,6 @@
 //!
 //! 每个 handle_xxx 接收参数字符串, 返回响应字符串。
 
-use std::time::Duration;
-
 use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16, parse_u16_list};
 use crate::device;
 
@@ -172,11 +170,7 @@ pub fn handle_status(_args: &str) -> String {
 pub fn handle_reset(_args: &str) -> String {
     // 直接置位 IO.sys 请求复位 (无锁)
     crate::bus::IO.sys.request_reset();
-    // 异步复位, 避免阻塞 AT 响应
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(200));
-        unsafe { esp_idf_sys::esp_restart() };
-    });
+    // main_loop 在响应入队后执行复位，不创建一次性 pthread。
     ok_data("resetting in 200ms")
 }
 

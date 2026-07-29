@@ -11,3 +11,4 @@
 //! - 不引入新依赖, 不修改现有任务签名
 
 pub mod stack_guard;
+pub mod stack_budget;

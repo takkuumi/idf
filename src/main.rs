@@ -59,6 +59,8 @@ use crate::hal::Hal;
 use crate::config::MAIN_LOOP_PERIOD_MS;
 use crate::error::AppResult;
 
+static MAIN_HB: health::TaskHb = health::TaskHb::new("main");
+
 fn main() -> AppResult<()> {
     // 1. 初始化日志
     init_logger();
@@ -252,6 +254,7 @@ fn main() -> AppResult<()> {
     protocols.start_all()?;
 
     // 10. 主循环
+    health::register_with_stack(&MAIN_HB, safety::stack_budget::MAIN);
     log::info!("[main] entering main loop (period={}ms)", MAIN_LOOP_PERIOD_MS);
     // 打印任务-核心分配 (便于验证双核优化)
     health::print_core_assignment();
@@ -293,6 +296,7 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
 
     loop {
         tick = tick.wrapping_add(1);
+        MAIN_HB.tick();
 
         // 每个周期喂狗 (100ms), 远小于 WDT 超时 10s
         health::feed_wdt();
@@ -401,6 +405,7 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
                     "[mem] free_heap={}KB min_heap={}KB uptime={}s",
                     free_heap / 1024, min_heap / 1024, uptime
                 );
+                health::print_stack_watermarks();
                 if free_heap < 20 * 1024 {
                     log::error!("[mem] LOW MEMORY WARNING: free_heap < 20KB!");
                 }

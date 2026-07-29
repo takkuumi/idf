@@ -22,7 +22,11 @@
 *.log
 flash_args
 flash_project_args
-/log
+# 默认忽略测试目录，仅保留本次栈容量验证记录。
+/log/*
+!/log/stress/
+/log/stress/*
+!/log/stress/stack_capacity_2026-07-29.md
 
 # Mac
 .DS_Store

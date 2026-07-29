@@ -214,6 +214,12 @@ const PROTO_DATA_BYTES: usize = PROTO_WORDS * 2; // 3000
 const BLOB_HEADER_BYTES: usize = 10;
 /// 完整 blob 大小: 头部 + 数据
 const BLOB_TOTAL_BYTES: usize = BLOB_HEADER_BYTES + PROTO_DATA_BYTES; // 3010
+/// 必须大于 SPIRAM_MALLOC_ALWAYSINTERNAL(4096)，普通 malloc 才优先使用 PSRAM。
+const BLOB_ALLOC_BYTES: usize = 4097;
+
+/// commit/reload 共用的协议序列化缓冲。避免 3010 字节数组进入 DeviceActor 调用栈。
+static PROTO_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
+    LazyLock::new(|| Spin::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
 
 // ----------------------------------------------------------------------------
 // 全局状态
@@ -272,7 +278,7 @@ pub fn init() -> AppResult<()> {
         load_proto_from_nvs(nvs)?
     } else {
         log::warn!("[device] NVS unavailable, using empty protocol data");
-        ([0u16; PROTO_WORDS], 0, 0)
+        (vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0)
     };
 
     // 3. 加载设备文本区 (Android 1.0.78 0x1388-0x1B77)
@@ -314,7 +320,7 @@ pub fn init() -> AppResult<()> {
 
         let snap = StorageSnapshot {
             proto: ProtoStore {
-                data: data.to_vec().into_boxed_slice(),
+                data,
                 version,
                 length,
                 dirty: false,
@@ -375,7 +381,7 @@ pub fn init() -> AppResult<()> {
     // 4. 启动 DeviceActor (替代 watch_loop)
     // 关键: 必须在此处 force(), 否则后续 DEVICE_ACTOR.send() 会触发 lazy init
     // 在其他线程/上下文访问 spinlock 时产生重入, 触发 FreeRTOS assert
-    health::register(&WATCH_HB);
+    health::register_with_stack(&WATCH_HB, crate::safety::stack_budget::DEVICE_ACTOR);
     health::set_next_thread_core(health::CORE_NET);
     LazyLock::force(&DEVICE_ACTOR);
     log::info!("[device] DeviceActor started (mailbox consumer thread)");
@@ -528,40 +534,26 @@ fn commit() -> AppResult<()> {
     })
     .unwrap_or((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0));
 
-    // 2. 序列化为 blob: [magic:2][version:2][length:2][crc:4][data:3000] = 3010 字节
-    let mut blob = [0u8; BLOB_TOTAL_BYTES];
-    blob[0..2].copy_from_slice(&PROTO_MAGIC.to_le_bytes());
-    blob[2..4].copy_from_slice(&version.to_le_bytes());
-    blob[4..6].copy_from_slice(&length.to_le_bytes());
-    // blob[6..10] = crc, 稍后填入
-    for (i, &v) in data.iter().enumerate() {
-        blob[BLOB_HEADER_BYTES + 2 * i..BLOB_HEADER_BYTES + 2 * i + 2]
-            .copy_from_slice(&v.to_le_bytes());
-    }
-    // 计算 CRC32 (覆盖 header[0..6] + data, 不含 crc 字段本身)
-    let crc = crc32(&blob[0..6]);
-    let crc_data = crc32(&blob[BLOB_HEADER_BYTES..]);
-    let combined_crc = crc.wrapping_add(crc_data);
-    blob[6..10].copy_from_slice(&combined_crc.to_le_bytes());
+    // 2-6. 所有持锁路径统一 NVS -> blob，避免同步 AT 与 DeviceActor 形成 ABBA 死锁。
+    let write_result = try_with_nvs_mut(|nvs| -> AppResult<u8> {
+        let active = nvs.get_u8(NVS_KEY_ACTIVE).ok().flatten().unwrap_or(0);
+        let write_key = if active == 0 { NVS_KEY_DATA_B } else { NVS_KEY_DATA_A };
+        let new_active = if active == 0 { 1u8 } else { 0u8 };
 
-    // 3. 读当前 active 标志, 决定写入哪个 blob (若 NVS 不可用则假设首次启动)
-    let active = try_with_nvs(|nvs| {
-        nvs.get_u8(NVS_KEY_ACTIVE)
-            .ok()
-            .flatten()
-            .unwrap_or(0) // 默认 A (首次启动)
-    })
-    .unwrap_or(0);
-    let write_key = if active == 0 {
-        NVS_KEY_DATA_B
-    } else {
-        NVS_KEY_DATA_A
-    };
-    let new_active = if active == 0 { 1u8 } else { 0u8 };
+        let mut blob = PROTO_BLOB_BUFFER.lock();
+        blob.fill(0);
+        blob[0..2].copy_from_slice(&PROTO_MAGIC.to_le_bytes());
+        blob[2..4].copy_from_slice(&version.to_le_bytes());
+        blob[4..6].copy_from_slice(&length.to_le_bytes());
+        for (i, &v) in data.iter().enumerate() {
+            blob[BLOB_HEADER_BYTES + 2 * i..BLOB_HEADER_BYTES + 2 * i + 2]
+                .copy_from_slice(&v.to_le_bytes());
+        }
+        let crc = crc32(&blob[0..6]);
+        let crc_data = crc32(&blob[BLOB_HEADER_BYTES..BLOB_TOTAL_BYTES]);
+        blob[6..10].copy_from_slice(&crc.wrapping_add(crc_data).to_le_bytes());
 
-    // 4-6. 写入 NVS (若 NVS 不可用, 跳过持久化但不报错)
-    let write_result = try_with_nvs_mut(|nvs| -> AppResult<()> {
-        nvs.set_blob(write_key, &blob)
+        nvs.set_blob(write_key, &blob[..BLOB_TOTAL_BYTES])
             .map_err(|e| AppError::Config(format!("nvs set_blob {write_key}: {e:?}")))?;
         nvs.set_u8(NVS_KEY_ACTIVE, new_active)
             .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
@@ -570,16 +562,20 @@ fn commit() -> AppResult<()> {
         let _ = nvs.remove(NVS_KEY_MAGIC_LEGACY);
         let _ = nvs.remove(NVS_KEY_VERSION_LEGACY);
         let _ = nvs.remove(NVS_KEY_LENGTH_LEGACY);
-        Ok(())
+        Ok(new_active)
     });
 
-    if let Some(result) = write_result {
-        if let Err(e) = result {
+    let new_active = match write_result {
+        Some(Ok(active)) => Some(active),
+        Some(Err(e)) => {
+            bus::storage_state::proto_status_set(3);
             return Err(e);
         }
-    } else {
-        log::warn!("[device] NVS unavailable, proto commit skipped");
-    }
+        None => {
+            log::warn!("[device] NVS unavailable, proto commit skipped");
+            None
+        }
+    };
 
     // 7. 更新状态: atomic 复位 + RCU RMW 把 dirty 清零 (快照镜像也会被同步)
     bus::storage_state::proto_status_set(0);
@@ -589,7 +585,9 @@ fn commit() -> AppResult<()> {
 
     log::info!(
         "[device] proto committed: {} words, ver={:#06x}, blob={}",
-        length, version, if new_active == 0 { 'A' } else { 'B' }
+        length,
+        version,
+        match new_active { Some(0) => "A", Some(_) => "B", None => "skipped" }
     );
     Ok(())
 }
@@ -604,13 +602,13 @@ fn reload() -> AppResult<()> {
     })
     .unwrap_or_else(|| {
         log::warn!("[device] NVS unavailable on reload, using empty data");
-        Ok(([0u16; PROTO_WORDS], 0, 0))
+        Ok((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0))
     })?;
 
     // 3. 写回快照: RCU RMW 仅替换 proto; device_text / holding_buf 保持不动.
     bus::storage_state::proto_status_set(0);
     bus::backends::storage_modify(|snap| {
-        snap.proto.data = data.to_vec().into_boxed_slice();
+        snap.proto.data = data;
         snap.proto.version = version;
         snap.proto.length = length;
         snap.proto.dirty = false;
@@ -834,8 +832,8 @@ pub fn persist_do_bits_throttled(now_ms: u32) {
     }
 }
 
-fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<([u16; PROTO_WORDS], u16, u16)> {
-    let data = [0u16; PROTO_WORDS];
+fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<(Box<[u16]>, u16, u16)> {
+    let data = vec![0u16; PROTO_WORDS].into_boxed_slice();
 
     // 尝试读取双 blob
     let active = nvs
@@ -877,8 +875,8 @@ fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<([u16; PROTO_WORDS], u1
 ///
 /// blob 布局: [magic:2][version:2][length:2][crc:4][data:3000] = 3010 字节
 /// CRC 覆盖 header[0..6] + data, 用 wrapping_add 合并两部分 CRC
-fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<([u16; PROTO_WORDS], u16, u16)>> {
-    let mut buf = [0u8; BLOB_TOTAL_BYTES];
+fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<(Box<[u16]>, u16, u16)>> {
+    let mut buf = PROTO_BLOB_BUFFER.lock();
     let blob = nvs
         .get_blob(key, &mut buf)
         .map_err(|e| AppError::Config(format!("nvs get_blob {key}: {e:?}")))?;
@@ -910,7 +908,7 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<([u16; P
     }
 
     // CRC 校验通过, 解析数据
-    let mut data = [0u16; PROTO_WORDS];
+    let mut data = vec![0u16; PROTO_WORDS].into_boxed_slice();
     let valid_words = (length as usize).min(PROTO_WORDS);
     for i in 0..valid_words {
         let off = BLOB_HEADER_BYTES + 2 * i;
@@ -921,7 +919,7 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<([u16; P
 }
 
 /// 读取 legacy 单 blob 格式 (兼容旧固件, 仅用于迁移)
-fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<([u16; PROTO_WORDS], u16, u16)>> {
+fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<(Box<[u16]>, u16, u16)>> {
     // 1. 检查 legacy magic
     let magic = nvs
         .get_u16(NVS_KEY_MAGIC_LEGACY)
@@ -933,9 +931,9 @@ fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<([u16; PROTO_WORDS]
     }
 
     // 2. 读 legacy blob
-    let mut buf = [0u8; PROTO_DATA_BYTES];
+    let mut buf = PROTO_BLOB_BUFFER.lock();
     let blob = nvs
-        .get_blob(NVS_KEY_DATA_LEGACY, &mut buf)
+        .get_blob(NVS_KEY_DATA_LEGACY, &mut buf[..PROTO_DATA_BYTES])
         .map_err(|e| AppError::Config(format!("nvs get legacy blob: {e:?}")))?;
 
     let bytes = match blob {
@@ -943,7 +941,7 @@ fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<([u16; PROTO_WORDS]
         None => return Ok(None),
     };
 
-    let mut data = [0u16; PROTO_WORDS];
+    let mut data = vec![0u16; PROTO_WORDS].into_boxed_slice();
     let words = (bytes.len() / 2).min(PROTO_WORDS);
     for i in 0..words {
         data[i] = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);

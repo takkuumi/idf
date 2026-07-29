@@ -1,94 +1,75 @@
-# 系统架构方案 (2026-07-22 已完成)
+# ESP32-S3R2 任务与内存架构
 
-## 状态: 已实施并验证
+> 更新：2026-07-29。容量数字来自最终 `cargo build` 生成的 sdkconfig 和 linker map。
 
-Phase 2 架构改造已 100% 完成。所有目标实现并验证通过。
+## 硬件容量边界
 
-## 资源限制 (根本)
-- **硬件**: ESP32-S3R2, **288KB SRAM**, **2MB PSRAM**
-- **pthread 默认栈**: 6KB (sdkconfig PTHREAD_TASK_STACK_SIZE_DEFAULT=6144)
-- **可用 internal heap**: ~200KB
+- MCU：ESP32-S3R2，双核 Xtensa LX7 240MHz。
+- 片上 SRAM：物理总量 512KB；不能把该数字直接当作 FreeRTOS heap。
+- 片外 PSRAM：2MB Quad SPI，80MHz。
+- 最终链接 DRAM 段：`0x53700 = 333.75KB`。
+- 最终 `.dram0.data + .dram0.bss`：`0x685d + 0x6450 = 51.17KB`。
+- `.dram0.bss` 结束至 DRAM 段末：`0x2c050 = 176.08KB`，这是当前连续内部
+  DRAM heap 候选区，不等于启动完成后的 `esp_get_free_heap_size()`。
+- `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536` 为 DMA/内部专用申请保留 64KB。
+- pthread 默认 `stack_alloc_caps` 是 `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`；启用
+  `FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` 不会自动把 Rust pthread 栈迁到 PSRAM。
 
-## 崩溃根本原因 (已修复)
-1. **pthread 栈溢出**: 默认 3KB 太小, 6KB 足够
-2. **Vec 临时分配**: modbus/shared.rs 在 pthread 中 `Vec::with_capacity()` 频繁分配 heap
-3. **任务数过多**: 11 个用户任务耗尽 SRAM
+## 根因
 
-## 最终架构 (4 个用户 pthread + main_loop tick)
+旧架构用扩大栈掩盖深调用链：DeviceActor 32KB，Modbus TCP 每连接 20KB，BTC/BTU
+各 12KB。8 个 TCP 连接会额外申请 160KB internal SRAM，超过本机实际余量，结果在
+不同负载下表现为 pthread ENOMEM、heap 碎片或 Stack canary，并非单一任务栈太小。
 
-### 用户 pthread 任务 (4 个)
-| # | 任务 | 栈 | 用途 |
-|---|------|-----|------|
-| 1 | main_loop (main_task) | esp-idf default | 100ms tick, 调度所有业务 |
-| 2 | DeviceActor | 8KB | NVS 持久化, RCU snapshot 序列化 |
-| 3 | mb-rtu-master | 6KB | Modbus RTU 主站严格时序 |
-| 4 | mb-rtu-slave | 6KB | 监听外部 Modbus RTU 请求 |
-| 5 | mb-tcp-listen | 6KB | Modbus TCP accept |
+另一个根因是 BLE GATT 写回调直接在 BTC_TASK 中执行 Modbus、配置 RCU 和持久化
+通知。BTC 栈大小因此与业务深度耦合，任何业务扩展都可能重新引入溢出。
 
-### main_loop tick 调度 (合并 7 个任务)
+## 当前任务模型
 
-| 模块 | 原周期 | 实际周期 | 调度 |
-|------|--------|----------|------|
-| ai-sample | 100ms (pthread) | 100ms | tick_ai_sample(&hal) |
-| ao-output | 100ms (pthread) | 100ms | tick_ao_output(&hal) |
-| di-scan | 5ms (pthread) | 20ms (5 分频) | tick % 5 == 0 |
-| do-output | 1ms (pthread) | 100ms + notify | tick_do_output(&hal) + notify 触发 |
-| eth-heartbeat | 5s (pthread) | 5s (50 分频) | tick % 50 == 0 |
+所有生产 pthread 栈值集中在 `src/safety/stack_budget.rs`，业务模块禁止硬编码。
 
-### 状态管理
-- 每个合并模块用 `std::sync::Mutex<Option<State>>` 保护状态
-- `try_lock()` 非阻塞, 死锁安全
-- main_loop 单线程访问, Mutex 实际不竞争
-- `notify()` 仍可触发立即刷新 (通过 atomic flag)
+| 用户任务 | 栈 | 数量 | 调度职责 |
+|---|---:|---:|---|
+| main | 32KB | 1 | 100ms tick、IO/AI/AO、BLE 业务消费、健康监控 |
+| DeviceActor | 16KB | 1 | NVS 串行持久化；3010B blob 已移至 PSRAM 缓冲 |
+| mb-tcp | 16KB | 1 | 4 监听端口 + 最多 8 个非阻塞连接状态机 |
+| mb-rtu-master | 8KB | 1 | RS485 主站 |
+| mb-rtu-slave | 8KB | 1 | RS485 从站 |
+| udp-mcast | 6KB | 1 | UDP 组播接收 |
+| nfc-st25 | 8KB | 1 | NFC 备份/恢复 |
+| http-srv | 12KB | 1 | Web 配置与流式 OTA |
+| **默认用户任务合计** | **106KB** | **8** | 固定，不随 TCP 连接数变化 |
 
-## 验证结果
+可选 RTU3 为 8KB，可选 Wi-Fi heartbeat 为 6KB；全部启用时用户任务上限 120KB，
+编译期断言限制为不超过 128KB。
 
-### 启动日志 (Phase 2 完成版)
-```
-[eth] heartbeat registered in main_loop (period=5s)
-[di] scan task registered in main_loop (period=20ms)
-[do] output task registered in main_loop (max_poll=10ms)
-[ai] sample task registered in main_loop (period=100ms)
-[ao] output task registered in main_loop (period=100ms)
-```
+主要系统任务的保守配置合计约 48.5KB：BTC 8KB、BTU 8KB、LwIP 8KB、系统事件
+4KB、FreeRTOS timer 4KB、W5500 RX 4KB、BT controller 3.5KB、esp_timer 3.5KB、
+双核 IPC 2.5KB、双核 Idle 3KB。用户默认任务和这些系统任务合计约 154.5KB。
 
-### Modbus TCP 测试 (全部成功)
-- READ_FW_VERSION (FC=04): 13 bytes ✓
-- READ_HW_INFO (FC=04): 13 bytes ✓
-- READ_IP (FC=03): 33 bytes ✓
-- READ_MAC (FC=03): 21 bytes ✓
-- READ_HW_VER (FC=03): 11 bytes ✓
+## 固定连接状态机
 
-### 稳定性
-- uptime: 持续运行 (1 小时长稳测试中)
-- 无 Guru Meditation
-- 无 Stack canary watchpoint
-- 无 ENOMEM
+Modbus TCP 保留 502/503/504/5002、8 连接上限、2s RX/TX 超时和原 MBAP/PDU
+格式。连接建立只在预留 `Vec<Client>` 中增加状态，不创建 pthread。一次性预留失败
+会返回启动错误；运行中不扩容。每个周期限制 accept 数量，写端背压有独立超时，
+异常客户端不能无限占用调度循环。
 
-## 收益
+连接状态总分配超过 4KB，按当前 `SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 策略进入
+PSRAM；socket、任务栈、DMA 仍保留在 internal SRAM。
 
-| 指标 | 改造前 | 改造后 | 收益 |
-|------|--------|--------|------|
-| 用户 pthread 任务 | 11 | 5 | -55% |
-| pthread 栈总量 | 66KB | 32KB | -52% |
-| 内部 SRAM 占用 | 高 (碎片化) | 低 (稳定) | 7×24 稳定 |
-| 栈溢出风险 | 高 | 极低 | 长期运行 |
-| 代码复杂度 | 多线程同步 | 单线程 + tick | 易调试 |
+## BLE 栈隔离
 
-## 关键修改文件
+BTC 回调只执行：GATT 写响应、最多 512 字节分片重组、固定 3 槽 MPSC 入队。
+Modbus/手持机兼容命令在 main_loop 消费，原事务 ID、CRC、长度字段和通知帧格式不变。
+因此 `metuory-wireless-management-app-1.0.78` 的协议表面不变，而业务调用深度不再
+叠加到 BTC_TASK。
 
-```
-sdkconfig.defaults    - PTHREAD_TASK_STACK_SIZE_DEFAULT=6144
-src/main.rs           - main_loop 接收 hal, 调用各 tick
-src/channel/ai.rs     - 取消 pthread, 暴露 tick_ai_sample
-src/channel/ao.rs     - 取消 pthread, 暴露 tick_ao_output
-src/io/di.rs          - 取消 pthread, 暴露 tick_di_scan
-src/io/do_.rs         - 取消 pthread, 暴露 tick_do_output
-src/ethernet/w5500.rs - 取消 pthread, 暴露 tick_eth_heartbeat
-```
+## 运行时水位闭环
 
-## 未来改进
+每个真实常驻用户任务首次 `TaskHb::tick()` 捕获自己的 `TaskHandle_t`。main_loop
+每 60 秒调用 `uxTaskGetStackHighWaterMark2`，记录 ESP-IDF 定义的“历史最小剩余
+字节”。低于 1024B 或使用率达到 90%只记错误和降级诊断，不主动重启。
 
-- [ ] modbus/shared.rs: Vec → heapless::Vec (进一步减少 heap 分配)
-- [ ] 健康监控: 移除已合并任务的 register (避免误导显示)
-- [ ] eth-heartbeat stall bug: 已合并但仍 stall, 需要进一步排查
+最终缩栈必须依据真实硬件水位：所有任务在峰值业务下至少保留 1KB且不超过 90%。
+编译通过只能证明结构和预算生效，不能代替 72 小时 BLE + 8 TCP + RTU + Web/NFC
+并发浸泡测试。

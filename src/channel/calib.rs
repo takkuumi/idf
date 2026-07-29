@@ -43,7 +43,6 @@ fn finish_calib() {
 /// 机制: 每次重启仅校准一个通道。遍历所有通道，
 /// 找到第一个 min=0 且 max=0 的通道进行校准。
 pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
-    health::register(&TASK_HB);
 
     // 读取现有校准值 (从 RCU STORAGE 快照的 holding_buf)
     let holding = crate::bus::storage_state::storage_read()

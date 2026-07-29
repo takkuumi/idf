@@ -2,7 +2,7 @@
 
 ## 硬件平台
 
-- **主控**：ESP32-S3R8 (Xtensa LX7 双核 240MHz, 512KB SRAM, **8MB Octal SPI PSRAM**)
+- **主控**：ESP32-S3R2 (Xtensa LX7 双核 240MHz, 512KB 物理 SRAM, **2MB Quad SPI PSRAM**)
 - **以太网**：WIZnet W5500 (SPI 接口)
 - **Flash**：8MB (分区表见 `partitions.csv`)
 
@@ -152,7 +152,7 @@ embuild = { version = "0.33", features = ["espidf"] }  # build-dependencies
 
 关键配置项（详见文件本身）：
 - Flash: QIO 80MHz 8MB
-- PSRAM: Octal 80MHz 8MB
+- PSRAM: Quad 80MHz 2MB
 - BLE: `CONFIG_BT_BLUEDROID_ENABLED=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLUEDROID` 已废弃）
 - BLE Mesh: `CONFIG_BLE_MESH=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLE_MESH` 已废弃）
 - W5500: `CONFIG_ETH_SPI_ETHERNET_W5500=y`
@@ -438,7 +438,7 @@ esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX \
 
 ## 工具链架构对照
 
-| 项目 | ESP32-C5 (旧) | ESP32-S3R8 (新) |
+| 项目 | ESP32-C5 (旧) | ESP32-S3R2 (当前) |
 |------|---------------|-----------------|
 | CPU 架构 | RISC-V 32-bit | Xtensa LX7 32-bit 双核 |
 | Rust target | `riscv32imc-esp-espidf` | `xtensa-esp32s3-espidf` |

@@ -1,6 +1,6 @@
-# ESP32-S3R8 工业网关 用户手册
+# ESP32-S3R2 工业网关 用户手册
 
-> 固件版本：v0.1.0 ｜ 硬件平台：ESP32-S3R8 ｜ 文档版本：1.0
+> 固件版本：v2.2.1 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：1.1
 >
 > 适用硬件版本：Default / F3 / F4（详见第 2 章）
 
@@ -25,10 +25,10 @@
 
 | 项目 | 规格 |
 |------|------|
-| 主控 MCU | ESP32-S3R8（Xtensa LX7 双核 32-bit，240MHz） |
+| 主控 MCU | ESP32-S3R2（Xtensa LX7 双核 32-bit，240MHz） |
 | 内部 SRAM | 512 KB |
-| 片外 PSRAM | 8 MB Octal SPI（80MHz，XIP） |
-| 片上 Flash | 8 MB Octal SPI |
+| 片外 PSRAM | 2 MB Quad SPI（80MHz） |
+| 片上 Flash | 8 MB Quad SPI |
 | 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI2 @ 20MHz） |
 | RS485 | 2 路（UART1 主站 + UART2 从站，独立隔离） |
 | 蓝牙 | BLE 5.0 + Bluetooth Mesh（Bluedroid 协议栈） |
@@ -141,7 +141,7 @@ I2C 总线参数：I2C0 端口，SDA=GPIO21，SCL=GPIO33，400kHz Fast Mode，MC
 ### 3.3 W5500 以太网接线
 
 ```
-ESP32-S3R8                W5500 Module
+ESP32-S3R2                W5500 Module
 GPIO11 (MOSI) ──────────── MOSI
 GPIO13 (MISO) ──────────── MISO
 GPIO12 (SCLK) ──────────── SCLK
@@ -162,7 +162,7 @@ GND           ──────────── GND
 #### 3.4.1 RS485 #0（主站，UART1）
 
 ```
-ESP32-S3R8                RS485 收发器 (如 SP3485/MAX485)
+ESP32-S3R2                RS485 收发器 (如 SP3485/MAX485)
 GPIO40 (TX)   ──────────── DI   (Driver Input)
 GPIO41 (RX)   ──────────── RO   (Receiver Output)
 GPIO42 (DE/RE) ─────────── DE + /RE  (共控，高=发送)
@@ -174,7 +174,7 @@ GPIO42 (DE/RE) ─────────── DE + /RE  (共控，高=发送)
 #### 3.4.2 RS485 #1（从站，UART2）
 
 ```
-ESP32-S3R8                RS485 收发器
+ESP32-S3R2                RS485 收发器
 GPIO17 (TX)   ──────────── DI
 GPIO18 (RX)   ──────────── RO
 GPIO7  (DE/RE) ─────────── DE + /RE
@@ -188,7 +188,7 @@ GPIO7  (DE/RE) ─────────── DE + /RE
 ### 3.5 I2C 扩展接线（仅 F3/F4）
 
 ```
-ESP32-S3R8                MCP23017 (U1, 0x20)
+ESP32-S3R2                MCP23017 (U1, 0x20)
 GPIO21 (SDA) ─┬────────── SDA
 GPIO33 (SCL) ─┼────────── SCL
               │            A0=0, A1=0, A2=0
@@ -1113,7 +1113,7 @@ print('OTA upgrade done, device rebooting')
 ```
 ================================================
 esp32s3-iot-gateway v0.1.0
-ESP32-S3R8 IoT Gateway starting...
+ESP32-S3R2 IoT Gateway starting...
 ================================================
 [main] starting device protocol store...
 [main] device init ok

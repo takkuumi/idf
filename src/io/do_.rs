@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::hw_version;
 use crate::error::AppResult;
 use crate::hal::Hal;
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 use crate::sync::MainLoopCell;
 
 /// 输出刷新间隔 (ms) — 配合 notify 实现亚 ms 级响应
@@ -44,7 +44,6 @@ static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
 
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
-    health::register(&TASK_HB);
     DO_STATE.init(DoState {
         last: u64::MAX,
         tick_div: 0,

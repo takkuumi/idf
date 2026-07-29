@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-28 (LOOP25: 非计划重启路径收敛 + BLE 长帧兼容)
+> 最后更新: 2026-07-29 (LOOP26: 固定任务栈架构 + 运行时水位闭环)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -219,6 +219,18 @@ cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 
 `log/` 目录:
 - `log/README.md` - 测试矩阵
+
+## LOOP26 栈容量架构重构 (2026-07-29)
+
+- [x] 最终 map 核对：DRAM 段 333.75KB，静态 data+bss 51.17KB，连续 heap 候选 176.08KB。
+- [x] Modbus TCP 改为单个 16KB pthread 管理 4 端口/8 连接，取消每连接 20KB pthread。
+- [x] BLE GATT 回调只重组和入队，业务迁移到 main_loop，保持 metuory 1.0.78 帧兼容。
+- [x] DeviceActor blob 改固定堆缓冲，任务栈 32KB 降到 16KB。
+- [x] OTA/AT/Web 延迟复位不再创建一次性 12KB pthread。
+- [x] 所有生产线程使用 `safety::stack_budget`，全功能用户栈编译期上限 128KB。
+- [x] 真实 TaskHandle 高水位每 60s 上报，修复原监控把最小值错误取 MAX 的缺陷。
+- [x] `cargo build`、默认 `cargo check`：通过，0 warning。
+- [ ] 真机 72h 峰值浸泡：BLE 手持机 + 8 TCP + RTU + Web OTA/NFC；见测试日志。
 
 ## LOOP7 BLE 名字 GAP 同步 (2026-07-24) - COMPLETE
 

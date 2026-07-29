@@ -101,10 +101,10 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 /// 周期性检查 Wi-Fi 链路 IP 是否仍存在, 失败时记日志。
 /// 不触发系统复位 (与 eth 不同, Wi-Fi 作为备份链路, 失败可接受)。
 fn spawn_heartbeat() -> AppResult<()> {
-    health::register(&WIFI_HB);
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("wifi-heartbeat".into())
+        .stack_size(crate::safety::stack_budget::WIFI_HEARTBEAT)
         .spawn(move || {
             // LOOP14: 长期运行 pthread 必须订阅 WDT
             health::subscribe_wdt();
@@ -120,6 +120,7 @@ fn spawn_heartbeat() -> AppResult<()> {
         });
     health::reset_thread_core();
     result.map_err(|e| AppError::Sys(format!("spawn wifi-heartbeat: {e}")))?;
+    health::register_with_stack(&WIFI_HB, crate::safety::stack_budget::WIFI_HEARTBEAT);
     log::info!("[wifi] heartbeat task started, period={}s", cfg::HEARTBEAT_PERIOD_S);
     Ok(())
 }

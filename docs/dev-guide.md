@@ -1,6 +1,6 @@
 # 开发指南 (Development Guide)
 
-> ESP32-S3R8 工业网关项目 — Rust + esp-idf-hal + std::thread
+> ESP32-S3R2 工业网关项目 — Rust + esp-idf-hal + std::thread
 
 本文档面向新加入项目的开发者，覆盖从环境搭建、编译烧录、架构理解到典型扩展开发（新硬件版本、Modbus 寄存器、AT 命令、NVS 持久化、OTA）的全流程。
 
@@ -8,7 +8,7 @@
 - Rust edition：2024
 - ESP-IDF：v5.5.4（通过 `esp_idf_sys` 绑定）
 - esp-idf-hal 0.45 + esp-idf-svc 0.50
-- 目标芯片：ESP32-S3R8（Xtensa LX7 双核 240MHz，512KB SRAM，8MB Octal PSRAM）
+- 目标芯片：ESP32-S3R2（Xtensa LX7 双核 240MHz，512KB 物理 SRAM，2MB Quad PSRAM）
 
 ---
 
@@ -92,7 +92,7 @@ espflash --version             # 应可用
 |------|------|
 | `.cargo/config.toml` | `target = "xtensaespidf"`，linker = `xtensa-esp32s3-elf-gcc`，runner = `espflash flash --monitor` |
 | `rust-toolchain.toml` | `channel = "nightly"`，`targets = ["xtensaespidf"]`，含 `rust-src`/`rustfmt`/`clippy` |
-| `sdkconfig.defaults` | ESP32-S3 + 8MB Octal PSRAM + BLE Mesh + W5500 + Task Watchdog |
+| `sdkconfig.defaults` | ESP32-S3R2 + 2MB Quad PSRAM + BLE + W5500 + Task Watchdog |
 | `partitions.csv` | 8MB Flash 分区表（factory 3MB + ota_0/ota_1 各 2.25MB） |
 | `build.rs` | embuild 编排 ESP-IDF，设置 `feature_*` cfg，feature 互斥校验 |
 | `idf_component.yml` | 声明 W5500 外部 IDF Component 依赖 `espressif/w5500: ^1.0.0` |

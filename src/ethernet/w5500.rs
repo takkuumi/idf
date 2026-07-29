@@ -28,7 +28,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use crate::config::pins;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 
 /// 心跳周期 (s)
 const HEARTBEAT_PERIOD_S: u64 = 5;
@@ -587,7 +587,7 @@ extern "C" fn eth_event_cb(
     }
 }
 
-// ---- 心跳任务：每 5s 检测网关连通性；连续失败 >= 3 次触发 esp_restart ----
+// ---- 心跳：每 5s 检测网关连通性；连续失败进入网络降级，绝不自动重启 ----
 // 架构改造 Phase 2: eth-heartbeat 合并到 main_loop
 // 状态用 MainLoopCell 保护 (单线程访问, 零开销)
 struct EthHbState {
@@ -597,7 +597,6 @@ struct EthHbState {
 static ETH_HB_STATE: MainLoopCell<EthHbState> = MainLoopCell::new();
 
 fn spawn_heartbeat() -> AppResult<()> {
-    health::register(&ETH_HB);
     ETH_HB_STATE.init(EthHbState { fail_count: 0 });
     log::info!("[eth] heartbeat registered in main_loop (period={}s)", HEARTBEAT_PERIOD_S);
     Ok(())

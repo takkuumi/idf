@@ -176,7 +176,6 @@ static TASK_HB: TaskHb = TaskHb::new_with_stall("http-srv", 30);
 
 /// 启动 HTTP Web 服务器 (后台线程)
 pub fn start() -> AppResult<()> {
-    crate::health::register(&TASK_HB);
     std::thread::Builder::new()
         .name("http-srv".into())
         // LOOP18: http-srv 栈从 8KB 提到 12KB.
@@ -186,9 +185,10 @@ pub fn start() -> AppResult<()> {
         //    + LwIP socket 状态, 实测峰值接近 7KB. 8KB 边界易触发 Stack canary.
         //  - 与 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288 对齐, 移除
         //    BLE/ETH/Modbus 同时启动时的栈压力来源.
-        .stack_size(12 * 1024)
+        .stack_size(crate::safety::stack_budget::HTTP)
         .spawn(server_loop)
         .map_err(|e| crate::error::AppError::Sys(format!("spawn http: {e}")))?;
+    crate::health::register_with_stack(&TASK_HB, crate::safety::stack_budget::HTTP);
     log::info!("[http] web server started on port {}", HTTP_PORT);
     Ok(())
 }
@@ -1134,11 +1134,7 @@ fn handle_reboot(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<(
         return send_json(stream, 405, &json_response("reboot", "405"));
     }
     send_json(stream, 200, &json_response("reboot", "0"))?;
-    // 异步触发, 给 HTTP 响应一点时间 flush 后再复位
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        unsafe { esp_idf_sys::esp_restart() };
-    });
+    crate::bus::IO.sys.request_reset();
     Ok(())
 }
 
@@ -1215,7 +1211,7 @@ fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io
     // LOOP18: OTA 上传单帧最大 4096B 过大, 在 8KB http-srv 栈上占用 50% 预算.
     // 缩小到 2048B (仍是合理块大小, OTA::write_chunk 处理任意长度), 给 stack
     // 溢出风险预留余量. BufReader 内部仍有 8KB heap 缓冲, 不影响吞吐.
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 2048].into_boxed_slice();
     let mut received = 0usize;
     while received < content_length {
         let want = (content_length - received).min(buf.len());

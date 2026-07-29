@@ -21,7 +21,6 @@ use crate::rs485::{Rs485Config, Rs485Port};
 static TASK_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port2", 10);
 
 pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
-    health::register(&TASK_HB);
     let port_cfg = Rs485Config::from_rtu_port2();
 
     // 优先读取 SystemConfig.rs485[2] 寄存器的从站地址
@@ -35,7 +34,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("mb-rtu-port2".into())
-        .stack_size(8 * 1024)  // LOOP15: 8KB 足够 (256B buf + handle_request, 节省 4KB heap)
+        .stack_size(crate::safety::stack_budget::MODBUS_RTU_PORT2)
         .spawn(move || {
             // LOOP14: 所有长期运行 pthread 必须订阅 WDT
             health::subscribe_wdt();
@@ -60,6 +59,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         });
     health::reset_thread_core();
     result.map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
+    health::register_with_stack(&TASK_HB, crate::safety::stack_budget::MODBUS_RTU_PORT2);
 
     log::info!(
         "[mb-rtu-port2] started on uart{} addr={} (RS485-3, slave-only)",

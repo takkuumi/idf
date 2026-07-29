@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::config::hw_version;
 use crate::error::AppResult;
 use crate::hal::Hal;
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 use crate::sync::MainLoopCell;
 
 /// 扫描周期 (ms)
@@ -48,7 +48,6 @@ static DI_STATE: MainLoopCell<DiState> = MainLoopCell::new();
 
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
-    health::register(&TASK_HB);
     DI_STATE.init(DiState {
         stable: 0,
         candidate: 0,

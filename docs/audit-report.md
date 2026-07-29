@@ -1,4 +1,7 @@
-# ESP32-S3R8 工业网关 代码审核报告
+# ESP32-S3 工业网关历史代码审核报告
+
+> 注意：本文是旧硬件假设下的历史审计。实际硬件已由启动日志确认是 ESP32-S3R2 +
+> 2MB Quad PSRAM；当前容量结论以 `docs/architecture.md` 为准。
 
 - **项目名称**：esp32s3-iot-gateway
 - **目标平台**：ESP32-S3R8 (Xtensa LX7 双核 240MHz, 512KB SRAM, 8MB Octal PSRAM, 8MB Flash)

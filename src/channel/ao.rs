@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::error::AppResult;
 use crate::hal::Hal;
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 use crate::sync::MainLoopCell;
 
 /// 输出周期 (ms)
@@ -39,7 +39,6 @@ struct AoState {
 static AO_STATE: MainLoopCell<AoState> = MainLoopCell::new();
 
 pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
-    health::register(&TASK_HB);
     AO_STATE.init(AoState {
         last_duty: [u32::MAX; CHANNEL_COUNT],
     });

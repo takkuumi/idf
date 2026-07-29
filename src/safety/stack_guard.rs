@@ -13,9 +13,9 @@
 //!    FreeRTOS `uxTaskGetStackHighWaterMark2`, 写入原子计数供 Web/Modbus
 //!    读取. 当任务剩余栈 < 256B 时, log warn 并进入 fallback mode.
 //!
-//! 3. **关键任务退出保护** — 每个长生命周期任务在休眠前调用 `feed_wdt` +
-//!    `check_exit_safety`, 一旦发现栈破坏立即触发 `esp_restart` 而不是破坏
-//!    其他任务的栈空间.
+//! 3. **关键任务存活保护** — 每个长生命周期任务在休眠前调用 `feed_wdt`，
+//!    运行时异常由 ESP-IDF 的栈 canary 和 core dump 保留现场；软件监控只
+//!    记录并进入降级模式，绝不因诊断阈值主动重启。
 //!
 //! ## 安全保障
 //!
@@ -23,9 +23,10 @@
 //! 新的 deep call chain. 此模块确保:
 //!
 //! - **探测在前**: 任务栈使用到 90% 阈值时主动 log warn, 提供预警.
-//! - **崩溃在后**: 任务栈溢出时, 哨兵 u32 先被覆盖 → FreeRTOS 检测 canary
-//!   or panic → 重启, 不会扩散到其他任务.
-//! - **恢复路径**: 重启次数计数 + device_text NVS 持久化, 重启后可恢复.
+//! - **故障隔离**: 任务栈溢出由 FreeRTOS 的 stack canary 检出，避免继续
+//!   损坏其他任务的内存。
+//! - **恢复路径**: 诊断阈值只记录水位和降级；异常复位的现场由 core dump
+//!   保留，供后续根因分析。
 //!
 //! ## 任务清单
 //!
@@ -35,12 +36,11 @@
 //! |----------------|--------|--------------------------------------------|
 //! | sys_evt        | 4KB   | 该任务无用户回调, 仅监控 ETH/BLE 事件栈  |
 //! | udp-mcast      | 6KB   | 心跳+配置读取栈深度                       |
-//! | mb-tcp-listen  | 6KB   | accept poll 栈                             |
+//! | mb-tcp         | 16KB  | 4 端口 + 8 连接单任务状态机               |
 //! | nfc-st25       | 8KB   | loop 缓冲区栈                              |
 //! | mb-rtu-*       | 8KB   | UART 读 + handler 栈                      |
 //! | http-srv       | 12KB  | 路由分发栈 (LOOP18)                       |
-//! | mb-tcp-conn    | 20KB  | PDU handler + config_modify 栈             |
-//! | actor          | 32KB  | commit/reload 深度栈                      |
+//! | actor          | 16KB  | NVS 串行持久化                            |
 //! | main           | 32KB  | 全局状态轮询栈                            |
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -74,12 +74,12 @@ impl TaskStackMonitor {
         Self {
             name,
             stack_size,
-            high_water_free: AtomicU32::new(0),
-            last_reported: AtomicU32::new(0),
+            high_water_free: AtomicU32::new(u32::MAX),
+            last_reported: AtomicU32::new(u32::MAX),
         }
     }
 
-    /// 当前观测到的最大剩余栈 (字节)
+    /// 当前观测到的历史最小剩余栈 (字节)
     pub fn high_water_free(&self) -> u32 {
         self.high_water_free.load(Ordering::Acquire)
     }
@@ -87,7 +87,7 @@ impl TaskStackMonitor {
     /// 计算栈使用百分比 (100% = 满)
     pub fn usage_pct(&self) -> u32 {
         let free = self.high_water_free();
-        if self.stack_size == 0 {
+        if self.stack_size == 0 || free == u32::MAX {
             0
         } else {
             let used = self.stack_size.saturating_sub(free);
@@ -107,10 +107,19 @@ impl TaskStackMonitor {
 
     /// 写入最新高水位线 — 由 `update_high_water` 调用
     pub fn record_high_water(&self, free_bytes: u32) {
-        let prev = self.high_water_free.load(Ordering::Acquire);
-        // 取 MAX (记录"曾经使用最少剩余栈", 即最危险时刻)
-        if free_bytes > prev {
-            self.high_water_free.store(free_bytes, Ordering::Release);
+        // Xtensa LLVM 对 AtomicU32::fetch_min 的 lowering 会产生无效临时标签，
+        // 使用项目已验证的 CAS 指令实现同样的单调 MIN 语义。
+        let mut current = self.high_water_free.load(Ordering::Acquire);
+        while free_bytes < current {
+            match self.high_water_free.compare_exchange_weak(
+                current,
+                free_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -150,7 +159,7 @@ pub struct StackReport {
 /// 然后对比 `last_reported` vs `high_water_free`, 仅在变化时报告.
 ///
 /// 为避免每 60s 重复读取 FreeRTOS, 监控项采用 `update_one()` 直接调用:
-/// 单调记录"曾使用最少剩余栈"的最大值, 这对长期稳定性最关键 — 一旦高峰
+/// 单调记录"曾使用最少剩余栈"的最小值, 这对长期稳定性最关键 — 一旦高峰
 /// 出现, 记录下来, 直到下次重启.
 pub fn update_one(m: &TaskStackMonitor, free: u32) {
     m.record_high_water(free);
@@ -239,22 +248,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn high_water_grows_monotonically() {
+    fn test_high_water_tracks_minimum_free_bytes() {
         let m = TaskStackMonitor::new("test", 8192);
-        assert_eq!(m.high_water_free(), 0);
+        assert_eq!(m.high_water_free(), u32::MAX);
         m.record_high_water(5000);
         assert_eq!(m.high_water_free(), 5000);
-        m.record_high_water(3000); // 更小, 不更新
-        assert_eq!(m.high_water_free(), 5000);
-        m.record_high_water(7000); // 更大, 更新
-        assert_eq!(m.high_water_free(), 7000);
+        m.record_high_water(3000); // 更小，更新为更危险的历史值
+        assert_eq!(m.high_water_free(), 3000);
+        m.record_high_water(7000); // 更大，不覆盖历史最小值
+        assert_eq!(m.high_water_free(), 3000);
     }
 
     #[test]
-    fn usage_pct_calculation() {
+    fn test_usage_pct_calculation() {
         let m = TaskStackMonitor::new("test", 8192);
         m.record_high_water(8192); // 100% free → 0% used
         assert_eq!(m.usage_pct(), 0);
+        let m = TaskStackMonitor::new("test", 8192);
         m.record_high_water(820); // 10% free → 90% used
         assert_eq!(m.usage_pct(), 90);
         assert!(m.is_warn());

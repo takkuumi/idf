@@ -424,12 +424,12 @@ pub fn start() -> AppResult<()> {
     if STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    health::register(&TASK_HB);
     std::thread::Builder::new()
         .name("nfc-st25".into())
-        .stack_size(8 * 1024)
+        .stack_size(crate::safety::stack_budget::NFC)
         .spawn(nfc_loop)
         .map_err(|e| crate::error::AppError::Sys(format!("spawn nfc: {e}")))?;
+    health::register_with_stack(&TASK_HB, crate::safety::stack_budget::NFC);
     log::info!("[nfc] background thread spawned (5s polling)");
     Ok(())
 }

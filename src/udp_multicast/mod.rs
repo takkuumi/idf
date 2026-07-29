@@ -116,12 +116,12 @@ impl MulticastConfig {
 
 /// 启动 UDP 组播接收任务 (后台线程, 失败不阻断主流程)
 pub fn start() -> AppResult<()> {
-    health::register(&TASK_HB);
     std::thread::Builder::new()
         .name("udp-mcast".into())
-        .stack_size(6 * 1024)
+        .stack_size(crate::safety::stack_budget::UDP_MULTICAST)
         .spawn(recv_loop)
         .map_err(|e| crate::error::AppError::Sys(format!("spawn udp-mcast: {e}")))?;
+    health::register_with_stack(&TASK_HB, crate::safety::stack_budget::UDP_MULTICAST);
     log::info!("[udp-mcast] receiver thread spawned");
     Ok(())
 }

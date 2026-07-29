@@ -297,12 +297,7 @@ pub fn abort() -> AppResult<()> {
 /// 调用前应已调用 `end()` 成功。
 pub fn reboot_to_new_firmware() -> ! {
     log::info!("[ota] rebooting to apply new firmware in 500ms...");
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        unsafe { esp_idf_sys::esp_restart() };
-    });
-    // 当前线程等待 esp_restart 生效
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     unsafe { esp_idf_sys::esp_restart() };
 }
 

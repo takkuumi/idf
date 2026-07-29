@@ -106,12 +106,10 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
     let type_name = core::any::type_name::<A>();
     let short = type_name.split("::").last().unwrap_or(type_name);
     let name = format!("actor-{short}");
-    // 栈 32KB: DeviceActor commit/reload 会序列化 11KB StorageSnapshot + 递归
-    // clone DeviceConfigTable (32 entry × 32 param), 实测需 >12KB (LOOP5 panic 根因).
-    // 预留 32KB 给序列化栈分配, 避免 Guru Meditation (Unhandled debug exception).
+    // DeviceActor 的协议 blob 已移到固定堆缓冲，任务栈受集中预算约束。
     match std::thread::Builder::new()
         .name(name)
-        .stack_size(32 * 1024)
+        .stack_size(crate::safety::stack_budget::DEVICE_ACTOR)
         .spawn(move || {
             // LOOP14: Actor 线程订阅 WDT — 任何 actor 卡死都触发系统重启
             crate::health::subscribe_wdt();

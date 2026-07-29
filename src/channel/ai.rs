@@ -12,7 +12,7 @@ use crate::config::ai_calib;
 use crate::error::AppResult;
 use crate::hal::Hal;
 use esp_idf_svc::timer::EspTaskTimerService;
-use crate::health::{self, TaskHb};
+use crate::health::TaskHb;
 use crate::sync::MainLoopCell;
 
 /// 采样周期 (ms)
@@ -49,7 +49,6 @@ struct AiState {
 static AI_STATE: MainLoopCell<AiState> = MainLoopCell::new();
 
 pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppResult<()> {
-    health::register(&TASK_HB);
     // 不再创建独立 pthread. ADC driver 通过 hal.adc 访问, 状态由 main_loop 持有.
     AI_STATE.init(AiState {
         buf: [[0u16; AVG_WINDOW]; CHANNEL_COUNT],

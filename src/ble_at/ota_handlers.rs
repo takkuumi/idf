@@ -98,10 +98,7 @@ pub fn handle_ota_reboot(_args: &str) -> String {
     if st != ota::OtaStatus::DonePendingReboot {
         return err(30, &format!("cannot reboot: status={}", st.as_u16()));
     }
-    // 在新线程中延时 500ms 重启, 给 AT 响应发送留时间
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        unsafe { esp_idf_sys::esp_restart() };
-    });
+    // 交给 main_loop 的 1s 调度点执行，避免为一次性延时申请 12KB pthread 栈。
+    crate::bus::IO.sys.request_reset();
     ok_none()
 }

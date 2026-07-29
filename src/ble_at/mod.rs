@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use std::sync::LazyLock;
 
-use crate::sync::Spin;
+use crate::sync::{MpscRing, Spin};
 use crate::config::regs;
 
 use crate::error::AppResult;
@@ -91,6 +91,8 @@ static GATTS_IF: AtomicU8 = AtomicU8::new(0xFF);
 /// - 其他 = 有效连接 ID
 /// 替代 Spin<Option<u16>>, 真无锁
 static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
+/// 每次连接/断线递增，防止 Bluedroid 复用 conn_id 后发送旧连接的排队响应。
+static CONNECTION_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// TX Characteristic CCCD 使能标志 (主机写 0x0001 启用 notify)
 static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -120,6 +122,13 @@ static BINARY_TX: LazyLock<Spin<heapless::Vec<u8, 2048>>> =
 /// GATT Write；必须先完整重组再校验 CRC，不能落入 AT 文本通道。
 static BINARY_RX: LazyLock<Spin<heapless::Vec<u8, 512>>> =
     LazyLock::new(|| Spin::new(heapless::Vec::new()));
+/// BTC 回调只负责重组并入队；Modbus/配置/NVS 业务统一在 main_loop 执行。
+struct BinaryRequest {
+    frame: heapless::Vec<u8, BLE_BINARY_FRAME_MAX>,
+    conn_id: u16,
+    epoch: u32,
+}
+static BINARY_REQUESTS: MpscRing<BinaryRequest, 4> = MpscRing::new();
 /// BLE notify 丢弃帧计数器 (Modbus 寄存器 0x0108 暴露)
 static BINARY_TX_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// 有待发送的 BLE 通知 (由 CONNECT_EVT 或 Modbus 响应设置, main loop 消费)
@@ -492,8 +501,8 @@ unsafe extern "C" fn gatts_event_cb(
                 // 关键修复: 必须先发送写响应, 然后再处理数据发送通知
                 // 否则 Android BLE 栈可能在收到通知前就进入下一状态
                 //
-                // LOOP18: 此回调在 Bluedroid BTC 任务栈 (12KB) 上执行.
-                //   - 不要 `Vec::new()`: 12KB 栈下 Vec heap 分配没问题,
+                // LOOP18: 此回调在 Bluedroid BTC 任务栈 (8KB) 上执行.
+                //   - 不要 `Vec::new()`: BTC 栈下 Vec heap 分配没问题,
                 //     但 0 字节拷贝时 BLE stack 可能复用同一指针 → Vec 析构
                 //     释放后原指针失效. 改用 slice 引用直接传入.
                 //   - 不要 `format!("{:02X}", b)`: format! 每次调用构造 ~24B
@@ -523,7 +532,7 @@ unsafe extern "C" fn gatts_event_cb(
                     };
                 }
 
-                // 2. 写响应后, 处理数据并发送通知
+                // 2. 写响应后只做有界重组/入队。禁止在 BTC 栈执行业务调用链。
                 //    LOOP18: 用零分配 hex 格式化 (heapless::String<64>), 避免 BTC 栈上
                 //    构造 Vec<String> (每 format!("{:02X}") 一次 heap 分配, 累积可触发 Stack canary)
                 if !data.is_empty() {
@@ -557,6 +566,7 @@ unsafe extern "C" fn gatts_event_cb(
             }
             let p = unsafe { &(*param).connect };
             // LOOP8: 原子写入替代 Spin<Option>
+            CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             CONN_ID.store(p.conn_id, Ordering::Release);
             GATTS_IF.store(gatts_if as u8, Ordering::Release);
             log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
@@ -611,6 +621,7 @@ unsafe extern "C" fn gatts_event_cb(
             log::warn!("[ble_at] GATT disconnect conn_id={} reason={:#x}",
                 p.conn_id, p.reason);
             CONN_ID.store(0xFFFF, Ordering::Release);  // LOOP8: 原子 sentinel = None
+            CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
             // 清空 BINARY_TX 残留数据，防止旧帧在新连接时被发送
             if let Some(mut btx) = BINARY_TX.try_lock() {
@@ -618,6 +629,9 @@ unsafe extern "C" fn gatts_event_cb(
             }
             // 清空 RX_BUFFER 和 TX_BUFFER
             if let Some(mut rx) = RX_BUFFER.try_lock() {
+                rx.clear();
+            }
+            if let Some(mut rx) = BINARY_RX.try_lock() {
                 rx.clear();
             }
             if let Some(mut tx) = TX_BUFFER.try_lock() {
@@ -913,6 +927,20 @@ pub fn process_tick() {
     if gatts_if_raw == 0xFF { return; }  // sentinel = 未注册
     let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     if tx_handle == 0 { return; }
+
+    // GATT 回调投递的二进制请求在 main 任务处理，隔离 Bluedroid BTC 栈。
+    if let Some(request) = BINARY_REQUESTS.dequeue() {
+        if request.conn_id == conn_id_raw
+            && request.epoch == CONNECTION_EPOCH.load(Ordering::Acquire)
+        {
+            let _ = try_handle_binary_protocol(&request.frame, request.conn_id, 0);
+        } else {
+            log::debug!(
+                "[ble_at] dropping stale request for conn_id={}",
+                request.conn_id
+            );
+        }
+    }
     
     // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
     //    完整行 (以 \n 结尾) 调 parser::process 处理, 响应推送 BINARY_TX
@@ -1171,7 +1199,7 @@ fn binary_frame_total_len(data: &[u8]) -> Option<usize> {
 
 /// 将一或多次 GATT Write 重组为完整的 Android 协议帧。
 /// 返回 true 表示输入属于二进制协议（包括等待后续分片），false 才交给 AT 文本处理。
-fn try_feed_binary_protocol(data: &[u8], conn_id: u16, trans_id: u32) -> bool {
+fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
     let mut rx = match BINARY_RX.try_lock() {
         Some(rx) => rx,
         None => return false,
@@ -1211,9 +1239,20 @@ fn try_feed_binary_protocol(data: &[u8], conn_id: u16, trans_id: u32) -> bool {
         return true;
     }
 
-    let handled = try_handle_binary_protocol(&rx[..], conn_id, trans_id);
+    let mut frame = heapless::Vec::new();
+    let copied = frame.extend_from_slice(&rx).is_ok();
     rx.clear();
-    handled
+    drop(rx);
+    let request = BinaryRequest {
+        frame,
+        conn_id,
+        epoch: CONNECTION_EPOCH.load(Ordering::Acquire),
+    };
+    if !copied || !BINARY_REQUESTS.try_enqueue(request) {
+        log::warn!("[ble_at] binary request queue full, dropping frame");
+        BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {

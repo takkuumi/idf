@@ -153,8 +153,10 @@ CONFIG_LWIP_DHCPS=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=n
-CONFIG_BT_BTC_TASK_STACK_SIZE=12288
-CONFIG_BT_BTU_TASK_STACK_SIZE=12288
+# GATT 回调只做有界重组和队列投递，业务处理已迁移到 main_loop。
+# 8KB 仍显著高于 ESP-IDF 默认值（BTC 3KB / BTU 4.25KB），同时释放 8KB internal SRAM。
+CONFIG_BT_BTC_TASK_STACK_SIZE=8192
+CONFIG_BT_BTU_TASK_STACK_SIZE=8192
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
 CONFIG_BT_BLE_SMP_ENABLE=y
@@ -250,16 +252,15 @@ CONFIG_FMB_SERIAL_BUFFER_SIZE=256
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
 
-# ---- pthread 任务栈大小 (根本修复: 解决 ENOMEM 与 Stack canary) ----
-# ESP32-S3R2 资源紧张: 11 个用户 pthread 任务 + BLE/ETH/Wi-Fi 系统任务
-# 默认 3KB 不够 (Vec 临时分配 + 深调用链), 增大到 6KB
-# 配合 modbus/shared.rs 的 Vec→heapless::Vec 改造彻底消除 heap 分配
-CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288
+# ---- pthread 默认任务栈 ----
+# 所有生产任务必须引用 safety::stack_budget 的显式值；此项仅作为遗漏时的保护值。
+# pthread 栈固定从 internal SRAM 分配，禁止再用 12KB 默认值放大偶发临时线程。
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
 # 减小 BLE host 栈 (默认 4096 → 3072) 释放 SRAM
 # 注意: ESP-IDF v5.5 Bluedroid 不存在 CONFIG_BT_BLE_HOST_TASK_STACK_SIZE 选项.
 # 实际可配置项为 BT_BTC_TASK_STACK_SIZE (默认 3072) + BT_BTU_TASK_STACK_SIZE (默认 4352),
-# 两者已在上面显式设为 12288. LOOP15: 删除无效配置行, 避免误导.
+# 两者已在上面显式设为 8192，最终下限由硬件高水位和 72h 压测校准。
 
 # I2C: 旧驱动弃用警告抑制 (LOOP6)
 # 我们只用 sw_i2c (软件 I2C, src/hal/sw_i2c.rs) 和新 I2C master 框架
