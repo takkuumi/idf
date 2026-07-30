@@ -11,14 +11,16 @@ use std::time::{Duration, Instant};
 
 use crate::config::modbus::tcp as cfg;
 use crate::error::{AppError, AppResult};
-use crate::modbus::shared::{BusBackend, PDU_BUF_SIZE};
+use crate::modbus::shared::{
+    BusBackend, MODBUS_TCP_MAX_ADU_LEN, MODBUS_TCP_MAX_MBAP_LENGTH, PDU_BUF_SIZE,
+};
 use crate::sync::MainLoopCell;
 
 const MBAP_PREFIX_LEN: usize = 6;
 const MBAP_HEADER_LEN: usize = 7;
-const MAX_MBAP_LENGTH: usize = 254;
-const MAX_ADU_SIZE: usize = MBAP_PREFIX_LEN + MAX_MBAP_LENGTH;
-const RX_BUFFER_SIZE: usize = MAX_ADU_SIZE * 2;
+const MAX_MBAP_LENGTH: usize = MODBUS_TCP_MAX_MBAP_LENGTH;
+const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
+const _: () = assert!(MAX_ADU_SIZE == MBAP_PREFIX_LEN + MAX_MBAP_LENGTH);
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
 static NEXT_CONN_ID: AtomicU32 = AtomicU32::new(1);
@@ -27,7 +29,8 @@ struct Client {
     id: u32,
     peer: SocketAddr,
     stream: TcpStream,
-    rx: [u8; RX_BUFFER_SIZE],
+    // 一个完整标准 ADU 足够：首帧处理后其余流水数据继续保留在 socket 接收队列。
+    rx: [u8; MAX_ADU_SIZE],
     rx_len: usize,
     tx: [u8; MAX_ADU_SIZE],
     tx_len: usize,
@@ -46,7 +49,7 @@ impl Client {
             id,
             peer,
             stream,
-            rx: [0; RX_BUFFER_SIZE],
+            rx: [0; MAX_ADU_SIZE],
             rx_len: 0,
             tx: [0; MAX_ADU_SIZE],
             tx_len: 0,
@@ -368,6 +371,8 @@ mod tests {
         assert!(!(2..=MAX_MBAP_LENGTH).contains(&1));
         assert!(!(2..=MAX_MBAP_LENGTH).contains(&255));
         assert!((2..=MAX_MBAP_LENGTH).contains(&2));
+        assert!((2..=MAX_MBAP_LENGTH).contains(&MODBUS_TCP_MAX_MBAP_LENGTH));
+        assert_eq!(MAX_ADU_SIZE, 260);
     }
 
     #[test]

@@ -1459,8 +1459,9 @@ fn handle_handheld_config_text(
             } else {
                 addr
             };
-            let words = count.min(120);
-            let mut bytes: heapless::Vec<u8, 240> = heapless::Vec::new();
+            let words = count.min(crate::modbus::shared::MAX_REGS_PER_WRITE);
+            let mut bytes: heapless::Vec<u8, { crate::modbus::shared::MAX_REGS_PER_WRITE * 2 }> =
+                heapless::Vec::new();
             for i in 0..words {
                 let a = read_addr.saturating_add(i as u16);
                 let v = if func == 0xB2 {
@@ -1478,7 +1479,7 @@ fn handle_handheld_config_text(
                 return false;
             }
             let byte_count = pdu[4] as usize;
-            if byte_count > 240
+            if byte_count > crate::modbus::shared::MAX_REGS_PER_WRITE * 2
                 || pdu.len() != 5 + byte_count
                 || byte_count != count.saturating_mul(2)
             {
@@ -1489,7 +1490,8 @@ fn handle_handheld_config_text(
             } else {
                 addr
             };
-            let mut values: heapless::Vec<u16, 120> = heapless::Vec::new();
+            let mut values: heapless::Vec<u16, { crate::modbus::shared::MAX_REGS_PER_WRITE }> =
+                heapless::Vec::new();
             for i in 0..count {
                 let off = 5 + i * 2;
                 let value = u16::from_be_bytes([pdu[off], pdu[off + 1]]);

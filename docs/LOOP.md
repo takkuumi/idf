@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-30 (LOOP27: PC TCP/RTU 配置兼容与 PRegBuf 持久化)
+> 最后更新: 2026-07-30 (LOOP28: 标准 Modbus 报文上限与热路径栈优化)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -29,7 +29,7 @@
 | 1 | heapless 升级 0.9.3 | ✅ | `Cargo.toml` |
 | 2 | 手持机显示 IP/MAC/BLE_ID | ✅ | `handle_ble_android_read_command` (LOOP2) |
 | 3 | 硬件信息确认 | ✅ | `docs/pinmap.md` 重写 (ESP32-S3R2) |
-| 4 | 无锁测试 + 栈估算 | ✅ | 127 测试 + 架构合并消除栈风险 |
+| 4 | 无锁测试 + 栈估算 | ✅ | 固定任务预算 + Modbus 位图热路径去除 2KB 临时栈 |
 | 5 | Modbus TCP/RTU 协议兼容 | 🟡 | 编译与帧级回归通过；待目标设备 + tauri-app 实机验证 |
 | 6 | log/ 目录 + 详细日志 | ✅ | 7 子目录 + SUMMARY |
 | 7 | mesh 清理 | ✅ | 死代码已删 |

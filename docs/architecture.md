@@ -14,6 +14,8 @@
 - `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536` 为 DMA/内部专用申请保留 64KB。
 - pthread 默认 `stack_alloc_caps` 是 `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`；启用
   `FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` 不会自动把 Rust pthread 栈迁到 PSRAM。
+- release raw app 镜像为 `1,600,240B`，占 2.25MB OTA 槽约 67.8%；发布配置保持
+  `-O3`、fat LTO、单 codegen unit、strip 和 abort panic，未以牺牲实时性换取更小代码。
 
 ## 根因
 
@@ -57,6 +59,21 @@ Modbus TCP 默认 502/503/504/5002，端口寄存器 2243-2246 持久化后可�
 连接状态总分配超过 4KB，按当前 `SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 策略进入
 PSRAM；socket和 DMA 仍保留在 internal SRAM。NFC 的两个 4KB 工作区也通过 capability
 allocator 明确放入 PSRAM，不再依赖 4096B 阈值的边界行为。
+
+## Modbus 报文与栈边界
+
+Modbus TCP 严格采用标准最大边界：PDU 253B、MBAP `length` 254B、完整 TCP ADU
+260B；FC=01/02 支持 2,000 位读取，FC=03/04 支持 125 寄存器读取，FC=0F 支持
+2,000 位写入，FC=10 支持 123 寄存器写入。不存在 60 字长度上限，60 仅是旧 PC
+工具的常用逻辑块尺寸。
+
+每个 TCP 客户端保留一个完整 260B 接收 ADU 和一个 260B 发送 ADU。处理完首帧后，
+同一缓冲中的后续流水字节会前移，超出当前缓冲的字节保留在 LwIP socket 队列，因此
+不牺牲流水请求兼容性，同时八连接减少 2KB PSRAM 状态。
+
+FC=01/02/0F 不再将标准最大 2,000 位展开为 `heapless::Vec<bool, 2000>`；读取直接
+写入响应位图，写入直接消费请求位图。单次 Modbus 调用由此移除约 2KB 临时栈对象，
+仍保留全部标准数量上限。
 
 ## BLE 栈隔离
 
