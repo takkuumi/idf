@@ -1635,7 +1635,7 @@ fn handle_mca_custom_command(
 /// | 0x03 | 0x08A5   | 0x0001  | HW_VER       | [2][hw_hi][hw_lo]
 /// | 0x03 | 0x08C7   | 0x000C  | IP/MASK/GW   | [12][ip(4)][mask(4)][gw(4)]
 /// | 0x03 | 0x08D7   | 0x0006  | ETH_MAC      | [6][mac(6)]
-/// | 0x03 | 0x08E2   | 0x0004  | BT_ID        | [4][ble_id(4)]
+/// | 0x03 | 0x08E2   | 0x0004  | BT_ID        | [8][ble_id(8)]
 ///
 /// LOOP10: 波特率 → metuory packed nibble 索引 (与 system_config.rs baud_table 顺序一致)
 /// 对齐 CommandDataUtil.decodeSerialBaudRate: (value & 0xf0) >> 4
@@ -1654,6 +1654,20 @@ fn baud_to_index(baud: u32) -> u8 {
         921600 => 10,
         _ => 3, // 默认 9600
     }
+}
+
+/// Encode the four-register Bluetooth ID window used by the mobile protocol.
+/// The leading length is the actual UTF-8 byte count; the following eight bytes
+/// are retained verbatim so the legacy hexadecimal view can safely read bytes 4..8.
+fn encode_ble_name_read_response(ble_name: &[u8; 8]) -> heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> {
+    let name_len = ble_name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(ble_name.len());
+    let mut response = heapless::Vec::new();
+    let _ = response.push(name_len as u8);
+    let _ = response.extend_from_slice(ble_name);
+    response
 }
 
 /// 返回 true 表示已处理 (调用方应停止继续走 Modbus RTU 路径).
@@ -1802,25 +1816,16 @@ fn handle_ble_android_read_command(
                 // READ_BLUETOOTH_ID (0x08E2, 0x0004): Android 端蓝牙 ID 显示
                 //   - UTF-8 模式 (新版本): parseBluetoothIDItem → bluetoothIDBytesToUTF8Str
                 //     按字节遍历到第一个 0, 返回 UTF-8 字符串
-                //   - HEX 模式 (旧版本): bluetoothIDBytesToHexStr 从 offset 4 读 int → OOB
-                // 兼容性: 发 8 字节 [4][name(4)][padding(4)], HEX 模式读 offset 4 也安全
-                // length_byte = 4 (getBluetoothIDBufferLength() = 4*2 = 8)
+                //   - HEX 模式 (旧版本): bluetoothIDBytesToHexStr 从 offset 4 读 int,
+                //     因此必须始终返回完整的 8-byte 寄存器窗口。
+                // 手持机写入与读取均按 4 个寄存器分配 8 bytes。此前错误地回报
+                // length=4，导致 5-8 byte 名称写入成功后回读被截断、界面未刷新。
                 (0x08E2, 4) => {
-                    let name_len = cfg
-                        .ble_name
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(cfg.ble_name.len());
-                    let take = name_len.min(4);
-                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-                    let _ = d.push(4); // length_byte = 4 (Android 实际读 bytes[1..5])
-                    // ble_name 前 4 字节 (不足补 0, UTF-8 mode 截断到 0; HEX mode 跳过)
-                    for i in 0..4 {
-                        let _ = d.push(if i < take { cfg.ble_name[i] } else { 0 });
-                    }
+                    let d = encode_ble_name_read_response(&cfg.ble_name);
+                    let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(8);
                     log::info!(
                         "[ble_at] READ_BLE_ID: {:?}",
-                        core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>")
+                        core::str::from_utf8(&cfg.ble_name[..name_len]).unwrap_or("<bin>")
                     );
                     Some(d)
                 }
@@ -2217,7 +2222,9 @@ pub(crate) fn mod_test_build_rs485_value_response(
 
 #[cfg(test)]
 mod android_compat_tests {
-    use super::{binary_frame_total_len, build_android_read_response_pdu};
+    use super::{
+        binary_frame_total_len, build_android_read_response_pdu, encode_ble_name_read_response,
+    };
 
     // ---- READ_HARDWARE_INFO (0x087C, 2 regs) ----
     #[test]
@@ -2368,6 +2375,24 @@ mod android_compat_tests {
         // 旧 helper: BLE MAC[2..6] = [0x4E, 0x5B, 0x24, 0xE5]
         assert_eq!(&pdu[3..7], &[0x4E, 0x5B, 0x24, 0xE5]);
         assert_eq!(pdu.len(), 7);
+    }
+
+    #[test]
+    fn test_read_ble_name_returns_full_eight_byte_window() {
+        let response = encode_ble_name_read_response(b"NODE-123");
+
+        assert_eq!(response.len(), 9);
+        assert_eq!(response[0], 8);
+        assert_eq!(&response[1..], b"NODE-123");
+    }
+
+    #[test]
+    fn test_read_ble_name_preserves_zero_padding() {
+        let response = encode_ble_name_read_response(b"Mesh\0\0\0\0");
+
+        assert_eq!(response.len(), 9);
+        assert_eq!(response[0], 4);
+        assert_eq!(&response[1..], b"Mesh\0\0\0\0");
     }
 
     // ---- 未命中已知地址 ----
