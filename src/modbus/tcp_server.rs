@@ -1,8 +1,8 @@
-//! Modbus TCP Server（四端口、单任务、多连接状态机）。
+//! Modbus TCP Server（四端口、主循环多连接状态机）。
 //!
-//! 所有监听 socket 和最多 8 个客户端都由同一个非阻塞任务处理。连接建立不会
-//! 创建 pthread，因此并发连接数不再线性消耗内部 SRAM，也不会因 pthread ENOMEM
-//! 导致协议服务退出。MBAP/PDU 格式和四个监听端口保持不变。
+//! 所有监听 socket 和最多 8 个客户端都由 main_loop 的 20ms 非阻塞 tick 处理。
+//! 模块不创建 pthread，因此不再申请 16KB internal SRAM 任务栈，连接建立也不会
+//! 增加任务数量。MBAP/PDU 格式和四个监听端口保持不变。
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::modbus::tcp as cfg;
 use crate::error::{AppError, AppResult};
-use crate::health::{self, TaskHb};
 use crate::modbus::shared::{BusBackend, PDU_BUF_SIZE};
-use crate::safety::stack_budget;
+use crate::sync::MainLoopCell;
 
 const MBAP_PREFIX_LEN: usize = 6;
 const MBAP_HEADER_LEN: usize = 7;
@@ -23,7 +22,6 @@ const RX_BUFFER_SIZE: usize = MAX_ADU_SIZE * 2;
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
 static NEXT_CONN_ID: AtomicU32 = AtomicU32::new(1);
-static LISTEN_HB: TaskHb = TaskHb::new_with_stall("mb-tcp", 60);
 
 struct Client {
     id: u32,
@@ -100,7 +98,7 @@ impl Client {
 
     fn is_timed_out(&self) -> bool {
         let timeout_ms = if self.tx_len == 0 {
-            cfg::RX_TIMEOUT_MS
+            cfg::IDLE_TIMEOUT_MS
         } else {
             cfg::TX_TIMEOUT_MS
         };
@@ -152,11 +150,7 @@ impl Client {
             return true;
         }
 
-        let response_len = match build_response(
-            &self.rx[..request_len],
-            backend,
-            &mut self.tx,
-        ) {
+        let response_len = match build_response(&self.rx[..request_len], backend, &mut self.tx) {
             Some(n) => n,
             None => return false,
         };
@@ -169,70 +163,136 @@ impl Client {
     }
 }
 
+struct TcpServerState {
+    listeners: Vec<TcpListener>,
+    clients: Vec<Client>,
+    active_ports: [u16; 4],
+    next_port_check: Instant,
+}
+
+static SERVER_STATE: MainLoopCell<TcpServerState> = MainLoopCell::new();
+
 pub fn start() -> AppResult<()> {
-    let mut listeners = Vec::new();
-    listeners
-        .try_reserve_exact(cfg::PORTS.len())
-        .map_err(|e| AppError::Modbus(format!("listener allocation: {e}")))?;
-    for &port in cfg::PORTS {
-        let listener = TcpListener::bind(("0.0.0.0", port))
-            .map_err(|e| AppError::Modbus(format!("bind {port}: {e}")))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| AppError::Modbus(format!("nonblocking {port}: {e}")))?;
-        listeners.push(listener);
-        log::info!("[mb-tcp] bound :{port}");
+    if SERVER_STATE.is_initialized() {
+        return Ok(());
+    }
+    let ports = configured_ports();
+    if !ports_are_valid(&ports) {
+        return Err(AppError::Modbus(format!(
+            "invalid/duplicate TCP port set: {ports:?}"
+        )));
     }
 
-    // 在 main 任务中一次性预留连接状态。运行中的 mb-tcp pthread 不扩容。
+    // 先预留全部连接状态，再创建 socket；失败时不会留下部分监听器占用 LwIP 堆。
     let mut clients: Vec<Client> = Vec::new();
     clients
         .try_reserve_exact(cfg::MAX_CONNECTIONS)
         .map_err(|e| AppError::Modbus(format!("client state allocation: {e}")))?;
-    health::set_next_thread_core(health::CORE_NET);
-    let result = std::thread::Builder::new()
-        .name("mb-tcp".into())
-        .stack_size(stack_budget::MODBUS_TCP)
-        .spawn(move || poll_loop(listeners, clients));
-    health::reset_thread_core();
+    let mut listeners = Vec::new();
+    listeners
+        .try_reserve_exact(ports.len())
+        .map_err(|e| AppError::Modbus(format!("listener allocation: {e}")))?;
+    bind_ports(&ports, &mut listeners)
+        .map_err(|(port, e)| AppError::Modbus(format!("bind {port}: {e}")))?;
 
-    if result.is_ok() {
-        health::register_with_stack(&LISTEN_HB, stack_budget::MODBUS_TCP);
-    }
-    result.map_err(|e| AppError::Modbus(format!("spawn mb-tcp: {e}")))?;
+    SERVER_STATE
+        .init(TcpServerState {
+            listeners,
+            clients,
+            active_ports: ports,
+            next_port_check: Instant::now(),
+        })
+        .map_err(|_| AppError::Modbus("TCP state busy during init".into()))?;
     log::info!(
-        "[mb-tcp] {} ports, max {} clients, one {}KB task",
-        cfg::PORTS.len(),
-        cfg::MAX_CONNECTIONS,
-        stack_budget::MODBUS_TCP / stack_budget::KIB
+        "[mb-tcp] {} ports, max {} clients, main-loop polling",
+        ports.len(),
+        cfg::MAX_CONNECTIONS
     );
     Ok(())
 }
 
-fn poll_loop(listeners: Vec<TcpListener>, mut clients: Vec<Client>) {
-    health::subscribe_wdt();
-    let backend = BusBackend;
-    loop {
-        LISTEN_HB.tick();
-        health::feed_wdt();
-        accept_pending(&listeners, &mut clients);
+/// main_loop 每 20ms 调用一次。所有 socket 均为 nonblocking，每轮工作有界。
+pub fn tick_tcp_server() {
+    let _ = SERVER_STATE.with_mut(|state| {
+        if Instant::now() >= state.next_port_check {
+            state.next_port_check = Instant::now() + Duration::from_secs(1);
+            let desired = configured_ports();
+            if desired != state.active_ports {
+                if !ports_are_valid(&desired) {
+                    log::error!(
+                        "[mb-tcp] rejected invalid/duplicate port set: {:?}",
+                        desired
+                    );
+                } else {
+                    let previous = state.active_ports;
+                    match bind_ports(&desired, &mut state.listeners) {
+                        Ok(()) => {
+                            state.active_ports = desired;
+                            log::info!("[mb-tcp] listeners rebound: {:?}", state.active_ports);
+                        }
+                        Err((port, e)) => {
+                            log::error!(
+                                "[mb-tcp] rebind :{} failed: {}; restoring {:?}",
+                                port,
+                                e,
+                                previous
+                            );
+                            if let Err((rollback_port, rollback_error)) =
+                                bind_ports(&previous, &mut state.listeners)
+                            {
+                                log::error!(
+                                    "[mb-tcp] listener rollback :{} failed: {} (will retry)",
+                                    rollback_port,
+                                    rollback_error
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        accept_pending(&state.listeners, &mut state.clients);
 
         let mut i = 0;
-        while i < clients.len() {
-            if clients[i].poll(&backend) {
+        while i < state.clients.len() {
+            if state.clients[i].poll(&BusBackend) {
                 i += 1;
             } else {
-                let client = clients.swap_remove(i);
-                log::info!(
-                    "[mb-tcp] conn_id={} from {} closed",
-                    client.id,
-                    client.peer
-                );
+                let client = state.clients.swap_remove(i);
+                log::info!("[mb-tcp] conn_id={} from {} closed", client.id, client.peer);
                 CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        std::thread::sleep(Duration::from_millis(cfg::ACCEPT_POLL_INTERVAL_MS));
+    });
+}
+
+fn configured_ports() -> [u16; 4] {
+    crate::bus::config_state::config_read_with(|state| state.cfg.tcp_ports)
+        .unwrap_or(crate::config::regs::TCP_PORTS_DEFAULT)
+}
+
+fn ports_are_valid(ports: &[u16; 4]) -> bool {
+    ports.iter().all(|&port| port != 0)
+        && ports
+            .iter()
+            .enumerate()
+            .all(|(i, port)| !ports[..i].contains(port))
+}
+
+/// 复用启动期预留的 Vec 容量。运行中的 TCP 状态机不扩容；发生失败时调用方
+/// 可用旧端口集回滚，已建立的客户端 socket 不受 listener 重绑影响。
+fn bind_ports(
+    ports: &[u16; 4],
+    listeners: &mut Vec<TcpListener>,
+) -> Result<(), (u16, std::io::Error)> {
+    listeners.clear();
+    for &port in ports {
+        let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| (port, e))?;
+        listener.set_nonblocking(true).map_err(|e| (port, e))?;
+        listeners.push(listener);
+        log::info!("[mb-tcp] bound :{port}");
     }
+    Ok(())
 }
 
 fn accept_pending(listeners: &[TcpListener], clients: &mut Vec<Client>) {
@@ -241,7 +301,10 @@ fn accept_pending(listeners: &[TcpListener], clients: &mut Vec<Client>) {
         for _ in 0..cfg::MAX_CONNECTIONS {
             match listener.accept() {
                 Ok((stream, peer)) if clients.len() >= cfg::MAX_CONNECTIONS => {
-                    log::warn!("[mb-tcp] rejected {peer} (max={} reached)", cfg::MAX_CONNECTIONS);
+                    log::warn!(
+                        "[mb-tcp] rejected {peer} (max={} reached)",
+                        cfg::MAX_CONNECTIONS
+                    );
                     drop(stream);
                 }
                 Ok((stream, peer)) => {
@@ -295,9 +358,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tcp_stack_is_constant_for_all_connections() {
-        assert_eq!(stack_budget::MODBUS_TCP, 16 * 1024);
+    fn test_tcp_uses_one_bounded_main_loop_state() {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
+        assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
     }
 
     #[test]
@@ -305,5 +368,20 @@ mod tests {
         assert!(!(2..=MAX_MBAP_LENGTH).contains(&1));
         assert!(!(2..=MAX_MBAP_LENGTH).contains(&255));
         assert!((2..=MAX_MBAP_LENGTH).contains(&2));
+    }
+
+    #[test]
+    fn test_mbap_exception_response_golden_vector() {
+        let request = [0x12, 0x34, 0, 0, 0, 2, 1, 0x7F];
+        let mut response = [0u8; MAX_ADU_SIZE];
+        let len = build_response(&request, &BusBackend, &mut response).expect("response");
+        assert_eq!(&response[..len], &[0x12, 0x34, 0, 0, 0, 3, 1, 0xFF, 0x01]);
+    }
+
+    #[test]
+    fn test_tcp_port_set_validation() {
+        assert!(ports_are_valid(&[502, 503, 504, 5002]));
+        assert!(!ports_are_valid(&[502, 502, 504, 5002]));
+        assert!(!ports_are_valid(&[502, 503, 0, 5002]));
     }
 }

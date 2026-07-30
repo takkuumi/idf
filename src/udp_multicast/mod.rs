@@ -19,11 +19,11 @@
 //! 可靠性设计:
 //! - 单独线程, 启动失败仅记日志, 不阻断主流程
 //! - 网络未就绪时退避重试 (5s 间隔)
-//! - 配置变更需重启生效 (对齐参考固件: `udp.begin` 只在启动时调用一次)
+//! - 配置每秒检查，变更后自动重建 socket，无需重启
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
 
 use crate::bus::config_state::config_read_with;
@@ -34,6 +34,7 @@ use crate::sync::Spin;
 
 /// 组播接收任务心跳 (阈值 30s, 每秒一次轮询, 余量充足)
 static TASK_HB: TaskHb = TaskHb::new_with_stall("udp-mcast", 30);
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 接收缓冲区 (对齐参考固件 recvBuffer[32])
 /// 存放最近一次收到的组播数据, 通过 Modbus FC=04 0x0090 段读取.
@@ -94,9 +95,11 @@ fn read_multicast_config() -> MulticastConfig {
             port,
             switch_ip,
         }
-    }).unwrap_or_else(MulticastConfig::default)
+    })
+    .unwrap_or_else(MulticastConfig::default)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct MulticastConfig {
     group: [u8; 4],
     port: u16,
@@ -116,14 +119,24 @@ impl MulticastConfig {
 
 /// 启动 UDP 组播接收任务 (后台线程, 失败不阻断主流程)
 pub fn start() -> AppResult<()> {
-    std::thread::Builder::new()
+    if STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let spawn_result = std::thread::Builder::new()
         .name("udp-mcast".into())
         .stack_size(crate::safety::stack_budget::UDP_MULTICAST)
-        .spawn(recv_loop)
-        .map_err(|e| crate::error::AppError::Sys(format!("spawn udp-mcast: {e}")))?;
+        .spawn(recv_loop);
+    if let Err(e) = spawn_result {
+        return Err(crate::error::AppError::Sys(format!("spawn udp-mcast: {e}")));
+    }
+    STARTED.store(true, Ordering::Release);
     health::register_with_stack(&TASK_HB, crate::safety::stack_budget::UDP_MULTICAST);
     log::info!("[udp-mcast] receiver thread spawned");
     Ok(())
+}
+
+pub fn is_started() -> bool {
+    STARTED.load(Ordering::Acquire)
 }
 
 /// 接收主循环
@@ -137,8 +150,8 @@ fn recv_loop() {
         let cfg = read_multicast_config();
         match bind_and_recv(&cfg) {
             Ok(()) => {
-                // 正常情况下 bind_and_recv 内部循环直到 socket 失效
-                log::warn!("[udp-mcast] recv loop exited, reconnecting in {}ms", BACKOFF_MS);
+                // 配置变更主动返回，立即用新参数重建 socket。
+                continue;
             }
             Err(e) => {
                 log::warn!("[udp-mcast] setup failed: {}, retry in {}ms", e, BACKOFF_MS);
@@ -166,12 +179,19 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
 
     log::info!(
         "[udp-mcast] listening on port {}, group {}.{}.{}.{}",
-        cfg.port, cfg.group[0], cfg.group[1], cfg.group[2], cfg.group[3]
+        cfg.port,
+        cfg.group[0],
+        cfg.group[1],
+        cfg.group[2],
+        cfg.group[3]
     );
     if let Some(sip) = cfg.switch_ip {
         log::info!(
             "[udp-mcast] source IP filter: {}.{}.{}.{}",
-            sip[0], sip[1], sip[2], sip[3]
+            sip[0],
+            sip[1],
+            sip[2],
+            sip[3]
         );
     } else {
         log::info!("[udp-mcast] source IP filter: DISABLED (accept all)");
@@ -207,7 +227,9 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
                 RECV_LEN.store(n as u16, Ordering::Release);
                 log::debug!(
                     "[udp-mcast] received {} bytes from {} (stored {})",
-                    len, src.ip(), n
+                    len,
+                    src.ip(),
+                    n
                 );
             }
             Err(e) => {
@@ -219,6 +241,10 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
                     return Err(format!("recv_from: {e}"));
                 }
             }
+        }
+        if read_multicast_config() != *cfg {
+            log::info!("[udp-mcast] configuration changed, rebuilding socket");
+            return Ok(());
         }
     }
 }
@@ -233,11 +259,10 @@ fn src_ip_matches(src: &SocketAddr, filter: [u8; 4]) -> bool {
 
 /// 通过 setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP) 加入 IPv4 组播组
 ///
-/// LOOP9 字节序修复 (最终正确版): `in_addr.s_addr` 期望**网络字节序** (BE),
-/// `group`/`if_ip` 已是主机序 octet 数组, 必须用 `from_be_bytes` 转 BE u32.
-///
-/// (前一个 LOOP9 错误版本用 `from_ne_bytes` — 在 ESP32-S3 LE 平台上等价
-/// `from_le_bytes`, 产生 `0x010000EF` 而非 `0xEF000001`, 组播加入失败。)
+/// `in_addr.s_addr` 要求其内存中的四个字节按网络顺序排列。ESP32-S3 是小端，
+/// 因此必须用 `from_ne_bytes(octets)` 保持 `[239, 0, 0, 1]` 的内存字节不变。
+/// 使用 `from_be_bytes` 会让内存变成 `[1, 0, 0, 239]`，LwIP IGMP 因目标并非
+/// 组播地址而返回 EADDRNOTAVAIL(125)。
 ///
 /// 同时, LwIP 中 `imr_interface=设备 IP` 在以太网 DHCP 尚未完成或 netif 短暂脱绑
 /// 时会返回 ENOTSUP/125 (`Address not available`)。优先尝试 INADDR_ANY (=0),
@@ -253,12 +278,14 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
         imr_interface: u32,
     }
 
-    let if_ip = config_read_with(|cs| cs.cfg.ip)
-        .unwrap_or([0, 0, 0, 0]);
+    let if_ip = config_read_with(|cs| cs.cfg.ip).unwrap_or([0, 0, 0, 0]);
 
     log::info!(
         "[udp-mcast] join group={}.{}.{}.{}",
-        group[0], group[1], group[2], group[3]
+        group[0],
+        group[1],
+        group[2],
+        group[3]
     );
 
     const IPPROTO_IP: i32 = 0;
@@ -267,12 +294,14 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
 
     // 1) 优先 INADDR_ANY, 让 LwIP 自动选取当前活动的 netif.
     let mreq_any = IpMreq {
-        imr_multiaddr: u32::from_be_bytes(group),
+        imr_multiaddr: ipv4_s_addr(group),
         imr_interface: 0,
     };
     let ret_any = unsafe {
         esp_idf_sys::lwip_setsockopt(
-            fd, IPPROTO_IP, ip_add_membership,
+            fd,
+            IPPROTO_IP,
+            ip_add_membership,
             &mreq_any as *const _ as *mut _,
             std::mem::size_of::<IpMreq>() as u32,
         )
@@ -284,14 +313,17 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
     let errno_any = std::io::Error::last_os_error();
     log::debug!("[udp-mcast] INADDR_ANY join failed: {:?}", errno_any);
 
-    // 2) 回退到设备 IP (主机序字节转 BE u32). 与原 LOOP11 行为一致.
+    // 2) 回退到设备 IP。与原 LOOP11 行为一致。
     log::info!(
         "[udp-mcast] retry with iface={}.{}.{}.{}",
-        if_ip[0], if_ip[1], if_ip[2], if_ip[3]
+        if_ip[0],
+        if_ip[1],
+        if_ip[2],
+        if_ip[3]
     );
     let mreq = IpMreq {
-        imr_multiaddr: u32::from_be_bytes(group),
-        imr_interface: u32::from_be_bytes(if_ip),
+        imr_multiaddr: ipv4_s_addr(group),
+        imr_interface: ipv4_s_addr(if_ip),
     };
     let ret = unsafe {
         esp_idf_sys::lwip_setsockopt(
@@ -307,6 +339,11 @@ fn join_multicast_group(sock: &UdpSocket, group: [u8; 4]) -> Result<(), std::io:
         return Err(errno);
     }
     Ok(())
+}
+
+#[inline]
+fn ipv4_s_addr(octets: [u8; 4]) -> u32 {
+    u32::from_ne_bytes(octets)
 }
 
 // ----------------------------------------------------------------------------
@@ -345,4 +382,18 @@ pub fn read_switch_status(word_idx: u16) -> Option<u16> {
 /// 最近一次接收的字节数 (供诊断)
 pub fn recv_len() -> usize {
     RECV_LEN.load(Ordering::Acquire) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipv4_s_addr_preserves_network_octets_in_memory() {
+        assert_eq!(ipv4_s_addr([239, 0, 0, 1]).to_ne_bytes(), [239, 0, 0, 1]);
+        assert_eq!(
+            ipv4_s_addr([192, 168, 51, 221]).to_ne_bytes(),
+            [192, 168, 51, 221]
+        );
+    }
 }

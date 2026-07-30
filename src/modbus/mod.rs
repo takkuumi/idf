@@ -15,12 +15,12 @@ use crate::hal::Hal;
 #[cfg(feature = "modbus-rtu")]
 pub mod rtu_master;
 #[cfg(feature = "modbus-rtu")]
-pub mod rtu_slave;
-#[cfg(feature = "modbus-rtu")]
 pub mod rtu_port2;
+#[cfg(feature = "modbus-rtu")]
+pub mod rtu_slave;
+pub mod shared;
 #[cfg(feature = "modbus-tcp")]
 pub mod tcp_server;
-pub mod shared;
 
 /// 启动 RTU Master + Slave 任务
 #[cfg(feature = "modbus-rtu")]
@@ -36,7 +36,7 @@ pub fn start_rtu(_hal: Arc<Hal>) -> AppResult<()> {
     Ok(())
 }
 
-/// 启动 TCP Server 任务
+/// 初始化 TCP Server 主循环状态机
 #[cfg(feature = "modbus-tcp")]
 pub fn start_tcp() -> AppResult<()> {
     tcp_server::start()

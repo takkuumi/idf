@@ -28,7 +28,7 @@
 
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use heapless::spsc::Queue;
 
@@ -125,8 +125,11 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
 //
 // 本实现: 拆 4× AtomicU16 (xtensa 原生无锁), 配合单字节 seqlock:
 // - 读 (`load_bits`): 序号前后比对 + 读 4 个 word; 不一致重试 (类 seqlock, 无限重试边界).
-// - 写 (`store_bits`): 进/出临界区时 fetch_add seq, 中间 Release 写 4 个 word.
-// - 单位写 (`set_bit`): 进/出 seq + CAS 单 word.
+// - 写: CAS 把偶数序号改成奇数以取得唯一写者资格，完成后发布下一个偶数序号。
+//
+// 不能仅在写入前后 `fetch_add`：两个写者重叠时序号会暂时变回偶数，读者可能
+// 把半写入数据当成稳定快照。DO 可由 BLE/TCP/RTU/Web 并发写入，因此写者互斥
+// 是业务正确性要求，不只是性能优化。
 //
 // 性能: 读 ≈ 4 次 atomic load + 2 次 seq load (常驻 cache, 纳秒级); 写 ≈ 8 次 atomic op.
 // 多写者安全: store_bits 是多写者最后写入生效; set_bit 用 CAS 单位写入者相互重试.
@@ -182,12 +185,12 @@ impl AtomicBits64 {
 
     /// 全量替换 (多写者最后写入生效).
     pub fn store_bits(&self, value: u64) {
-        self.bump_seq();
+        let write_seq = self.begin_write();
         self.words[0].store(value as u16, Ordering::Release);
         self.words[1].store((value >> 16) as u16, Ordering::Release);
         self.words[2].store((value >> 32) as u16, Ordering::Release);
         self.words[3].store((value >> 48) as u16, Ordering::Release);
-        self.bump_seq();
+        self.end_write(write_seq);
     }
 
     /// 读取单个位 (ch < 64, 越界返回 false).
@@ -204,49 +207,58 @@ impl AtomicBits64 {
         if ch >= 64 {
             return false;
         }
-        self.bump_seq();
+        let write_seq = self.begin_write();
         let idx = ch >> 4;
         let mask = 1u16 << (ch & 0x0F);
-        loop {
-            let cur = self.words[idx].load(Ordering::Acquire);
-            let nv = if value { cur | mask } else { cur & !mask };
-            match self.words[idx].compare_exchange_weak(
-                cur,
-                nv,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => spin_loop(),
-            }
-        }
-        self.bump_seq();
+        let cur = self.words[idx].load(Ordering::Relaxed);
+        let nv = if value { cur | mask } else { cur & !mask };
+        self.words[idx].store(nv, Ordering::Release);
+        self.end_write(write_seq);
         true
     }
 
     /// 用 (mask, value) 在 64 位范围内批量替换指定 bit. 多写者 best-effort.
     pub fn mask_replace(&self, mask: u64, value: u64) {
-        self.bump_seq();
+        let write_seq = self.begin_write();
         for i in 0..4usize {
             let m = ((mask >> (i * 16)) & 0xFFFF) as u16;
             if m == 0 {
                 continue;
             }
             let v = ((value >> (i * 16)) & 0xFFFF) as u16;
-            let cur = self.words[i].load(Ordering::Acquire);
+            let cur = self.words[i].load(Ordering::Relaxed);
             let nv = (cur & !m) | (v & m);
-            let _ = self.words[i].compare_exchange(
-                cur,
-                nv,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            self.words[i].store(nv, Ordering::Release);
         }
-        self.bump_seq();
+        self.end_write(write_seq);
     }
 
-    fn bump_seq(&self) {
-        let _ = self.seq.fetch_add(1, Ordering::AcqRel);
+    /// 取得唯一写者资格，返回取得时的偶数序号。
+    fn begin_write(&self) -> u8 {
+        loop {
+            let seq = self.seq.load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            if self
+                .seq
+                .compare_exchange_weak(
+                    seq,
+                    seq.wrapping_add(1),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return seq;
+            }
+            spin_loop();
+        }
+    }
+
+    fn end_write(&self, write_seq: u8) {
+        self.seq.store(write_seq.wrapping_add(2), Ordering::Release);
     }
 }
 
@@ -326,35 +338,36 @@ impl<T, const N: usize> Default for MpscRing<T, N> {
 }
 
 // ============================================================================
-// MainLoopCell<T> — 单线程 tick 状态的零开销 cell (取代 Mutex<Option<T>>)
+// MainLoopCell<T> — main_loop tick 状态的受控借用 cell (取代 Mutex<Option<T>>)
 // ============================================================================
 //
 // ## 为什么不用 Mutex
-// - `main_loop` 中调用的 `tick_xxx` 函数都在同一线程, 没有并发争用
-// - `Mutex<Option<T>>` + `try_lock` 模式即使无争用也要做 atomic CAS (数十 ns/次)
+// - `main_loop` 中调用的 `tick_xxx` 函数通常在同一线程, 没有并发争用
+// - 仍用一个原子借用标志防止递归调用或未来调度变更制造 Rust 引用别名
 // - 持锁失败 `try_lock → return` 会跳过本次 tick, 导致 I/O 数据丢失
 //
 // ## 适用场景
-// - **只从 main_loop 调用的 tick 函数的状态** (DI/DO/AI/AO/eth-hb)
-// - init 由启动阶段一次性写入, tick 只读不写
+// - **只从 main_loop 调用的 tick 函数的状态** (TCP/DI/DO/AI/AO/eth-hb)
+// - init 由启动阶段一次性写入, tick 可在闭包作用域内更新状态
 // - 没有任何 BLE/Modbus 中断或 pthread 路径访问
 //
 // ## 安全保证
-// - `init()`: 调用一次, 写入值并发布 init 标志
-// - `with_mut / with`: 仅 init 后访问, 只能从 main_loop 调用 (caller 保证)
+// - `init()`: 与访问互斥且幂等, 写入值后发布 init 标志
+// - `with_mut / with`: 通过 CAS 取得唯一借用, 引用不能逃出闭包
 // - `init` happens-before 任何 `with_*` (Release/Acquire ordering)
-// - 多线程访问需要外部加锁; 本类型不保证多线程安全
+// - 并发或递归借用立即返回 None, 不等待、不死锁
 //
 // ## 内存模型
-// - T 存储在 UnsafeCell 中, 无 padding 浪费
-// - 没有任何 atomic 操作在 tick 热路径上 (init flag 只检查一次)
+// - T 存储在 UnsafeCell 中
+// - tick 热路径为一次无争用 CAS + init flag 检查
 pub struct MainLoopCell<T> {
     init: AtomicBool,
+    borrowed: AtomicBool,
     inner: UnsafeCell<Option<T>>,
 }
 
-// SAFETY: 内部 T 只通过 init (Release) 写入, 通过 with_* (Acquire) 读取.
-// 调用方保证只从单线程 (main_loop) 访问 with_* 路径, 这等价于 &mut 语义.
+// SAFETY: borrowed 以 Acquire/Release 串行化所有对 inner 的访问, T: Send
+// 允许值在线程之间转移独占访问权。
 unsafe impl<T: Send> Sync for MainLoopCell<T> {}
 
 impl<T> MainLoopCell<T> {
@@ -362,18 +375,27 @@ impl<T> MainLoopCell<T> {
     pub const fn new() -> Self {
         Self {
             init: AtomicBool::new(false),
+            borrowed: AtomicBool::new(false),
             inner: UnsafeCell::new(None),
         }
     }
 
-    /// 一次性初始化 (启动阶段, 调用一次).
-    /// 写入后发布 init 标志, 后续 with_* 立刻可见.
-    pub fn init(&self, value: T) {
-        // SAFETY: init 调用是单次的 (启动期), 后续不会再写.
+    /// 幂等初始化。正在访问时返回原值，供调用方触发服务重试。
+    /// 已初始化时丢弃新值并返回成功，不重置运行状态。
+    pub fn init(&self, value: T) -> Result<(), T> {
+        let _borrow = match self.try_borrow() {
+            Some(guard) => guard,
+            None => return Err(value),
+        };
+        if self.init.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // SAFETY: borrow guard 保证 inner 当前没有其它引用。
         unsafe {
             *self.inner.get() = Some(value);
         }
         self.init.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// 是否已初始化 (供 tick 路径快速跳过未初始化情况).
@@ -381,28 +403,47 @@ impl<T> MainLoopCell<T> {
         self.init.load(Ordering::Acquire)
     }
 
-    /// 获取不可变引用 (单线程, caller 必须保证).
-    /// 未初始化返回 None.
+    /// 在闭包作用域内共享访问；未初始化、并发或递归借用时返回 None。
     #[inline(always)]
-    pub fn get(&self) -> Option<&T> {
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let _borrow = self.try_borrow()?;
         if !self.init.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: init 为 true 时, Some(T) 已发布; 单线程访问.
-        let p = unsafe { &*self.inner.get() };
-        p.as_ref()
+        // SAFETY: borrow guard 保证闭包结束前 inner 没有可变引用。
+        let value = unsafe { &*self.inner.get() }.as_ref()?;
+        Some(f(value))
     }
 
-    /// 获取可变引用 (单线程, caller 必须保证).
-    /// 未初始化返回 None.
+    /// 在闭包作用域内独占访问；未初始化、并发或递归借用时返回 None。
     #[inline(always)]
-    pub fn get_mut(&self) -> Option<&mut T> {
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let _borrow = self.try_borrow()?;
         if !self.init.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: init 为 true 时, Some(T) 已发布; 单线程访问.
-        let p = unsafe { &mut *self.inner.get() };
-        p.as_mut()
+        // SAFETY: borrow guard 保证闭包结束前 inner 没有其它引用。
+        let value = unsafe { &mut *self.inner.get() }.as_mut()?;
+        Some(f(value))
+    }
+
+    fn try_borrow(&self) -> Option<MainLoopBorrow<'_>> {
+        self.borrowed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| MainLoopBorrow {
+                borrowed: &self.borrowed,
+            })
+    }
+}
+
+struct MainLoopBorrow<'a> {
+    borrowed: &'a AtomicBool,
+}
+
+impl Drop for MainLoopBorrow<'_> {
+    fn drop(&mut self) {
+        self.borrowed.store(false, Ordering::Release);
     }
 }
 
@@ -424,12 +465,31 @@ mod tests {
     fn test_mlc_basic() {
         let c: MainLoopCell<u32> = MainLoopCell::new();
         assert!(!c.is_initialized());
-        assert!(c.get().is_none());
-        c.init(42);
+        assert!(c.with(|value| *value).is_none());
+        c.init(42).unwrap();
         assert!(c.is_initialized());
-        assert_eq!(*c.get().unwrap(), 42);
-        *c.get_mut().unwrap() += 1;
-        assert_eq!(*c.get().unwrap(), 43);
+        assert_eq!(c.with(|value| *value), Some(42));
+        assert_eq!(c.with_mut(|value| *value += 1), Some(()));
+        assert_eq!(c.with(|value| *value), Some(43));
+    }
+
+    #[test]
+    fn test_mlc_rejects_nested_borrow() {
+        let c = MainLoopCell::new();
+        c.init(7u32).unwrap();
+        assert_eq!(
+            c.with(|value| (*value, c.with_mut(|nested| *nested += 1).is_none())),
+            Some((7, true))
+        );
+        assert_eq!(c.with(|value| *value), Some(7));
+    }
+
+    #[test]
+    fn test_mlc_init_is_idempotent() {
+        let c = MainLoopCell::new();
+        c.init(7u32).unwrap();
+        c.init(99u32).unwrap();
+        assert_eq!(c.with(|value| *value), Some(7));
     }
 
     #[test]
@@ -437,7 +497,6 @@ mod tests {
         let c: MainLoopCell<Vec<u8>> = MainLoopCell::default();
         assert!(!c.is_initialized());
     }
-
 
     use std::sync::Arc;
     use std::thread;

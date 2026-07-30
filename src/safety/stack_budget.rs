@@ -8,7 +8,6 @@ pub const KIB: usize = 1024;
 
 pub const MAIN: usize = 32 * KIB;
 pub const DEVICE_ACTOR: usize = 16 * KIB;
-pub const MODBUS_TCP: usize = 16 * KIB;
 pub const MODBUS_RTU_MASTER: usize = 8 * KIB;
 pub const MODBUS_RTU_SLAVE: usize = 8 * KIB;
 pub const MODBUS_RTU_PORT2: usize = 8 * KIB;
@@ -25,32 +24,21 @@ pub const FREERTOS_TIMER: usize = 4 * KIB;
 pub const W5500_RX: usize = 4 * KIB;
 
 /// 默认功能集常驻用户任务栈。
-pub const DEFAULT_USER_STACK_TOTAL: usize = MAIN
-    + DEVICE_ACTOR
-    + MODBUS_TCP
-    + MODBUS_RTU_MASTER
-    + MODBUS_RTU_SLAVE
-    + UDP_MULTICAST
-    + NFC
-    + HTTP;
+pub const DEFAULT_USER_STACK_TOTAL: usize =
+    MAIN + DEVICE_ACTOR + MODBUS_RTU_MASTER + MODBUS_RTU_SLAVE + UDP_MULTICAST + NFC + HTTP;
 
 /// 可选任务全部启用时的用户任务栈上限（不含 ESP-IDF 系统任务）。
 pub const ALL_USER_STACK_TOTAL: usize =
     DEFAULT_USER_STACK_TOTAL + MODBUS_RTU_PORT2 + WIFI_HEARTBEAT;
 
-pub const KNOWN_SYSTEM_STACK_TOTAL: usize = BLUEDROID_BTC
-    + BLUEDROID_BTU
-    + LWIP_TCPIP
-    + SYSTEM_EVENT
-    + FREERTOS_TIMER
-    + W5500_RX;
+pub const KNOWN_SYSTEM_STACK_TOTAL: usize =
+    BLUEDROID_BTC + BLUEDROID_BTU + LWIP_TCPIP + SYSTEM_EVENT + FREERTOS_TIMER + W5500_RX;
 
 /// 用户任务栈预算硬上限。为 BLE/LwIP/事件/W5500、DMA 和内部堆保留空间。
 pub const USER_STACK_BUDGET_LIMIT: usize = 128 * KIB;
 
 const _: () = assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
 const _: () = assert!(DEVICE_ACTOR <= 16 * KIB);
-const _: () = assert!(MODBUS_TCP <= 16 * KIB);
 
 #[cfg(test)]
 mod tests {
@@ -58,8 +46,8 @@ mod tests {
 
     #[test]
     fn test_all_user_stacks_stay_within_internal_sram_budget() {
-        assert_eq!(DEFAULT_USER_STACK_TOTAL, 106 * KIB);
-        assert_eq!(ALL_USER_STACK_TOTAL, 120 * KIB);
+        assert_eq!(DEFAULT_USER_STACK_TOTAL, 90 * KIB);
+        assert_eq!(ALL_USER_STACK_TOTAL, 104 * KIB);
         assert_eq!(KNOWN_SYSTEM_STACK_TOTAL, 36 * KIB);
         assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
     }

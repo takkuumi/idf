@@ -46,8 +46,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use std::sync::LazyLock;
 
-use crate::sync::{MpscRing, Spin};
 use crate::config::regs;
+use crate::sync::{MpscRing, Spin};
 
 use crate::error::AppResult;
 use crate::modbus::shared::modbus_crc16;
@@ -76,7 +76,10 @@ const ATTR_TABLE_LEN: usize = 4;
 /// - 写: CREAT_ATTR_TAB_EVT 中一次性填入, 之后只读
 /// - 读: 每 GATT 回调 + 每 process_tick (100ms) → 真无锁
 static HANDLE_TABLE: [AtomicU16; ATTR_TABLE_LEN] = [
-    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
 ];
 
 /// Bluedord 分配的 GATT 接口号. 用 AtomicU8:
@@ -112,9 +115,6 @@ static TASK_HB: TaskHb = TaskHb::new("ble-at");
 static RX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
     LazyLock::new(|| Spin::new(heapless::String::new()));
 
-/// 输出缓冲区 (notify 给主机, AT 命令文本响应)
-static TX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
-    LazyLock::new(|| Spin::new(heapless::String::new()));
 /// 二进制响应队列 (由 GATT 写回调填充, main loop 发送)
 static BINARY_TX: LazyLock<Spin<heapless::Vec<u8, 2048>>> =
     LazyLock::new(|| Spin::new(heapless::Vec::new()));
@@ -131,21 +131,27 @@ struct BinaryRequest {
 static BINARY_REQUESTS: MpscRing<BinaryRequest, 4> = MpscRing::new();
 /// BLE notify 丢弃帧计数器 (Modbus 寄存器 0x0108 暴露)
 static BINARY_TX_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// 有待发送的 BLE 通知 (由 CONNECT_EVT 或 Modbus 响应设置, main loop 消费)
-static PENDING_NOTIFY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Android requests MTU 512. A complete Modbus PDU can hold 253 bytes, so
 /// compatibility responses must not use the old 32-byte control-buffer limit.
 const BLE_RESPONSE_PDU_MAX: usize = 253;
 const BLE_RESPONSE_DATA_MAX: usize = BLE_RESPONSE_PDU_MAX - 2;
 const BLE_BINARY_FRAME_MAX: usize = 512;
 const BLE_BINARY_PDU_MAX: usize = BLE_BINARY_FRAME_MAX - 8;
+/// ATT 默认 MTU 为 23；notification value 最多为协商 MTU - opcode/handle 3 字节。
+const BLE_ATT_MTU_MIN: u16 = 23;
+const BLE_LOCAL_MTU: u16 = 500;
+const BLE_ATT_PAYLOAD_MAX: usize = BLE_LOCAL_MTU as usize - 3;
+static NEGOTIATED_MTU: AtomicU16 = AtomicU16::new(BLE_ATT_MTU_MIN);
+static GATT_CONGESTED: AtomicBool = AtomicBool::new(false);
+/// 断线回调不与 main-loop 争抢多个缓冲区锁；由 main-loop 在下一 tick 统一清理。
+static CONNECTION_BUFFERS_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// LOOP15: 广播启动完成标志 (ADV_START_COMPLETE_EVT 成功后置位).
 /// 用于 process_tick 周期自检 — 若启动后仍 false, 重新触发 config_adv_data → 广播.
 /// 防止启动期任意一步静默失败导致设备永久不可发现 (手持机搜不到蓝牙).
 static ADV_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 改名时只停止一次广播，等待 STOP_COMPLETE 后重建 ADV data。
+static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
 /// LOOP15: GATT 服务是否已启动 (CREAT_ATTR_TAB_EVT 后 start_service 成功)
 static SVC_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -164,6 +170,10 @@ const ESP_GATTS_CONNECT_EVT: esp_idf_sys::esp_gatts_cb_event_t =
     esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CONNECT_EVT;
 const ESP_GATTS_DISCONNECT_EVT: esp_idf_sys::esp_gatts_cb_event_t =
     esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT;
+const ESP_GATTS_MTU_EVT: esp_idf_sys::esp_gatts_cb_event_t =
+    esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_MTU_EVT;
+const ESP_GATTS_CONGEST_EVT: esp_idf_sys::esp_gatts_cb_event_t =
+    esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CONGEST_EVT;
 const ESP_GATTS_CREAT_ATTR_TAB_EVT: esp_idf_sys::esp_gatts_cb_event_t =
     esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CREAT_ATTR_TAB_EVT;
 
@@ -304,8 +314,8 @@ fn start_advertising() {
 ///   只要首字符仍是 m/M, metuory 过滤仍能命中.
 fn config_adv_data() {
     let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
-        set_scan_rsp: false,      // LOOP17: 不用 scan_rsp, 名字+UUID 同放 ADV (size=27B<31)
-        include_name: true,       // name 放 ADV data, 兼容所有扫描器 (含旧 startLeScan)
+        set_scan_rsp: false, // LOOP17: 不用 scan_rsp, 名字+UUID 同放 ADV (size=27B<31)
+        include_name: true,  // name 放 ADV data, 兼容所有扫描器 (含旧 startLeScan)
         include_txpower: false,
         min_interval: 0i32,
         max_interval: 0i32,
@@ -316,8 +326,8 @@ fn config_adv_data() {
         p_service_data: core::ptr::null_mut(),
         service_uuid_len: SERVICE_UUID_128.len() as u16,
         p_service_uuid: SERVICE_UUID_128.as_ptr() as *mut u8,
-        flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
-            | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) as u8,
+        flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT)
+            as u8,
     };
     // config_adv_data 异步: 成功后触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising
     let ret = unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _) };
@@ -363,6 +373,13 @@ unsafe extern "C" fn gap_event_cb(
                 ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
+        esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT => {
+            ADV_ACTIVE.store(false, Ordering::Release);
+            if ADV_RECONFIGURE_PENDING.swap(false, Ordering::AcqRel) {
+                log::info!("[ble_at] advertising stopped; applying updated name");
+                config_adv_data();
+            }
+        }
         _ => {}
     }
 }
@@ -386,13 +403,21 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let reg = unsafe { (*param).reg };
-            log::info!("[ble_at] REG_EVT status={}, app_id={}", reg.status, reg.app_id);
+            log::info!(
+                "[ble_at] REG_EVT status={}, app_id={}",
+                reg.status,
+                reg.app_id
+            );
             if reg.status != esp_idf_sys::esp_gatt_status_t_ESP_GATT_OK {
                 log::error!("[ble_at] GATT app registration failed: {}", reg.status);
                 return;
             }
             GATTS_IF.store(gatts_if as u8, Ordering::Release);
-            log::info!("[ble_at] calling create_attr_tab(gatts_if={}, n_attr={})", gatts_if, ATTR_TABLE_LEN);
+            log::info!(
+                "[ble_at] calling create_attr_tab(gatts_if={}, n_attr={})",
+                gatts_if,
+                ATTR_TABLE_LEN
+            );
             let ret = unsafe {
                 esp_idf_sys::esp_ble_gatts_create_attr_tab(
                     ATTRIBUTE_TABLE
@@ -415,8 +440,12 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).add_attr_tab };
-            log::info!("[ble_at] CREAT_ATTR_TAB_EVT status={} num_handle={} handles={:p}",
-                p.status, p.num_handle, p.handles);
+            log::info!(
+                "[ble_at] CREAT_ATTR_TAB_EVT status={} num_handle={} handles={:p}",
+                p.status,
+                p.num_handle,
+                p.handles
+            );
             if p.status != 0 || p.num_handle == 0 || p.handles.is_null() {
                 log::warn!(
                     "[ble_at] attr_tab creation failed (status={}, num_handle={})",
@@ -441,7 +470,10 @@ unsafe extern "C" fn gatts_event_cb(
                 svc_handle,
                 p.status
             );
-            log::info!("[ble_at] about to call start_service(handle={})", svc_handle);
+            log::info!(
+                "[ble_at] about to call start_service(handle={})",
+                svc_handle
+            );
             // 启动服务
             // SAFETY: svc_handle 来自 Bluedord 分配, 有效
             let ret = unsafe { esp_idf_sys::esp_ble_gatts_start_service(svc_handle) };
@@ -569,20 +601,15 @@ unsafe extern "C" fn gatts_event_cb(
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             CONN_ID.store(p.conn_id, Ordering::Release);
             GATTS_IF.store(gatts_if as u8, Ordering::Release);
+            NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
+            GATT_CONGESTED.store(false, Ordering::Release);
+            ADV_ACTIVE.store(false, Ordering::Release);
             log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
-            
+
             // MCA 兼容: 连接后立即产一个心跳通知到 BINARY_TX 队列
             // Android BLEDataSyncManager.onStateConnected 会发心跳命令,
             // 但有时 Service 未发现, 写入失败, 导致数据流卡死。
             // 我们主动发心跳, 触发 Android 的 onHeartbeatChanged → readHardwareInfo
-            //
-            // ---- LOOP14 P3-3 已知限制: BLE 心跳 CONNECT_EVT 帧丢失 ----
-            // 此处构造的 frame 仅设置 PENDING_NOTIFY=true, **未推入 BINARY_TX 队列**.
-            // try_send_notify() 从 TX_BUFFER 读取待发帧, 而非 PENDING_NOTIFY 标记的临时帧.
-            // 周期心跳 (~10s process_tick 调用 BLEHeartBeat) 弥补此缺陷.
-            // 影响: Android 端首次 connect 后需等待 ~10s 收到首次心跳, 略延迟 UI 刷新.
-            // 修复方向: 把 frame 推到 BINARY_TX 后置 PENDING_NOTIFY, 或 try_send_notify
-            //          优先消费 PENDING_NOTIFY 标记的临时帧.
             let hb = {
                 use std::sync::atomic::{AtomicU16, Ordering};
                 static HB: AtomicU16 = AtomicU16::new(0);
@@ -590,23 +617,20 @@ unsafe extern "C" fn gatts_event_cb(
             };
             // 用 BLE 帧格式: tx_id=0, proto_id=0, pdu_data=[unit=1, func=0x11, hb_hi, hb_lo]
             let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = frame.extend_from_slice(&[0u8, 0]);  // tx_id=0
-            let _ = frame.extend_from_slice(&[0u8, 0]);  // proto_id=0
+            let _ = frame.extend_from_slice(&[0u8, 0]); // tx_id=0
+            let _ = frame.extend_from_slice(&[0u8, 0]); // proto_id=0
             let _ = frame.extend_from_slice(&4u16.to_be_bytes()); // length=4
-            let _ = frame.push(1);   // unit
+            let _ = frame.push(1); // unit
             let _ = frame.push(0x11); // func=heartbeat
             let _ = frame.push((hb >> 8) as u8);
             let _ = frame.push((hb & 0xFF) as u8);
             let crc = modbus_crc16(&frame[..frame.len()]);
             let _ = frame.push(crc as u8);
             let _ = frame.push((crc >> 8) as u8);
-            // LOOP15: 修复 P3-3 — 把 CONNECT 心跳帧实际推入 BINARY_TX 队列,
             // Android 首次 connect 后能立即收到心跳, 不用等 ~10s 周期心跳.
-            // (原代码仅 set PENDING_NOTIFY=true, frame 未入队 → 丢失)
             if let Some(mut btx) = BINARY_TX.try_lock() {
                 if btx.len() + frame.len() <= 2048 {
                     let _ = btx.extend_from_slice(&frame);
-                    PENDING_NOTIFY.store(true, std::sync::atomic::Ordering::Release);
                     log::info!("[ble_at] connect heartbeat queued ({} bytes)", frame.len());
                 } else {
                     log::warn!("[ble_at] BINARY_TX full, connect heartbeat dropped");
@@ -618,25 +642,17 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).disconnect };
-            log::warn!("[ble_at] GATT disconnect conn_id={} reason={:#x}",
-                p.conn_id, p.reason);
-            CONN_ID.store(0xFFFF, Ordering::Release);  // LOOP8: 原子 sentinel = None
+            log::warn!(
+                "[ble_at] GATT disconnect conn_id={} reason={:#x}",
+                p.conn_id,
+                p.reason
+            );
+            CONN_ID.store(0xFFFF, Ordering::Release); // LOOP8: 原子 sentinel = None
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
-            // 清空 BINARY_TX 残留数据，防止旧帧在新连接时被发送
-            if let Some(mut btx) = BINARY_TX.try_lock() {
-                btx.clear();
-            }
-            // 清空 RX_BUFFER 和 TX_BUFFER
-            if let Some(mut rx) = RX_BUFFER.try_lock() {
-                rx.clear();
-            }
-            if let Some(mut rx) = BINARY_RX.try_lock() {
-                rx.clear();
-            }
-            if let Some(mut tx) = TX_BUFFER.try_lock() {
-                tx.clear();
-            }
+            NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
+            GATT_CONGESTED.store(false, Ordering::Release);
+            CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
             log::info!(
                 "[ble_at] GATT client disconnected (conn_id={}, reason={})",
                 p.conn_id,
@@ -644,6 +660,27 @@ unsafe extern "C" fn gatts_event_cb(
             );
             // 可连接广播在建立连接时会停止，断开后必须显式恢复。
             start_advertising();
+        }
+        ESP_GATTS_MTU_EVT => {
+            if param.is_null() {
+                return;
+            }
+            let p = unsafe { &(*param).mtu };
+            if p.conn_id == CONN_ID.load(Ordering::Acquire) {
+                let mtu = p.mtu.clamp(BLE_ATT_MTU_MIN, BLE_LOCAL_MTU);
+                NEGOTIATED_MTU.store(mtu, Ordering::Release);
+                log::info!("[ble_at] negotiated ATT MTU={} payload={}", mtu, mtu - 3);
+            }
+        }
+        ESP_GATTS_CONGEST_EVT => {
+            if param.is_null() {
+                return;
+            }
+            let p = unsafe { &(*param).congest };
+            if p.conn_id == CONN_ID.load(Ordering::Acquire) {
+                GATT_CONGESTED.store(p.congested, Ordering::Release);
+                log::info!("[ble_at] GATT congestion={}", p.congested);
+            }
         }
         _ => {
             log::debug!("[ble_at] GATT event={} gatts_if={}", event, gatts_if);
@@ -795,7 +832,12 @@ pub fn start() -> AppResult<()> {
     }
     log::info!(
         "[ble_at] BLE MAC = {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        ble_mac[0], ble_mac[1], ble_mac[2], ble_mac[3], ble_mac[4], ble_mac[5]
+        ble_mac[0],
+        ble_mac[1],
+        ble_mac[2],
+        ble_mac[3],
+        ble_mac[4],
+        ble_mac[5]
     );
 
     // 读取并打印以太网 MAC 地址, 便于现场识别
@@ -805,7 +847,12 @@ pub fn start() -> AppResult<()> {
     }
     log::info!(
         "[ble_at] ETH MAC = {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        eth_mac[0], eth_mac[1], eth_mac[2], eth_mac[3], eth_mac[4], eth_mac[5]
+        eth_mac[0],
+        eth_mac[1],
+        eth_mac[2],
+        eth_mac[3],
+        eth_mac[4],
+        eth_mac[5]
     );
 
     let ret = unsafe { esp_idf_sys::esp_ble_gap_register_callback(Some(gap_event_cb)) };
@@ -822,12 +869,12 @@ pub fn start() -> AppResult<()> {
         )));
     }
 
-    // BLE MTU 设 500 (与原始 5617b8f 实现一致, Android 协商后取 min(500, request))
-    let mtu_ret = unsafe { esp_idf_sys::esp_ble_gatt_set_local_mtu(500) };
+    // Android 请求 512；ESP-IDF Bluedroid 支持的本地上限使用 500。
+    let mtu_ret = unsafe { esp_idf_sys::esp_ble_gatt_set_local_mtu(BLE_LOCAL_MTU) };
     if mtu_ret != esp_idf_sys::ESP_OK {
         log::warn!("[ble_at] set local MTU failed: 0x{:x}", mtu_ret);
     } else {
-        log::info!("[ble_at] local MTU set to 500");
+        log::info!("[ble_at] local MTU set to {}", BLE_LOCAL_MTU);
     }
 
     let ret = unsafe { esp_idf_sys::esp_ble_gatts_app_register(GATTS_APP_ID) };
@@ -857,7 +904,10 @@ pub fn update_gap_device_name() {
     let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Mesh".to_owned());
-    log::warn!("[ble_at] update_gap_device_name: cfg.ble_name='{}'", configured_name);
+    log::warn!(
+        "[ble_at] update_gap_device_name: cfg.ble_name='{}'",
+        configured_name
+    );
     if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
         let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
         log::warn!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
@@ -865,10 +915,22 @@ pub fn update_gap_device_name() {
             // 关键: set_device_name 后必须重发 config_adv_data 让新名字进入 ADV 包
             // 仅在服务已启动时重发, 否则首次启动链仍由 CREAT_ATTR_TAB_EVT 负责
             if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire) {
-                log::info!("[ble_at] re-trigger config_adv_data after rename");
-                // 清 ADV_ACTIVE 触发被动重试逻辑 (避免快速连续 config_adv_data)
-                ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-                config_adv_data();
+                if ADV_ACTIVE.load(Ordering::Acquire) {
+                    // Bluedroid 不保证在正在广播时原地替换 ADV data。先异步停止，
+                    // STOP_COMPLETE 回调再配置，避免 start/stop 周期抖动和旧名称残留。
+                    ADV_RECONFIGURE_PENDING.store(true, Ordering::Release);
+                    let stop_ret = unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() };
+                    if stop_ret != esp_idf_sys::ESP_OK {
+                        ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
+                        log::warn!(
+                            "[ble_at] stop advertising for rename failed: 0x{:x}",
+                            stop_ret
+                        );
+                    }
+                } else {
+                    log::info!("[ble_at] reconfigure advertising data after rename");
+                    config_adv_data();
+                }
             }
         }
     } else {
@@ -877,41 +939,21 @@ pub fn update_gap_device_name() {
 }
 
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
-/// 有则调用 parser::process 处理, 响应写入 TX_BUFFER 等待 notify。
+/// 有则调用 parser::process 处理，响应排入统一 notification 字节流。
 pub fn process_tick() {
     // LOOP8: 心跳 — 之前从未 tick, 导致 ble-at 总被误判停滞
     TASK_HB.tick();
-    // LOOP15: BLE 广播健康自检 — 两层策略:
-    //
-    // 1. **主动重置 (每 ~15s)**: 调 stop_advertising() + 清 ADV_ACTIVE, 强制下个 tick 走
-    //    config_adv_data → start_advertising 完整链路, 重刷 BLE controller 状态.
-    //    解决: 广播静默死亡 (controller 缓冲区耗尽/堆压力) 后 ADV_ACTIVE 卡 true →
-    //    重试逻辑永不触发 → 设备永久不可发现.
-    //
-    // 2. **被动重试 (启动后 ADV_ACTIVE 仍 false)**: config_adv_data 重新配置.
-    //    解决: 启动期 config_adv_data/start_advertising 静默失败.
-    //
-    // 仅在未连接时 (CONN_ID=0xFFFF) 触发, 避免干扰已有连接.
+    // 广播只在启动/回调失败时被动恢复。正常广播不做周期 stop/start，避免扫描
+    // 窗口丢失和 controller churn。仅在未连接时执行恢复。
     if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire)
         && CONN_ID.load(Ordering::Acquire) == 0xFFFF
     {
         static TICK_DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let tick = TICK_DIV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // 每 ~15s 主动重置一次广播 (150 ticks × 100ms = 15s)
-        // stop_advertising() → controller 立即停止广播 → 无回调.
-        // 置 ADV_ACTIVE=false → 下个 tick (%50==0) 走 config_adv_data 重新启动.
-        if tick % 150 == 0 && ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
-            log::info!("[ble_at] periodic advertising reset (tick={})", tick);
-            unsafe { esp_idf_sys::esp_ble_gap_stop_advertising(); }
-            ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-        }
-
         // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data
         // LOOP17: 统一使用 config_adv_data() 入口 (与 start/update_gap_device_name 一致)
-        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
-            && tick % 50 == 0
-        {
+        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && tick % 50 == 0 {
             log::warn!("[ble_at] advertising not active, retrying config_adv_data");
             config_adv_data();
         }
@@ -920,13 +962,25 @@ pub fn process_tick() {
     if PENDING_GAP_NAME_UPDATE.swap(false, std::sync::atomic::Ordering::SeqCst) {
         update_gap_device_name();
     }
+    if CONNECTION_BUFFERS_DIRTY.swap(false, Ordering::AcqRel) {
+        BINARY_TX.lock().clear();
+        BINARY_RX.lock().clear();
+        RX_BUFFER.lock().clear();
+        log::debug!("[ble_at] stale connection buffers cleared");
+    }
     // LOOP8: 原子读取替代 Spin lock — 真无锁
     let conn_id_raw = CONN_ID.load(Ordering::Acquire);
-    if conn_id_raw == 0xFFFF { return; }  // sentinel = None
+    if conn_id_raw == 0xFFFF {
+        return;
+    } // sentinel = None
     let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
-    if gatts_if_raw == 0xFF { return; }  // sentinel = 未注册
+    if gatts_if_raw == 0xFF {
+        return;
+    } // sentinel = 未注册
     let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
-    if tx_handle == 0 { return; }
+    if tx_handle == 0 {
+        return;
+    }
 
     // GATT 回调投递的二进制请求在 main 任务处理，隔离 Bluedroid BTC 栈。
     if let Some(request) = BINARY_REQUESTS.dequeue() {
@@ -941,7 +995,7 @@ pub fn process_tick() {
             );
         }
     }
-    
+
     // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
     //    完整行 (以 \n 结尾) 调 parser::process 处理, 响应推送 BINARY_TX
     let mut at_response: Option<String> = None;
@@ -951,7 +1005,9 @@ pub fn process_tick() {
             let line_str: String = rx[..pos].trim_end_matches('\r').to_string();
             // 删除前 pos+1 个字符 (= line + '\n')
             for _ in 0..=pos {
-                if rx.is_empty() { break; }
+                if rx.is_empty() {
+                    break;
+                }
                 let _ = rx.remove(0);
             }
             drop(rx);
@@ -979,135 +1035,95 @@ pub fn process_tick() {
             }
         }
     }
-    
-    // 1. 优先发送 BINARY_TX 队列中的响应 (Android 请求的 Modbus 响应)
-    if let Some(mut btx) = BINARY_TX.try_lock() {
-        if !btx.is_empty() {
-            let data: Vec<u8> = btx[..].to_vec();
-            let data_len = data.len();
-            btx.clear();
-            drop(btx);
-            // LOOP8: gatts_if_raw/conn_id_raw 是原子读出的原始值 (已校验非 sentinel)
-            let ret = unsafe {
-                esp_idf_sys::esp_ble_gatts_send_indicate(
-                    gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
-                    conn_id_raw,
-                    tx_handle,
-                    data.len() as u16, data.as_ptr() as *mut u8, false,
-                )
-            };
-            if ret == 0 {
-                log::info!("[ble_at] BINARY_TX sent: {} bytes OK", data_len);
-            } else {
-                log::warn!("[ble_at] BINARY_TX send failed rc=0x{:x}", ret);
-            }
-            return;
-        }
-    }
 
-    // 2. 每 100 次主循环 (~10s) 发一次心跳
+    // 每 100 次主循环 (~10s) 将心跳完整帧排到响应之后。所有帧必须经过同一
+    // 字节流队列，禁止在大帧的 ATT 分片之间插入另一条通知。
     use std::sync::atomic::{AtomicU16, Ordering};
     static HB_DIV: AtomicU16 = AtomicU16::new(0);
     static HB_SEQ: AtomicU16 = AtomicU16::new(0);
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
-    if n % 100 != 0 { return; }
-    let seq = HB_SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
-    let _ = frame.extend_from_slice(&[0u8, 0, 0, 0, 0, 4]);
-    let _ = frame.push(1);
-    let _ = frame.push(0x11);
-    let _ = frame.push((seq >> 8) as u8);
-    let _ = frame.push((seq & 0xFF) as u8);
-    let crc = crate::modbus::shared::modbus_crc16(&frame[..frame.len()]);
-    let _ = frame.push(crc as u8);
-    let _ = frame.push((crc >> 8) as u8);
-
-    log::info!("[ble_at] heartbeat #{} ({} bytes)", seq, frame.len());
-    let ret = unsafe {
-        esp_idf_sys::esp_ble_gatts_send_indicate(
-            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
-            conn_id_raw, tx_handle,
-            frame.len() as u16, frame.as_ptr() as *mut u8, false,
-        )
-    };
-    if ret != 0 {
-        log::warn!("[ble_at] heartbeat failed rc=0x{:x}", ret);
+    if n % 100 == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
+        let seq = HB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&[0u8, 0, 0, 0, 0, 4]);
+        let _ = frame.push(1);
+        let _ = frame.push(0x11);
+        let _ = frame.push((seq >> 8) as u8);
+        let _ = frame.push((seq & 0xFF) as u8);
+        let crc = crate::modbus::shared::modbus_crc16(&frame);
+        let _ = frame.push(crc as u8);
+        let _ = frame.push((crc >> 8) as u8);
+        if let Some(mut btx) = BINARY_TX.try_lock() {
+            if btx.len() + frame.len() <= btx.capacity() {
+                let _ = btx.extend_from_slice(&frame);
+                log::debug!("[ble_at] heartbeat #{} queued", seq);
+            }
+        }
     }
+
+    send_next_notification(gatts_if_raw, conn_id_raw, tx_handle);
 }
 
-/// 尝试通过 GATT notify 发送 TX_BUFFER 中的响应
+/// 发送队首的一个 ATT notification 分片。
 ///
-/// 当以下条件全部满足时实际发送:
-/// 1. TX Characteristic CCCD 已被主机使能 (notify enabled)
-/// 2. 当前有 GATT 客户端连接 (conn_id 有效)
-/// 3. GATT 服务已注册完成 (HANDLE_TABLE 已填充, GATTS_IF 有效)
-///
-/// 任一条件不满足时静默回退 (数据保留在 TX_BUFFER, 等下次重试)。
-fn try_send_notify() {
-    // LOOP8: 原子读取替代 Spin lock
-    let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
-    let conn_id_raw = CONN_ID.load(Ordering::Acquire);
-    log::info!("[ble_at] try_send_notify called, enabled={}, conn={:#06x}, gatts_if={}",
-        TX_NOTIFY_ENABLED.load(Ordering::SeqCst),
-        conn_id_raw,
-        gatts_if_raw
-    );
-    // 检查 CCCD 是否使能
-    if !TX_NOTIFY_ENABLED.load(Ordering::SeqCst) {
+/// Android 1.0.78 的 CommandCodecUtil 会跨 notification 重组业务帧；这里仅按
+/// `MTU - 3` 切分 ATT value，不改变外层帧、事务号、长度或 CRC。ESP-IDF 接受并
+/// 深拷贝数据后才从队列移除；拥塞或 API 失败时保留原数据，下一 tick 重试。
+fn send_next_notification(gatts_if_raw: u8, conn_id: u16, tx_handle: u16) {
+    if !TX_NOTIFY_ENABLED.load(Ordering::Acquire) || GATT_CONGESTED.load(Ordering::Acquire) {
         return;
     }
 
-    // 检查是否有客户端连接
-    if conn_id_raw == 0xFFFF {
-        return;
-    }
-
-    // 取出待发送数据
-    let data = match take_response() {
-        Some(d) => d,
-        None => return,
+    let mtu = NEGOTIATED_MTU.load(Ordering::Acquire);
+    let payload_limit = usize::from(mtu.saturating_sub(3)).clamp(1, BLE_ATT_PAYLOAD_MAX);
+    let epoch = CONNECTION_EPOCH.load(Ordering::Acquire);
+    let mut chunk = [0u8; BLE_ATT_PAYLOAD_MAX];
+    let chunk_len = {
+        let Some(btx) = BINARY_TX.try_lock() else {
+            return;
+        };
+        let len = btx.len().min(payload_limit);
+        chunk[..len].copy_from_slice(&btx[..len]);
+        len
     };
-    if data.is_empty() {
+    if chunk_len == 0 {
         return;
     }
 
-    // 检查 GATT 服务是否已注册
-    let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
-    if tx_handle == 0 {
-        // GATT 服务尚未注册, 数据放回 TX_BUFFER 等下次重试
-        let mut tx = TX_BUFFER.lock();
-        let _ = tx.push_str(&data);
-        return;
-    }
-
-    if gatts_if_raw == 0xFF {
-        let mut tx = TX_BUFFER.lock();
-        let _ = tx.push_str(&data);
-        return;
-    }
-    // SAFETY: gatts_if / conn_id / tx_handle 来源可靠 (Bluedroid 分配)
     let ret = unsafe {
         esp_idf_sys::esp_ble_gatts_send_indicate(
             gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
-            conn_id_raw,
+            conn_id,
             tx_handle,
-            data.len() as u16,
-            data.as_ptr() as *mut u8,
+            chunk_len as u16,
+            chunk.as_mut_ptr(),
             false,
         )
     };
-    if ret != 0 {
+    if ret != esp_idf_sys::ESP_OK {
         log::warn!(
-            "[ble_at] send_indicate failed: 0x{:x} ({} bytes)",
+            "[ble_at] notify submit failed: 0x{:x} ({} bytes retained)",
             ret,
-            data.len()
+            chunk_len
         );
-        // 放回缓冲区等待下次重试
-        let mut tx = TX_BUFFER.lock();
-        let _ = tx.push_str(&data);
-    } else {
-        log::debug!("[ble_at] notify sent: {} bytes", data.len());
+        return;
+    }
+
+    // 断线回调可能与 API 返回并发。只有连接世代仍一致时才消费队首；否则断线
+    // 清理负责丢弃旧连接数据，绝不能把旧发送结果应用到新连接。
+    if CONN_ID.load(Ordering::Acquire) == conn_id
+        && CONNECTION_EPOCH.load(Ordering::Acquire) == epoch
+    {
+        let mut btx = BINARY_TX.lock();
+        let consumed = chunk_len.min(btx.len());
+        let remaining = btx.len() - consumed;
+        btx.as_mut_slice().rotate_left(consumed);
+        btx.truncate(remaining);
+        log::debug!(
+            "[ble_at] notify submitted: {} bytes, queued={}",
+            consumed,
+            remaining
+        );
     }
 }
 
@@ -1149,18 +1165,6 @@ fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> b
     // 用 BLE 帧格式包装 (Android 期望)
     send_ble_frame(tx_id, proto_id, &rtu_rsp, conn_id);
     true
-}
-
-/// 取出待发送的响应数据 (供 GATT notify 调用)
-pub fn take_response() -> Option<String> {
-    let mut tx = TX_BUFFER.lock();
-    if tx.is_empty() {
-        None
-    } else {
-        let s = tx.as_str().to_string();
-        tx.clear();
-        Some(s)
-    }
 }
 
 // ============================================================================
@@ -1297,7 +1301,8 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         // CRC 校验失败, 已 consume 数据避免无限循环, 但不响应
         log::warn!(
             "[ble_at] binary CRC fail: calc={:04X} recv={:04X}",
-            calc_crc, rx_crc
+            calc_crc,
+            rx_crc
         );
         return true;
     }
@@ -1313,16 +1318,28 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         // BLE 帧: 2+2+2+10+2 = 18 字节
         let hb = heartbeat_counter();
         let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
-        let _ = rsp.push(unit);              // pdu[0] = unit_id (Modbus slave addr)
-        let _ = rsp.push(func);              // pdu[1] = func = 0x11
-        let _ = rsp.push(unit);              // pdu[2] = slave address (echo unit)
-        let _ = rsp.push(0x01);              // pdu[3] = runStatus = 1 (运行中)
+        let _ = rsp.push(unit); // pdu[0] = unit_id (Modbus slave addr)
+        let _ = rsp.push(func); // pdu[1] = func = 0x11
+        let _ = rsp.push(unit); // pdu[2] = slave address (echo unit)
+        let _ = rsp.push(0x01); // pdu[3] = runStatus = 1 (运行中)
         // terminal: 6 字节 BLE MAC (设备标识, metuory 存入 BLEDataSyncModel)
         let mut mac = [0u8; 6];
-        unsafe { esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2); } // ESP_MAC_BT=2
-        for b in mac { let _ = rsp.push(b); }
-        log::debug!("[ble_at] heartbeat: hb_seq={} mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            hb, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        unsafe {
+            esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2);
+        } // ESP_MAC_BT=2
+        for b in mac {
+            let _ = rsp.push(b);
+        }
+        log::debug!(
+            "[ble_at] heartbeat: hb_seq={} mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            hb,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
+        );
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
@@ -1330,7 +1347,14 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // Android 期望自定义格式响应 ([length_byte][data]), 不是标准 Modbus RTU.
     // 命中 Android 已知名单后直接返回, 跳过 Modbus RTU 路径.
     if (func == 0x03 || func == 0x04) && data.len() >= 12 {
-        if handle_ble_android_read_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit) {
+        if handle_ble_android_read_command(
+            func,
+            &data[8..crc_begin],
+            tx_id,
+            proto_id,
+            conn_id,
+            unit,
+        ) {
             return true;
         }
     }
@@ -1370,13 +1394,27 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // B2/B3/B4-B7 使用标准 BLE 外层帧 + Modbus FC03/FC06/FC16 载荷。
     // 这些命令必须在通用 Modbus fallback 之前处理，否则会被当作非法功能码。
     if matches!(func, 0xB2..=0xB7) {
-        return handle_handheld_config_text(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit);
+        return handle_handheld_config_text(
+            func,
+            &data[8..crc_begin],
+            tx_id,
+            proto_id,
+            conn_id,
+            unit,
+        );
     }
 
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
     if func >= 0xC0 && func <= 0xCF {
-        return handle_mca_custom_command(func, &data[8..crc_begin], tx_id, proto_id, conn_id, unit);
+        return handle_mca_custom_command(
+            func,
+            &data[8..crc_begin],
+            tx_id,
+            proto_id,
+            conn_id,
+            unit,
+        );
     }
     // ---- MCA 逻辑配置协议 (0xD0-0xD3) ----
     // 0xD0 LOGIC_CONFIG / 0xD1 LOGIC_RETRIEVE / 0xD2 DELETE_CONFIG / 0xD3 COM_REQUEST
@@ -1416,7 +1454,11 @@ fn handle_handheld_config_text(
 
     match func {
         0xB2 | 0xB4 | 0xB6 => {
-            let read_addr = if func == 0xB4 { regs::DEVICE_TEXT_BASE } else { addr };
+            let read_addr = if func == 0xB4 {
+                regs::DEVICE_TEXT_BASE
+            } else {
+                addr
+            };
             let words = count.min(120);
             let mut bytes: heapless::Vec<u8, 240> = heapless::Vec::new();
             for i in 0..words {
@@ -1436,14 +1478,25 @@ fn handle_handheld_config_text(
                 return false;
             }
             let byte_count = pdu[4] as usize;
-            if byte_count > 240 || pdu.len() != 5 + byte_count || byte_count != count.saturating_mul(2) {
+            if byte_count > 240
+                || pdu.len() != 5 + byte_count
+                || byte_count != count.saturating_mul(2)
+            {
                 return false;
             }
-            let write_addr = if func == 0xB5 { regs::DEVICE_TEXT_BASE } else { addr };
+            let write_addr = if func == 0xB5 {
+                regs::DEVICE_TEXT_BASE
+            } else {
+                addr
+            };
             for i in 0..count {
                 let off = 5 + i * 2;
                 let value = u16::from_be_bytes([pdu[off], pdu[off + 1]]);
-                let target = if func == 0xB3 { write_addr.saturating_add(i as u16) } else { write_addr.saturating_add(i as u16) };
+                let target = if func == 0xB3 {
+                    write_addr.saturating_add(i as u16)
+                } else {
+                    write_addr.saturating_add(i as u16)
+                };
                 if !crate::bus::backends::write_hold_reg(target, value) {
                     return false;
                 }
@@ -1478,31 +1531,49 @@ fn handle_mca_custom_command(
     conn_id: u16,
     _unit: u8,
 ) -> bool {
-    log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={}", 
-        data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "));
+    log::info!(
+        "[ble_at] MCA custom cmd: func=0x{func:02X}, data={}",
+        data.iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     match func {
         0xCE => {
             // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
-            let (ip, mask, gw) = crate::bus::config_state::config_read_with(|cs| (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway))
-                .unwrap_or(([0u8; 4], [0u8; 4], [0u8; 4]));
+            let (ip, mask, gw) = crate::bus::config_state::config_read_with(|cs| {
+                (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway)
+            })
+            .unwrap_or(([0u8; 4], [0u8; 4], [0u8; 4]));
             let mut rsp: heapless::Vec<u8, 16> = heapless::Vec::new();
             let _ = rsp.push(0xCE); // cmd
-            let _ = rsp.push(0);    // status = 成功
-            let _ = rsp.extend_from_slice(&ip);   // IP 4 字节
+            let _ = rsp.push(0); // status = 成功
+            let _ = rsp.extend_from_slice(&ip); // IP 4 字节
             let _ = rsp.extend_from_slice(&mask); // 掩码 4 字节
-            let _ = rsp.extend_from_slice(&gw);   // 网关 4 字节
-            log::info!("[ble_at] GET_NET_INFO: ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3],
-                mask[0], mask[1], mask[2], mask[3],
-                gw[0], gw[1], gw[2], gw[3]);
+            let _ = rsp.extend_from_slice(&gw); // 网关 4 字节
+            log::info!(
+                "[ble_at] GET_NET_INFO: ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                mask[0],
+                mask[1],
+                mask[2],
+                mask[3],
+                gw[0],
+                gw[1],
+                gw[2],
+                gw[3]
+            );
             // 用 BLE 协议帧格式包装响应
             send_ble_frame(tx_id, proto_id, &rsp, conn_id);
             true
         }
         0xC2 => {
             // GET_SN_CODE
-            let sn = crate::bus::config_state::config_read_with(|cs| cs.cfg.sn)
-                .unwrap_or([0u8; 32]);
+            let sn =
+                crate::bus::config_state::config_read_with(|cs| cs.cfg.sn).unwrap_or([0u8; 32]);
             let mut rsp: heapless::Vec<u8, 20> = heapless::Vec::new();
             let _ = rsp.push(0xC2);
             let _ = rsp.push(0);
@@ -1534,8 +1605,8 @@ fn handle_mca_custom_command(
         }
         0xC6 => {
             // GET_ETH_MAC
-            let mac = crate::bus::config_state::config_read_with(|cs| cs.cfg.eth_mac)
-                .unwrap_or([0u8; 6]);
+            let mac =
+                crate::bus::config_state::config_read_with(|cs| cs.cfg.eth_mac).unwrap_or([0u8; 6]);
             let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
             let _ = rsp.push(0xC6);
             let _ = rsp.push(0);
@@ -1550,7 +1621,6 @@ fn handle_mca_custom_command(
         }
     }
 }
-
 
 /// 处理 metuory-wireless-management-app-1.0.78 通过 BLE 发送的设备信息读命令
 ///
@@ -1570,8 +1640,17 @@ fn handle_mca_custom_command(
 /// 对齐 CommandDataUtil.decodeSerialBaudRate: (value & 0xf0) >> 4
 fn baud_to_index(baud: u32) -> u8 {
     match baud {
-        1200 => 0, 2400 => 1, 4800 => 2, 9600 => 3, 19200 => 4, 38400 => 5,
-        57600 => 6, 115200 => 7, 230400 => 8, 460800 => 9, 921600 => 10,
+        1200 => 0,
+        2400 => 1,
+        4800 => 2,
+        9600 => 3,
+        19200 => 4,
+        38400 => 5,
+        57600 => 6,
+        115200 => 7,
+        230400 => 8,
+        460800 => 9,
+        921600 => 10,
         _ => 3, // 默认 9600
     }
 }
@@ -1601,231 +1680,322 @@ fn handle_ble_android_read_command(
     // 栈上 clone ConfigSnapshot (~2.5KB). 闭包内借用 &cs.cfg, 所有 cfg.xxx
     // Keep payload and length prefix in one bounded buffer so a successful
     // response can never advertise bytes that were silently discarded.
-    let rsp_data: Option<Option<heapless::Vec<u8, BLE_RESPONSE_DATA_MAX>>> = crate::bus::config_state::config_read_with(|cs| {
-        let cfg: &crate::device::system_config::SystemConfig = &cs.cfg;
-        match (reg_addr, reg_cnt) {
-        // ⚠️ 所有 push 必须在 Vec 容量 (32) 内! 超出会静默截断 → Android 严格长度检查失败 → UI 空
-        // ⚠️ READ_IP (0x08C7) 需 25 字节 (1 length + 8 ip + 8 mask + 8 gw), 旧 Vec<u8, 16> bug 见 LOOP2
-        // 回归测试: test_android_parse_ip_no_truncation
+    let rsp_data: Option<Option<heapless::Vec<u8, BLE_RESPONSE_DATA_MAX>>> =
+        crate::bus::config_state::config_read_with(|cs| {
+            let cfg: &crate::device::system_config::SystemConfig = &cs.cfg;
+            match (reg_addr, reg_cnt) {
+                // ⚠️ 所有 push 必须在 Vec 容量 (32) 内! 超出会静默截断 → Android 严格长度检查失败 → UI 空
+                // ⚠️ READ_IP (0x08C7) 需 25 字节 (1 length + 8 ip + 8 mask + 8 gw), 旧 Vec<u8, 16> bug 见 LOOP2
+                // 回归测试: test_android_parse_ip_no_truncation
 
-        // READ_HARDWARE_INFO (0x087C, 0x0002): [4][DO][DI][ADC][RS485]
-        (0x087C, 2) => {
-            let do_cnt = crate::config::hw_version::DO_COUNT as u8;
-            let di_cnt = crate::config::hw_version::DI_COUNT as u8;
-            let adc_cnt = crate::config::hw_version::AI_COUNT as u8;
-            let rs485_cnt = 2u8;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(4); // length
-            let _ = d.push(do_cnt);
-            let _ = d.push(di_cnt);
-            let _ = d.push(adc_cnt);
-            let _ = d.push(rs485_cnt);
-            Some(d)
-        }
-        // READ_FW_VERSION (0x087E, 0x0002): Android 期望 [4][fw_hi][fw_lo][dt_hi][dt_lo] (5B)
-        // fwVersionBytesToStr: fw=bytes[0..2]BE/100 → main.sub.tail, dt=bytes[2..4]BE
-        // fw_version=221 → 2.2.1, fw_date=0x0615 → 1557 → 显示 "2.2.1.1557"
-        (0x087E, 2) => {
-            let fw = cfg.fw_version;
-            let dt = cfg.fw_date;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(4); // length = getFWVersionBufferLength() = 2*2 = 4
-            let _ = d.push((fw >> 8) as u8);
-            let _ = d.push((fw & 0xFF) as u8);
-            let _ = d.push((dt >> 8) as u8);
-            let _ = d.push((dt & 0xFF) as u8);
-            log::info!("[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
-                fw, fw / 100, (fw % 100) / 10, fw % 10, dt, dt);
-            Some(d)
-        }
-        // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
-        (0x08A5, 1) => {
-            let hw = cfg.hw_version;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(2);
-            let _ = d.push((hw >> 8) as u8);
-            let _ = d.push((hw & 0xFF) as u8);
-            Some(d)
-        }
-        // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
-        //   [length_byte=24][ip(8)][mask(8)][gw(8)]
-        //   每个 octet 编码为 BE u16 (高字节=0), 即 192 → [0x00, 0xC0]
-        //   ipBytesToStr 读 4 BE short: ip[0..2], ip[2..4], ip[4..6], ip[6..8]
-        //   getIPComponentLength() = ipLength/3 = 24/3 = 8
-        (0x08C7, 12) => {
-            let ip = cfg.ip;
-            let mask = cfg.mask;
-            let gw = cfg.gateway;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
-            // IP 每个 octet → 2 bytes BE (高字节 0)
-            for &b in &ip { let _ = d.push(0); let _ = d.push(b); }
-            for &b in &mask { let _ = d.push(0); let _ = d.push(b); }
-            for &b in &gw { let _ = d.push(0); let _ = d.push(b); }
-            log::info!("[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3],
-                mask[0], mask[1], mask[2], mask[3],
-                gw[0], gw[1], gw[2], gw[3]);
-            Some(d)
-        }
-        // READ_MAC (0x08D7, 0x0006): Android 期望 [12][mac(12)] (13B)
-        //   每个 mac byte 编码为 BE u16: 0x80 → [0x00, 0x80]
-        //   macBytesToStr 按 2 字节步长读 short, 格式化为 "%02X"
-        //   getMacBufferLength() = 6*2 = 12
-        (0x08D7, 6) => {
-            let mac = cfg.eth_mac;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(12); // length = getMacBufferLength() = 6*2 = 12
-            for &b in &mac { let _ = d.push(0); let _ = d.push(b); }
-            log::info!("[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            Some(d)
-        }
-        // READ_BLUETOOTH_ID (0x08E2, 0x0004): Android 端蓝牙 ID 显示
-        //   - UTF-8 模式 (新版本): parseBluetoothIDItem → bluetoothIDBytesToUTF8Str
-        //     按字节遍历到第一个 0, 返回 UTF-8 字符串
-        //   - HEX 模式 (旧版本): bluetoothIDBytesToHexStr 从 offset 4 读 int → OOB
-        // 兼容性: 发 8 字节 [4][name(4)][padding(4)], HEX 模式读 offset 4 也安全
-        // length_byte = 4 (getBluetoothIDBufferLength() = 4*2 = 8)
-        (0x08E2, 4) => {
-            let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(cfg.ble_name.len());
-            let take = name_len.min(4);
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(4); // length_byte = 4 (Android 实际读 bytes[1..5])
-            // ble_name 前 4 字节 (不足补 0, UTF-8 mode 截断到 0; HEX mode 跳过)
-            for i in 0..4 {
-                let _ = d.push(if i < take { cfg.ble_name[i] } else { 0 });
-            }
-            log::info!("[ble_at] READ_BLE_ID: {:?}", core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>"));
-            Some(d)
-        }
-        // READ_SN (0x0894, 0x0009): Android 期望 [length][length bytes of SN ASCII]
-        // parseSNItem 读 buffer[0] = length, 然后 [1..1+length] = SN bytes
-        (0x0894, 9) => {
-            let sn_str = cfg.sn_str();
-            let bytes = sn_str.as_bytes();
-            let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(take as u8);
-            for i in 0..take { let _ = d.push(bytes[i]); }
-            log::info!("[ble_at] READ_SN: {} bytes", take);
-            Some(d)
-        }
-        // READ_LOCATION (0x089D, 0x0008): 同 SN 格式, [length][location bytes]
-        (0x089D, 8) => {
-            let name_str = cfg.name_str();
-            let bytes = name_str.as_bytes();
-            let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(take as u8);
-            for i in 0..take { let _ = d.push(bytes[i]); }
-            log::info!("[ble_at] READ_LOCATION: {} bytes", take);
-            Some(d)
-        }
-        // READ_RS485_INDEX_CONFIG (0x08A6/0x08AB/0x08B0, 5): metuory 期望 packed 10-byte struct
-        // parseRS485ConfigItem: [0x0a][packed][masterSlave][slaveAddr(2BE)][retry(2BE)][timeout(2BE)][interval(2BE)]
-        // packed byte: baud(high nibble) | parity(bits 3-2) | stop(bit 1) | data(bit 0)
-        // LOOP10: 之前落入 generic FC=03 catch-all 返回 BE u16 列表, metuory 解析失败
-        (0x08A6, 5) | (0x08AB, 5) | (0x08B0, 5) => {
-            let port = ((reg_addr - 0x08A6) / 5) as usize;
-            let r = if port < cfg.rs485.len() { &cfg.rs485[port] } else { &cfg.rs485[0] };
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(0x0a); // length = 10
-            let baud_idx = baud_to_index(r.baudrate);
-            let stop_enc: u8 = if r.stop_bits >= 2 { 1 } else { 0 };
-            let data_enc: u8 = if r.data_bits == 7 { 1 } else { 0 };
-            let packed = ((baud_idx & 0xF) << 4) | ((r.parity & 0x3) << 2) | (stop_enc << 1) | data_enc;
-            let _ = d.push(packed);
-            let _ = d.push(r.mode); // masterSlaveType
-            let _ = d.push((r.slave_addr as u16 >> 8) as u8);
-            let _ = d.push(r.slave_addr & 0xFF);
-            let _ = d.push((r.retry_count >> 8) as u8);
-            let _ = d.push((r.retry_count & 0xFF) as u8);
-            let _ = d.push((r.timeout_ms >> 8) as u8);
-            let _ = d.push((r.timeout_ms & 0xFF) as u8);
-            let _ = d.push((r.interval_ms >> 8) as u8);
-            let _ = d.push((r.interval_ms & 0xFF) as u8);
-            log::info!("[ble_at] READ_RS485_CONFIG: port={} baud={} parity={} stop={} data={} mode={} slave={} retry={} timeout={} interval={}",
-                port, r.baudrate, r.parity, r.stop_bits, r.data_bits, r.mode, r.slave_addr, r.retry_count, r.timeout_ms, r.interval_ms);
-            Some(d)
-        }
-        // READ_ADC_VALUE (0x0080, count): Android 期望 [length][length bytes of BE u16]
-        // parseResReadADC: length = buffer[0], 然后 for i=1; i<buffer.length; i+=2 → BE short
-        (0x0080, _) => {
-            // 读所有 AI 通道 (F16=4, F4=8)
-            let ai_count = crate::config::hw_version::AI_COUNT as u16;
-            let n = reg_cnt.min(ai_count) as usize;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push((n * 2) as u8); // length = 2*N bytes
-            for i in 0..n {
-                let v = crate::bus::backends::read_input_reg(0x0080 + i as u16).unwrap_or(0);
-                let _ = d.push((v >> 8) as u8);
-                let _ = d.push((v & 0xFF) as u8);
-            }
-            log::info!("[ble_at] READ_ADC: {} channels", n);
-            Some(d)
-        }
-        // READ_COM_INPUT_IO_STATUS (0x0000, count): Android 期望 [N bytes][N bytes of packed I/O bits]
-        // parseResReadComInputIOStatus: bufferLength = buffer[0], 读 bufferLength*8 bits
-        // READ_COM_OUTPUT_IO_STATUS (0x0200, count): 同上, 解析复用
-        (0x0000, _) | (0x0200, _) => {
-            let bit_count = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX * 8);
-            let n_bytes = (bit_count + 7) / 8;
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push(n_bytes as u8); // length = N bytes of packed I/O
-            // 读 coil/disc 状态并打包
-            for i in 0..n_bytes {
-                let mut acc: u8 = 0;
-                for j in 0..8 {
-                    let bit_idx = i * 8 + j;
-                    if bit_idx >= bit_count { break; }
-                    let val = if reg_addr == 0x0200 {
-                        crate::bus::backends::read_coil(reg_addr + bit_idx as u16).unwrap_or(false)
-                    } else {
-                        crate::bus::backends::read_disc(reg_addr + bit_idx as u16).unwrap_or(false)
-                    };
-                    if val { acc |= 1 << j; }
+                // READ_HARDWARE_INFO (0x087C, 0x0002): [4][DO][DI][ADC][RS485]
+                (0x087C, 2) => {
+                    let do_cnt = crate::config::hw_version::DO_COUNT as u8;
+                    let di_cnt = crate::config::hw_version::DI_COUNT as u8;
+                    let adc_cnt = crate::config::hw_version::AI_COUNT as u8;
+                    let rs485_cnt = 2u8;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(4); // length
+                    let _ = d.push(do_cnt);
+                    let _ = d.push(di_cnt);
+                    let _ = d.push(adc_cnt);
+                    let _ = d.push(rs485_cnt);
+                    Some(d)
                 }
-                let _ = d.push(acc);
+                // READ_FW_VERSION (0x087E, 0x0002): Android 期望 [4][fw_hi][fw_lo][dt_hi][dt_lo] (5B)
+                // fwVersionBytesToStr: fw=bytes[0..2]BE/100 → main.sub.tail, dt=bytes[2..4]BE
+                // fw_version=221 → 2.2.1, fw_date=0x0615 → 1557 → 显示 "2.2.1.1557"
+                (0x087E, 2) => {
+                    let fw = cfg.fw_version;
+                    let dt = cfg.fw_date;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(4); // length = getFWVersionBufferLength() = 2*2 = 4
+                    let _ = d.push((fw >> 8) as u8);
+                    let _ = d.push((fw & 0xFF) as u8);
+                    let _ = d.push((dt >> 8) as u8);
+                    let _ = d.push((dt & 0xFF) as u8);
+                    log::info!(
+                        "[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
+                        fw,
+                        fw / 100,
+                        (fw % 100) / 10,
+                        fw % 10,
+                        dt,
+                        dt
+                    );
+                    Some(d)
+                }
+                // READ_DEVICE_PRODUCT (0x08A5, 0x0001): [2][hw_hi][hw_lo]
+                (0x08A5, 1) => {
+                    let hw = cfg.hw_version;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(2);
+                    let _ = d.push((hw >> 8) as u8);
+                    let _ = d.push((hw & 0xFF) as u8);
+                    Some(d)
+                }
+                // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
+                //   [length_byte=24][ip(8)][mask(8)][gw(8)]
+                //   每个 octet 编码为 BE u16 (高字节=0), 即 192 → [0x00, 0xC0]
+                //   ipBytesToStr 读 4 BE short: ip[0..2], ip[2..4], ip[4..6], ip[6..8]
+                //   getIPComponentLength() = ipLength/3 = 24/3 = 8
+                (0x08C7, 12) => {
+                    let ip = cfg.ip;
+                    let mask = cfg.mask;
+                    let gw = cfg.gateway;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
+                    // IP 每个 octet → 2 bytes BE (高字节 0)
+                    for &b in &ip {
+                        let _ = d.push(0);
+                        let _ = d.push(b);
+                    }
+                    for &b in &mask {
+                        let _ = d.push(0);
+                        let _ = d.push(b);
+                    }
+                    for &b in &gw {
+                        let _ = d.push(0);
+                        let _ = d.push(b);
+                    }
+                    log::info!(
+                        "[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
+                        ip[0],
+                        ip[1],
+                        ip[2],
+                        ip[3],
+                        mask[0],
+                        mask[1],
+                        mask[2],
+                        mask[3],
+                        gw[0],
+                        gw[1],
+                        gw[2],
+                        gw[3]
+                    );
+                    Some(d)
+                }
+                // READ_MAC (0x08D7, 0x0006): Android 期望 [12][mac(12)] (13B)
+                //   每个 mac byte 编码为 BE u16: 0x80 → [0x00, 0x80]
+                //   macBytesToStr 按 2 字节步长读 short, 格式化为 "%02X"
+                //   getMacBufferLength() = 6*2 = 12
+                (0x08D7, 6) => {
+                    let mac = cfg.eth_mac;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(12); // length = getMacBufferLength() = 6*2 = 12
+                    for &b in &mac {
+                        let _ = d.push(0);
+                        let _ = d.push(b);
+                    }
+                    log::info!(
+                        "[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                        mac[0],
+                        mac[1],
+                        mac[2],
+                        mac[3],
+                        mac[4],
+                        mac[5]
+                    );
+                    Some(d)
+                }
+                // READ_BLUETOOTH_ID (0x08E2, 0x0004): Android 端蓝牙 ID 显示
+                //   - UTF-8 模式 (新版本): parseBluetoothIDItem → bluetoothIDBytesToUTF8Str
+                //     按字节遍历到第一个 0, 返回 UTF-8 字符串
+                //   - HEX 模式 (旧版本): bluetoothIDBytesToHexStr 从 offset 4 读 int → OOB
+                // 兼容性: 发 8 字节 [4][name(4)][padding(4)], HEX 模式读 offset 4 也安全
+                // length_byte = 4 (getBluetoothIDBufferLength() = 4*2 = 8)
+                (0x08E2, 4) => {
+                    let name_len = cfg
+                        .ble_name
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(cfg.ble_name.len());
+                    let take = name_len.min(4);
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(4); // length_byte = 4 (Android 实际读 bytes[1..5])
+                    // ble_name 前 4 字节 (不足补 0, UTF-8 mode 截断到 0; HEX mode 跳过)
+                    for i in 0..4 {
+                        let _ = d.push(if i < take { cfg.ble_name[i] } else { 0 });
+                    }
+                    log::info!(
+                        "[ble_at] READ_BLE_ID: {:?}",
+                        core::str::from_utf8(&cfg.ble_name[..take]).unwrap_or("<bin>")
+                    );
+                    Some(d)
+                }
+                // READ_SN (0x0894, 0x0009): Android 期望 [length][length bytes of SN ASCII]
+                // parseSNItem 读 buffer[0] = length, 然后 [1..1+length] = SN bytes
+                (0x0894, 9) => {
+                    let sn_str = cfg.sn_str();
+                    let bytes = sn_str.as_bytes();
+                    let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(take as u8);
+                    for i in 0..take {
+                        let _ = d.push(bytes[i]);
+                    }
+                    log::info!("[ble_at] READ_SN: {} bytes", take);
+                    Some(d)
+                }
+                // READ_LOCATION (0x089D, 0x0008): 同 SN 格式, [length][location bytes]
+                (0x089D, 8) => {
+                    let name_str = cfg.name_str();
+                    let bytes = name_str.as_bytes();
+                    let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(take as u8);
+                    for i in 0..take {
+                        let _ = d.push(bytes[i]);
+                    }
+                    log::info!("[ble_at] READ_LOCATION: {} bytes", take);
+                    Some(d)
+                }
+                // READ_RS485_INDEX_CONFIG (0x08A6/0x08AB/0x08B0, 5): metuory 期望 packed 10-byte struct
+                // parseRS485ConfigItem: [0x0a][packed][masterSlave][slaveAddr(2BE)][retry(2BE)][timeout(2BE)][interval(2BE)]
+                // packed byte: baud(high nibble) | parity(bits 3-2) | stop(bit 1) | data(bit 0)
+                // LOOP10: 之前落入 generic FC=03 catch-all 返回 BE u16 列表, metuory 解析失败
+                (0x08A6, 5) | (0x08AB, 5) | (0x08B0, 5) => {
+                    let port = ((reg_addr - 0x08A6) / 5) as usize;
+                    let r = if port < cfg.rs485.len() {
+                        &cfg.rs485[port]
+                    } else {
+                        &cfg.rs485[0]
+                    };
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(0x0a); // length = 10
+                    let baud_idx = baud_to_index(r.baudrate);
+                    let stop_enc: u8 = if r.stop_bits >= 2 { 1 } else { 0 };
+                    let data_enc: u8 = if r.data_bits == 7 { 1 } else { 0 };
+                    let packed = ((baud_idx & 0xF) << 4)
+                        | ((r.parity & 0x3) << 2)
+                        | (stop_enc << 1)
+                        | data_enc;
+                    let _ = d.push(packed);
+                    let _ = d.push(r.mode); // masterSlaveType
+                    let _ = d.push((r.slave_addr as u16 >> 8) as u8);
+                    let _ = d.push(r.slave_addr & 0xFF);
+                    let _ = d.push((r.retry_count >> 8) as u8);
+                    let _ = d.push((r.retry_count & 0xFF) as u8);
+                    let _ = d.push((r.timeout_ms >> 8) as u8);
+                    let _ = d.push((r.timeout_ms & 0xFF) as u8);
+                    let _ = d.push((r.interval_ms >> 8) as u8);
+                    let _ = d.push((r.interval_ms & 0xFF) as u8);
+                    log::info!(
+                        "[ble_at] READ_RS485_CONFIG: port={} baud={} parity={} stop={} data={} mode={} slave={} retry={} timeout={} interval={}",
+                        port,
+                        r.baudrate,
+                        r.parity,
+                        r.stop_bits,
+                        r.data_bits,
+                        r.mode,
+                        r.slave_addr,
+                        r.retry_count,
+                        r.timeout_ms,
+                        r.interval_ms
+                    );
+                    Some(d)
+                }
+                // READ_ADC_VALUE (0x0080, count): Android 期望 [length][length bytes of BE u16]
+                // parseResReadADC: length = buffer[0], 然后 for i=1; i<buffer.length; i+=2 → BE short
+                (0x0080, _) => {
+                    // 读所有 AI 通道 (F16=4, F4=8)
+                    let ai_count = crate::config::hw_version::AI_COUNT as u16;
+                    let n = reg_cnt.min(ai_count) as usize;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push((n * 2) as u8); // length = 2*N bytes
+                    for i in 0..n {
+                        let v =
+                            crate::bus::backends::read_input_reg(0x0080 + i as u16).unwrap_or(0);
+                        let _ = d.push((v >> 8) as u8);
+                        let _ = d.push((v & 0xFF) as u8);
+                    }
+                    log::info!("[ble_at] READ_ADC: {} channels", n);
+                    Some(d)
+                }
+                // READ_COM_INPUT_IO_STATUS (0x0000, count): Android 期望 [N bytes][N bytes of packed I/O bits]
+                // parseResReadComInputIOStatus: bufferLength = buffer[0], 读 bufferLength*8 bits
+                // READ_COM_OUTPUT_IO_STATUS (0x0200, count): 同上, 解析复用
+                (0x0000, _) | (0x0200, _) => {
+                    let bit_count = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX * 8);
+                    let n_bytes = (bit_count + 7) / 8;
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push(n_bytes as u8); // length = N bytes of packed I/O
+                    // 读 coil/disc 状态并打包
+                    for i in 0..n_bytes {
+                        let mut acc: u8 = 0;
+                        for j in 0..8 {
+                            let bit_idx = i * 8 + j;
+                            if bit_idx >= bit_count {
+                                break;
+                            }
+                            let val = if reg_addr == 0x0200 {
+                                crate::bus::backends::read_coil(reg_addr + bit_idx as u16)
+                                    .unwrap_or(false)
+                            } else {
+                                crate::bus::backends::read_disc(reg_addr + bit_idx as u16)
+                                    .unwrap_or(false)
+                            };
+                            if val {
+                                acc |= 1 << j;
+                            }
+                        }
+                        let _ = d.push(acc);
+                    }
+                    log::info!(
+                        "[ble_at] READ_COM_IO: addr=0x{:04X} cnt={}",
+                        reg_addr,
+                        reg_cnt
+                    );
+                    Some(d)
+                }
+                // READ_RS485_VALUE (用户自定义地址, count): 透传读取输入寄存器, length-prefix BE u16
+                // 匹配: 任何 FC=04 读非 0x0080/0x0880-0x08CF 范围 (排除硬件信息等已知名单)
+                // 实际 metuory 透传地址由 DEVICE_FUNCTION_CONFIG 配置
+                (addr, _)
+                    if func == 0x04
+                        && !(0x087C..=0x087F).contains(&addr)
+                        && addr != 0x0080
+                        && addr < 0x4000 =>
+                {
+                    // 透传: 读输入寄存器, length-prefix BE u16
+                    let n = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX / 2);
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push((n * 2) as u8);
+                    for i in 0..n {
+                        let v = crate::bus::backends::read_input_reg(addr + i as u16).unwrap_or(0);
+                        let _ = d.push((v >> 8) as u8);
+                        let _ = d.push((v & 0xFF) as u8);
+                    }
+                    log::info!(
+                        "[ble_at] READ_RS485_VALUE: addr=0x{:04X} cnt={}",
+                        reg_addr,
+                        reg_cnt
+                    );
+                    Some(d)
+                }
+                // READ_RS485_CUSTOM_VALUE: 同上但 FC=03 (读保持寄存器)
+                (addr, _)
+                    if func == 0x03 && !(0x087C..=0x08FF).contains(&addr) && addr < 0x4000 =>
+                {
+                    // 透传: 读保持寄存器, length-prefix 原始字节
+                    let n = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX / 2);
+                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
+                    let _ = d.push((n * 2) as u8);
+                    for i in 0..n {
+                        let v = crate::bus::backends::read_hold_reg(addr + i as u16).unwrap_or(0);
+                        let _ = d.push((v >> 8) as u8);
+                        let _ = d.push((v & 0xFF) as u8);
+                    }
+                    log::info!(
+                        "[ble_at] READ_RS485_CUSTOM: addr=0x{:04X} cnt={}",
+                        reg_addr,
+                        reg_cnt
+                    );
+                    Some(d)
+                }
+                _ => None, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
             }
-            log::info!("[ble_at] READ_COM_IO: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            Some(d)
-        }
-        // READ_RS485_VALUE (用户自定义地址, count): 透传读取输入寄存器, length-prefix BE u16
-        // 匹配: 任何 FC=04 读非 0x0080/0x0880-0x08CF 范围 (排除硬件信息等已知名单)
-        // 实际 metuory 透传地址由 DEVICE_FUNCTION_CONFIG 配置
-        (addr, _) if func == 0x04 && !(0x087C..=0x087F).contains(&addr)
-            && addr != 0x0080 && addr < 0x4000 => {
-            // 透传: 读输入寄存器, length-prefix BE u16
-            let n = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX / 2);
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push((n * 2) as u8);
-            for i in 0..n {
-                let v = crate::bus::backends::read_input_reg(addr + i as u16).unwrap_or(0);
-                let _ = d.push((v >> 8) as u8);
-                let _ = d.push((v & 0xFF) as u8);
-            }
-            log::info!("[ble_at] READ_RS485_VALUE: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            Some(d)
-        }
-        // READ_RS485_CUSTOM_VALUE: 同上但 FC=03 (读保持寄存器)
-        (addr, _) if func == 0x03 && !(0x087C..=0x08FF).contains(&addr)
-            && addr < 0x4000 => {
-            // 透传: 读保持寄存器, length-prefix 原始字节
-            let n = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX / 2);
-            let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-            let _ = d.push((n * 2) as u8);
-            for i in 0..n {
-                let v = crate::bus::backends::read_hold_reg(addr + i as u16).unwrap_or(0);
-                let _ = d.push((v >> 8) as u8);
-                let _ = d.push((v & 0xFF) as u8);
-            }
-            log::info!("[ble_at] READ_RS485_CUSTOM: addr=0x{:04X} cnt={}", reg_addr, reg_cnt);
-            Some(d)
-        }
-        _ => None, // 未命中 Android 已知名单, 让调用方继续走 Modbus RTU
-    }
-    });
+        });
     let rsp_data = match rsp_data {
         Some(Some(d)) => d,
         _ => return false,
@@ -1895,16 +2065,28 @@ fn build_android_read_response_pdu(
             // Android: [24][ip(8)][mask(8)][gw(8)]  (25B rsp_data, 每 octet BE u16)
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(24);
-            for &b in &cfg_ip { let _ = d.push(0); let _ = d.push(b); }
-            for &b in &cfg_mask { let _ = d.push(0); let _ = d.push(b); }
-            for &b in &cfg_gw { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &cfg_ip {
+                let _ = d.push(0);
+                let _ = d.push(b);
+            }
+            for &b in &cfg_mask {
+                let _ = d.push(0);
+                let _ = d.push(b);
+            }
+            for &b in &cfg_gw {
+                let _ = d.push(0);
+                let _ = d.push(b);
+            }
             d
         }
         (0x08D7, 6) => {
             // Android: [12][mac(12)]  (13B rsp_data, 每 mac byte BE u16)
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(12);
-            for &b in &cfg_mac { let _ = d.push(0); let _ = d.push(b); }
+            for &b in &cfg_mac {
+                let _ = d.push(0);
+                let _ = d.push(b);
+            }
             d
         }
         (0x08E2, 4) => {
@@ -1936,7 +2118,9 @@ pub(crate) fn mod_test_build_sn_response(
     let take = bytes.len().min(32);
     let mut d: heapless::Vec<u8, 64> = heapless::Vec::new();
     let _ = d.push(take as u8);
-    for i in 0..take { let _ = d.push(bytes[i]); }
+    for i in 0..take {
+        let _ = d.push(bytes[i]);
+    }
     let mut pdu: heapless::Vec<u8, 64> = heapless::Vec::new();
     let _ = pdu.push(unit);
     let _ = pdu.push(func);
@@ -1955,7 +2139,9 @@ pub(crate) fn mod_test_build_location_response(
     let take = bytes.len().min(32);
     let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
     let _ = d.push(take as u8);
-    for i in 0..take { let _ = d.push(bytes[i]); }
+    for i in 0..take {
+        let _ = d.push(bytes[i]);
+    }
     let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
     let _ = pdu.push(unit);
     let _ = pdu.push(func);
@@ -1996,7 +2182,9 @@ pub(crate) fn mod_test_build_com_input_response(
     let n_bytes = ((count as usize) + 7) / 8;
     let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
     let _ = d.push(n_bytes.min(2) as u8);
-    for i in 0..n_bytes.min(2) { let _ = d.push(packed[i]); }
+    for i in 0..n_bytes.min(2) {
+        let _ = d.push(packed[i]);
+    }
     let mut pdu: heapless::Vec<u8, 32> = heapless::Vec::new();
     let _ = pdu.push(unit);
     let _ = pdu.push(func);
@@ -2034,10 +2222,9 @@ mod android_compat_tests {
     #[test]
     fn test_read_hardware_info_format() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087C, 2,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 2,
+        )
+        .expect("must handle");
         // 期望: [unit(1)][func=0x04(1)][length=4(1)][DO=8(1)][DI=8(1)][ADC=6(1)][RS485=2(1)]
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x04);
@@ -2053,10 +2240,10 @@ mod android_compat_tests {
     #[test]
     fn test_read_fw_version_format() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087E, 2,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0x0221, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x04, 0x087E, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0x0221, 0x0615, 8, 8,
+            6, 2,
+        )
+        .expect("must handle");
         // [unit=0x01][func=0x04][length=4][fw_hi=0x02][fw_lo=0x21][dt_hi=0x06][dt_lo=0x15]
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x04);
@@ -2072,10 +2259,10 @@ mod android_compat_tests {
     #[test]
     fn test_read_device_product_format() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08A5, 1,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0x00F3, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x03, 0x08A5, 1, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0x00F3, 0, 0x0615, 8, 8,
+            6, 2,
+        )
+        .expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03); // FC=03
         assert_eq!(pdu[2], 2);
@@ -2089,17 +2276,30 @@ mod android_compat_tests {
     fn test_read_ip_format() {
         // Android 期望 [unit=0x01][func=0x03][length=24][ip(8)][mask(8)][gw(8)]
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08C7, 12,
-            [192, 168, 51, 140], [255, 255, 255, 0], [192, 168, 51, 1],
-            [0; 6], [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01,
+            0x03,
+            0x08C7,
+            12,
+            [192, 168, 51, 140],
+            [255, 255, 255, 0],
+            [192, 168, 51, 1],
+            [0; 6],
+            [0; 6],
+            0,
+            0,
+            0x0615,
+            8,
+            8,
+            6,
+            2,
+        )
+        .expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
         assert_eq!(pdu[2], 24); // length = 12*2
-        assert_eq!(&pdu[3..11], &[0x00,192, 0x00,168, 0x00,51, 0x00,140]); // ip
-        assert_eq!(&pdu[11..19], &[0x00,255, 0x00,255, 0x00,255, 0x00,0]);   // mask
-        assert_eq!(&pdu[19..27], &[0x00,192, 0x00,168, 0x00,51, 0x00,1]);   // gw
+        assert_eq!(&pdu[3..11], &[0x00, 192, 0x00, 168, 0x00, 51, 0x00, 140]); // ip
+        assert_eq!(&pdu[11..19], &[0x00, 255, 0x00, 255, 0x00, 255, 0x00, 0]); // mask
+        assert_eq!(&pdu[19..27], &[0x00, 192, 0x00, 168, 0x00, 51, 0x00, 1]); // gw
         assert_eq!(pdu.len(), 27); // unit+func+25
     }
 
@@ -2108,16 +2308,33 @@ mod android_compat_tests {
     fn test_read_mac_format() {
         // Android 期望 [unit=0x01][func=0x03][length=12][mac(12)]
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08D7, 6,
-            [0; 4], [0; 4], [0; 4],
+            0x01,
+            0x03,
+            0x08D7,
+            6,
+            [0; 4],
+            [0; 4],
+            [0; 4],
             [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE4],
             [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0,
+            0,
+            0x0615,
+            8,
+            8,
+            6,
+            2,
+        )
+        .expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
         assert_eq!(pdu[2], 12); // length = 6*2
-        assert_eq!(&pdu[3..15], &[0x00,0x80, 0x00,0xB5, 0x00,0x4E, 0x00,0x5B, 0x00,0x24, 0x00,0xE4]);
+        assert_eq!(
+            &pdu[3..15],
+            &[
+                0x00, 0x80, 0x00, 0xB5, 0x00, 0x4E, 0x00, 0x5B, 0x00, 0x24, 0x00, 0xE4
+            ]
+        );
         assert_eq!(pdu.len(), 15); // unit+func+13
     }
 
@@ -2126,11 +2343,24 @@ mod android_compat_tests {
     fn test_read_ble_id_format() {
         // 旧 helper 使用 cfg_ble_mac[2..6]; 实际生产代码用 cfg.ble_name (默认 "Mesh")
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08E2, 4,
-            [0; 4], [0; 4], [0; 4], [0; 6],
+            0x01,
+            0x03,
+            0x08E2,
+            4,
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 6],
             [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE5], // BLE MAC
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0,
+            0,
+            0x0615,
+            8,
+            8,
+            6,
+            2,
+        )
+        .expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
         assert_eq!(pdu[2], 4);
@@ -2143,9 +2373,7 @@ mod android_compat_tests {
     #[test]
     fn test_unmapped_returns_none() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x0880, 5,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
+            0x01, 0x03, 0x0880, 5, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 2,
         );
         assert!(pdu.is_none());
     }
@@ -2174,11 +2402,24 @@ mod android_compat_tests {
     #[test]
     fn test_android_parse_ip() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08C7, 12,
-            [192, 168, 51, 140], [255, 255, 255, 0], [192, 168, 51, 1],
-            [0; 6], [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01,
+            0x03,
+            0x08C7,
+            12,
+            [192, 168, 51, 140],
+            [255, 255, 255, 0],
+            [192, 168, 51, 1],
+            [0; 6],
+            [0; 6],
+            0,
+            0,
+            0x0615,
+            8,
+            8,
+            6,
+            2,
+        )
+        .expect("must handle");
 
         // 模拟 CommandParserUtil.parseCMDModel 解析: data = pdu[2..]
         // 然后 parseIP(model.getData())
@@ -2187,7 +2428,11 @@ mod android_compat_tests {
         // Android parseIP 期望:
         //   buffer.length == 1 + getIPBufferLength() = 1 + 24 = 25
         let ip_length_expected = 12 * 2; // getIPBufferLength
-        assert_eq!(data.len(), 1 + ip_length_expected, "Android parseIP: buffer.length must be 25");
+        assert_eq!(
+            data.len(),
+            1 + ip_length_expected,
+            "Android parseIP: buffer.length must be 25"
+        );
 
         let data_length = data[0];
         assert_eq!(data_length as usize, ip_length_expected);
@@ -2210,11 +2455,10 @@ mod android_compat_tests {
     fn test_android_parse_ip_no_truncation() {
         // 边界值 0xFF 测试最大情况
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08C7, 12,
-            [0xFF; 4], [0xFF; 4], [0xFF; 4],
-            [0xFF; 6], [0xFF; 6],
-            0, 0xFFFF, 0xFFFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        ).expect("must handle");
+            0x01, 0x03, 0x08C7, 12, [0xFF; 4], [0xFF; 4], [0xFF; 4], [0xFF; 6], [0xFF; 6], 0,
+            0xFFFF, 0xFFFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        )
+        .expect("must handle");
         let data = &pdu[2..];
         // 必须是 25 字节 (1 length + 8 ip + 8 mask + 8 gw)
         assert_eq!(data.len(), 25, "rsp_data 容量不足! IP 响应被截断");
@@ -2224,12 +2468,24 @@ mod android_compat_tests {
     #[test]
     fn test_android_parse_mac() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08D7, 6,
-            [0; 4], [0; 4], [0; 4],
+            0x01,
+            0x03,
+            0x08D7,
+            6,
+            [0; 4],
+            [0; 4],
+            [0; 4],
             [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE7],
             [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0,
+            0,
+            0x0615,
+            8,
+            8,
+            6,
+            2,
+        )
+        .expect("must handle");
 
         let data = &pdu[2..]; // skip unit+func
         // Android parseMacItem: data[0] = length, data[1..1+length] = mac bytes
@@ -2242,8 +2498,12 @@ mod android_compat_tests {
         assert_eq!(mac_bytes.len(), mac_buffer_length);
 
         // 验证格式: 80:B5:4E:5B:24:E7
-        assert_eq!(mac_bytes, &[0x00, 0x80, 0x00, 0xB5, 0x00, 0x4E,
-                                  0x00, 0x5B, 0x00, 0x24, 0x00, 0xE7]);
+        assert_eq!(
+            mac_bytes,
+            &[
+                0x00, 0x80, 0x00, 0xB5, 0x00, 0x4E, 0x00, 0x5B, 0x00, 0x24, 0x00, 0xE7
+            ]
+        );
     }
 
     // ---- 回归测试: READ_SN length-prefix 格式 (LOOP4) ----
@@ -2280,7 +2540,11 @@ mod android_compat_tests {
         let length = data[0] as usize;
 
         assert_eq!(length, 32, "SN length must describe all configured bytes");
-        assert_eq!(data.len(), 33, "length prefix and payload must not be truncated");
+        assert_eq!(
+            data.len(),
+            33,
+            "length prefix and payload must not be truncated"
+        );
         assert_eq!(&data[1..], &cfg.sn);
     }
 
@@ -2292,7 +2556,8 @@ mod android_compat_tests {
         let s = b"POS-001";
         name[..s.len()].copy_from_slice(s);
         cfg.name = name;
-        let pdu = crate::ble_at::mod_test_build_location_response(0x01, 0x03, &cfg).expect("must handle");
+        let pdu =
+            crate::ble_at::mod_test_build_location_response(0x01, 0x03, &cfg).expect("must handle");
         let data = &pdu[2..];
 
         let length = data[0] as usize;
@@ -2306,8 +2571,14 @@ mod android_compat_tests {
     // Android parseResReadADC: length = buffer[0], 然后 BE u16 values
     #[test]
     fn test_android_parse_adc_length_prefix() {
-        let pdu = crate::ble_at::mod_test_build_adc_response(0x01, 0x04, 0x0080, 4, [0x0123, 0x0456, 0x0789, 0x0ABC])
-            .expect("must handle");
+        let pdu = crate::ble_at::mod_test_build_adc_response(
+            0x01,
+            0x04,
+            0x0080,
+            4,
+            [0x0123, 0x0456, 0x0789, 0x0ABC],
+        )
+        .expect("must handle");
         let data = &pdu[2..];
 
         // ADC: 4 通道, 长度=8
@@ -2327,8 +2598,9 @@ mod android_compat_tests {
     #[test]
     fn test_android_parse_com_input_length_prefix() {
         // 16 DI, packed as 2 bytes [0xAA, 0x55]
-        let pdu = crate::ble_at::mod_test_build_com_input_response(0x01, 0x02, 0x0000, 16, [0xAA, 0x55])
-            .expect("must handle");
+        let pdu =
+            crate::ble_at::mod_test_build_com_input_response(0x01, 0x02, 0x0000, 16, [0xAA, 0x55])
+                .expect("must handle");
         let data = &pdu[2..];
 
         let buffer_length = data[0] as usize;
@@ -2340,23 +2612,45 @@ mod android_compat_tests {
         // 验证 16 位模式
         let mut bits = [0u8; 16];
         for j in 0..8 {
-            if (byte0 & (1 << j)) > 0 { bits[j] = 1; }
-            if (byte1 & (1 << j)) > 0 { bits[8 + j] = 1; }
+            if (byte0 & (1 << j)) > 0 {
+                bits[j] = 1;
+            }
+            if (byte1 & (1 << j)) > 0 {
+                bits[8 + j] = 1;
+            }
         }
         // 0xAA = 0b10101010 → bits[0]=0, bits[1]=1, bits[2]=0, ..., bits[7]=1
-        assert_eq!(bits[0], 0); assert_eq!(bits[1], 1); assert_eq!(bits[2], 0); assert_eq!(bits[3], 1);
-        assert_eq!(bits[4], 0); assert_eq!(bits[5], 1); assert_eq!(bits[6], 0); assert_eq!(bits[7], 1);
+        assert_eq!(bits[0], 0);
+        assert_eq!(bits[1], 1);
+        assert_eq!(bits[2], 0);
+        assert_eq!(bits[3], 1);
+        assert_eq!(bits[4], 0);
+        assert_eq!(bits[5], 1);
+        assert_eq!(bits[6], 0);
+        assert_eq!(bits[7], 1);
         // 0x55 = 0b01010101
-        assert_eq!(bits[8], 1); assert_eq!(bits[9], 0); assert_eq!(bits[10], 1); assert_eq!(bits[11], 0);
-        assert_eq!(bits[12], 1); assert_eq!(bits[13], 0); assert_eq!(bits[14], 1); assert_eq!(bits[15], 0);
+        assert_eq!(bits[8], 1);
+        assert_eq!(bits[9], 0);
+        assert_eq!(bits[10], 1);
+        assert_eq!(bits[11], 0);
+        assert_eq!(bits[12], 1);
+        assert_eq!(bits[13], 0);
+        assert_eq!(bits[14], 1);
+        assert_eq!(bits[15], 0);
     }
 
     // ---- 回归测试: READ_RS485_VALUE length-prefix BE u16 格式 (用户自定义地址) ----
     // Android parseResReadRS485Value: length = buffer[0], 然后 BE u16 values
     #[test]
     fn test_android_parse_rs485_value_length_prefix() {
-        let pdu = crate::ble_at::mod_test_build_rs485_value_response(0x01, 0x04, 0x1000, 4, [0x1234, 0x5678, 0x9ABC, 0xDEF0])
-            .expect("must handle");
+        let pdu = crate::ble_at::mod_test_build_rs485_value_response(
+            0x01,
+            0x04,
+            0x1000,
+            4,
+            [0x1234, 0x5678, 0x9ABC, 0xDEF0],
+        )
+        .expect("must handle");
         let data = &pdu[2..];
 
         let length = data[0] as usize;
@@ -2373,10 +2667,10 @@ mod android_compat_tests {
     fn test_android_parse_fw_version() {
         // fw=221 (2.2.1), dt=0x0615 (1557) → 显示 "2.2.1.1557"
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087E, 2,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0x0221, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x04, 0x087E, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0x0221, 0x0615, 8, 8,
+            6, 2,
+        )
+        .expect("must handle");
 
         let data = &pdu[2..];
         // Android 期望: length=4 (2 shorts)
@@ -2421,7 +2715,11 @@ mod android_compat_tests {
         // bluetoothIDBytesToUTF8Str: iterate bytes, stop at first 0, return UTF-8
         let mut str_len = 0;
         for &b in bytes {
-            if b > 0 { str_len += 1; } else { break; }
+            if b > 0 {
+                str_len += 1;
+            } else {
+                break;
+            }
         }
         let s = core::str::from_utf8(&bytes[..str_len]).unwrap();
         assert_eq!(s, "Mesh");
@@ -2430,26 +2728,25 @@ mod android_compat_tests {
     #[test]
     fn test_android_parse_hardware_info() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087C, 2,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 2,
+        )
+        .expect("must handle");
         let data = &pdu[2..];
         // Android parseHardwareInfoItem: length == 4 → 读 4 fields
         assert_eq!(data[0], 4);
-        assert_eq!(data[1], 8);  // DO
-        assert_eq!(data[2], 8);  // DI
-        assert_eq!(data[3], 6);  // ADC
-        assert_eq!(data[4], 2);  // RS485
+        assert_eq!(data[1], 8); // DO
+        assert_eq!(data[2], 8); // DI
+        assert_eq!(data[3], 6); // ADC
+        assert_eq!(data[4], 2); // RS485
     }
 
     #[test]
     fn test_android_parse_device_product() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x03, 0x08A5, 1,
-            [0; 4], [0; 4], [0; 4], [0; 6], [0; 6],
-            0x00F3, 0, 0x0615, 8, 8, 6, 2,
-        ).expect("must handle");
+            0x01, 0x03, 0x08A5, 1, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0x00F3, 0, 0x0615, 8, 8,
+            6, 2,
+        )
+        .expect("must handle");
         let data = &pdu[2..];
         // Android: data[0]=length, data[1..1+length] = product bytes (BE short)
         let length = data[0] as usize;
@@ -2458,9 +2755,6 @@ mod android_compat_tests {
         assert_eq!(product, 0x00F3); // 显示为 hex "F3"
     }
 }
-
-
-
 
 /// 发送 DI 状态变化上报 (REPORT_COM_INPUT_IO_STATUS, 0x94)
 ///
@@ -2512,8 +2806,11 @@ pub fn send_di_status_report(conn_id: u16) {
     }
     // 3. 用 BLE 帧格式包装 (tx_id=0x0001 特殊 ID)
     send_ble_frame(0x0001, 0x0000, &pdu, conn_id);
-    log::info!("[ble_at] DI status report: di_bits=0x{:016X} bytes={}",
-        di_bits, bitmap_bytes);
+    log::info!(
+        "[ble_at] DI status report: di_bits=0x{:016X} bytes={}",
+        di_bits,
+        bitmap_bytes
+    );
 }
 
 fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
@@ -2526,10 +2823,14 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
     let crc = modbus_crc16(&frame[..frame.len()]);
     let _ = frame.push(crc as u8);
     let _ = frame.push((crc >> 8) as u8);
-    log::info!("[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
-        tx_id, proto_id, length, pdu_data.len()
+    log::info!(
+        "[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
+        tx_id,
+        proto_id,
+        length,
+        pdu_data.len()
     );
-    // 放入二进制响应队列, 由 process_loop 的 try_send_notify 发送
+    // 放入二进制响应队列，由 main loop 按协商 MTU 分片发送。
     // 关键: 不在 GATT 回调中直接 send_indicate!
     if let Some(mut btx) = BINARY_TX.try_lock() {
         // queue size 2048 bytes, 容纳约 30+ 帧 (每帧 ~60 bytes)
@@ -2540,8 +2841,12 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
             let drops = BINARY_TX_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // 每 10 次丢弃才记日志, 避免日志洪水
             if drops % 10 == 1 {
-                log::warn!("[ble_at] binary TX full, dropped frame #{} ({} bytes, queue={} bytes)",
-                    drops, frame.len(), btx.len());
+                log::warn!(
+                    "[ble_at] binary TX full, dropped frame #{} ({} bytes, queue={} bytes)",
+                    drops,
+                    frame.len(),
+                    btx.len()
+                );
                 // 记录为可恢复故障
                 crate::error::recovery::record_failure(
                     crate::error::recovery::Severity::Recoverable,
@@ -2566,14 +2871,21 @@ pub fn binary_tx_drops() -> u32 {
 fn send_notify(data: &[u8]) {
     // LOOP8: 原子读取替代 Spin lock
     let gatts_if_raw = GATTS_IF.load(Ordering::Acquire);
-    if gatts_if_raw == 0xFF { return; }
+    if gatts_if_raw == 0xFF {
+        return;
+    }
     let conn_id_raw = CONN_ID.load(Ordering::Acquire);
-    if conn_id_raw == 0xFFFF { return; }
+    if conn_id_raw == 0xFFFF {
+        return;
+    }
     let handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     unsafe {
         let rc = esp_idf_sys::esp_ble_gatts_send_indicate(
-            gatts_if_raw as esp_idf_sys::esp_gatt_if_t, conn_id_raw, handle,
-            data.len() as u16, data.as_ptr() as *mut u8,
+            gatts_if_raw as esp_idf_sys::esp_gatt_if_t,
+            conn_id_raw,
+            handle,
+            data.len() as u16,
+            data.as_ptr() as *mut u8,
             false,
         );
         if rc != 0 {
@@ -2730,7 +3042,13 @@ mod tests_ble_cmd {
     use super::*;
 
     /// 构建 Android 兼容的 BLE 请求帧 (与 CommandBuilderUtil.buildCMD 一致)
-    fn build_ble_request(tx_id: u16, proto_id: u16, unit_id: u8, func: u8, pdu_data: &[u8]) -> Vec<u8> {
+    fn build_ble_request(
+        tx_id: u16,
+        proto_id: u16,
+        unit_id: u8,
+        func: u8,
+        pdu_data: &[u8],
+    ) -> Vec<u8> {
         let length = 1 + 1 + pdu_data.len(); // unit + func + data
         let mut out = Vec::new();
         out.extend_from_slice(&tx_id.to_be_bytes());
@@ -2747,18 +3065,30 @@ mod tests_ble_cmd {
 
     /// 解析 Android BLE 响应 (与 CommandCodecUtil.decodeList + parseCMDModel 一致)
     fn parse_ble_response(data: &[u8]) -> Option<(u16, u16, u16, u8, u8, Vec<u8>, bool)> {
-        if data.len() < 10 { return None; }
+        if data.len() < 10 {
+            return None;
+        }
         let tx_id = u16::from_be_bytes([data[0], data[1]]);
         let proto_id = u16::from_be_bytes([data[2], data[3]]);
         let length = u16::from_be_bytes([data[4], data[5]]);
         let unit = data[6];
         let func = data[7];
         let data_len = length as usize - 2;
-        if data.len() < 8 + data_len + 2 { return None; }
+        if data.len() < 8 + data_len + 2 {
+            return None;
+        }
         let pdu_data = data[8..8 + data_len].to_vec();
         let crc_rx = u16::from_le_bytes([data[8 + data_len], data[8 + data_len + 1]]);
         let crc_calc = crate::modbus::shared::modbus_crc16(&data[..8 + data_len]);
-        Some((tx_id, proto_id, length, unit, func, pdu_data, crc_rx == crc_calc))
+        Some((
+            tx_id,
+            proto_id,
+            length,
+            unit,
+            func,
+            pdu_data,
+            crc_rx == crc_calc,
+        ))
     }
 
     /// 模拟 Modbus RTU 响应 (Android 收到后解析)
@@ -2774,9 +3104,7 @@ mod tests_ble_cmd {
     #[test]
     fn test_ble_request_construction_matches_android() {
         // 模拟 Android READ_SN: FC=03, addr=0x0894, count=9
-        let req = build_ble_request(0x1234, 0x5678, 1, 0x03, &[
-            0x08, 0x94, 0x00, 0x09,
-        ]);
+        let req = build_ble_request(0x1234, 0x5678, 1, 0x03, &[0x08, 0x94, 0x00, 0x09]);
         // Total: 2+2+2+1+1+4+2 = 14 bytes
         assert_eq!(req.len(), 14);
         assert_eq!(u16::from_be_bytes([req[0], req[1]]), 0x1234); // tx_id
@@ -2892,12 +3220,12 @@ mod tests_ble_cmd {
     fn test_multiple_register_reads() {
         // 测试多个不同寄存器的解析, 确保长度字段处理正确
         let cases = [
-            (0x0894u16, 9usize, "SN"),        // 18 bytes
-            (0x089D, 8, "Location"),           // 16 bytes
-            (0x08D7, 6, "MAC"),                // 12 bytes
-            (0x08E2, 4, "BT ID"),              // 8 bytes
-            (0x08A5, 1, "HW Ver"),             // 2 bytes
-            (0x08C7, 12, "IP"),                // 24 bytes
+            (0x0894u16, 9usize, "SN"), // 18 bytes
+            (0x089D, 8, "Location"),   // 16 bytes
+            (0x08D7, 6, "MAC"),        // 12 bytes
+            (0x08E2, 4, "BT ID"),      // 8 bytes
+            (0x08A5, 1, "HW Ver"),     // 2 bytes
+            (0x08C7, 12, "IP"),        // 24 bytes
         ];
         for &(addr, count, name) in &cases {
             let req = build_ble_request(1, 1, 1, 0x03, &{

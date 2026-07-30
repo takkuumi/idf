@@ -3,7 +3,7 @@
 基于 ESP-IDF v5.5 + Rust 重构的工业控制系统固件。
 
 ## 硬件
-- **MCU**: ESP32-S3R2 (Xtensa LX7 双核 240MHz, 288KB SRAM, **2MB Quad PSRAM**, 8MB Flash)
+- **MCU**: ESP32-S3R2 (Xtensa LX7 双核 240MHz, 512KB 物理 SRAM, **2MB Quad PSRAM**, 8MB Flash)
 - **以太网**: W5500 over SPI3
 - **RS485 #0 (主)**: UART1 (GPIO45/46/7)
 - **RS485 #1 (从)**: UART2 (GPIO42/41/8)

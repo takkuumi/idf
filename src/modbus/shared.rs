@@ -24,8 +24,13 @@ pub const PDU_BUF_SIZE: usize = 256;
 /// 容量常量: MAX_REGS_PER_READ (125) / MAX_BITS_PER_READ (2000)
 pub trait ModbusBackend {
     fn read_coils(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ>;
-    fn read_discrete_inputs(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ>;
-    fn read_holding_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>;
+    fn read_discrete_inputs(&self, addr: u16, count: u16)
+    -> heapless::Vec<bool, MAX_BITS_PER_READ>;
+    fn read_holding_registers(
+        &self,
+        addr: u16,
+        count: u16,
+    ) -> heapless::Vec<u16, MAX_REGS_PER_READ>;
     fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>;
     fn write_single_coil(&self, addr: u16, value: bool) -> bool;
     fn write_single_register(&self, addr: u16, value: u16) -> bool;
@@ -48,43 +53,72 @@ impl ModbusBackend for BusBackend {
             return v;
         }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_coil(addr.wrapping_add(i)).unwrap_or(false));
+            let Some(value) = crate::bus::backends::read_coil(addr.wrapping_add(i)) else {
+                return heapless::Vec::new();
+            };
+            let _ = v.push(value);
         }
         v
     }
 
-    fn read_discrete_inputs(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
+    fn read_discrete_inputs(
+        &self,
+        addr: u16,
+        count: u16,
+    ) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
         let mut v = heapless::Vec::new();
+        if count == 0 {
+            return v;
+        }
         let last = (addr as u32) + (count as u32) - 1;
         if last > u16::MAX as u32 {
             return v;
         }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_disc(addr.wrapping_add(i)).unwrap_or(false));
+            let Some(value) = crate::bus::backends::read_disc(addr.wrapping_add(i)) else {
+                return heapless::Vec::new();
+            };
+            let _ = v.push(value);
         }
         v
     }
 
-    fn read_holding_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
+    fn read_holding_registers(
+        &self,
+        addr: u16,
+        count: u16,
+    ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
         let mut v = heapless::Vec::new();
+        if count == 0 {
+            return v;
+        }
         let last = (addr as u32) + (count as u32) - 1;
         if last > u16::MAX as u32 {
             return v;
         }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_hold_reg(addr.wrapping_add(i)).unwrap_or(0));
+            let Some(value) = crate::bus::backends::read_hold_reg(addr.wrapping_add(i)) else {
+                return heapless::Vec::new();
+            };
+            let _ = v.push(value);
         }
         v
     }
 
     fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
         let mut v = heapless::Vec::new();
+        if count == 0 {
+            return v;
+        }
         let last = (addr as u32) + (count as u32) - 1;
         if last > u16::MAX as u32 {
             return v;
         }
         for i in 0..count {
-            let _ = v.push(crate::bus::backends::read_input_reg(addr.wrapping_add(i)).unwrap_or(0));
+            let Some(value) = crate::bus::backends::read_input_reg(addr.wrapping_add(i)) else {
+                return heapless::Vec::new();
+            };
+            let _ = v.push(value);
         }
         v
     }
@@ -316,12 +350,7 @@ pub fn handle_pdu<B: ModbusBackend>(
     }
 }
 
-fn read_bits_pdu<B, F>(
-    backend: &B,
-    pdu: &[u8],
-    f: F,
-    out: &mut [u8; PDU_BUF_SIZE],
-) -> PduResult
+fn read_bits_pdu<B, F>(backend: &B, pdu: &[u8], f: F, out: &mut [u8; PDU_BUF_SIZE]) -> PduResult
 where
     B: ModbusBackend,
     F: Fn(&B, u16, u16) -> heapless::Vec<bool, MAX_BITS_PER_READ>,
@@ -357,12 +386,7 @@ where
     PduResult::Ok(2 + byte_count)
 }
 
-fn read_regs_pdu<B, F>(
-    backend: &B,
-    pdu: &[u8],
-    f: F,
-    out: &mut [u8; PDU_BUF_SIZE],
-) -> PduResult
+fn read_regs_pdu<B, F>(backend: &B, pdu: &[u8], f: F, out: &mut [u8; PDU_BUF_SIZE]) -> PduResult
 where
     B: ModbusBackend,
     F: Fn(&B, u16, u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>,
@@ -567,31 +591,51 @@ mod tests {
             }
             v
         }
-        fn read_discrete_inputs(&self, addr: u16, count: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
+        fn read_discrete_inputs(
+            &self,
+            addr: u16,
+            count: u16,
+        ) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
             let mut v = heapless::Vec::new();
             for i in 0..count {
                 let _ = v.push(self.disc[(addr + i) as usize]);
             }
             v
         }
-        fn read_holding_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
+        fn read_holding_registers(
+            &self,
+            addr: u16,
+            count: u16,
+        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
             let mut v = heapless::Vec::new();
             for i in 0..count {
                 let _ = v.push(self.holding[(addr + i) as usize]);
             }
             v
         }
-        fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
+        fn read_input_registers(
+            &self,
+            addr: u16,
+            count: u16,
+        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
             let mut v = heapless::Vec::new();
             for i in 0..count {
                 let _ = v.push(self.input_reg[(addr + i) as usize]);
             }
             v
         }
-        fn write_single_coil(&self, _addr: u16, _value: bool) -> bool { true }
-        fn write_single_register(&self, _addr: u16, _value: u16) -> bool { true }
-        fn write_multiple_coils(&self, _addr: u16, _values: &[bool]) -> bool { true }
-        fn write_multiple_registers(&self, _addr: u16, _values: &[u16]) -> bool { true }
+        fn write_single_coil(&self, _addr: u16, _value: bool) -> bool {
+            true
+        }
+        fn write_single_register(&self, _addr: u16, _value: u16) -> bool {
+            true
+        }
+        fn write_multiple_coils(&self, _addr: u16, _values: &[bool]) -> bool {
+            true
+        }
+        fn write_multiple_registers(&self, _addr: u16, _values: &[u16]) -> bool {
+            true
+        }
     }
 
     #[test]

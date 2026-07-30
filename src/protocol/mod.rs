@@ -22,15 +22,13 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-
 use crate::error::AppResult;
-
 
 // Arc + Hal 仅被需要 Arc<Hal> 的适配器使用 (ModbusRtuProtocol)
 #[cfg(feature = "modbus-rtu")]
-use std::sync::Arc;
-#[cfg(feature = "modbus-rtu")]
 use crate::hal::Hal;
+#[cfg(feature = "modbus-rtu")]
+use std::sync::Arc;
 
 // ============================================================================
 // Protocol trait
@@ -188,8 +186,9 @@ impl ProtocolRegistry {
 
     /// 启动所有未运行的协议
     ///
-    /// 某个协议启动失败仅记日志, 不影响其它协议启动 (尽力而为策略)。
+    /// 某个协议启动失败不阻断其它协议，但最终返回错误，供 supervisor 定时重试。
     pub fn start_all(&self) -> AppResult<()> {
+        let mut failed = 0usize;
         for p in &self.protocols {
             if p.is_running() {
                 log::warn!("[protocol] {} already running, skip", p.name());
@@ -197,10 +196,24 @@ impl ProtocolRegistry {
             }
             match p.start() {
                 Ok(()) => log::info!("[protocol] {} started", p.name()),
-                Err(e) => log::error!("[protocol] {} start failed: {}", p.name(), e),
+                Err(e) => {
+                    failed += 1;
+                    log::error!("[protocol] {} start failed: {}", p.name(), e);
+                }
             }
         }
-        Ok(())
+        if failed == 0 {
+            Ok(())
+        } else {
+            Err(crate::error::AppError::Sys(format!(
+                "{} protocol service(s) failed to start",
+                failed
+            )))
+        }
+    }
+
+    pub fn all_running(&self) -> bool {
+        self.protocols.iter().all(|protocol| protocol.is_running())
     }
 
     /// 停止所有协议
@@ -337,4 +350,3 @@ impl Protocol for ModbusTcpProtocol {
         self.state.stats(self.name())
     }
 }
-

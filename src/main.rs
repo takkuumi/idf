@@ -23,25 +23,25 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 
 mod actor;
-mod sync;
-mod error;
-mod config;
-mod bus;
-mod device;
-mod device_config;
-mod safety;
 #[cfg(feature = "ble-at")]
 mod ble_at;
-mod hal;
-mod ethernet;
-mod rs485;
-mod modbus;
-mod io;
+mod bus;
 mod channel;
+mod config;
+mod device;
+mod device_config;
+mod error;
+mod ethernet;
+mod hal;
 mod health;
+mod io;
+mod modbus;
+mod nfc;
 mod ota;
 mod protocol;
-mod nfc;
+mod rs485;
+mod safety;
+mod sync;
 mod udp_multicast;
 mod web;
 #[cfg(feature = "wifi")]
@@ -55,9 +55,9 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_sys::{self as _};
 
-use crate::hal::Hal;
 use crate::config::MAIN_LOOP_PERIOD_MS;
 use crate::error::AppResult;
+use crate::hal::Hal;
 
 static MAIN_HB: health::TaskHb = health::TaskHb::new("main");
 
@@ -69,12 +69,6 @@ fn main() -> AppResult<()> {
     log::info!("{} v{}", config::APP_NAME, config::APP_VERSION);
     log::info!("ESP32-S3R2 IoT Gateway starting...");
     log::info!("================================================");
-
-    // 1.1 OTA 固件确认 (取消回滚)
-    // 如果当前是 OTA 升级后首次启动 (状态=PENDING_VERIFY),
-    // 标记新固件有效, 防止 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 超时后自动回滚
-    // 详见 ESP-IDF OTA 文档:  app 需在首次启动时主动确认运行正常
-    confirm_new_firmware();
 
     // 2. ESP-IDF 基础设施
     let peripherals = Peripherals::take()
@@ -92,7 +86,8 @@ fn main() -> AppResult<()> {
         let ret = esp_idf_sys::esp_netif_init();
         if ret != esp_idf_sys::ESP_OK {
             return Err(crate::error::AppError::Sys(format!(
-                "esp_netif_init failed: esp_err=0x{:08X}", ret
+                "esp_netif_init failed: esp_err=0x{:08X}",
+                ret
             )));
         }
     }
@@ -158,7 +153,7 @@ fn main() -> AppResult<()> {
     #[cfg(feature = "ethernet-w5500")]
     {
         log::info!("[main] starting ethernet (W5500)...");
-       
+
         ethernet::start(hal.clone(), sys_loop.clone())?;
     }
 
@@ -232,7 +227,7 @@ fn main() -> AppResult<()> {
 
     // 8.4 启动 HTTP Web 配置服务器 (端口 80, JSON API)
     // 提供 13 个 REST 路由 (login / getsysteminfo / getiodata / updateota 等).
-    // Cookie 认证 (ESPSESSIONID=1), 密码存储在 NVS (默认 admin/admin123).
+    // 随机 Cookie 会话认证，密码存储在 NVS (默认 admin/admin123).
     // 启动失败仅记日志, 不阻断主流程.
     {
         if let Err(e) = web::start() {
@@ -251,14 +246,22 @@ fn main() -> AppResult<()> {
         log::info!("[main] registering modbus tcp...");
         protocols.register(Box::new(protocol::ModbusTcpProtocol::new()));
     }
-    protocols.start_all()?;
+    if let Err(e) = protocols.start_all() {
+        log::error!(
+            "[main] protocol startup incomplete; supervisor will retry: {}",
+            e
+        );
+    }
 
     // 10. 主循环
     health::register_with_stack(&MAIN_HB, safety::stack_budget::MAIN);
-    log::info!("[main] entering main loop (period={}ms)", MAIN_LOOP_PERIOD_MS);
+    log::info!(
+        "[main] entering main loop (period={}ms)",
+        MAIN_LOOP_PERIOD_MS
+    );
     // 打印任务-核心分配 (便于验证双核优化)
     health::print_core_assignment();
-    if let Err(e) = main_loop(timer_svc, hal.clone()) {
+    if let Err(e) = main_loop(timer_svc, hal.clone(), protocols) {
         log::error!("[main] main loop returned error: {e}");
         // 不再立即重启, 尝试降级运行
         crate::error::recovery::record_failure(
@@ -267,9 +270,7 @@ fn main() -> AppResult<()> {
             &format!("main loop exited: {e}"),
         );
         // 进入降级模式
-        crate::error::recovery::enter_mode(
-            crate::error::recovery::DegradedMode::Minimal
-        );
+        crate::error::recovery::enter_mode(crate::error::recovery::DegradedMode::Minimal);
         // 短暂等待, 给系统机会继续响应
         std::thread::sleep(Duration::from_secs(1));
         // LOOP14: 喂狗 + 健康检查, 防止 WDT 10s 超时导致系统卡死
@@ -286,10 +287,16 @@ fn main() -> AppResult<()> {
 // ----------------------------------------------------------------------------
 // 主循环：周期性更新系统状态、复位计数、喂狗、健康检查
 // ----------------------------------------------------------------------------
-fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
+fn main_loop(
+    _timer_svc: EspTaskTimerService,
+    hal: Arc<Hal>,
+    protocols: protocol::ProtocolRegistry,
+) -> AppResult<()> {
     let mut tick: u32 = 0;
+    let mut ota_validation_done = false;
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
     let start = std::time::Instant::now();
+    let mut next_tick = start;
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
     // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
@@ -298,23 +305,27 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
         tick = tick.wrapping_add(1);
         MAIN_HB.tick();
 
-        // 每个周期喂狗 (100ms), 远小于 WDT 超时 10s
+        // 每个周期喂狗 (20ms), 远小于 WDT 超时 10s
         health::feed_wdt();
 
-        // AI/AO/DI/DO tick (架构合并 Phase 2: 取消独立 pthread)
-        #[cfg(feature = "ai-ao")]
-        {
-            crate::channel::ai::tick_ai_sample(&hal);
-            crate::channel::ao::tick_ao_output(&hal);
+        // 20ms 基准调度；AI/AO 按 5 分频保持 100ms 周期。
+        if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            #[cfg(feature = "ai-ao")]
+            {
+                crate::channel::ai::tick_ai_sample(&hal);
+                crate::channel::ao::tick_ao_output(&hal);
+            }
         }
-        // DI/DO 每 5 tick (20ms) 调用一次, 保留去抖逻辑
-        if tick % 5 == 0 {
-            #[cfg(feature = "io-di-do")]
-            crate::io::di::tick_di_scan(&hal);
-        }
-        // DO notify 由 modbus 写入触发 (见 bus::backends::write_coil), tick_do_output 在 100ms poll 中调用
+
+        // DI 每 20ms 去抖；DO 每 20ms 消费 dirty，10s 另有兜底同步。
+        #[cfg(feature = "io-di-do")]
+        crate::io::di::tick_di_scan(&hal);
         #[cfg(feature = "io-di-do")]
         crate::io::do_::tick_do_output(&hal);
+
+        // Modbus TCP 使用同一个非阻塞主调度，不再创建 16KB pthread。
+        #[cfg(feature = "modbus-tcp")]
+        crate::modbus::tcp_server::tick_tcp_server();
         // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
         #[cfg(feature = "io-di-do")]
         {
@@ -322,14 +333,16 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
             crate::device::persist_do_bits_throttled(now_ms as u32);
         }
 
-        // ETH 心跳 (50 tick = 5s, 架构合并 Phase 2: 取消独立 pthread)
-        if tick % 50 == 0 {
+        // ETH 心跳 5s，取消独立 pthread。
+        if tick % (5000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             crate::ethernet::w5500::tick_eth_heartbeat();
         }
 
-        // BLE 通知发送 (每 100ms, 替代独立线程)
-        #[cfg(feature = "ble-at")]
-        ble_at::process_tick();
+        // BLE 通知发送保持 100ms 周期，替代独立线程。
+        if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            #[cfg(feature = "ble-at")]
+            ble_at::process_tick();
+        }
 
         // 消费 IO 事件 (避免事件队列满, 触发重置丢失关键状态变化)
         // 阶段 3: DI 变化触发 BLE notify (REPORT_COM_INPUT_IO_STATUS 0x94, Android tx_id=0x01)
@@ -358,8 +371,13 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
                 }
                 crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
                     // DHCP 完成, 把 IP/mask/gw 写入 CONFIG RCU
-                    log::info!("[eth] main loop: IP assigned {}.{}.{}.{}",
-                        ip_b[0], ip_b[1], ip_b[2], ip_b[3]);
+                    log::info!(
+                        "[eth] main loop: IP assigned {}.{}.{}.{}",
+                        ip_b[0],
+                        ip_b[1],
+                        ip_b[2],
+                        ip_b[3]
+                    );
                     crate::bus::backends::config_modify(|c| {
                         c.ip = ip_b;
                         c.mask = mask_b;
@@ -389,12 +407,54 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
             // 单个业务任务异常不能中断仍可工作的 IO、BLE 或其他协议。
             let stalled = health::check_all();
             if !stalled.is_empty() {
-                log::error!("[health] stalled tasks: {:?}; keeping gateway online", stalled.as_slice());
+                log::error!(
+                    "[health] stalled tasks: {:?}; keeping gateway online",
+                    stalled.as_slice()
+                );
                 crate::error::recovery::record_failure(
                     crate::error::recovery::Severity::Degradable,
                     "health",
                     "registered task heartbeat stalled",
                 );
+            }
+
+            // 启动期 pthread/资源短缺不应永久丢失协议。只重试尚未标记运行的
+            // 协议；成功任务不会重复创建。每 5 秒一次，避免资源压力下忙重试。
+            if uptime % 5 == 0 && !protocols.all_running() {
+                if let Err(e) = protocols.start_all() {
+                    log::warn!("[supervisor] protocol retry incomplete: {}", e);
+                }
+            }
+            if uptime % 5 == 0 {
+                if !udp_multicast::is_started() {
+                    if let Err(e) = udp_multicast::start() {
+                        log::warn!("[supervisor] UDP task retry failed: {}", e);
+                    }
+                }
+                if !nfc::is_started() {
+                    if let Err(e) = nfc::start() {
+                        log::warn!("[supervisor] NFC task retry failed: {}", e);
+                    }
+                }
+                if !web::is_started() {
+                    if let Err(e) = web::start() {
+                        log::warn!("[supervisor] HTTP task retry failed: {}", e);
+                    }
+                }
+            }
+
+            // OTA 镜像必须先完成全部服务启动并稳定运行 30 秒，且没有任务停滞，
+            // 才取消 bootloader 回滚。不能在 main 入口就确认，否则“能进 main、
+            // 但 TCP/BLE/IO 服务起不来”的坏镜像会失去自动回滚保护。
+            if !ota_validation_done
+                && uptime >= 30
+                && stalled.is_empty()
+                && protocols.all_running()
+                && udp_multicast::is_started()
+                && nfc::is_started()
+                && web::is_started()
+            {
+                ota_validation_done = confirm_new_firmware();
             }
 
             // LOOP8: 每 60s 打印内存使用 (7×24 运维监控)
@@ -403,7 +463,9 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
                 let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };
                 log::info!(
                     "[mem] free_heap={}KB min_heap={}KB uptime={}s",
-                    free_heap / 1024, min_heap / 1024, uptime
+                    free_heap / 1024,
+                    min_heap / 1024,
+                    uptime
                 );
                 health::print_stack_watermarks();
                 if free_heap < 20 * 1024 {
@@ -414,7 +476,15 @@ fn main_loop(_timer_svc: EspTaskTimerService, hal: Arc<Hal>) -> AppResult<()> {
             log::info!("[main] uptime={}s tick={}", uptime, tick);
         }
 
-        std::thread::sleep(period);
+        // 以绝对 deadline 调度，避免“业务耗时 + 固定 sleep”使 20ms 周期持续漂移。
+        next_tick += period;
+        let now = std::time::Instant::now();
+        if let Some(remaining) = next_tick.checked_duration_since(now) {
+            std::thread::sleep(remaining);
+        } else {
+            // 本轮超时后从当前时刻重新对齐，不连续追赶导致其它任务饥饿。
+            next_tick = now;
+        }
     }
 }
 
@@ -425,15 +495,14 @@ fn init_logger() {
     esp_idf_svc::log::EspLogger::initialize_default();
     // 默认 INFO 级别 (运行时可通过 Modbus 寄存器 0x0106 调节)
     log::set_max_level(log::LevelFilter::Info);
-    // 安装 Rust panic hook, 打印 panic 位置 + backtrace
-    // 注意: release 用 panic=abort, hook 仍会被调用 (在 abort 之前)
+    // 安装 Rust panic hook，记录位置；ESP-IDF panic handler/coredump 负责回溯。
     install_panic_hook();
 }
 
-/// 安装 Rust panic hook, 打印 panic 位置 + backtrace
+/// 安装 Rust panic hook，打印 panic 位置。
 ///
-/// ESP-IDF 自身的 panic handler (CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT) 已会打印
-/// CPU 寄存器 + Xtensa backtrace; 此 Rust hook 用于补充 Rust 层 backtrace。
+/// 不在 panic 路径调用 `Backtrace::force_capture`：panic 可能正由栈/堆损坏触发，
+/// 此时再次深度走栈和分配内存会掩盖首个故障。ESP-IDF coredump 保留完整上下文。
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -441,21 +510,13 @@ fn install_panic_hook() {
         log::error!("========== RUST PANIC ==========");
         log::error!("panic: {}", info);
         if let Some(loc) = info.location() {
-            log::error!(
-                "  at {}:{}:{}",
-                loc.file(),
-                loc.line(),
-                loc.column()
-            );
+            log::error!("  at {}:{}:{}", loc.file(), loc.line(), loc.column());
         }
-        // 打印 backtrace (std::backtrace::Backtrace::force_capture)
-        let bt = std::backtrace::Backtrace::force_capture();
-        log::error!("backtrace:\n{}", bt);
         log::error!("================================");
         // 调用默认 hook (会触发 ESP-IDF panic handler → 复位)
         default_hook(info);
     }));
-    log::debug!("[main] Rust panic hook installed (with backtrace)");
+    log::debug!("[main] Rust panic hook installed");
 }
 
 /// 确认 OTA 新固件运行正常, 取消自动回滚
@@ -464,14 +525,13 @@ fn install_panic_hook() {
 /// 状态为 `ESP_OTA_IMG_PENDING_VERIFY`。若 app 不主动调用
 /// `esp_ota_mark_app_valid_cancel_rollback` 标记有效, 下次重启会自动回滚到旧固件。
 ///
-/// 本函数在 main 入口调用, 表示"启动到此处即认为新固件可运行"。
-/// 如需更严格的确认 (如启动所有任务 + 网络连通后才确认), 可改为延后到主循环中调用。
-fn confirm_new_firmware() {
+/// 本函数仅在主循环稳定运行 30 秒、服务全部启动且无任务停滞后调用。
+fn confirm_new_firmware() -> bool {
     // 获取当前运行的 OTA 分区
     let partition = unsafe { esp_idf_sys::esp_ota_get_running_partition() };
     if partition.is_null() {
         log::warn!("[main] OTA: get running partition failed (null), skip confirm");
-        return;
+        return false;
     }
 
     // 查询分区状态
@@ -479,22 +539,30 @@ fn confirm_new_firmware() {
     let ret = unsafe { esp_idf_sys::esp_ota_get_state_partition(partition, &mut state) };
     if ret != esp_idf_sys::ESP_OK {
         log::warn!("[main] OTA: get state failed (err={}), skip confirm", ret);
-        return;
+        return false;
     }
 
     // ESP_OTA_IMG_PENDING_VERIFY = 2 (新固件待确认)
     // 如状态不是 PENDING_VERIFY (如 factory 启动 / 已确认), 直接返回
     const ESP_OTA_IMG_PENDING_VERIFY: esp_idf_sys::esp_ota_img_states_t = 2;
     if state != ESP_OTA_IMG_PENDING_VERIFY {
-        log::debug!("[main] OTA: state={} (not pending verify), skip confirm", state);
-        return;
+        log::debug!(
+            "[main] OTA: state={} (not pending verify), skip confirm",
+            state
+        );
+        return true;
     }
 
     // 标记新固件有效, 取消回滚
     let ret = unsafe { esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback() };
     if ret == esp_idf_sys::ESP_OK {
-        log::info!("[main] OTA: new firmware confirmed valid (rollback cancelled)");
+        log::info!("[main] OTA: 30s stability window passed, firmware confirmed valid");
+        true
     } else {
-        log::error!("[main] OTA: mark valid failed (err={}), firmware may rollback next reboot", ret);
+        log::error!(
+            "[main] OTA: mark valid failed (err={}), firmware may rollback next reboot",
+            ret
+        );
+        false
     }
 }

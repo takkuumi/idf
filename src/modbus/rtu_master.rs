@@ -8,6 +8,7 @@
 //! (umodbus 0.1 API 在 embedded std 环境下不稳定)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::modbus::rtu_master as cfg;
@@ -22,6 +23,7 @@ const MAX_RETRY: u32 = 0; // 无从站时不重试, 避免长时间阻塞
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("mb-rtu-master");
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 单条轮询任务
 #[derive(Clone, Copy)]
@@ -47,6 +49,9 @@ const POLL_TABLE: &[PollItem] = &[
 ];
 
 pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
+    if STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let port_cfg = Rs485Config::from_rtu_master();
     let mut port = Rs485Port::open(&port_cfg)?;
 
@@ -66,7 +71,10 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                     if let Err(e) = poll_with_retry(&mut port, *item) {
                         log::warn!(
                             "[mb-rtu-master] poll slave={} fc={:02x} failed after {} retries: {}",
-                            item.slave, item.func, MAX_RETRY, e
+                            item.slave,
+                            item.func,
+                            MAX_RETRY,
+                            e
                         );
                     }
                 }
@@ -75,6 +83,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         });
     health::reset_thread_core();
     result.map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
+    STARTED.store(true, Ordering::Release);
     health::register_with_stack(&TASK_HB, crate::safety::stack_budget::MODBUS_RTU_MASTER);
 
     log::info!("[mb-rtu-master] started on uart{}", cfg::UART_PORT);
@@ -88,10 +97,7 @@ fn poll_with_retry(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
         match poll_once(port, item) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                log::debug!(
-                    "[mb-rtu-master] attempt {} failed: {}",
-                    attempt + 1, e
-                );
+                log::debug!("[mb-rtu-master] attempt {} failed: {}", attempt + 1, e);
                 last_err = Some(e);
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -114,21 +120,30 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
     if resp.len() < 5 {
         // LOOP14: 帧太短 (通信错误) → 累加 COMERR
         crate::modbus::shared::RS485_STATS.inc_master_comerr();
-        return Err(crate::error::AppError::Modbus(format!("short resp: {} bytes", resp.len())));
+        return Err(crate::error::AppError::Modbus(format!(
+            "short resp: {} bytes",
+            resp.len()
+        )));
     }
 
     // 校验从站地址
     if resp[0] != item.slave {
         // LOOP14: 从站地址不匹配 (通信错误) → 累加 COMERR
         crate::modbus::shared::RS485_STATS.inc_master_comerr();
-        return Err(crate::error::AppError::Modbus(format!("slave mismatch: {}!={}", resp[0], item.slave)));
+        return Err(crate::error::AppError::Modbus(format!(
+            "slave mismatch: {}!={}",
+            resp[0], item.slave
+        )));
     }
 
     // 异常响应 (Modbus spec: func | 0x80, code: Illegal F/R/V/Slave Failure)
     if resp[1] & 0x80 != 0 {
         // LOOP14: 异常响应 → 累加 APPERR
         crate::modbus::shared::RS485_STATS.inc_master_apperr();
-        return Err(crate::error::AppError::Modbus(format!("exception: {:02x}", resp[2])));
+        return Err(crate::error::AppError::Modbus(format!(
+            "exception: {:02x}",
+            resp[2]
+        )));
     }
 
     // CRC 校验
@@ -138,21 +153,32 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
     if crc != recv_crc {
         // LOOP14: CRC 校验失败 (通信错误) → 累加 COMERR
         crate::modbus::shared::RS485_STATS.inc_master_comerr();
-        return Err(crate::error::AppError::Modbus(format!("crc mismatch: {:#06x}!={:#06x}", crc, recv_crc)));
+        return Err(crate::error::AppError::Modbus(format!(
+            "crc mismatch: {:#06x}!={:#06x}",
+            crc, recv_crc
+        )));
     }
 
     // 解析寄存器数据 (FC=03/04) 并写回 bus
     if item.func == 0x03 || item.func == 0x04 {
         let byte_count = resp[2] as usize;
         if byte_count + 5 != n {
-            log::warn!("[mb-rtu-master] byte_count {} != payload {}", byte_count, n - 5);
+            log::warn!(
+                "[mb-rtu-master] byte_count {} != payload {}",
+                byte_count,
+                n - 5
+            );
         }
         // Modbus RTU FC=03/04 单帧最多 125 reg, 用 heapless::Vec 避免 heap 分配
         let mut regs: heapless::Vec<u16, 128> = heapless::Vec::new();
         for i in 0..byte_count / 2 {
             let v = u16::from_be_bytes([resp[3 + 2 * i], resp[4 + 2 * i]]);
             if regs.push(v).is_err() {
-                log::warn!("[mb-rtu-master] regs overflow at {}, byte_count={}", i, byte_count);
+                log::warn!(
+                    "[mb-rtu-master] regs overflow at {}, byte_count={}",
+                    i,
+                    byte_count
+                );
                 break;
             }
         }
@@ -179,7 +205,8 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
             if written > 0 {
                 log::debug!(
                     "[mb-rtu-master] wrote {} regs to RCU storage at {:#06X}",
-                    written, dest_start
+                    written,
+                    dest_start
                 );
             }
         }

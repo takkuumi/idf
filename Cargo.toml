@@ -21,7 +21,9 @@ panic = "abort"
 opt-level = 2
 lto = false
 codegen-units = 1
-panic = "unwind"
+# 固件不存在可安全跨 ESP-IDF FFI 边界展开的调用栈；开发烧录也使用 abort，
+# 与生产语义一致并避免 unwind 元数据和二次栈消耗。
+panic = "abort"
 
 [features]
 default = ["ble-at", "adc-continuous", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do"]

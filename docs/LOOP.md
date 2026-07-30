@@ -183,18 +183,18 @@ esp_core_dump_flash: Save core dump to flash...
 ## 架构 (Phase 2 完成)
 
 ```
-main_loop (100ms tick)
-├── tick_ai_sample(&hal)        # 100ms, 合并 ai-sample pthread
-├── tick_ao_output(&hal)         # 100ms, 合并 ao-output pthread
-├── tick_di_scan(&hal)           # 20ms (5 分频), 合并 di-scan pthread
-├── tick_do_output(&hal)         # 100ms, 合并 do-output pthread (notify 立即触发)
-└── tick_eth_heartbeat()         # 5s (50 分频), 合并 eth-heartbeat pthread
+main_loop (20ms tick)
+├── tick_tcp_server()            # 20ms, 4 端口/8 连接非阻塞状态机
+├── tick_di_scan(&hal)           # 20ms, 合并 di-scan pthread
+├── tick_do_output(&hal)         # 20ms dirty 消费 + 10s 兜底
+├── tick_ai/ao(&hal)             # 100ms (5 分频)
+├── ble_at::process_tick()       # 100ms (5 分频)
+└── tick_eth_heartbeat()         # 5s (250 分频)
 
-4 个保留 pthread 任务:
-- DeviceActor (NVS 持久化, 8KB 栈)
+3 个核心协议/状态 pthread 任务:
+- DeviceActor (NVS 持久化, 16KB 栈)
 - mb-rtu-master (Modbus RTU 主站)
 - mb-rtu-slave (Modbus RTU 从站)
-- mb-tcp-listen (Modbus TCP)
 ```
 
 详细架构: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
@@ -222,8 +222,8 @@ cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 
 ## LOOP26 栈容量架构重构 (2026-07-29)
 
-- [x] 最终 map 核对：DRAM 段 333.75KB，静态 data+bss 51.17KB，连续 heap 候选 176.08KB。
-- [x] Modbus TCP 改为单个 16KB pthread 管理 4 端口/8 连接，取消每连接 20KB pthread。
+- [x] 最终 map 核对：DRAM 段 333.75KB，静态 data+bss 53.86KB，连续 heap 候选 168.12KB。
+- [x] Modbus TCP 最终并入 20ms main-loop，管理 4 端口/8 连接，不再申请 pthread 栈。
 - [x] BLE GATT 回调只重组和入队，业务迁移到 main_loop，保持 metuory 1.0.78 帧兼容。
 - [x] DeviceActor blob 改固定堆缓冲，任务栈 32KB 降到 16KB。
 - [x] OTA/AT/Web 延迟复位不再创建一次性 12KB pthread。
@@ -231,6 +231,32 @@ cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 - [x] 真实 TaskHandle 高水位每 60s 上报，修复原监控把最小值错误取 MAX 的缺陷。
 - [x] `cargo build`、默认 `cargo check`：通过，0 warning。
 - [ ] 真机 72h 峰值浸泡：BLE 手持机 + 8 TCP + RTU + Web OTA/NFC；见测试日志。
+
+## LOOP27 工业服务链路重塑 (2026-07-29)
+
+- [x] BLE 下行按协商 MTU-3 分片，拥塞/提交失败保留队列，协议帧和 CRC 不变。
+- [x] 对照手机 1.0.78 确认 `CommandCodecUtil` 支持跨 notification 重组。
+- [x] 正常 BLE 广播不再每 15 秒 stop/start；改名使用 GAP stop-complete 状态链。
+- [x] TCP 2243-2246 端口进入 NVS 配置并支持运行时监听器重绑，长连接 idle 为 5 分钟。
+
+## LOOP28 真机 ENOMEM / UDP / NFC 闭环 (2026-07-30)
+
+- [x] 根据真机日志确认单个 16KB `mb-tcp` 任务仍因 internal SRAM 不连续而 ENOMEM。
+- [x] 取消 `mb-tcp` pthread；默认/全功能用户任务栈由 106/120KB 降为 90/104KB。
+- [x] 主调度改为 20ms，修复此前注释为 20ms、实际为 500ms 的 DI 扫描周期。
+- [x] 修复 UDP `ip_mreq` 小端内存字节序，消除组播加入错误 125。
+- [x] 软件 I2C 恢复约 100kHz，NFC 两个 4KB 工作区显式迁移到 PSRAM。
+- [x] `MainLoopCell` 改为闭包借用，消除 `&self -> &mut T` 未定义行为。
+- [x] 默认/Wi-Fi/F4 check、测试目标编译、固件 build 均通过且 0 warning。
+- [ ] 用本次固件复测 TCP 四端口、UDP 入组、NFC 完整 4096B 写入及 72h 浸泡。
+- [x] Web OTA 使用 `BufReader` 原流式读取，1 秒读超时持续喂 WDT，上传上限 0x240000。
+- [x] OTA 读取真实 running/next partition，30 秒全服务健康后才取消回滚。
+- [x] NFC 使用 ST25DV DATA/SYSTEM 双地址、17 字节密码流程、4096B 快照和 Type-5 NDEF。
+- [x] NFC 写失败不再误报 BackedUp 或清除 holding dirty；spawn 失败允许 supervisor 重试。
+- [x] Web 会话服务端 TTL 与 Cookie Max-Age 同为 24 小时，增加 SameSite=Strict。
+- [x] UDP 配置变化自动重建 socket；Web socket 参数失败不会落入无超时阻塞。
+- [x] 默认/Wi-Fi/F4 `cargo check`、`cargo build`、abort test compile：通过，0 warning。
+- [ ] 手持机/TCP/NFC/Web/OTA 并发真机功能与 72h 浸泡（需维护窗口烧录）。
 
 ## LOOP7 BLE 名字 GAP 同步 (2026-07-24) - COMPLETE
 

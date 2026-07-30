@@ -42,10 +42,11 @@ mod pages;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::bus::storage_state::storage_read_with;
-use crate::bus::{config_state::config_read_with, IO};
+use crate::bus::{IO, config_state::config_read_with};
 use crate::config::regs;
 use crate::error::AppResult;
 use crate::health::{self, TaskHb};
@@ -56,10 +57,13 @@ const HTTP_PORT: u16 = 80;
 const BUF_SIZE: usize = 4096;
 /// 单条 HTTP header 行最大字节数 (防止恶意超长 header → OOM)
 const MAX_HEADER_LINE: usize = 1024;
-/// POST body 总量上限 (对齐参考固件最大包, 防 Content-Length 伪造 → OOM)
-const MAX_BODY_SIZE: usize = 512 * 1024; // 512KB 足够配置/JSON; OTA 走流式 (见下方)
+/// 配置类 POST body 上限。现有表单均小于 4KB，保留 16KB 兼容余量；OTA 走独立流式路径。
+const MAX_BODY_SIZE: usize = 16 * 1024;
 /// 流式 OTA body 总量上限 (与 flash 分区大小一致: ota 分区 2.25MB)
-const MAX_OTA_SIZE: usize = 2 * 1024 * 1024;
+const MAX_OTA_SIZE: usize = 0x24_0000;
+/// HTTP 头总量和字段数量上限，避免大量短 header 消耗 PSRAM。
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_HEADER_COUNT: usize = 32;
 /// 默认用户名
 const DEFAULT_USERNAME: &str = "admin";
 /// 默认密码 (NVS 未保存时使用)
@@ -82,11 +86,13 @@ const SESSION_TTL_SECS: u64 = 86400;
 struct Session {
     token: [u8; 16],
     active: bool,
+    created_at: Option<std::time::Instant>,
 }
 
 static SESSION: Mutex<Session> = Mutex::new(Session {
     token: [0u8; 16],
     active: false,
+    created_at: None,
 });
 
 /// 生成 16 字节硬件随机 token (生产路径: ESP32 TRNG; 测试路径: 固定序列).
@@ -122,10 +128,11 @@ fn create_session_cookie() -> String {
     if let Ok(mut s) = SESSION.lock() {
         s.token = token;
         s.active = true;
+        s.created_at = Some(std::time::Instant::now());
     }
     // Set-Cookie: ESPSESSIONID=<32hex>; HttpOnly; Path=/; Max-Age=86400
     format!(
-        "ESPSESSIONID={}; HttpOnly; Path=/; Max-Age={}",
+        "ESPSESSIONID={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         std::str::from_utf8(&hex).unwrap_or(""),
         SESSION_TTL_SECS
     )
@@ -136,6 +143,7 @@ fn destroy_session() {
     if let Ok(mut s) = SESSION.lock() {
         s.token = [0u8; 16];
         s.active = false;
+        s.created_at = None;
     }
 }
 
@@ -144,8 +152,18 @@ fn validate_session_cookie(token_hex: &[u8]) -> bool {
     if token_hex.len() != 32 {
         return false;
     }
-    if let Ok(s) = SESSION.lock() {
+    if let Ok(mut s) = SESSION.lock() {
         if !s.active {
+            return false;
+        }
+        let expired = s
+            .created_at
+            .map(|created| created.elapsed().as_secs() >= SESSION_TTL_SECS)
+            .unwrap_or(true);
+        if expired {
+            s.token = [0u8; 16];
+            s.active = false;
+            s.created_at = None;
             return false;
         }
         // 对比 hex(token) == cookie_hex (常量时间)
@@ -173,10 +191,14 @@ fn hex_encode_16(src: &[u8; 16]) -> [u8; 32] {
 
 /// HTTP 服务器任务心跳 (阈值 30s, 5s accept 循环 + 余量)
 static TASK_HB: TaskHb = TaskHb::new_with_stall("http-srv", 30);
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 启动 HTTP Web 服务器 (后台线程)
 pub fn start() -> AppResult<()> {
-    std::thread::Builder::new()
+    if STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let spawn_result = std::thread::Builder::new()
         .name("http-srv".into())
         // LOOP18: http-srv 栈从 8KB 提到 12KB.
         //  - OTA 上传期间单帧 buf 已缩到 2048B (见 handle_ota_upload_stream)
@@ -186,11 +208,18 @@ pub fn start() -> AppResult<()> {
         //  - 与 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288 对齐, 移除
         //    BLE/ETH/Modbus 同时启动时的栈压力来源.
         .stack_size(crate::safety::stack_budget::HTTP)
-        .spawn(server_loop)
-        .map_err(|e| crate::error::AppError::Sys(format!("spawn http: {e}")))?;
+        .spawn(server_loop);
+    if let Err(e) = spawn_result {
+        return Err(crate::error::AppError::Sys(format!("spawn http: {e}")));
+    }
+    STARTED.store(true, Ordering::Release);
     crate::health::register_with_stack(&TASK_HB, crate::safety::stack_budget::HTTP);
     log::info!("[http] web server started on port {}", HTTP_PORT);
     Ok(())
+}
+
+pub fn is_started() -> bool {
+    STARTED.load(Ordering::Acquire)
 }
 
 /// 服务器主循环
@@ -209,9 +238,11 @@ fn server_loop() {
                 continue;
             }
         };
-        listener
-            .set_nonblocking(true)
-            .ok();
+        if let Err(e) = listener.set_nonblocking(true) {
+            log::warn!("[http] set_nonblocking failed: {}, retry in 5s", e);
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
         log::info!("[http] listening on 0.0.0.0:{}", HTTP_PORT);
 
         loop {
@@ -220,12 +251,14 @@ fn server_loop() {
 
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .ok();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(3)))
-                        .ok();
+                    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(3))) {
+                        log::warn!("[http] set read timeout failed: {}", e);
+                        continue;
+                    }
+                    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(3))) {
+                        log::warn!("[http] set write timeout failed: {}", e);
+                        continue;
+                    }
                     if let Err(e) = handle_connection(stream) {
                         log::debug!("[http] connection error: {}", e);
                     }
@@ -343,8 +376,11 @@ fn send_response(
 ) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
+        204 => "No Content",
         301 => "Moved Permanently",
+        400 => "Bad Request",
         401 => "Unauthorized",
+        413 => "Payload Too Large",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -414,21 +450,42 @@ fn json_response(response_type: &str, code: &str) -> String {
     )
 }
 
+/// 有界读取一行。`BufRead::read_line` 只有在返回后才能检查长度，攻击者若一直不发
+/// 换行会让 String 无界增长；Take 将单行实际读取量限制为 MAX_HEADER_LINE + 1。
+fn read_bounded_header_line(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut String,
+) -> std::io::Result<usize> {
+    line.clear();
+    let n = reader
+        .by_ref()
+        .take((MAX_HEADER_LINE + 1) as u64)
+        .read_line(line)?;
+    if line.len() > MAX_HEADER_LINE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "http header line too long",
+        ));
+    }
+    Ok(n)
+}
+
 /// 解析请求行 + headers (不含 body)
 ///
 /// LOOP9 安全加固:
 /// - header 行长度上限 MAX_HEADER_LINE (防恶意超长 header → OOM)
 /// 返回 (HttpRequest 框架, content_length, reader) — body 由调用方按需读取,
 /// OTA 走流式 (handle_ota_upload_stream), 其余路由走 read_exact 上限 MAX_BODY_SIZE.
-fn parse_request_headers(stream: TcpStream) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
+fn parse_request_headers(
+    stream: TcpStream,
+) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
     let mut reader = BufReader::new(stream);
     // 读请求行 (限制长度)
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    if request_line.len() > MAX_HEADER_LINE {
+    if read_bounded_header_line(&mut reader, &mut request_line)? == 0 {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "request line too long",
+            std::io::ErrorKind::UnexpectedEof,
+            "empty http request",
         ));
     }
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
@@ -438,18 +495,31 @@ fn parse_request_headers(stream: TcpStream) -> std::io::Result<(HttpRequest, usi
 
     // 读 Headers (每行限制长度)
     let mut headers = Vec::new();
+    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.len() > MAX_HEADER_LINE {
+        if read_bounded_header_line(&mut reader, &mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "http headers not terminated",
+            ));
+        }
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HEADER_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "header line too long",
+                "http headers too large",
             ));
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
+        }
+        if headers.len() >= MAX_HEADER_COUNT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many http headers",
+            ));
         }
         if let Some((k, v)) = trimmed.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
@@ -522,7 +592,9 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
             send_redirect(&mut s, "/login")?;
             return Ok(());
         }
-        return handle_ota_upload_stream(reader.into_inner(), content_length);
+        // 必须把现有 BufReader 原样传入。into_inner() 会丢弃解析 header 时已经
+        // 预读到 BufReader 内部的固件字节，导致 OTA 固件头缺失或上传永久超时。
+        return handle_ota_upload_stream(reader, content_length);
     }
 
     // 非 OTA: 缓存 body (上限校验)
@@ -561,7 +633,12 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
         "/favicon.ico" => send_response(&mut stream, 204, "text/plain", b""),
         "/" => {
             if req.is_authenticated() {
-                send_response(&mut stream, 200, "text/html; charset=utf-8", pages::INDEX_HTML.as_bytes())
+                send_response(
+                    &mut stream,
+                    200,
+                    "text/html; charset=utf-8",
+                    pages::INDEX_HTML.as_bytes(),
+                )
             } else {
                 send_redirect(&mut stream, "/login")
             }
@@ -602,7 +679,12 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
 fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
     if req.method != "POST" {
         // GET: 返回登录页面
-        return send_response(stream, 200, "text/html; charset=utf-8", pages::LOGIN_HTML.as_bytes());
+        return send_response(
+            stream,
+            200,
+            "text/html; charset=utf-8",
+            pages::LOGIN_HTML.as_bytes(),
+        );
     }
     let username = req.form_field("username").unwrap_or_default();
     let pwd = req.form_field("pwd").unwrap_or_default();
@@ -660,11 +742,17 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
     // SystemConfig 没有独立 manufacturer/model 存储槽，仍接受并保留协议兼容，
     // devicename/addressinfo 映射到原有 name 字段.
     if devicename.is_none() && addressinfo.is_none() {
-        return send_json(stream, 200, &json_response("updatesysteminfoconfig", "0x01000001"));
+        return send_json(
+            stream,
+            200,
+            &json_response("updatesysteminfoconfig", "0x01000001"),
+        );
     }
     log::info!(
         "[http] update system info: devicename={:?}, manufacturer={:?}, model={:?}",
-        devicename, manufacturer, model
+        devicename,
+        manufacturer,
+        model
     );
     let name = addressinfo.or(devicename).unwrap_or_default();
     let name_bytes: Vec<u8> = name.as_bytes().to_vec();
@@ -675,6 +763,8 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
             *b = 0;
         }
     });
+    crate::device::request_apply_config();
+    let _ = crate::nfc::backup_now();
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
 }
 
@@ -683,19 +773,39 @@ fn handle_get_network_config(stream: &mut TcpStream, _req: &HttpRequest) -> std:
     let json = match config_read_with(|cs| {
         let cfg = &cs.cfg;
         let ip = format!("{}.{}.{}.{}", cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
-        let mask = format!("{}.{}.{}.{}", cfg.mask[0], cfg.mask[1], cfg.mask[2], cfg.mask[3]);
-        let gw = format!("{}.{}.{}.{}", cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]);
-        let dns = format!("{}.{}.{}.{}", cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]);
+        let mask = format!(
+            "{}.{}.{}.{}",
+            cfg.mask[0], cfg.mask[1], cfg.mask[2], cfg.mask[3]
+        );
+        let gw = format!(
+            "{}.{}.{}.{}",
+            cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]
+        );
+        let dns = format!(
+            "{}.{}.{}.{}",
+            cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]
+        );
         let mac = format!(
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            cfg.eth_mac[0], cfg.eth_mac[1], cfg.eth_mac[2],
-            cfg.eth_mac[3], cfg.eth_mac[4], cfg.eth_mac[5],
+            cfg.eth_mac[0],
+            cfg.eth_mac[1],
+            cfg.eth_mac[2],
+            cfg.eth_mac[3],
+            cfg.eth_mac[4],
+            cfg.eth_mac[5],
         );
         let sn = cfg.sn_str();
         let name = cfg.name_str();
         format!(
             r#"{{"type":"getnetworkconfig","code":"0","msg":"","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{},"version":"F16","bloothaddress":""}}}}"#,
-            ip, mask, gw, dns, mac, escape_json(&sn), escape_json(&name), if cfg.dhcp { 1 } else { 0 },
+            ip,
+            mask,
+            gw,
+            dns,
+            mac,
+            escape_json(&sn),
+            escape_json(&name),
+            if cfg.dhcp { 1 } else { 0 },
         )
     }) {
         Some(j) => j,
@@ -724,22 +834,28 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         ])
     };
 
-    let ip = req
-        .form_field("ip")
-        .and_then(|s| parse_ip(&s))
-        .unwrap_or([0; 4]);
-    let mask = req
-        .form_field("mask")
-        .and_then(|s| parse_ip(&s))
-        .unwrap_or([0; 4]);
-    let gw = req
-        .form_field("gateway")
-        .and_then(|s| parse_ip(&s))
-        .unwrap_or([0; 4]);
-    let dns = req
-        .form_field("dns")
-        .and_then(|s| parse_ip(&s))
-        .unwrap_or([0; 4]);
+    let parsed = || -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
+        let ip = parse_ip(&req.form_field("ip")?)?;
+        let mask = parse_ip(&req.form_field("mask")?)?;
+        let gw = parse_ip(&req.form_field("gateway")?)?;
+        let dns = parse_ip(&req.form_field("dns")?)?;
+        if ip == [0; 4] || ip[0] == 0 || ip[0] >= 224 || mask == [0; 4] {
+            return None;
+        }
+        let mask_u32 = u32::from_be_bytes(mask);
+        let inverted = !mask_u32;
+        if inverted & inverted.wrapping_add(1) != 0 {
+            return None; // netmask 必须是连续的 1 后接连续的 0
+        }
+        Some((ip, mask, gw, dns))
+    };
+    let Some((ip, mask, gw, dns)) = parsed() else {
+        return send_json(
+            stream,
+            200,
+            &json_response("updatenetworkconfig", "0x01000003"),
+        );
+    };
 
     crate::bus::backends::config_modify(|cfg| {
         cfg.ip = ip;
@@ -763,13 +879,22 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
 
     log::info!(
         "[http] update network: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
-        ip[0], ip[1], ip[2], ip[3],
-        mask[0], mask[1], mask[2], mask[3],
-        gw[0], gw[1], gw[2], gw[3],
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        mask[0],
+        mask[1],
+        mask[2],
+        mask[3],
+        gw[0],
+        gw[1],
+        gw[2],
+        gw[3],
     );
 
     // 持久化 + NFC 备份
-    crate::device::request_save_device_text();
+    crate::device::request_apply_config();
     let _ = crate::nfc::backup_now();
 
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
@@ -779,8 +904,8 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
 /// 0/4=9600, 1=1200, 2=2400, 3=4800, 5=14400, 6=19200, 7=38400, 8=57600, 9=115200,
 /// 10=128000, 11=153600, 12=230400, 13=256000, 14=460800, 15=921600)
 const C_BAUD_TABLE: [u32; 16] = [
-    9600, 1200, 2400, 4800, 9600, 14400, 19200, 38400,
-    57600, 115200, 128000, 153600, 230400, 256000, 460800, 921600,
+    9600, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 153600, 230400,
+    256000, 460800, 921600,
 ];
 
 /// GET /getportconfig — 对齐 C++ handleGetPortConfig 字段格式
@@ -793,13 +918,33 @@ fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io
             if i < cfg.rs485.len() {
                 let r = &cfg.rs485[i];
                 // 把实际波特率反查成 C++ 索引（不匹配时落到 0=9600）
-                let baud_idx = C_BAUD_TABLE.iter().position(|&b| b == r.baudrate).unwrap_or(0) as u16;
+                let baud_idx = C_BAUD_TABLE
+                    .iter()
+                    .position(|&b| b == r.baudrate)
+                    .unwrap_or(0) as u16;
                 let datalen = if r.data_bits == 7 { 1 } else { 0 };
                 let checkmode = r.parity;
                 let stopbit = r.stop_bits.saturating_sub(1);
                 format!(
                     r#""datalen_{}":{},"checkmode_{}":{},"stopbit_{}":{},"baud_{}":{},"masterslaveport_{}":{},"slaveaddress_{}":{},"retrycount_{}":{},"responeinteval_{}":{},"tti_{}":{}"#,
-                    i, datalen, i, checkmode, i, stopbit, i, baud_idx, i, r.mode, i, r.slave_addr, i, r.retry_count, i, r.timeout_ms, i, r.interval_ms,
+                    i,
+                    datalen,
+                    i,
+                    checkmode,
+                    i,
+                    stopbit,
+                    i,
+                    baud_idx,
+                    i,
+                    r.mode,
+                    i,
+                    r.slave_addr,
+                    i,
+                    r.retry_count,
+                    i,
+                    r.timeout_ms,
+                    i,
+                    r.interval_ms,
                 )
             } else {
                 format!(
@@ -880,25 +1025,39 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    if index < 3 {
-        crate::bus::backends::config_modify(|cfg| {
-            if index < cfg.rs485.len() {
-                cfg.rs485[index].baudrate = baud;
-                cfg.rs485[index].mode = mode;
-                cfg.rs485[index].slave_addr = slave_addr as u8;
-                cfg.rs485[index].data_bits = databits;
-                cfg.rs485[index].stop_bits = stopbits;
-                cfg.rs485[index].parity = parity;
-                cfg.rs485[index].retry_count = retry;
-                cfg.rs485[index].timeout_ms = timeout;
-                cfg.rs485[index].interval_ms = interval;
-            }
-        });
-        log::info!(
-            "[http] update RS485 port {}: baud={} mode={} slave={} retry={} timeout={} interval={}",
-            index, baud, mode, slave_addr, retry, timeout, interval
+    if index >= 3
+        || baud_idx as usize >= C_BAUD_TABLE.len()
+        || mode > 2
+        || !(1..=247).contains(&slave_addr)
+        || parity > 2
+    {
+        return send_json(
+            stream,
+            200,
+            &json_response("updateportconfig", "0x01000003"),
         );
     }
+    crate::bus::backends::config_modify(|cfg| {
+        cfg.rs485[index].baudrate = baud;
+        cfg.rs485[index].mode = mode;
+        cfg.rs485[index].slave_addr = slave_addr as u8;
+        cfg.rs485[index].data_bits = databits;
+        cfg.rs485[index].stop_bits = stopbits;
+        cfg.rs485[index].parity = parity;
+        cfg.rs485[index].retry_count = retry;
+        cfg.rs485[index].timeout_ms = timeout;
+        cfg.rs485[index].interval_ms = interval;
+    });
+    log::info!(
+        "[http] update RS485 port {}: baud={} mode={} slave={} retry={} timeout={} interval={}",
+        index,
+        baud,
+        mode,
+        slave_addr,
+        retry,
+        timeout,
+        interval
+    );
 
     // 配置类写入应通过 SystemConfig 持久化 (走 ApplyConfig), 而非 device_text (那只是文本快照).
     crate::device::request_apply_config();
@@ -916,26 +1075,53 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
     };
     let eth = {
         #[cfg(feature = "ethernet-w5500")]
-        { crate::ethernet::w5500::link_up() }
+        {
+            crate::ethernet::w5500::link_up()
+        }
         #[cfg(not(feature = "ethernet-w5500"))]
-        { false }
+        {
+            false
+        }
     };
     let ble = {
         #[cfg(feature = "ble-at")]
-        { crate::ble_at::has_client() }
+        {
+            crate::ble_at::has_client()
+        }
         #[cfg(not(feature = "ble-at"))]
-        { false }
+        {
+            false
+        }
     };
     let udp = crate::udp_multicast::is_receiving();
     let json = format!(
         r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{}}}}}"#,
-        IO.sys.get_uptime(), eth, ble,
-        { #[cfg(feature = "ble-at")] { crate::ble_at::notify_enabled() } #[cfg(not(feature = "ble-at"))] { false } },
-        udp, crate::udp_multicast::received_len(),
-        crate::modbus::shared::RS485_STATS.master_comerr(), crate::modbus::shared::RS485_STATS.master_apperr(),
-        crate::modbus::shared::RS485_STATS.slave_comerr(), crate::modbus::shared::RS485_STATS.slave_apperr(),
-        mode, stats.recoverable, stats.degradable, stats.severe,
-        unsafe { esp_idf_sys::esp_get_free_heap_size() }, IO.sys.get_reset_count(), IO.sys.get_reset_reason(),
+        IO.sys.get_uptime(),
+        eth,
+        ble,
+        {
+            #[cfg(feature = "ble-at")]
+            {
+                crate::ble_at::notify_enabled()
+            }
+            #[cfg(not(feature = "ble-at"))]
+            {
+                false
+            }
+        },
+        udp,
+        crate::udp_multicast::received_len(),
+        crate::modbus::shared::RS485_STATS.master_comerr(),
+        crate::modbus::shared::RS485_STATS.master_apperr(),
+        crate::modbus::shared::RS485_STATS.slave_comerr(),
+        crate::modbus::shared::RS485_STATS.slave_apperr(),
+        mode,
+        stats.recoverable,
+        stats.degradable,
+        stats.severe,
+        unsafe { esp_idf_sys::esp_get_free_heap_size() },
+        IO.sys.get_reset_count(),
+        IO.sys.get_reset_reason(),
     );
     send_json(stream, 200, &json)
 }
@@ -980,8 +1166,10 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         let val = crate::bus::backends::read_input_reg(regs::INREG_AI_BASE + i).unwrap_or(0);
         ai_data.push_str(&format!("\"ai_addr_{}\":{}", i, val));
         // C++ 在 getiodata 同时返回 ai_data_max / ai_data_min (校准值), 来自 holding_buf 2288+/2280+
-        let max_v = crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MAX_BASE + i).unwrap_or(0);
-        let min_v = crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MIN_BASE + i).unwrap_or(0);
+        let max_v =
+            crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MAX_BASE + i).unwrap_or(0);
+        let min_v =
+            crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MIN_BASE + i).unwrap_or(0);
         ai_max.push_str(&format!("\"ai_addr_max_{}\":{}", i, max_v));
         ai_min.push_str(&format!("\"ai_addr_min_{}\":{}", i, min_v));
     }
@@ -1027,17 +1215,24 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
 fn handle_get_ble_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
     let json = match config_read_with(|cs| {
         let cfg = &cs.cfg;
-        let name_bytes: Vec<u8> = cfg.ble_name.iter()
+        let name_bytes: Vec<u8> = cfg
+            .ble_name
+            .iter()
             .take_while(|&&b| b != 0)
-            .copied().collect();
+            .copied()
+            .collect();
         let name = String::from_utf8_lossy(&name_bytes);
         format!(
             r#"{{"type":"getbleconfig","code":"0","data":{{"blename":"{}","mac":"{}"}}}}"#,
             escape_json(&name),
             escape_json(&format!(
                 "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                cfg.ble_mac[0], cfg.ble_mac[1], cfg.ble_mac[2],
-                cfg.ble_mac[3], cfg.ble_mac[4], cfg.ble_mac[5]
+                cfg.ble_mac[0],
+                cfg.ble_mac[1],
+                cfg.ble_mac[2],
+                cfg.ble_mac[3],
+                cfg.ble_mac[4],
+                cfg.ble_mac[5]
             )),
         )
     }) {
@@ -1058,14 +1253,16 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
         return send_json(stream, 200, &json_response("updatebleconfig", "0x01000004"));
     }
     crate::bus::backends::config_modify(|cfg| {
-        for b in &mut cfg.ble_name { *b = 0; }
+        for b in &mut cfg.ble_name {
+            *b = 0;
+        }
         let take = name_bytes.len().min(8);
         cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
     });
     // 立即触发 GAP 名更新 (无需重启)
     crate::ble_at::notify_ble_name_changed();
     log::info!("[http] update BLE name: {:?}", name);
-    crate::device::request_save_device_text();
+    crate::device::request_apply_config();
     send_json(stream, 200, &json_response("updatebleconfig", "0"))
 }
 
@@ -1078,9 +1275,19 @@ fn handle_get_sensor_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::
         let cfg_base = regs::HOLD_CFG_BASE as usize;
         let mut sensor_data = String::new();
         for i in 0..ai_count {
-            if i > 0 { sensor_data.push(','); }
-            let min_v = s.holding_buf.get(base_min - cfg_base + i).copied().unwrap_or(605);
-            let max_v = s.holding_buf.get(base_max - cfg_base + i).copied().unwrap_or(3016);
+            if i > 0 {
+                sensor_data.push(',');
+            }
+            let min_v = s
+                .holding_buf
+                .get(base_min - cfg_base + i)
+                .copied()
+                .unwrap_or(605);
+            let max_v = s
+                .holding_buf
+                .get(base_max - cfg_base + i)
+                .copied()
+                .unwrap_or(3016);
             sensor_data.push_str(&format!(
                 r#""ai_{}":{{"min":{},"max":{}}}"#,
                 i, min_v, max_v
@@ -1102,12 +1309,25 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
     if req.method != "POST" {
         return send_json(stream, 405, &json_response("updatesensorconfig", "405"));
     }
-    let ch: usize = req.form_field("ch").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let min_v: u16 = req.form_field("min").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_v: u16 = req.form_field("max").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ch: usize = req
+        .form_field("ch")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let min_v: u16 = req
+        .form_field("min")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let max_v: u16 = req
+        .form_field("max")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let ai_count = crate::config::hw_version::AI_COUNT as usize;
     if ch >= ai_count {
-        return send_json(stream, 200, &json_response("updatesensorconfig", "0x01000003"));
+        return send_json(
+            stream,
+            200,
+            &json_response("updatesensorconfig", "0x01000003"),
+        );
     }
     let base_min = regs::HOLD_SENSOR_MIN_BASE as usize;
     let base_max = regs::HOLD_SENSOR_MAX_BASE as usize;
@@ -1123,7 +1343,7 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
         }
         snap.proto.dirty = true;
     });
-    crate::device::request_save_device_text();
+    crate::device::request_persist_holding();
     log::info!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);
     send_json(stream, 200, &json_response("updatesensorconfig", "0"))
 }
@@ -1176,9 +1396,12 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
 /// 边读边写入 OTA 分区, 内存占用恒定 ~4KB。
 ///
 /// 同时放宽 TCP read/write 超时 (固件上传耗时较长, 3s 太短)。
-fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io::Result<()> {
+fn handle_ota_upload_stream(
+    mut reader: BufReader<TcpStream>,
+    content_length: usize,
+) -> std::io::Result<()> {
     if content_length == 0 {
-        return send_json(&mut { stream }, 400, &json_response("updateota", "400"));
+        return send_json(reader.get_mut(), 400, &json_response("updateota", "400"));
     }
     if content_length > MAX_OTA_SIZE {
         log::warn!(
@@ -1186,12 +1409,19 @@ fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io
             content_length,
             MAX_OTA_SIZE
         );
-        return send_json(&mut { stream }, 413, &json_response("updateota", "413"));
+        return send_json(reader.get_mut(), 413, &json_response("updateota", "413"));
     }
 
     // 放宽超时: 固件上传是慢操作, 3s 全局超时易误触发
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(60))).ok();
+    // socket 单次阻塞必须短于 10s Task WDT；总的“无进度”窗口仍允许 60s。
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .ok();
+    reader
+        .get_ref()
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .ok();
 
     let total = content_length as u32;
     log::info!("[http] OTA upload (streaming): {} bytes", total);
@@ -1203,26 +1433,51 @@ fn handle_ota_upload_stream(stream: TcpStream, content_length: usize) -> std::io
             log::error!("[http] OTA begin failed: {}", e);
             // LOOP9: begin 失败时也尝试 abort (abort 内部对空会话是幂等 no-op), 防状态泄漏
             let _ = crate::ota::abort();
-            return send_json(&mut { stream }, 500, &json_response("updateota", "500"));
+            return send_json(reader.get_mut(), 500, &json_response("updateota", "500"));
         }
     }
 
-    let mut reader = BufReader::new(stream);
     // LOOP18: OTA 上传单帧最大 4096B 过大, 在 8KB http-srv 栈上占用 50% 预算.
     // 缩小到 2048B (仍是合理块大小, OTA::write_chunk 处理任意长度), 给 stack
     // 溢出风险预留余量. BufReader 内部仍有 8KB heap 缓冲, 不影响吞吐.
     let mut buf = vec![0u8; 2048].into_boxed_slice();
     let mut received = 0usize;
+    let mut last_progress = std::time::Instant::now();
     while received < content_length {
         let want = (content_length - received).min(buf.len());
-        if let Err(e) = reader.read_exact(&mut buf[..want]) {
-            log::error!("[http] OTA read failed at {}: {}", received, e);
-            let _ = crate::ota::abort();
-            // 取回 stream 发送错误响应
-            let mut s = reader.into_inner();
-            return send_json(&mut s, 500, &json_response("updateota", "500"));
-        }
-        match crate::ota::write_chunk(&buf[..want]) {
+        let count = match reader.read(&mut buf[..want]) {
+            Ok(0) => {
+                log::error!("[http] OTA peer closed at {}/{}", received, content_length);
+                let _ = crate::ota::abort();
+                let mut s = reader.into_inner();
+                return send_json(&mut s, 400, &json_response("updateota", "400"));
+            }
+            Ok(n) => {
+                last_progress = std::time::Instant::now();
+                n
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                TASK_HB.tick();
+                health::feed_wdt();
+                if last_progress.elapsed() < Duration::from_secs(60) {
+                    continue;
+                }
+                log::error!("[http] OTA idle timeout at {}/{}", received, content_length);
+                let _ = crate::ota::abort();
+                let mut s = reader.into_inner();
+                return send_json(&mut s, 500, &json_response("updateota", "500"));
+            }
+            Err(e) => {
+                log::error!("[http] OTA read failed at {}: {}", received, e);
+                let _ = crate::ota::abort();
+                let mut s = reader.into_inner();
+                return send_json(&mut s, 500, &json_response("updateota", "500"));
+            }
+        };
+        match crate::ota::write_chunk(&buf[..count]) {
             Ok(n) => received += n,
             Err(e) => {
                 log::error!("[http] OTA write failed at {}: {}", received, e);
@@ -1304,7 +1559,7 @@ mod tests {
     #[test]
     fn test_json_response_format() {
         let r = json_response("login", "0");
-        assert_eq!(r, r#"{"type":"login","code":"0","data":{}}"#);
+        assert_eq!(r, r#"{"type":"login","code":"0","msg":"","data":{}}"#);
     }
 
     #[test]
@@ -1328,8 +1583,10 @@ mod tests {
     /// hex 编码 16 字节 → 32 字符, 与已知向量对照
     #[test]
     fn test_hex_encode_16() {
-        let token = [0x01, 0x02, 0x0a, 0x0f, 0x10, 0xff, 0xab, 0xcd,
-                     0x00, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33];
+        let token = [
+            0x01, 0x02, 0x0a, 0x0f, 0x10, 0xff, 0xab, 0xcd, 0x00, 0x99, 0x88, 0x77, 0x66, 0x55,
+            0x44, 0x33,
+        ];
         let hex = hex_encode_16(&token);
         let s = std::str::from_utf8(&hex).unwrap();
         assert_eq!(s, "01020a0f10ffabcd0099887766554433");
@@ -1340,12 +1597,15 @@ mod tests {
     fn test_session_auth_flow() {
         // 初始: 无活跃会话
         destroy_session();
-        assert!(!validate_session_cookie(b"00000000000000000000000000000000"));
+        assert!(!validate_session_cookie(
+            b"00000000000000000000000000000000"
+        ));
 
         // 登录: 创建会话, Cookie 含正确 token hex
         let cookie = create_session_cookie();
         assert!(cookie.starts_with("ESPSESSIONID="));
         assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=86400"));
         // 提取 token hex (ESPSESSIONID= 后到第一个 ; 之前)
         let token_hex = cookie
@@ -1396,5 +1656,21 @@ mod tests {
         let wrong = b"deadbeefdeadbeefdeadbeefdeadbeef";
         assert_eq!(wrong.len(), 32);
         assert!(!validate_session_cookie(wrong));
+    }
+
+    #[test]
+    fn test_session_server_side_expiry() {
+        destroy_session();
+        let cookie = create_session_cookie();
+        let token = cookie
+            .strip_prefix("ESPSESSIONID=")
+            .and_then(|value| value.split(';').next())
+            .expect("session token");
+        if let Ok(mut session) = SESSION.lock() {
+            session.created_at = Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(SESSION_TTL_SECS + 1),
+            );
+        }
+        assert!(!validate_session_cookie(token.as_bytes()));
     }
 }

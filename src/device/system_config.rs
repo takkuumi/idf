@@ -4,7 +4,7 @@
 //! Modbus 寄存器映射见 `config::regs::CFG_*` (0x0200-0x025F)。
 //!
 //! 持久化:
-//! - 整个 SystemConfig 序列化为 ~110 字节 blob, 单 key 存 NVS
+//! - 整个 SystemConfig 序列化为 152 字节固定布局 blob，单 key 存 NVS
 //! - 修改后写 CFG_APPLY=0xB5B5 触发持久化 + 运行时应用
 //! - 写 CFG_RESET=0xD5D5 恢复默认
 
@@ -25,8 +25,10 @@ const NVS_MAGIC: u32 = 0x4757_4346; // "GWCF"
 /// eth_mac(6) + dhcp(1) + ip(4) + mask(4) + gw(4) + dns(4) = 23
 /// ble_mac(6) + ble_name(8) = 14
 /// rs485[0](15) + rs485[1](15) + rs485[2](15) = 45  (对齐参考固件 3 端口)
-/// 总 = 136, 取 144 留余量
-const CFG_BLOB_SIZE: usize = 144;
+/// tcp_ports(8)；总使用 145 字节，取 152 留余量。
+const CFG_BLOB_SIZE: usize = 152;
+/// v2.2.1 及更早版本的 NVS blob 大小；升级时必须保留原配置并为新增字段补默认值。
+const CFG_BLOB_LEGACY_SIZE: usize = 144;
 
 // NVS 偏移
 const OFF_SN: usize = 0;
@@ -45,6 +47,7 @@ const OFF_BLE_NAME: usize = 83;
 const OFF_RS485_0: usize = 92;
 const OFF_RS485_1: usize = 107; // LOOP5 修复: 原来是 101, 与 OFF_RS485_0+9 (retry_count) 重叠
 const OFF_RS485_2: usize = 122; // RS485 第 3 端口 (对齐参考固件 3 端口)
+const OFF_TCP_PORTS: usize = 137;
 
 // RS485 配置结构: baudrate(4) + data_bits(1) + stop_bits(1) + parity(1) +
 //                 slave_addr(1) + mode(1) + retry_count(2) + timeout_ms(2) + interval_ms(2) = 15 bytes
@@ -59,12 +62,12 @@ pub struct Rs485Config {
     pub baudrate: u32,
     pub data_bits: u8,
     pub stop_bits: u8,
-    pub parity: u8,     // 0=None 1=Odd 2=Even
-    pub slave_addr: u8, // 0=主站
-    pub mode: u8,       // 0=Master 1=Slave 2=Gateway
-    pub retry_count: u16,    // LOOP5: 之前漏存, 现加上 (Word3 of RS485 config)
-    pub timeout_ms: u16,     // LOOP5: Word4 of RS485 config
-    pub interval_ms: u16,    // LOOP5: Word5 of RS485 config
+    pub parity: u8,       // 0=None 1=Odd 2=Even
+    pub slave_addr: u8,   // 0=主站
+    pub mode: u8,         // 0=Master 1=Slave 2=Gateway
+    pub retry_count: u16, // LOOP5: 之前漏存, 现加上 (Word3 of RS485 config)
+    pub timeout_ms: u16,  // LOOP5: Word4 of RS485 config
+    pub interval_ms: u16, // LOOP5: Word5 of RS485 config
 }
 
 impl Default for Rs485Config {
@@ -111,6 +114,8 @@ pub struct SystemConfig {
     /// - [1] = RS485-2 (UART2)
     /// - [2] = RS485-3 (UART0, 与 USB 串口复用 — 仅从站监听模式)
     pub rs485: [Rs485Config; 3],
+    /// 四路 Modbus TCP 监听端口，对应 HOLD_TCP_COM_BASE..+3。
+    pub tcp_ports: [u16; 4],
 }
 
 /// 写入结果
@@ -119,7 +124,7 @@ pub struct SystemConfig {
 /// 区别仅在调用方 (`bus::backends::write_hold_reg`) 应触发的副作用:
 ///
 /// - `Ok`       : 仅写入 CONFIG RCU, **不** 触发 NVS 持久化. 用于只读/诊断类寄存器
-///                (HW_VER / FW_VER / CFG_VER / UNKNOWN / TCP_COM 等).
+///                (FW_VER / CFG_VER / UNKNOWN 等).
 /// - `Persist`  : 写入 CONFIG RCU **且** 触发 NVS 持久化 (cfg_version 不变). 用于
 ///                用户可编辑但不需要重启的配置 (SN / PLACE / BLE_NAME / BLE_MESH_EN /
 ///                RS485 配置等). Android 1.0.78 直接 Modbus FC=10 写入, 不调 APPLY,
@@ -198,6 +203,7 @@ impl SystemConfig {
                     interval_ms: 20,
                 },
             ],
+            tcp_ports: regs::TCP_PORTS_DEFAULT,
         }
     }
 
@@ -291,11 +297,15 @@ impl SystemConfig {
             b[off + 11..off + 13].copy_from_slice(&r.timeout_ms.to_le_bytes());
             b[off + 13..off + 15].copy_from_slice(&r.interval_ms.to_le_bytes());
         }
+        for (i, port) in self.tcp_ports.iter().enumerate() {
+            let off = OFF_TCP_PORTS + i * 2;
+            b[off..off + 2].copy_from_slice(&port.to_le_bytes());
+        }
         b
     }
 
     fn decode(b: &[u8]) -> Self {
-        if b.len() < CFG_BLOB_SIZE {
+        if b.len() < CFG_BLOB_LEGACY_SIZE {
             return Self::defaults();
         }
         let mut s = Self::defaults();
@@ -332,6 +342,17 @@ impl SystemConfig {
                 interval_ms: u16::from_le_bytes([b[off + 13], b[off + 14]]),
             };
         }
+        if b.len() >= OFF_TCP_PORTS + 8 {
+            for i in 0..4 {
+                let off = OFF_TCP_PORTS + i * 2;
+                let port = u16::from_le_bytes([b[off], b[off + 1]]);
+                s.tcp_ports[i] = if port == 0 {
+                    regs::TCP_PORTS_DEFAULT[i]
+                } else {
+                    port
+                };
+            }
+        }
         s
     }
 
@@ -364,8 +385,12 @@ impl SystemConfig {
             }
         };
 
-        if data.len() < CFG_BLOB_SIZE {
-            log::warn!("[cfg] nvs blob truncated: {}/{}", data.len(), CFG_BLOB_SIZE);
+        if data.len() < CFG_BLOB_LEGACY_SIZE {
+            log::warn!(
+                "[cfg] nvs blob truncated: {}/{}",
+                data.len(),
+                CFG_BLOB_LEGACY_SIZE
+            );
             return Ok(Self::defaults());
         }
 
@@ -436,7 +461,9 @@ impl SystemConfig {
         // BLE 名称 (0x08E2, 4 regs = 8 bytes) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51)
         // 必须放在 BLE MAC 之前检查, 虽然两者不重叠, 但 0x08E2 是 metuory 蓝牙 ID 显示字段,
         // 误写会污染 BLE MAC → BLE 重启时显示异常
-        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
+        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT)
+            .contains(&addr)
+        {
             let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             return Some(u16::from_be_bytes([
                 self.ble_name[idx],
@@ -448,7 +475,11 @@ impl SystemConfig {
         if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
             let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
             let b0 = if idx < 6 { self.ble_mac[idx] } else { 0 };
-            let b1 = if idx + 1 < 6 { self.ble_mac[idx + 1] } else { 0 };
+            let b1 = if idx + 1 < 6 {
+                self.ble_mac[idx + 1]
+            } else {
+                0
+            };
             return Some(u16::from_be_bytes([b0, b1]));
         }
         // RS485 — 5端口×5字, Word1=组合格式匹配参考固件
@@ -503,12 +534,13 @@ impl SystemConfig {
             .contains(&addr)
         {
             let idx = (addr - regs::HOLD_TCP_COM_BASE) as usize;
-            return Some(regs::TCP_PORTS_DEFAULT.get(idx).copied().unwrap_or(0));
+            return self.tcp_ports.get(idx).copied();
         }
         None
     }
 
-    pub fn write_reg(&mut self, addr: u16, value: u16) -> WriteResult {        // SN — 用户可编辑配置, 写入后立即持久化到 NVS.
+    pub fn write_reg(&mut self, addr: u16, value: u16) -> WriteResult {
+        // SN — 用户可编辑配置, 写入后立即持久化到 NVS.
         // Android 1.0.78 WRITE_SN (0x21) 不调 APPLY, 必须 Persist 才能落盘.
         if (regs::HOLD_SN_BASE..regs::HOLD_SN_BASE + regs::HOLD_SN_COUNT).contains(&addr) {
             let idx = (addr - regs::HOLD_SN_BASE) as usize * 2;
@@ -576,12 +608,20 @@ impl SystemConfig {
         // BLE 名称 (0x08E2, 4 regs) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51) 必须 Persist
         // 顺序必须在 BLE MAC 之前: metuory 写入 0x08E2 期待更新 ble_name (蓝牙 ID 显示)
         // 若先匹配 BLE_MAC (旧地址), ble_name 永远不会被写入, 重启后丢失
-        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT).contains(&addr) {
+        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT)
+            .contains(&addr)
+        {
             let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
             self.ble_name[idx] = hi;
             self.ble_name[idx + 1] = lo;
-            log::warn!("[write_reg] BLE_NAME write addr=0x{:04X} idx={} hi={:02X} lo={:02X}", addr, idx, hi, lo);
+            log::warn!(
+                "[write_reg] BLE_NAME write addr=0x{:04X} idx={} hi={:02X} lo={:02X}",
+                addr,
+                idx,
+                hi,
+                lo
+            );
             crate::ble_at::notify_ble_name_changed();
             return WriteResult::Persist;
         }
@@ -589,8 +629,12 @@ impl SystemConfig {
         if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
             let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
             let [hi, lo] = value.to_be_bytes();
-            if idx < 6 { self.ble_mac[idx] = hi; }
-            if idx + 1 < 6 { self.ble_mac[idx + 1] = lo; }
+            if idx < 6 {
+                self.ble_mac[idx] = hi;
+            }
+            if idx + 1 < 6 {
+                self.ble_mac[idx + 1] = lo;
+            }
             return WriteResult::Apply;
         }
         // RS485 — Word1=组合格式匹配参考固件
@@ -617,7 +661,7 @@ impl SystemConfig {
                         r.mode = (value & 0xFF) as u8;
                     }
                     1 => r.slave_addr = value as u8,
-                    2 => r.retry_count = value,  // LOOP5 修复: 之前 2..=4 => {} 漏存 retry/timeout/interval
+                    2 => r.retry_count = value, // LOOP5 修复: 之前 2..=4 => {} 漏存 retry/timeout/interval
                     3 => r.timeout_ms = value,
                     4 => r.interval_ms = value,
                     _ => {}
@@ -636,6 +680,11 @@ impl SystemConfig {
         if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
             .contains(&addr)
         {
+            if value == 0 {
+                return WriteResult::NotFound;
+            }
+            let idx = (addr - regs::HOLD_TCP_COM_BASE) as usize;
+            self.tcp_ports[idx] = value;
             return WriteResult::Persist;
         }
         WriteResult::NotFound
@@ -647,20 +696,32 @@ impl SystemConfig {
 
     pub fn sn_str(&self) -> String {
         // LOOP9: 改回 ASCII 字节解码 (LOOP7 错误引入 UTF-16 BE)
-        let end = self.sn.iter().position(|&b| b == 0).unwrap_or(self.sn.len());
+        let end = self
+            .sn
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.sn.len());
         String::from_utf8_lossy(&self.sn[..end]).into_owned()
     }
 
     pub fn name_str(&self) -> String {
         // LOOP9: 改回 ASCII 字节解码
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.name.len());
         String::from_utf8_lossy(&self.name[..end]).into_owned()
     }
 
     pub fn ble_name_str(&self) -> String {
         // LOOP9: 改回 ASCII 字节解码, 与 metuory 1.0.78 parseBluetoothIDItem 一致
         // (BLE 名字最多 8 字符, ASCII 编码)
-        let end = self.ble_name.iter().position(|&b| b == 0).unwrap_or(self.ble_name.len());
+        let end = self
+            .ble_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.ble_name.len());
         String::from_utf8_lossy(&self.ble_name[..end]).into_owned()
     }
 
@@ -811,9 +872,18 @@ mod tests {
 
     #[test]
     fn test_parse_mac() {
-        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF"), Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
-        assert_eq!(parse_mac("00:08:DC:11:22:33"), Some([0x00, 0x08, 0xDC, 0x11, 0x22, 0x33]));
-        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(
+            parse_mac("AA:BB:CC:DD:EE:FF"),
+            Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+        );
+        assert_eq!(
+            parse_mac("00:08:DC:11:22:33"),
+            Some([0x00, 0x08, 0xDC, 0x11, 0x22, 0x33])
+        );
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
         assert_eq!(parse_mac("invalid"), None);
         assert_eq!(parse_mac("AA:BB:CC"), None);
     }
@@ -883,10 +953,15 @@ mod tests {
         let cfg = SystemConfig::defaults();
         // 默认 BLE 名字 = "Mesh", 必须以 'M'/'m' 开头 (手持机过滤要求)
         let ble = cfg.ble_name_str();
-        assert_eq!(ble, "Mesh", "default ble_name must decode to 'Mesh' (got '{ble}')");
+        assert_eq!(
+            ble, "Mesh",
+            "default ble_name must decode to 'Mesh' (got '{ble}')"
+        );
         let first = ble.chars().next().unwrap();
-        assert!(first == 'M' || first == 'm',
-            "BLE name must start with m/M for handheld visibility");
+        assert!(
+            first == 'M' || first == 'm',
+            "BLE name must start with m/M for handheld visibility"
+        );
         // 默认 SN = "ESP32-001"
         assert_eq!(cfg.sn_str(), "ESP32-001");
         // 默认设备名 = "GW-ESP32"
@@ -899,7 +974,7 @@ mod tests {
     //
     // 关键约定:
     // - 用户可编辑配置 (SN/PLACE/BLE_NAME/RS485/BLE_MESH_EN) → Persist
-    // - 诊断/只读字段 (HW_VER/FW_VER/UNKNOW/TCP_COM) → Ok (不持久化)
+    // - 诊断/只读字段 (FW_VER/UNKNOW) → Ok (不持久化)
     // - 网络/BLE MAC → Apply (需重启或重新初始化)
     // - CFG_APPLY (0xB5B5) → Apply
     // - CFG_RESET_DEFAULT (0xD5D5) → Reset
@@ -954,12 +1029,13 @@ mod tests {
         assert_eq!(result, WriteResult::Ok);
     }
 
-    /// TCP_COM 端口 (2243-2246) 写入必须返回 Ok (诊断, 实际配置由 net.rs 管).
+    /// TCP_COM 端口 (2243-2246) 写入必须持久化并可读回。
     #[test]
     fn test_write_reg_tcp_com_ok() {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(regs::HOLD_TCP_COM_BASE, 502);
-        assert_eq!(result, WriteResult::Ok);
+        assert_eq!(result, WriteResult::Persist);
+        assert_eq!(cfg.read_reg(regs::HOLD_TCP_COM_BASE), Some(502));
     }
 
     /// IP 写入必须返回 Apply (网络需重新初始化).
@@ -996,7 +1072,11 @@ mod tests {
         let result1 = cfg.write_reg(0x08E3, 0x4344);
         let result2 = cfg.write_reg(0x08E4, 0x4500); // 'E' + padding
         let result3 = cfg.write_reg(0x08E5, 0x0000);
-        assert_eq!(result0, WriteResult::Persist, "metuory BLE ID write must trigger NVS persist");
+        assert_eq!(
+            result0,
+            WriteResult::Persist,
+            "metuory BLE ID write must trigger NVS persist"
+        );
         assert_eq!(result1, WriteResult::Persist);
         assert_eq!(result2, WriteResult::Persist);
         assert_eq!(result3, WriteResult::Persist);
@@ -1004,7 +1084,10 @@ mod tests {
         assert_eq!(&cfg.ble_name[0..2], b"AB", "ble_name[0..2] should be AB");
         assert_eq!(&cfg.ble_name[2..4], b"CD", "ble_name[2..4] should be CD");
         // 关键: ble_mac 必须保持不变
-        assert_eq!(cfg.ble_mac, original_mac, "ble_mac must NOT be touched by metuory BLE ID write");
+        assert_eq!(
+            cfg.ble_mac, original_mac,
+            "ble_mac must NOT be touched by metuory BLE ID write"
+        );
     }
 
     /// 0x0FA4 (用户区 BLE MAC) 仍可写 (兼容遗留 master)
@@ -1012,7 +1095,11 @@ mod tests {
     fn test_ble_mac_at_user_area_still_writable() {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(0x0FA4, 0xAABB);
-        assert_eq!(result, WriteResult::Apply, "BLE MAC write still works at 0x0FA4 (legacy)");
+        assert_eq!(
+            result,
+            WriteResult::Apply,
+            "BLE MAC write still works at 0x0FA4 (legacy)"
+        );
         assert_eq!(cfg.ble_mac[0], 0xAA);
         assert_eq!(cfg.ble_mac[1], 0xBB);
     }
@@ -1026,8 +1113,14 @@ mod tests {
         let v0 = cfg.read_reg(0x08E2).expect("must be Some");
         let v1 = cfg.read_reg(0x08E3).expect("must be Some");
         // ble_name[0..2] = "Me" = 0x4D 0x65 → BE u16 = 0x4D65
-        assert_eq!(v0, 0x4D65, "0x08E2 read should return ble_name[0..2] BE = Me");
-        assert_eq!(v1, 0x7368, "0x08E3 read should return ble_name[2..4] BE = sh");
+        assert_eq!(
+            v0, 0x4D65,
+            "0x08E2 read should return ble_name[0..2] BE = Me"
+        );
+        assert_eq!(
+            v1, 0x7368,
+            "0x08E3 read should return ble_name[2..4] BE = sh"
+        );
     }
 
     /// RS485 (0x08A6..0x08BD, 5 端口 × 5 字) Persist 路径完整覆盖
@@ -1042,9 +1135,13 @@ mod tests {
         let r1 = cfg.write_reg(0x08A7, 5); // slave=5
         let r2 = cfg.write_reg(0x08A8, 3); // retry=3
         let r3 = cfg.write_reg(0x08A9, 500); // timeout=500ms
-        let r4 = cfg.write_reg(0x08AA, 50);  // interval=50ms
+        let r4 = cfg.write_reg(0x08AA, 50); // interval=50ms
         for r in [r0, r1, r2, r3, r4] {
-            assert_eq!(r, WriteResult::Persist, "RS485 reg write must Persist (not Ok/Apply)");
+            assert_eq!(
+                r,
+                WriteResult::Persist,
+                "RS485 reg write must Persist (not Ok/Apply)"
+            );
         }
         assert_eq!(cfg.rs485[0].baudrate, 115200);
         assert_eq!(cfg.rs485[0].parity, 2);
@@ -1085,7 +1182,7 @@ mod tests {
             stop_bits: 2,
             parity: 1, // Odd
             slave_addr: 12,
-            mode: 2,   // Gateway
+            mode: 2, // Gateway
             retry_count: 3,
             timeout_ms: 500,
             interval_ms: 50,
@@ -1096,6 +1193,7 @@ mod tests {
         cfg.eth_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
         // 修改 IP
         cfg.ip = [10, 20, 30, 40];
+        cfg.tcp_ports = [1502, 1503, 1504, 1505];
 
         // encode → decode
         let buf = cfg.encode();
@@ -1111,6 +1209,7 @@ mod tests {
         assert_eq!(&decoded.ble_name[..8], b"Test1234");
         assert_eq!(decoded.eth_mac, [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
         assert_eq!(decoded.ip, [10, 20, 30, 40]);
+        assert_eq!(decoded.tcp_ports, [1502, 1503, 1504, 1505]);
         // BLE MAC 默认 (HW) 在 encode/decode 后应保持不变
         assert_eq!(decoded.ble_mac, cfg.ble_mac);
     }
@@ -1122,60 +1221,108 @@ mod tests {
     /// MCA SLAVE_REG_SN1 = 2196 = 0x894
     #[test]
     fn test_layout_sn_matches_mca() {
-        assert_eq!(regs::HOLD_SN_BASE, 0x0894, "SN base must be 0x0894 (MCA 2196)");
-        assert_eq!(regs::HOLD_SN_COUNT, 9, "SN count must be 9 (MCA 18 chars UTF-16)");
+        assert_eq!(
+            regs::HOLD_SN_BASE,
+            0x0894,
+            "SN base must be 0x0894 (MCA 2196)"
+        );
+        assert_eq!(
+            regs::HOLD_SN_COUNT,
+            9,
+            "SN count must be 9 (MCA 18 chars UTF-16)"
+        );
     }
 
     /// MCA SLAVE_REG_PLACE1 = 2205 = 0x89D
     #[test]
     fn test_layout_place_matches_mca() {
-        assert_eq!(regs::HOLD_PLACE_BASE, 0x089D, "PLACE base must be 0x089D (MCA 2205)");
-        assert_eq!(regs::HOLD_PLACE_COUNT, 8, "PLACE count must be 8 (MCA 16 chars UTF-16)");
+        assert_eq!(
+            regs::HOLD_PLACE_BASE,
+            0x089D,
+            "PLACE base must be 0x089D (MCA 2205)"
+        );
+        assert_eq!(
+            regs::HOLD_PLACE_COUNT,
+            8,
+            "PLACE count must be 8 (MCA 16 chars UTF-16)"
+        );
     }
 
     /// MCA SLAVE_REG_HW_VER = 2213 = 0x8A5
     #[test]
     fn test_layout_hw_ver_matches_mca() {
-        assert_eq!(regs::HOLD_HW_VER, 0x08A5, "HW_VER must be 0x08A5 (MCA 2213)");
+        assert_eq!(
+            regs::HOLD_HW_VER,
+            0x08A5,
+            "HW_VER must be 0x08A5 (MCA 2213)"
+        );
     }
 
     /// MCA SLAVE_REG_485_1_1 = 2214 = 0x8A6, stride=5
     #[test]
     fn test_layout_rs485_matches_mca() {
-        assert_eq!(regs::HOLD_RS485_BASE, 0x08A6, "RS485 base must be 0x08A6 (MCA 2214)");
+        assert_eq!(
+            regs::HOLD_RS485_BASE,
+            0x08A6,
+            "RS485 base must be 0x08A6 (MCA 2214)"
+        );
         assert_eq!(regs::HOLD_RS485_STRIDE, 5, "RS485 stride must be 5");
     }
 
     /// MCA SLAVE_REG_PIP1 = 2247 = 0x8C7
     #[test]
     fn test_layout_ip_matches_mca() {
-        assert_eq!(regs::HOLD_IP_BASE, 0x08C7, "IP base must be 0x08C7 (MCA 2247)");
+        assert_eq!(
+            regs::HOLD_IP_BASE,
+            0x08C7,
+            "IP base must be 0x08C7 (MCA 2247)"
+        );
     }
 
     /// MCA SLAVE_REG_PNTEMASK1 = 2251 = 0x8CB
     #[test]
     fn test_layout_mask_matches_mca() {
-        assert_eq!(regs::HOLD_MASK_BASE, 0x08CB, "MASK base must be 0x08CB (MCA 2251)");
+        assert_eq!(
+            regs::HOLD_MASK_BASE,
+            0x08CB,
+            "MASK base must be 0x08CB (MCA 2251)"
+        );
     }
 
     /// MCA SLAVE_REG_PGW1 = 2255 = 0x8CF
     #[test]
     fn test_layout_gw_matches_mca() {
-        assert_eq!(regs::HOLD_GW_BASE, 0x08CF, "GW base must be 0x08CF (MCA 2255)");
+        assert_eq!(
+            regs::HOLD_GW_BASE,
+            0x08CF,
+            "GW base must be 0x08CF (MCA 2255)"
+        );
     }
 
     /// MCA SLAVE_REG_MAC1 = 2263 = 0x8D7
     #[test]
     fn test_layout_mac_matches_mca() {
-        assert_eq!(regs::HOLD_MAC_BASE, 0x08D7, "MAC base must be 0x08D7 (MCA 2263)");
+        assert_eq!(
+            regs::HOLD_MAC_BASE,
+            0x08D7,
+            "MAC base must be 0x08D7 (MCA 2263)"
+        );
     }
 
     /// LOOP3: BLE MAC 已从 MCA 0x08E2 迁到 0x0FA4 (metuory 1.0.78 用 0x08E2 作为 BLE NAME)
     /// LOOP10: 更新测试断言, 匹配实际常量值
     #[test]
     fn test_layout_bt_addr_matches_design() {
-        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x0FA4, "BT_ADDR 迁到用户区 0x0FA4 (metuory 0x08E2 被 BLE NAME 占用)");
-        assert_eq!(regs::HOLD_BLE_NAME_BASE, 0x08E2, "BLE_NAME 必须在 0x08E2 (metuory WRITE_BLUETOOTH_ID 0x51)");
+        assert_eq!(
+            regs::HOLD_BT_ADDR_BASE,
+            0x0FA4,
+            "BT_ADDR 迁到用户区 0x0FA4 (metuory 0x08E2 被 BLE NAME 占用)"
+        );
+        assert_eq!(
+            regs::HOLD_BLE_NAME_BASE,
+            0x08E2,
+            "BLE_NAME 必须在 0x08E2 (metuory WRITE_BLUETOOTH_ID 0x51)"
+        );
     }
 
     /// HOLD_485_ERR RO 必须返回 0 (cold boot 初值, 与 MCA 一致)
@@ -1191,8 +1338,16 @@ mod tests {
     /// 设备文本区对齐 Android 0x1388 (5000) 起始
     #[test]
     fn test_layout_device_text_matches_android() {
-        assert_eq!(regs::DEVICE_TEXT_BASE, 0x1388, "DEVICE_TEXT_BASE must be 0x1388 (Android 5000)");
-        assert_eq!(regs::DEVICE_TEXT_COUNT, 2000, "DEVICE_TEXT_COUNT must be 2000");
+        assert_eq!(
+            regs::DEVICE_TEXT_BASE,
+            0x1388,
+            "DEVICE_TEXT_BASE must be 0x1388 (Android 5000)"
+        );
+        assert_eq!(
+            regs::DEVICE_TEXT_COUNT,
+            2000,
+            "DEVICE_TEXT_COUNT must be 2000"
+        );
         assert_eq!(regs::DEVICE_TEXT_END, 6999);
     }
 
@@ -1201,10 +1356,15 @@ mod tests {
     fn test_inreg_ai_count_matches_hw_version() {
         // 物理采 6 路 (ADC1_CH0..5), 但 Modbus 报告值跟随 hw_version
         let expected = crate::config::hw_version::AI_COUNT;
-        assert_eq!(regs::INREG_AI_COUNT, crate::config::hw_version::AI_COUNT,
-            "INREG_AI_COUNT must follow hw_version (F16=4 / F48=8)");
+        assert_eq!(
+            regs::INREG_AI_COUNT,
+            crate::config::hw_version::AI_COUNT,
+            "INREG_AI_COUNT must follow hw_version (F16=4 / F48=8)"
+        );
         // 至少 4, 最多 8 (硬编码范围)
-        assert!(expected >= 4 && expected <= 8,
-            "AI_COUNT must be 4..=8 (MCA F16/F48)");
+        assert!(
+            expected >= 4 && expected <= 8,
+            "AI_COUNT must be 4..=8 (MCA F16/F48)"
+        );
     }
 }

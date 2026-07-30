@@ -21,35 +21,35 @@ use esp_idf_hal::peripherals::Peripherals;
 #[allow(unused_imports)]
 use crate::error::{AppError, AppResult};
 
-pub mod pins;
-pub mod uart;
 pub mod adc;
-pub mod ledc;
-pub mod gpio;
 pub mod digital_io;
+pub mod gpio;
 #[cfg(any(feature = "f3", feature = "f4"))]
 pub mod i2c_bus;
 #[cfg(any(feature = "f3", feature = "f4"))]
-pub mod mcp23017;
-#[cfg(any(feature = "f3", feature = "f4"))]
 pub mod io_ext;
-/// Software I2C bit-bang (LOOP12: 任何 feature 下都需保留, 因为 NFC ST25DV64KC
-/// 通过 bit-bang 访问 LED/IO 总线引脚, 不依赖硬件 I2C0).
-pub mod sw_i2c;
+pub mod ledc;
+#[cfg(any(feature = "f3", feature = "f4"))]
+pub mod mcp23017;
 /// PCA9555 IO 扩展芯片驱动 (默认版本 8 DI + 8 DO, F3/F4 走 MCP23017)
 #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
 pub mod pca9555;
+pub mod pins;
+/// Software I2C bit-bang (LOOP12: 任何 feature 下都需保留, 因为 NFC ST25DV64KC
+/// 通过 bit-bang 访问 LED/IO 总线引脚, 不依赖硬件 I2C0).
+pub mod sw_i2c;
+pub mod uart;
 
-pub use pins::HalPins;
-pub use uart::UartPort;
 pub use adc::AdcHandle;
-pub use ledc::LedcHandle;
-pub use gpio::GpioBank;
 pub use digital_io::DigitalIo;
+pub use gpio::GpioBank;
 #[cfg(any(feature = "f3", feature = "f4"))]
 pub use io_ext::IoExtender;
+pub use ledc::LedcHandle;
 #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
 pub use pca9555::Pca9555Duo;
+pub use pins::HalPins;
+pub use uart::UartPort;
 
 /// 硬件抽象总句柄
 pub struct Hal {
@@ -58,6 +58,9 @@ pub struct Hal {
     pub adc: AdcHandle,
     pub ledc: LedcHandle,
     pub gpio: GpioBank,
+    /// Wi-Fi 驱动需要拥有 modem 单例；放入有界同步槽，启动时只取一次。
+    #[cfg(feature = "wifi")]
+    wifi_modem: crate::sync::Spin<Option<esp_idf_hal::modem::Modem<'static>>>,
     /// I2C IO 扩展 (仅 F3/F4 版本)
     #[cfg(any(feature = "f3", feature = "f4"))]
     pub io_ext: IoExtender,
@@ -70,9 +73,12 @@ impl Hal {
     pub fn init(peripherals: Peripherals) -> AppResult<Self> {
         let pins = HalPins::split(peripherals.pins)?;
         let uart = UartPort::init(
-            pins.uart0_tx, pins.uart0_rx,
-            pins.uart1_tx, pins.uart1_rx,
-            pins.uart2_tx, pins.uart2_rx,
+            pins.uart0_tx,
+            pins.uart0_rx,
+            pins.uart1_tx,
+            pins.uart1_rx,
+            pins.uart2_tx,
+            pins.uart2_rx,
         )?;
         let adc = AdcHandle::init(pins.adc1)?;
         let ledc = LedcHandle::init(pins.ledc_timer, pins.ledc_channels)?;
@@ -86,11 +92,8 @@ impl Hal {
         #[cfg(any(feature = "f3", feature = "f4"))]
         let io_ext = {
             use crate::config::pins as p;
-            let i2c_bus = crate::hal::i2c_bus::I2cBus::init(
-                peripherals.i2c0,
-                p::I2C_SDA,
-                p::I2C_SCL,
-            )?;
+            let i2c_bus =
+                crate::hal::i2c_bus::I2cBus::init(peripherals.i2c0, p::I2C_SDA, p::I2C_SCL)?;
             IoExtender::init(i2c_bus)?
         };
 
@@ -99,8 +102,13 @@ impl Hal {
         // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
         #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
         {
-            use esp_idf_sys::{gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_OUTPUT, gpio_set_level};
-            for &pwr_pin in &[crate::config::pins::POWER_LED_EN, crate::config::pins::POWER_RELAY_EN] {
+            use esp_idf_sys::{
+                gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_OUTPUT, gpio_set_level,
+            };
+            for &pwr_pin in &[
+                crate::config::pins::POWER_LED_EN,
+                crate::config::pins::POWER_RELAY_EN,
+            ] {
                 let cfg = gpio_config_t {
                     pin_bit_mask: 1u64 << (pwr_pin as u64),
                     mode: gpio_mode_t_GPIO_MODE_OUTPUT,
@@ -110,7 +118,9 @@ impl Hal {
                 };
                 let ret = unsafe { gpio_config(&cfg) };
                 if ret != 0 {
-                    return Err(AppError::Io(format!("power_en gpio{pwr_pin} config: esp_err=0x{ret:08X}")));
+                    return Err(AppError::Io(format!(
+                        "power_en gpio{pwr_pin} config: esp_err=0x{ret:08X}"
+                    )));
                 }
                 unsafe { gpio_set_level(pwr_pin as i32, 1) }; // HIGH = 上电
             }
@@ -136,11 +146,21 @@ impl Hal {
             adc,
             ledc,
             gpio,
+            #[cfg(feature = "wifi")]
+            wifi_modem: crate::sync::Spin::new(Some(peripherals.modem)),
             #[cfg(any(feature = "f3", feature = "f4"))]
             io_ext,
             #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
             pca9555,
         })
+    }
+
+    #[cfg(feature = "wifi")]
+    pub fn take_wifi_modem(&self) -> AppResult<esp_idf_hal::modem::Modem<'static>> {
+        self.wifi_modem
+            .lock()
+            .take()
+            .ok_or_else(|| AppError::Sys("wifi modem already taken".into()))
     }
 
     /// 获取数字 IO 抽象接口 (DI/DO 统一访问)

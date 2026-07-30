@@ -19,7 +19,7 @@ pub const APP_NAME: &str = "esp32s3-iot-gateway";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 主循环周期 (ms)
-pub const MAIN_LOOP_PERIOD_MS: u64 = 100;
+pub const MAIN_LOOP_PERIOD_MS: u64 = 20;
 
 // ----------------------------------------------------------------------------
 // GPIO 引脚分配 (ESP32-S3R2)
@@ -42,8 +42,8 @@ pub mod pins {
     pub const ETH_SPI_MOSI: u8 = 12;
     pub const ETH_SPI_SCLK: u8 = 10;
     pub const ETH_SPI_CS: u8 = 9;
-    pub const ETH_INT: u8 = 13;  // W5500 INT 引脚, 低有效
-    pub const ETH_RST: u8 = 14;  // W5500 RST 引脚, 低有效
+    pub const ETH_INT: u8 = 13; // W5500 INT 引脚, 低有效
+    pub const ETH_RST: u8 = 14; // W5500 RST 引脚, 低有效
 
     // ---- RS485 #0 (Modbus RTU, UART1) ----
     // 引脚来自参考固件 MCA_F16V2_1_F48_BLE.ino: rs485_1.begin(baud, cfg, 46, 45)
@@ -51,7 +51,7 @@ pub mod pins {
     pub const RS485_0_UART: u8 = 1; // UART1
     pub const RS485_0_TX: u8 = 45;
     pub const RS485_0_RX: u8 = 46;
-    pub const RS485_0_DE: u8 = 7;  // DE/RE 共控 (高=发送, 低=接收)
+    pub const RS485_0_DE: u8 = 7; // DE/RE 共控 (高=发送, 低=接收)
 
     // ---- RS485 #1 (Modbus RTU, UART2) ----
     // 引脚来自参考固件: rs485_2.begin(baud, cfg, 41, 42) → RX=41, TX=42
@@ -88,7 +88,7 @@ pub mod pins {
     pub const NCA9555_IIC_SDA: u8 = 35;
     pub const NCA9555_LED_SCL: u8 = 37;
     pub const NCA9555_LED_SDA: u8 = 38;
-    pub const NCA9555_INT: u8 = 34;  // 与 ESP_STOP_PIN 共用 GPIO34
+    pub const NCA9555_INT: u8 = 34; // 与 ESP_STOP_PIN 共用 GPIO34
 
     // ---- 光纤检测输入 ----
     // 参考固件: FIB1=digitalRead(39), FIB2=digitalRead(40)
@@ -114,7 +114,7 @@ pub mod pins {
     // ---- AO 模拟输出 (LEDC PWM, 4 通道) ----
     // 使用空闲 GPIO: 15, 16, 17, 18 (不与 W5500/RS485/NCA9555 冲突)
     pub const AO_CHANNELS: [(u8, u8); 4] = [
-        (0, 15),  // (ledc_channel, gpio)
+        (0, 15), // (ledc_channel, gpio)
         (1, 16),
         (2, 17),
         (3, 18),
@@ -234,7 +234,7 @@ pub mod io_ext {
     // ---- MCP23017 寄存器地址 (Byte mode, IOCON.BANK=0) ----
     pub const REG_IODIRA: u8 = 0x00; // PORTA 方向 (1=输入, 0=输出)
     pub const REG_IODIRB: u8 = 0x01; // PORTB 方向
-    pub const REG_IOCON: u8 = 0x0A;  // 配置寄存器 (BANK=0 模式, LOOP13: 强制写 0x00)
+    pub const REG_IOCON: u8 = 0x0A; // 配置寄存器 (BANK=0 模式, LOOP13: 强制写 0x00)
     pub const REG_GPPUA: u8 = 0x0C; // PORTA 上拉 (1=使能)
     pub const REG_GPPUB: u8 = 0x0D; // PORTB 上拉
     pub const REG_GPIOA: u8 = 0x12; // PORTA 数据 (读=输入电平, 写=输出锁存)
@@ -280,7 +280,7 @@ pub mod modbus {
         pub const STOP_BITS: u8 = 1;
         pub const DATA_BITS: u8 = 8;
         pub const POLL_INTERVAL_MS: u64 = 1000; // 无实际从站时降低轮询频率
-        pub const TIMEOUT_MS: u64 = 100;  // 缩短超时减少等待
+        pub const TIMEOUT_MS: u64 = 100; // 缩短超时减少等待
     }
 
     /// RTU 从站参数
@@ -312,18 +312,18 @@ pub mod modbus {
     ///   - 503/504  扩展 (与 502 同协议, 供不同上位机接入)
     ///   - 5002 备用通道
     ///
-    /// 内存优化: 由 `tcp_server::start_multiclient` 用单线程 poll 多路复用所有端口,
+    /// 内存优化: 由 `tcp_server::tick_tcp_server` 在 main-loop 多路复用所有端口，
     /// 而非每端口一个监听线程 (LOOP8 曾因第 5 个 pthread 触发 ENOMEM 而裁剪到 1 端口).
-    /// 单线程 + 非阻塞 accept 实测在 ESP32-S3R2 (512KB SRAM) 上稳定运行.
+    /// 20ms tick + 非阻塞 accept 不再需要额外任务栈。
     pub mod tcp {
         /// 默认 4 端口 (对齐参考固件 ext_tcp_port1..4 = {502,503,504,5002}).
         /// 运行时端口可由 Modbus 写 HOLD_TCP_COM_BASE..3 (2243-2246) 动态修改.
         pub const PORTS: &[u16] = &[502, 503, 504, 5002];
         pub const MAX_CONNECTIONS: usize = 8;
-        pub const RX_TIMEOUT_MS: u64 = 2000;
+        /// 已建立连接的空闲回收时间。原 2 秒“读超时”不能直接当连接空闲超时，
+        /// 否则常见 PLC/SCADA 长连接在两次轮询间就被服务端主动断开。
+        pub const IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
         pub const TX_TIMEOUT_MS: u64 = 2000;
-        /// 单线程 poll 轮询监听器的间隔 (非阻塞 accept 间的睡眠)
-        pub const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
     }
 }
 
@@ -366,18 +366,18 @@ pub mod regs {
     pub const INREG_AI_COUNT: u16 = hw_version::AI_COUNT; // F16=4 / F48=8, 与 MCA 对齐
     pub const INREG_AI_STATUS_BASE: u16 = 0x0088;
     // 系统信息 (RO)
-    pub const INREG_QI_COUNT: u16 = 0x087C;   // Q和I点数 (高字节=Q, 低字节=I)
-    pub const INREG_ADC485: u16 = 0x087D;     // 模拟量+485通道数
-    pub const INREG_FW_VER: u16 = 0x087E;     // 固件版本号
-    pub const INREG_FW_DATE: u16 = 0x087F;    // 固件版本日期
+    pub const INREG_QI_COUNT: u16 = 0x087C; // Q和I点数 (高字节=Q, 低字节=I)
+    pub const INREG_ADC485: u16 = 0x087D; // 模拟量+485通道数
+    pub const INREG_FW_VER: u16 = 0x087E; // 固件版本号
+    pub const INREG_FW_DATE: u16 = 0x087F; // 固件版本日期
 
     // ---- 故障恢复状态 (RO, FC=04) ----
     // 暴露给 Modbus Master 用于远程监控设备健康
     pub const INREG_RECOV_RECOVERABLE: u16 = 0x0880; // 可恢复故障计数
-    pub const INREG_RECOV_DEGRADABLE: u16 = 0x0881;  // 降级故障计数
-    pub const INREG_RECOV_SEVERE: u16 = 0x0882;       // 严重故障计数
-    pub const INREG_RECOV_MODE: u16 = 0x0883;         // 当前降级模式 (0=Normal, 1=BleOnly, 2=LocalOnly, 3=Minimal)
-    pub const INREG_RECOV_BLE_DROPS: u16 = 0x0884;    // BLE notify 丢弃帧计数
+    pub const INREG_RECOV_DEGRADABLE: u16 = 0x0881; // 降级故障计数
+    pub const INREG_RECOV_SEVERE: u16 = 0x0882; // 严重故障计数
+    pub const INREG_RECOV_MODE: u16 = 0x0883; // 当前降级模式 (0=Normal, 1=BleOnly, 2=LocalOnly, 3=Minimal)
+    pub const INREG_RECOV_BLE_DROPS: u16 = 0x0884; // BLE notify 丢弃帧计数
 
     // ---- 错误环日志 (RO, FC=04) ----
     // 用于远程诊断: 拉取最近 8 条错误记录
@@ -385,14 +385,14 @@ pub mod regs {
     // ---- BLE Android 兼容寄存器 (RO, FC=04) ----
     // 0x08A5-0x08E2 是 metuory-wireless-management-app-1.0.78 通过 BLE 读取的寄存器,
     // 也通过 Modbus TCP 暴露给远程 Master (用于调试)
-    pub const INREG_HW_VER: u16 = 0x08A5;        // 硬件版本号 (CONFIG.cfg.hw_version)
-    pub const INREG_IP_BASE: u16 = 0x08C7;      // IP/Mask/GW (12 regs = 24 bytes)
-    pub const INREG_MAC_BASE: u16 = 0x08D7;      // MAC (6 regs = 12 bytes)
-    pub const INREG_BLE_ID_BASE: u16 = 0x08E2;  // BLE 名称 (4 regs = 8 bytes)
+    pub const INREG_HW_VER: u16 = 0x08A5; // 硬件版本号 (CONFIG.cfg.hw_version)
+    pub const INREG_IP_BASE: u16 = 0x08C7; // IP/Mask/GW (12 regs = 24 bytes)
+    pub const INREG_MAC_BASE: u16 = 0x08D7; // MAC (6 regs = 12 bytes)
+    pub const INREG_BLE_ID_BASE: u16 = 0x08E2; // BLE 名称 (4 regs = 8 bytes)
 
-    pub const INREG_RINGLOG_COUNT: u16 = 0x0885;      // 当前环日志条目数 (0-100)
-    pub const INREG_RINGLOG_WRITES: u16 = 0x0886;     // 总写入次数 (mod 2^32)
-    pub const INREG_RINGLOG_BASE: u16 = 0x0887;       // 8 条最近日志基地址
+    pub const INREG_RINGLOG_COUNT: u16 = 0x0885; // 当前环日志条目数 (0-100)
+    pub const INREG_RINGLOG_WRITES: u16 = 0x0886; // 总写入次数 (mod 2^32)
+    pub const INREG_RINGLOG_BASE: u16 = 0x0887; // 8 条最近日志基地址
     // 0x0887-0x08A6: 8 条 × 4 U16 = 32 个寄存器
 
     // ---- MCA 一体机分布式组播同步状态 (RO, FC=04) ----
@@ -400,13 +400,12 @@ pub mod regs {
     // 接收的 32 字节组播数据填入 [0x0090..0x00AF], 余下保留.
     pub const INREG_SWITCH_STATUS_BASE: u16 = 0x0090;
     pub const INREG_SWITCH_STATUS_END: u16 = 0x0100;
-    pub const INREG_SWITCH_STATUS_COUNT: u16 =
-        INREG_SWITCH_STATUS_END - INREG_SWITCH_STATUS_BASE;
+    pub const INREG_SWITCH_STATUS_COUNT: u16 = INREG_SWITCH_STATUS_END - INREG_SWITCH_STATUS_BASE;
     pub const INREG_MULTICAST_IP1_2: u16 = 2190; // 组播 IP (octet1<<8 | octet2)
     pub const INREG_MULTICAST_IP3_4: u16 = 2191; // 组播 IP (octet3<<8 | octet4)
-    pub const INREG_MULTICAST_PORT: u16 = 2192;  // 组播端口 (默认 5003)
-    pub const INREG_SWITCH_IP1_2: u16 = 2193;    // 源 IP 过滤 (octet1<<8 | octet2)
-    pub const INREG_SWITCH_IP3_4: u16 = 2194;    // 源 IP 过滤 (octet3<<8 | octet4)
+    pub const INREG_MULTICAST_PORT: u16 = 2192; // 组播端口 (默认 5003)
+    pub const INREG_SWITCH_IP1_2: u16 = 2193; // 源 IP 过滤 (octet1<<8 | octet2)
+    pub const INREG_SWITCH_IP3_4: u16 = 2194; // 源 IP 过滤 (octet3<<8 | octet4)
     /// 组播接收缓冲区大小 (对齐参考固件 RECEIVE_MULTICAST_BUF_SIZE)
     pub const MULTICAST_BUF_SIZE: usize = 32;
 
@@ -453,7 +452,7 @@ pub mod regs {
     // 0x08E2 在 metuory 1.0.78 中是 BLE 名称 (WRITE_BLUETOOTH_ID 0x51), 不是 BLE MAC
     pub const HOLD_BT_ADDR_BASE: u16 = 0x0FA4;
     // BLE 名称 — metuory 1.0.78 用 0x08E2 (4 words = 8 bytes) 读写 (WRITE_BLUETOOTH_ID 0x51)
-    // MCA C++ 参考固件此处是 BLE MAC, 但 metuory Android 把它当 BLE NAME (蓝牙 ID 显示), 
+    // MCA C++ 参考固件此处是 BLE MAC, 但 metuory Android 把它当 BLE NAME (蓝牙 ID 显示),
     // 故本系统优先 BLE NAME 在 0x08E2, BLE MAC 移到 0x0FA4 保留兼容性
     pub const HOLD_BLE_NAME_BASE: u16 = 0x08E2;
     pub const HOLD_BLE_NAME_COUNT: u16 = 4;
@@ -468,8 +467,8 @@ pub mod regs {
     // P区结束地址
     pub const HOLD_CFG_END: u16 = 4223;
     // 通用 P区缓冲 (0x0880..0x107F = 2048 字) — 用于未映射字段的通用读写
-    pub const HOLD_PXX_BASE: u16 = HOLD_CFG_BASE;  // = 0x0880
-    pub const HOLD_PXX_END: u16 = HOLD_CFG_END;    // = 0x107F
+    pub const HOLD_PXX_BASE: u16 = HOLD_CFG_BASE; // = 0x0880
+    pub const HOLD_PXX_END: u16 = HOLD_CFG_END; // = 0x107F
     pub const HOLD_PXX_COUNT: usize = (HOLD_PXX_END - HOLD_PXX_BASE + 1) as usize;
 
     // ---- 设备文本区 (5000-6999, 2000 字) ----
@@ -503,7 +502,6 @@ pub mod regs {
     pub const TEXT_DATA_BASE: u16 = 0x138A;
     // TEXT_DATA 占用到 DEVICE_TEXT_END (6999)
 
-
     // ---- Internal-only registers (not exposed via Modbus, for backward compat) ----
     pub const CFG_BASE: u16 = HOLD_CFG_BASE;
     pub const CFG_FW_VER: u16 = INREG_FW_VER;
@@ -530,10 +528,10 @@ pub mod regs {
     // 30001-30128 = 0x7531-0x75B0 (128 regs): 映射到 DI 状态 + AI scaled.
     // 40001-40300 = 0x9C41-0x9D6C (300 regs): 映射到 DO 状态 + HOLD_USER_BASE 区.
     pub const MONITOR_PLC_BASE: u16 = 0x7531; // 30001
-    pub const MONITOR_PLC_END: u16 = 0x75B0;  // 30128
+    pub const MONITOR_PLC_END: u16 = 0x75B0; // 30128
     pub const MONITOR_PLC_COUNT: u16 = 128;
     pub const CONTROL_PLC_BASE: u16 = 0x9C41; // 40001
-    pub const CONTROL_PLC_END: u16 = 0x9D6C;  // 40300
+    pub const CONTROL_PLC_END: u16 = 0x9D6C; // 40300
     pub const CONTROL_PLC_COUNT: u16 = 300;
 }
 
@@ -640,6 +638,6 @@ mod tests {
     #[test]
     fn test_app_metadata() {
         assert_eq!(APP_NAME, "esp32s3-iot-gateway");
-        assert_eq!(MAIN_LOOP_PERIOD_MS, 100);
+        assert_eq!(MAIN_LOOP_PERIOD_MS, 20);
     }
 }

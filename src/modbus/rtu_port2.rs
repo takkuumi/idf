@@ -8,19 +8,24 @@
 //! 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动 (默认 false).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::modbus::rtu_port2 as cfg;
 use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
-use crate::modbus::shared::{modbus_crc16, BusBackend};
+use crate::modbus::shared::{BusBackend, modbus_crc16};
 use crate::rs485::{Rs485Config, Rs485Port};
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port2", 10);
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
+    if STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let port_cfg = Rs485Config::from_rtu_port2();
 
     // 优先读取 SystemConfig.rs485[2] 寄存器的从站地址
@@ -59,6 +64,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         });
     health::reset_thread_core();
     result.map_err(|e| crate::error::AppError::Modbus(format!("spawn: {e}")))?;
+    STARTED.store(true, Ordering::Release);
     health::register_with_stack(&TASK_HB, crate::safety::stack_budget::MODBUS_RTU_PORT2);
 
     log::info!(
@@ -69,7 +75,12 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     Ok(())
 }
 
-fn handle_request(port: &mut Rs485Port, backend: &BusBackend, req: &[u8], addr: u8) -> AppResult<()> {
+fn handle_request(
+    port: &mut Rs485Port,
+    backend: &BusBackend,
+    req: &[u8],
+    addr: u8,
+) -> AppResult<()> {
     if req.len() < 4 {
         return Ok(());
     }
@@ -83,7 +94,11 @@ fn handle_request(port: &mut Rs485Port, backend: &BusBackend, req: &[u8], addr: 
     let crc = modbus_crc16(&req[..n - 2]);
     let recv_crc = u16::from_le_bytes([req[n - 2], req[n - 1]]);
     if crc != recv_crc {
-        log::debug!("[mb-rtu-port2] crc mismatch: {:#06x}!={:#06x}", crc, recv_crc);
+        log::debug!(
+            "[mb-rtu-port2] crc mismatch: {:#06x}!={:#06x}",
+            crc,
+            recv_crc
+        );
         return Ok(());
     }
 

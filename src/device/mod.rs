@@ -27,15 +27,15 @@
 //! - 读取流程: 读 active blob → CRC 校验失败则回退到 inactive → 都失败用默认值
 //! - 兼容旧格式: 若 `proto_act` 不存在但 `proto_data` 存在, 迁移到 A
 
-pub mod system_config;
 pub mod holding_store;
+pub mod system_config;
 
 use std::time::Duration;
 
-use std::sync::LazyLock;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
-use crate::actor::{spawn, Actor, ActorRef};
+use crate::actor::{Actor, ActorRef, spawn};
 use crate::sync::Spin;
 
 // ----------------------------------------------------------------------------
@@ -118,7 +118,9 @@ impl Actor for DeviceActor {
                         .map_err(|e| AppError::Config(format!("nvs set mesh_aidx: {e:?}")))?;
                     Ok(())
                 }) {
-                    Some(Ok(())) => log::debug!("[device] mesh_keys=({net_idx},{app_idx}) persisted"),
+                    Some(Ok(())) => {
+                        log::debug!("[device] mesh_keys=({net_idx},{app_idx}) persisted")
+                    }
                     Some(Err(e)) => log::error!("[device] mesh_keys persist failed: {e}"),
                     None => log::warn!("[device] NVS unavailable, mesh_keys not persisted"),
                 }
@@ -148,13 +150,12 @@ impl Actor for DeviceActor {
 /// 全局 DeviceActor 引用 (Lazy 初始化, 由 `init()` 唤起)
 static DEVICE_ACTOR: LazyLock<ActorRef<DeviceActor>> = LazyLock::new(|| spawn(DeviceActor).0);
 
-
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvsPartition, NvsDefault};
 
 use crate::bus;
+use crate::config::regs;
 use crate::error::{AppError, AppResult};
 use crate::health::{self, TaskHb};
-use crate::config::regs;
 
 pub use system_config::{SystemConfig, parse_ipv4};
 
@@ -227,15 +228,14 @@ static PROTO_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
 
 /// NVS 分区句柄 (单例, take 一次)。获取失败后继续以无持久化模式运行，
 /// 不允许因 Flash/NVS 故障触发 panic 或非计划复位。
-pub static NVS_PARTITION: LazyLock<Option<EspDefaultNvsPartition>> = LazyLock::new(|| {
-    match EspNvsPartition::<NvsDefault>::take() {
+pub static NVS_PARTITION: LazyLock<Option<EspDefaultNvsPartition>> =
+    LazyLock::new(|| match EspNvsPartition::<NvsDefault>::take() {
         Ok(partition) => Some(partition),
         Err(e) => {
             log::error!("[device] NVS partition take failed: {e:?}; persistence disabled");
             None
         }
-    }
-});
+    });
 
 /// NVS 句柄 (gateway namespace)
 /// 注意 esp_idf_svc 0.50: EspDefaultNvs::new 第三参数 read_write: bool
@@ -258,7 +258,6 @@ pub static NVS: LazyLock<Spin<Option<EspDefaultNvs>>> = LazyLock::new(|| {
     };
     Spin::new(inner)
 });
-
 
 // ----------------------------------------------------------------------------
 // 初始化
@@ -303,9 +302,11 @@ pub fn init() -> AppResult<()> {
     {
         // 直接写入 RCU 快照: STORAGE (proto / device_text / holding_buf) + CONFIG (cfg / device_config).
         // proto.status 是常量开销的 atomic; 写前先 publish 0, 快照内也镜像为 0.
-        use crate::bus::storage_state::{ProtoStore, StorageSnapshot, storage_write, proto_status_set};
         use crate::bus::config_state::{ConfigSnapshot, config_write};
         use crate::bus::io_global::IO;
+        use crate::bus::storage_state::{
+            ProtoStore, StorageSnapshot, proto_status_set, storage_write,
+        };
 
         proto_status_set(0);
 
@@ -368,7 +369,8 @@ pub fn init() -> AppResult<()> {
 
     log::info!(
         "[device] proto loaded: {} words, version={:#06x}",
-        length, version
+        length,
+        version
     );
     log::info!(
         "[device] cfg loaded: sn='{}' ip={} mac={} fw=0x{:04X}",
@@ -437,7 +439,9 @@ pub fn nvs_read_to_buf(key: &str, buf: &mut [u8]) -> Option<usize> {
 /// 写入 blob 到 NVS
 pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
     let guard = nvs_lock();
-    let nvs = guard.as_ref().ok_or_else(|| AppError::Config("NVS not available".into()))?;
+    let nvs = guard
+        .as_ref()
+        .ok_or_else(|| AppError::Config("NVS not available".into()))?;
     nvs.set_blob(key, data)
         .map_err(|e| AppError::Config(format!("nvs set_blob {key}: {e:?}")))
 }
@@ -449,13 +453,7 @@ pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
 /// 从 NVS 读取复位计数 (首次启动返回 0)
 pub fn load_reset_count() -> u16 {
     // NVS 可能未初始化 (init 失败时), 此时返回 0
-    try_with_nvs(|nvs| {
-        nvs.get_u16(NVS_KEY_RESET_CNT)
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-    })
-    .unwrap_or(0)
+    try_with_nvs(|nvs| nvs.get_u16(NVS_KEY_RESET_CNT).ok().flatten().unwrap_or(0)).unwrap_or(0)
 }
 
 /// 保存复位计数到 NVS (异步, 不阻塞调用方)
@@ -474,8 +472,16 @@ pub fn save_reset_count(cnt: u16) -> AppResult<()> {
 /// 从 NVS 读取 BLE Mesh net_idx / app_idx (未配网时返回 (0, 0))
 pub fn load_mesh_keys() -> (u16, u16) {
     try_with_nvs(|nvs| {
-        let net_idx = nvs.get_u16(NVS_KEY_MESH_NET_IDX).ok().flatten().unwrap_or(0);
-        let app_idx = nvs.get_u16(NVS_KEY_MESH_APP_IDX).ok().flatten().unwrap_or(0);
+        let net_idx = nvs
+            .get_u16(NVS_KEY_MESH_NET_IDX)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let app_idx = nvs
+            .get_u16(NVS_KEY_MESH_APP_IDX)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         (net_idx, app_idx)
     })
     .unwrap_or((0, 0))
@@ -505,6 +511,8 @@ pub fn request_reload() {
 /// 请求应用配置 (由 Modbus 写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 调用)
 pub fn request_apply_config() {
     DEVICE_ACTOR.send(DeviceCmd::ApplyConfig);
+    #[cfg(feature = "ethernet-w5500")]
+    crate::ethernet::w5500::request_reconfigure();
 }
 
 /// 同步提交 (供 AT 命令直接调用, 阻塞至完成)
@@ -537,7 +545,11 @@ fn commit() -> AppResult<()> {
     // 2-6. 所有持锁路径统一 NVS -> blob，避免同步 AT 与 DeviceActor 形成 ABBA 死锁。
     let write_result = try_with_nvs_mut(|nvs| -> AppResult<u8> {
         let active = nvs.get_u8(NVS_KEY_ACTIVE).ok().flatten().unwrap_or(0);
-        let write_key = if active == 0 { NVS_KEY_DATA_B } else { NVS_KEY_DATA_A };
+        let write_key = if active == 0 {
+            NVS_KEY_DATA_B
+        } else {
+            NVS_KEY_DATA_A
+        };
         let new_active = if active == 0 { 1u8 } else { 0u8 };
 
         let mut blob = PROTO_BLOB_BUFFER.lock();
@@ -587,7 +599,11 @@ fn commit() -> AppResult<()> {
         "[device] proto committed: {} words, ver={:#06x}, blob={}",
         length,
         version,
-        match new_active { Some(0) => "A", Some(_) => "B", None => "skipped" }
+        match new_active {
+            Some(0) => "A",
+            Some(_) => "B",
+            None => "skipped",
+        }
     );
     Ok(())
 }
@@ -597,13 +613,11 @@ fn reload() -> AppResult<()> {
     bus::storage_state::proto_status_set(2);
 
     // 2. 从 NVS 读取 (若 NVS 不可用则使用空数据)
-    let (data, version, length) = try_with_nvs(|nvs| {
-        load_proto_from_nvs(nvs)
-    })
-    .unwrap_or_else(|| {
-        log::warn!("[device] NVS unavailable on reload, using empty data");
-        Ok((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0))
-    })?;
+    let (data, version, length) =
+        try_with_nvs(|nvs| load_proto_from_nvs(nvs)).unwrap_or_else(|| {
+            log::warn!("[device] NVS unavailable on reload, using empty data");
+            Ok((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0))
+        })?;
 
     // 3. 写回快照: RCU RMW 仅替换 proto; device_text / holding_buf 保持不动.
     bus::storage_state::proto_status_set(0);
@@ -614,7 +628,11 @@ fn reload() -> AppResult<()> {
         snap.proto.dirty = false;
     });
 
-    log::info!("[device] proto reloaded: {} words, ver={:#06x}", length, version);
+    log::info!(
+        "[device] proto reloaded: {} words, ver={:#06x}",
+        length,
+        version
+    );
     Ok(())
 }
 
@@ -680,7 +698,10 @@ fn load_device_text_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
         .flatten()
         .unwrap_or(0);
     if magic != DEV_TEXT_MAGIC {
-        log::info!("[device] dev_text magic not found (got {:#06X}), using empty", magic);
+        log::info!(
+            "[device] dev_text magic not found (got {:#06X}), using empty",
+            magic
+        );
         return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
     }
     // 2. 读 blob
@@ -688,7 +709,11 @@ fn load_device_text_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
     let blob = match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut buf) {
         Ok(Some(b)) if b.len() == expected_bytes => b,
         Ok(Some(b)) => {
-            log::warn!("[device] dev_text blob truncated: {}/{}", b.len(), expected_bytes);
+            log::warn!(
+                "[device] dev_text blob truncated: {}/{}",
+                b.len(),
+                expected_bytes
+            );
             return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
         }
         Ok(None) => {
@@ -745,9 +770,7 @@ pub fn save_device_text_to_nvs(text: &[u16]) -> AppResult<()> {
 pub fn request_save_device_text() {
     use crate::bus::storage_state::storage_read_with;
     // 直接持 RCU reader 读 device_text, 不 clone 整个快照
-    let result = storage_read_with(|snap| {
-        save_device_text_to_nvs(&snap.device_text)
-    });
+    let result = storage_read_with(|snap| save_device_text_to_nvs(&snap.device_text));
     if let Some(Err(e)) = result {
         log::warn!("[device] dev_text persist failed: {e}");
     }
@@ -782,7 +805,9 @@ fn load_do_bits_from_nvs(nvs: &EspDefaultNvs) -> u64 {
             return 0;
         }
     };
-    u64::from_le_bytes([blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7]])
+    u64::from_le_bytes([
+        blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+    ])
 }
 
 /// LOOP13: 同步保存 DO 位图到 NVS. main_loop 节流调用 (1s + 值去重).
@@ -836,21 +861,29 @@ fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<(Box<[u16]>, u16, u16)>
     let data = vec![0u16; PROTO_WORDS].into_boxed_slice();
 
     // 尝试读取双 blob
-    let active = nvs
-        .get_u8(NVS_KEY_ACTIVE)
-        .ok()
-        .flatten();
+    let active = nvs.get_u8(NVS_KEY_ACTIVE).ok().flatten();
 
     if let Some(act) = active {
         // 双 blob 模式: 先读 active, 失败读 inactive
-        let first_key = if act == 0 { NVS_KEY_DATA_A } else { NVS_KEY_DATA_B };
-        let second_key = if act == 0 { NVS_KEY_DATA_B } else { NVS_KEY_DATA_A };
+        let first_key = if act == 0 {
+            NVS_KEY_DATA_A
+        } else {
+            NVS_KEY_DATA_B
+        };
+        let second_key = if act == 0 {
+            NVS_KEY_DATA_B
+        } else {
+            NVS_KEY_DATA_A
+        };
 
         if let Some((d, v, l)) = load_single_blob(nvs, first_key)? {
             log::info!("[device] loaded from active blob ({})", first_key);
             return Ok((d, v, l));
         }
-        log::warn!("[device] active blob {} corrupted, trying inactive", first_key);
+        log::warn!(
+            "[device] active blob {} corrupted, trying inactive",
+            first_key
+        );
         if let Some((d, v, l)) = load_single_blob(nvs, second_key)? {
             log::warn!("[device] recovered from inactive blob {}", second_key);
             return Ok((d, v, l));
@@ -889,7 +922,7 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<(Box<[u1
     // 校验 magic
     let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
     if magic != PROTO_MAGIC {
-        log::warn!("[device] blob {key} magic mismatch: {magic:#06x}", );
+        log::warn!("[device] blob {key} magic mismatch: {magic:#06x}",);
         return Ok(None);
     }
 
@@ -903,7 +936,11 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<(Box<[u1
     let calc_crc = crc_header.wrapping_add(crc_data);
 
     if stored_crc != calc_crc {
-        log::warn!("[device] blob {key} CRC mismatch: stored={:#010x} calc={:#010x}", stored_crc, calc_crc);
+        log::warn!(
+            "[device] blob {key} CRC mismatch: stored={:#010x} calc={:#010x}",
+            stored_crc,
+            calc_crc
+        );
         return Ok(None);
     }
 
@@ -956,7 +993,11 @@ fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<(Box<[u16]>, u16, u
         .map_err(|e| AppError::Config(format!("nvs get legacy len: {e:?}")))?
         .unwrap_or(0);
 
-    log::info!("[device] legacy blob loaded: {} words, ver={:#06x}", length, version);
+    log::info!(
+        "[device] legacy blob loaded: {} words, ver={:#06x}",
+        length,
+        version
+    );
     Ok(Some((data, version, length)))
 }
 
@@ -1042,7 +1083,7 @@ pub fn proto_write_bulk(start: u16, values: &[u16]) -> bool {
 
 /// 协议信息 (供 AT+INFO 调用)
 pub struct ProtoInfo {
-    pub capacity: u16,   // 1500
+    pub capacity: u16, // 1500
     pub version: u16,
     pub length: u16,
     pub dirty: bool,

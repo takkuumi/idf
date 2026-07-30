@@ -163,7 +163,11 @@ pub fn check_all() -> heapless::Vec<&'static str, MAX_TASKS> {
         let cur = t.counter.load(Ordering::Relaxed);
         let last = t.last_check.load(Ordering::Relaxed);
         let threshold = t.max_stall.load(Ordering::Relaxed);
-        let threshold = if threshold == 0 { DEFAULT_STALL_THRESHOLD } else { threshold };
+        let threshold = if threshold == 0 {
+            DEFAULT_STALL_THRESHOLD
+        } else {
+            threshold
+        };
 
         if cur == last {
             // 心跳停滞, 累积计数
@@ -247,7 +251,7 @@ pub fn unsubscribe_wdt() {
 // 随后创建的线程（非当前线程）。
 //
 // 核分配策略:
-//   Core 0 — 网络/协议栈 (LwIP/W5500/mb-tcp/mb-rtu/ble-mesh/main-loop)
+//   Core 0 — 网络/协议栈 (LwIP/W5500/mb-rtu/ble-mesh/main-loop)
 //   Core 1 — 实时 IO (di-scan/do-output/ai-sample/ao-output)
 
 /// 设置**下一次** `std::thread::spawn` 创建线程的目标核心。
@@ -279,7 +283,10 @@ pub const CORE_RT: u32 = 1;
 
 /// 已废弃: ESP-IDF 不支持在任务内动态修改核心绑定。
 /// 请改用 `set_next_thread_core()` 在 spawn 之前调用。
-#[deprecated(since = "0.2.0", note = "use set_next_thread_core() before thread::spawn instead")]
+#[deprecated(
+    since = "0.2.0",
+    note = "use set_next_thread_core() before thread::spawn instead"
+)]
 #[inline]
 pub fn pin_current_to_core(_core: u32) {}
 
@@ -308,7 +315,9 @@ pub fn print_core_assignment() {
         let t: &'static TaskHb = unsafe { &*ptr };
         log::info!(
             "  [{:2}] {} (max_stall={})",
-            i, t.name, t.max_stall.load(Ordering::Relaxed)
+            i,
+            t.name,
+            t.max_stall.load(Ordering::Relaxed)
         );
     }
 }

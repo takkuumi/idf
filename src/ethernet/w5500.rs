@@ -18,8 +18,9 @@
 //!
 //! 注意: 需在 sdkconfig.defaults 中启用 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
-use core::fmt::Write as _;
 use crate::sync::MainLoopCell;
+use core::cell::UnsafeCell;
+use core::fmt::Write as _;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -28,17 +29,11 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use crate::config::pins;
 use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
-use crate::health::TaskHb;
 
 /// 心跳周期 (s)
 const HEARTBEAT_PERIOD_S: u64 = 5;
 /// 心跳失败上限 (>= 即触发复位)
 const HEARTBEAT_MAX_FAIL: u32 = 3; // 旧值, 实际由 recovery 模块分级处理
-
-/// 以太网心跳任务记录 (静态分配, main_loop 监控)
-/// 阈值 = 8: eth 每 5s tick 一次, main_loop 每 1s 检查; 允许 8 个检查周期 (8s) 未变化
-/// 才报停滞, 留足 3s 余量应对 5s 周期 + 调度抖动, 避免健康检查先于 fail_count 降级逻辑触发重启.
-static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 8);
 
 /// 启动 W5500 以太网。
 ///
@@ -47,9 +42,16 @@ static ETH_HB: TaskHb = TaskHb::new_with_stall("eth-heartbeat", 8);
 pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let _ = sys_loop;
 
-    log::info!("[eth] initializing W5500 over SPI{} (MISO={},MOSI={},SCLK={},CS={},INT={},RST={})...",
-               pins::ETH_SPI_HOST, pins::ETH_SPI_MISO, pins::ETH_SPI_MOSI,
-               pins::ETH_SPI_SCLK, pins::ETH_SPI_CS, pins::ETH_INT, pins::ETH_RST);
+    log::info!(
+        "[eth] initializing W5500 over SPI{} (MISO={},MOSI={},SCLK={},CS={},INT={},RST={})...",
+        pins::ETH_SPI_HOST,
+        pins::ETH_SPI_MISO,
+        pins::ETH_SPI_MOSI,
+        pins::ETH_SPI_SCLK,
+        pins::ETH_SPI_CS,
+        pins::ETH_INT,
+        pins::ETH_RST
+    );
 
     // 0) 安装 GPIO ISR 服务 (W5500 驱动内部调用 gpio_isr_handler_add 注册 INT 引脚中断)
     //    必须在 esp_eth_driver_install 之前调用, 否则 W5500 复位会超时
@@ -57,7 +59,8 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let isr_ret = unsafe { esp_idf_sys::gpio_install_isr_service(0) };
     if isr_ret != esp_idf_sys::ESP_OK && isr_ret != esp_idf_sys::ESP_ERR_INVALID_STATE {
         return Err(AppError::Ethernet(format!(
-            "gpio_install_isr_service failed: esp_err=0x{:08X}", isr_ret
+            "gpio_install_isr_service failed: esp_err=0x{:08X}",
+            isr_ret
         )));
     }
     log::debug!("[eth] GPIO ISR service ready (ret={})", isr_ret);
@@ -70,9 +73,13 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 2) 初始化 SPI 总线 (W5500 独占 SPI3_HOST)
     //    DMA: SPI_DMA_CH_AUTO (ESP-IDF 自动分配 DMA 通道)
     let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
-    let bus_cfg = spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
+    let bus_cfg =
+        spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
     let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_CH_AUTO;
-    check(unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) }, "spi_bus_initialize")?;
+    check(
+        unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) },
+        "spi_bus_initialize",
+    )?;
     log::info!("[eth] SPI bus initialized (host={}, DMA=auto)", spi_host);
 
     // 3) W5500 SPI 设备配置
@@ -87,7 +94,9 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let w5500_cfg = eth_w5500_config_default(spi_host, &dev_cfg, pins::ETH_INT);
     let mac = unsafe { esp_idf_sys::esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg) };
     if mac.is_null() {
-        return Err(AppError::Ethernet("esp_eth_mac_new_w5500 returned null".into()));
+        return Err(AppError::Ethernet(
+            "esp_eth_mac_new_w5500 returned null".into(),
+        ));
     }
 
     // 5) 创建 PHY
@@ -95,14 +104,18 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     let phy_cfg = eth_phy_config_default();
     let phy = unsafe { esp_idf_sys::esp_eth_phy_new_w5500(&phy_cfg) };
     if phy.is_null() {
-        return Err(AppError::Ethernet("esp_eth_phy_new_w5500 returned null".into()));
+        return Err(AppError::Ethernet(
+            "esp_eth_phy_new_w5500 returned null".into(),
+        ));
     }
 
     // 6) 安装驱动
     let eth_cfg = eth_config_default(mac, phy);
     let mut eth_handle: esp_idf_sys::esp_eth_handle_t = std::ptr::null_mut();
-    check(unsafe { esp_idf_sys::esp_eth_driver_install(&eth_cfg, &mut eth_handle as *mut _) },
-          "esp_eth_driver_install")?;
+    check(
+        unsafe { esp_idf_sys::esp_eth_driver_install(&eth_cfg, &mut eth_handle as *mut _) },
+        "esp_eth_driver_install",
+    )?;
 
     // 6.5) 设置 MAC 地址 (W5500 无预置 MAC, 需从 ESP32 eFuse 读取后写入)
     {
@@ -114,8 +127,12 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
         if mac_bytes != [0u8; 6] && mac_bytes != [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] {
             log::info!(
                 "[eth] setting MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                mac_bytes[0], mac_bytes[1], mac_bytes[2],
-                mac_bytes[3], mac_bytes[4], mac_bytes[5]
+                mac_bytes[0],
+                mac_bytes[1],
+                mac_bytes[2],
+                mac_bytes[3],
+                mac_bytes[4],
+                mac_bytes[5]
             );
         }
         check(
@@ -143,20 +160,30 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
         return Err(AppError::Ethernet("esp_netif_new returned null".into()));
     }
     let glue = unsafe { esp_idf_sys::esp_eth_new_netif_glue(eth_handle) };
-    check(unsafe { esp_idf_sys::esp_netif_attach(netif, glue as *mut c_void) }, "esp_netif_attach")?;
+    check(
+        unsafe { esp_idf_sys::esp_netif_attach(netif, glue as *mut c_void) },
+        "esp_netif_attach",
+    )?;
+    ETH_NETIF.store(netif, Ordering::Release);
+    ETH_HANDLE.store(eth_handle as *mut c_void, Ordering::Release);
 
     // 7.5) 配置网络: 读取 SystemConfig, 禁用 DHCP → 设置静态 IP
     apply_netif_config(netif)?;
 
-    // 8) 启动
-    check(unsafe { esp_idf_sys::esp_eth_start(eth_handle) }, "esp_eth_start")?;
-    log::info!("[eth] W5500 driver installed and started, eth_handle={:p}", eth_handle);
-
-    // 9) IP 事件 watch
+    // 8) 先注册事件，再启动驱动。静态 IP 或链路已经接通时，esp_eth_start 后
+    // GOT_IP/CONNECTED 可能立即投递；反向排序会永久漏掉首次状态事件。
     spawn_ip_watch(eth_handle)?;
-
-    // 10) 链路事件 watch — LOOP12: 实时检测拔线 (DHCP lease 过期前数小时内 IP 不归零)
     spawn_eth_link_watch(eth_handle)?;
+
+    // 9) 启动
+    check(
+        unsafe { esp_idf_sys::esp_eth_start(eth_handle) },
+        "esp_eth_start",
+    )?;
+    log::info!(
+        "[eth] W5500 driver installed and started, eth_handle={:p}",
+        eth_handle
+    );
 
     // 11) 心跳任务
     spawn_heartbeat()?;
@@ -175,13 +202,12 @@ fn spi_bus_config_default(mosi: u8, miso: u8, sclk: u8) -> esp_idf_sys::spi_bus_
             miso_io_num: miso as i32,
         },
         sclk_io_num: sclk as i32,
-        __bindgen_anon_3: esp_idf_sys::spi_bus_config_t__bindgen_ty_3 {
-            quadwp_io_num: -1,
-        },
-        __bindgen_anon_4: esp_idf_sys::spi_bus_config_t__bindgen_ty_4 {
-            quadhd_io_num: -1,
-        },
-        data4_io_num: -1, data5_io_num: -1, data6_io_num: -1, data7_io_num: -1,
+        __bindgen_anon_3: esp_idf_sys::spi_bus_config_t__bindgen_ty_3 { quadwp_io_num: -1 },
+        __bindgen_anon_4: esp_idf_sys::spi_bus_config_t__bindgen_ty_4 { quadhd_io_num: -1 },
+        data4_io_num: -1,
+        data5_io_num: -1,
+        data6_io_num: -1,
+        data7_io_num: -1,
         data_io_default_level: false,
         // W5500 最大以太网帧约 1536B, 加 3B SPI header 留 1600B 足够.
         // LOOP20: max_transfer_sz 决定 SPI DMA descriptor pool 大小
@@ -211,8 +237,9 @@ fn spi_device_config_default(cs: u8) -> esp_idf_sys::spi_device_interface_config
         mode: 0,
         clock_source: esp_idf_sys::soc_periph_spi_clk_src_t_SPI_CLK_SRC_DEFAULT,
         duty_cycle_pos: 0,
-        cs_ena_pretrans: 0, cs_ena_posttrans: 0,  // SPI mode 0
-        clock_speed_hz: 40_000_000,  // 40MHz (W5500 最高 80MHz, 40MHz 兼顾速度与稳定性)
+        cs_ena_pretrans: 0,
+        cs_ena_posttrans: 0,        // SPI mode 0
+        clock_speed_hz: 40_000_000, // 40MHz (W5500 最高 80MHz, 40MHz 兼顾速度与稳定性)
         input_delay_ns: 0,
         sample_point: 0,
         spics_io_num: cs as i32,
@@ -232,13 +259,19 @@ fn spi_device_config_default(cs: u8) -> esp_idf_sys::spi_device_interface_config
         // W5500 MAC 本身已在 software 层串行 (socket mutex per port + multi-thread auto-serialize),
         // queue_size=3 不会丢包: 单帧 ~50µs, 3 帧 queue = 150µs 排队, 网关峰值流量 > 50Mbps
         // 都没问题.
-        flags: 0, queue_size: 3, pre_cb: None, post_cb: None,
+        flags: 0,
+        queue_size: 3,
+        pre_cb: None,
+        post_cb: None,
     }
 }
 
 fn eth_mac_config_default() -> esp_idf_sys::eth_mac_config_t {
     esp_idf_sys::eth_mac_config_t {
-        rx_task_stack_size: 4096, rx_task_prio: 15, sw_reset_timeout_ms: 100, flags: 0,
+        rx_task_stack_size: 4096,
+        rx_task_prio: 15,
+        sw_reset_timeout_ms: 100,
+        flags: 0,
     }
 }
 
@@ -271,14 +304,17 @@ struct W5500DmaStaging {
     rx: [u8; 1600],
 }
 
-// SAFETY: Accessed only from custom SPI read/write callbacks, protected by SPI mutex.
-unsafe impl Send for W5500DmaStaging {}
-unsafe impl Sync for W5500DmaStaging {}
+/// `static mut` 和“不可变 static 转可变裸指针”都会破坏 Rust 别名规则。
+/// UnsafeCell 明确声明内部可变性；实际串行化由每个 CustomSpiCtx 的 FreeRTOS mutex 保证。
+struct W5500DmaStagingCell(UnsafeCell<W5500DmaStaging>);
 
-static STAGING: W5500DmaStaging = W5500DmaStaging {
+// SAFETY: 所有 RX/TX 回调在访问缓冲前都持有同一个 ctx.lock。
+unsafe impl Sync for W5500DmaStagingCell {}
+
+static STAGING: W5500DmaStagingCell = W5500DmaStagingCell(UnsafeCell::new(W5500DmaStaging {
     tx: [0u8; 1600],
     rx: [0u8; 1600],
-};
+}));
 
 /// Custom SPI driver config (passed via `custom_spi_driver.config`).
 #[derive(Clone)]
@@ -354,7 +390,7 @@ unsafe extern "C" fn w5500_custom_spi_read(
     // SAFETY: ESP-IDF retains the context returned by init until deinit.
     let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
     let data_len_us = data_len as usize;
-    if data_len_us > STAGING.rx.len() {
+    if data_len_us > 1600 {
         return 0x1202;
     }
     if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
@@ -362,7 +398,8 @@ unsafe extern "C" fn w5500_custom_spi_read(
     }
     // SAFETY: STAGING.rx is a static array in .bss (internal SRAM DMA range),
     // 64-byte aligned via #[repr(C, align(64))].
-    let rx_ptr = STAGING.rx.as_ptr() as *mut u8;
+    // SAFETY: ctx.lock serializes both callbacks; UnsafeCell is the sole mutable storage.
+    let rx_ptr = unsafe { (*STAGING.0.get()).rx.as_mut_ptr() };
     let mut trans = esp_idf_sys::spi_transaction_t {
         cmd: cmd as u16,
         addr: addr as u64,
@@ -400,7 +437,7 @@ unsafe extern "C" fn w5500_custom_spi_write(
     // SAFETY: ESP-IDF retains the context returned by init until deinit.
     let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
     let data_len_us = data_len as usize;
-    if data_len_us > STAGING.tx.len() {
+    if data_len_us > 1600 {
         return 0x1202;
     }
     if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
@@ -410,7 +447,8 @@ unsafe extern "C" fn w5500_custom_spi_write(
     // Both reads (read function) and writes (write function) are guarded
     // by the SPI mutex (ctx.lock). The as_mut_ptr() call only returns a
     // raw pointer; actual mutation happens via copy_nonoverlapping.
-    let tx_ptr = STAGING.tx.as_ptr() as *mut u8;
+    // SAFETY: ctx.lock serializes both callbacks; UnsafeCell is the sole mutable storage.
+    let tx_ptr = unsafe { (*STAGING.0.get()).tx.as_mut_ptr() };
     if !data.is_null() {
         // SAFETY: `data` is the caller-provided TX buffer for data_len_us bytes.
         unsafe { core::ptr::copy_nonoverlapping(data as *const u8, tx_ptr, data_len_us) };
@@ -440,9 +478,11 @@ unsafe extern "C" fn w5500_custom_spi_write(
 /// 而是接受 spi_host_id + spi_devcfg 指针, MAC 驱动内部调用 spi_bus_add_device
 ///
 /// LOOP22: 使用 custom_spi_driver 注入预分配 PSRAM DMA buffer 包装.
-fn eth_w5500_config_default(spi_host: esp_idf_sys::spi_host_device_t,
-                             dev_cfg: &esp_idf_sys::spi_device_interface_config_t,
-                             int_gpio: u8) -> esp_idf_sys::eth_w5500_config_t {
+fn eth_w5500_config_default(
+    spi_host: esp_idf_sys::spi_host_device_t,
+    dev_cfg: &esp_idf_sys::spi_device_interface_config_t,
+    int_gpio: u8,
+) -> esp_idf_sys::eth_w5500_config_t {
     let init_cfg = Box::new(CustomSpiInitCfg {
         host_id: spi_host,
         dev_cfg: *dev_cfg,
@@ -467,29 +507,46 @@ fn eth_phy_config_default() -> esp_idf_sys::eth_phy_config_t {
     esp_idf_sys::eth_phy_config_t {
         // W5500 PHY 地址固定为 0 (内部 PHY)
         // reset_gpio_num=-1: RST 由 hal.gpio.eth_reset_pulse() 手动管理
-        phy_addr: 0, reset_timeout_ms: 100, autonego_timeout_ms: 4000, reset_gpio_num: -1,
-        hw_reset_assert_time_us: 0, post_hw_reset_delay_ms: 0,
+        phy_addr: 0,
+        reset_timeout_ms: 100,
+        autonego_timeout_ms: 4000,
+        reset_gpio_num: -1,
+        hw_reset_assert_time_us: 0,
+        post_hw_reset_delay_ms: 0,
     }
 }
 
-fn eth_config_default(mac: *mut esp_idf_sys::esp_eth_mac_t,
-                      phy: *mut esp_idf_sys::esp_eth_phy_t) -> esp_idf_sys::esp_eth_config_t {
+fn eth_config_default(
+    mac: *mut esp_idf_sys::esp_eth_mac_t,
+    phy: *mut esp_idf_sys::esp_eth_phy_t,
+) -> esp_idf_sys::esp_eth_config_t {
     esp_idf_sys::esp_eth_config_t {
-        mac, phy, check_link_period_ms: 2000,
-        stack_input: None, stack_input_info: None,
-        on_lowlevel_init_done: None, on_lowlevel_deinit_done: None,
-        read_phy_reg: None, write_phy_reg: None,
+        mac,
+        phy,
+        check_link_period_ms: 2000,
+        stack_input: None,
+        stack_input_info: None,
+        on_lowlevel_init_done: None,
+        on_lowlevel_deinit_done: None,
+        read_phy_reg: None,
+        write_phy_reg: None,
     }
 }
 
 // ---- IP 事件 watch ----
 fn spawn_ip_watch(eth_handle: esp_idf_sys::esp_eth_handle_t) -> AppResult<()> {
     let base = unsafe { esp_idf_sys::IP_EVENT };
-    check(unsafe {
-        esp_idf_sys::esp_event_handler_register(
-            base, esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32, Some(ip_event_cb),
-            eth_handle as *mut c_void)
-    }, "esp_event_handler_register(IP_EVENT_ETH_GOT_IP)")?;
+    check(
+        unsafe {
+            esp_idf_sys::esp_event_handler_register(
+                base,
+                esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32,
+                Some(ip_event_cb),
+                eth_handle as *mut c_void,
+            )
+        },
+        "esp_event_handler_register(IP_EVENT_ETH_GOT_IP)",
+    )?;
     log::info!("[eth] IP_EVENT_ETH_GOT_IP handler registered");
     Ok(())
 }
@@ -516,13 +573,22 @@ extern "C" fn ip_event_cb(
         let gw_raw = data.ip_info.gw.addr;
         crate::bus::send_event(crate::bus::IoEvent::IpAssigned(
             [
-                ip_raw as u8, (ip_raw >> 8) as u8, (ip_raw >> 16) as u8, (ip_raw >> 24) as u8,
+                ip_raw as u8,
+                (ip_raw >> 8) as u8,
+                (ip_raw >> 16) as u8,
+                (ip_raw >> 24) as u8,
             ],
             [
-                mask_raw as u8, (mask_raw >> 8) as u8, (mask_raw >> 16) as u8, (mask_raw >> 24) as u8,
+                mask_raw as u8,
+                (mask_raw >> 8) as u8,
+                (mask_raw >> 16) as u8,
+                (mask_raw >> 24) as u8,
             ],
             [
-                gw_raw as u8, (gw_raw >> 8) as u8, (gw_raw >> 16) as u8, (gw_raw >> 24) as u8,
+                gw_raw as u8,
+                (gw_raw >> 8) as u8,
+                (gw_raw >> 16) as u8,
+                (gw_raw >> 24) as u8,
             ],
         ));
     }
@@ -530,8 +596,14 @@ extern "C" fn ip_event_cb(
 
 fn fmt_ip(addr: &u32) -> heapless::String<15> {
     let mut s = heapless::String::new();
-    let _ = write!(s, "{}.{}.{}.{}",
-        addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF, (addr >> 24) & 0xFF);
+    let _ = write!(
+        s,
+        "{}.{}.{}.{}",
+        addr & 0xFF,
+        (addr >> 8) & 0xFF,
+        (addr >> 16) & 0xFF,
+        (addr >> 24) & 0xFF
+    );
     s
 }
 
@@ -541,30 +613,46 @@ fn fmt_ip(addr: &u32) -> heapless::String<15> {
 // 都保留非零 IP, 拔线后检测延迟可达数小时. 改为订阅 ETH_EVENT 的 CONNECTED/DISCONNECTED,
 // 用 AtomicBool 缓存链路状态; heartbeat_once 顶部优先查 link, link down 直接 false.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// 链路状态缓存 (true = 已连接). 由 eth_event_cb 维护, heartbeat_once 读取.
 /// 启动时假定为 true, 避免首次 IP 分配前误报 fail (后续事件会修正).
 static ETH_LINK_UP: AtomicBool = AtomicBool::new(true);
+static ETH_NETIF: AtomicPtr<esp_idf_sys::esp_netif_obj> = AtomicPtr::new(std::ptr::null_mut());
+static ETH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static NET_RECONFIG_REQUEST_MS: AtomicU32 = AtomicU32::new(0);
+
+/// 请求在 main_loop 中重新应用网络参数。500ms 去抖保证 FC=16/BLE 分片批量写完后
+/// 才应用，避免把半组 IP/掩码短暂写进 netif。
+pub fn request_reconfigure() {
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u32;
+    NET_RECONFIG_REQUEST_MS.store(now.max(1), Ordering::Release);
+}
 
 fn spawn_eth_link_watch(_eth_handle: esp_idf_sys::esp_eth_handle_t) -> AppResult<()> {
     let base = unsafe { esp_idf_sys::ETH_EVENT };
-    check(unsafe {
-        esp_idf_sys::esp_event_handler_register(
-            base,
-            esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32,
-            Some(eth_event_cb),
-            std::ptr::null_mut(),
-        )
-    }, "esp_event_handler_register(ETHERNET_EVENT_CONNECTED)")?;
-    check(unsafe {
-        esp_idf_sys::esp_event_handler_register(
-            base,
-            esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32,
-            Some(eth_event_cb),
-            std::ptr::null_mut(),
-        )
-    }, "esp_event_handler_register(ETHERNET_EVENT_DISCONNECTED)")?;
+    check(
+        unsafe {
+            esp_idf_sys::esp_event_handler_register(
+                base,
+                esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32,
+                Some(eth_event_cb),
+                std::ptr::null_mut(),
+            )
+        },
+        "esp_event_handler_register(ETHERNET_EVENT_CONNECTED)",
+    )?;
+    check(
+        unsafe {
+            esp_idf_sys::esp_event_handler_register(
+                base,
+                esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32,
+                Some(eth_event_cb),
+                std::ptr::null_mut(),
+            )
+        },
+        "esp_event_handler_register(ETHERNET_EVENT_DISCONNECTED)",
+    )?;
     log::info!("[eth] ETH_EVENT CONNECTED/DISCONNECTED handlers registered");
     Ok(())
 }
@@ -597,8 +685,13 @@ struct EthHbState {
 static ETH_HB_STATE: MainLoopCell<EthHbState> = MainLoopCell::new();
 
 fn spawn_heartbeat() -> AppResult<()> {
-    ETH_HB_STATE.init(EthHbState { fail_count: 0 });
-    log::info!("[eth] heartbeat registered in main_loop (period={}s)", HEARTBEAT_PERIOD_S);
+    ETH_HB_STATE
+        .init(EthHbState { fail_count: 0 })
+        .map_err(|_| AppError::Ethernet("heartbeat state busy during init".into()))?;
+    log::info!(
+        "[eth] heartbeat registered in main_loop (period={}s)",
+        HEARTBEAT_PERIOD_S
+    );
     Ok(())
 }
 
@@ -609,36 +702,87 @@ pub fn link_up() -> bool {
 
 /// main_loop 每 5s 调用一次
 pub fn tick_eth_heartbeat() {
-    let state = match ETH_HB_STATE.get_mut() {
-        Some(s) => s,
-        None => return,
-    };
-
-    ETH_HB.tick();
-    if heartbeat_once() {
-        if state.fail_count > 0 {
-            log::info!("[eth-heartbeat] link restored");
-            crate::error::recovery::enter_mode(
-                crate::error::recovery::DegradedMode::Normal
-            );
-        }
-        state.fail_count = 0;
-    } else {
-        state.fail_count = state.fail_count.saturating_add(1);
-        log::warn!("[eth-heartbeat] gateway unreachable (count={})", state.fail_count);
-        if state.fail_count >= 2 {
-            let action = crate::error::recovery::decide_action(
-                crate::error::recovery::Severity::Degradable,
-                state.fail_count,
-            );
-            crate::error::recovery::apply_action(action, "eth-heartbeat");
+    tick_pending_reconfigure();
+    let _ = ETH_HB_STATE.with_mut(|state| {
+        if heartbeat_once() {
+            if state.fail_count > 0 {
+                log::info!("[eth-heartbeat] link restored");
+                crate::error::recovery::enter_mode(crate::error::recovery::DegradedMode::Normal);
+            }
+            state.fail_count = 0;
         } else {
-            crate::error::recovery::record_failure(
-                crate::error::recovery::Severity::Recoverable,
-                "eth-heartbeat",
-                "gateway ping failed",
+            state.fail_count = state.fail_count.saturating_add(1);
+            log::warn!(
+                "[eth-heartbeat] gateway unreachable (count={})",
+                state.fail_count
             );
+            if state.fail_count >= 2 {
+                let action = crate::error::recovery::decide_action(
+                    crate::error::recovery::Severity::Degradable,
+                    state.fail_count,
+                );
+                crate::error::recovery::apply_action(action, "eth-heartbeat");
+            } else {
+                crate::error::recovery::record_failure(
+                    crate::error::recovery::Severity::Recoverable,
+                    "eth-heartbeat",
+                    "gateway ping failed",
+                );
+            }
         }
+    });
+}
+
+fn tick_pending_reconfigure() {
+    let requested = NET_RECONFIG_REQUEST_MS.load(Ordering::Acquire);
+    if requested == 0 {
+        return;
+    }
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u32;
+    if now.wrapping_sub(requested) < 500 {
+        return;
+    }
+    if NET_RECONFIG_REQUEST_MS
+        .compare_exchange(requested, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let netif = ETH_NETIF.load(Ordering::Acquire);
+    let eth_handle = ETH_HANDLE.load(Ordering::Acquire) as esp_idf_sys::esp_eth_handle_t;
+    if netif.is_null() || eth_handle.is_null() {
+        log::warn!("[eth] network reconfigure deferred: driver not ready");
+        request_reconfigure();
+        return;
+    }
+
+    let mac = crate::bus::config_read()
+        .map(|cs| cs.cfg.eth_mac)
+        .unwrap_or([0; 6]);
+    let mac_result = if mac == [0; 6] {
+        Ok(())
+    } else {
+        check(
+            unsafe {
+                esp_idf_sys::esp_eth_ioctl(
+                    eth_handle,
+                    esp_idf_sys::esp_eth_io_cmd_t_ETH_CMD_S_MAC_ADDR,
+                    mac.as_ptr() as *mut _,
+                )
+            },
+            "esp_eth_ioctl(S_MAC_ADDR reconfigure)",
+        )
+    };
+    if let Err(e) = mac_result.and_then(|_| apply_netif_config(netif)) {
+        log::error!("[eth] runtime network reconfigure failed: {e}");
+        crate::error::recovery::record_failure(
+            crate::error::recovery::Severity::Recoverable,
+            "eth-config",
+            "runtime network reconfigure failed",
+        );
+    } else {
+        log::info!("[eth] runtime network configuration applied");
     }
 }
 
@@ -700,12 +844,24 @@ fn apply_netif_config(netif: *mut esp_idf_sys::esp_netif_obj) -> AppResult<()> {
     );
 
     if cfg.dhcp {
+        let ret = unsafe { esp_idf_sys::esp_netif_dhcpc_start(netif) };
+        if ret != esp_idf_sys::ESP_OK && ret != esp_idf_sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED
+        {
+            return Err(AppError::Ethernet(format!(
+                "esp_netif_dhcpc_start failed: esp_err=0x{ret:08X}"
+            )));
+        }
         log::info!("[eth] DHCP mode, waiting for lease...");
         return Ok(());
     }
 
     // 静态 IP 模式: 停止 DHCP client
-    unsafe { esp_idf_sys::esp_netif_dhcpc_stop(netif) };
+    let ret = unsafe { esp_idf_sys::esp_netif_dhcpc_stop(netif) };
+    if ret != esp_idf_sys::ESP_OK && ret != esp_idf_sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED {
+        return Err(AppError::Ethernet(format!(
+            "esp_netif_dhcpc_stop failed: esp_err=0x{ret:08X}"
+        )));
+    }
 
     // 构造 esp_netif_ip_info_t
     fn to_ip4(b: [u8; 4]) -> esp_idf_sys::esp_ip4_addr_t {
@@ -726,13 +882,16 @@ fn apply_netif_config(netif: *mut esp_idf_sys::esp_netif_obj) -> AppResult<()> {
     // 设置 DNS
     let mut dns_main: esp_idf_sys::esp_netif_dns_info_t = Default::default();
     dns_main.ip.u_addr.ip4 = to_ip4(cfg.dns);
-    unsafe {
-        esp_idf_sys::esp_netif_set_dns_info(
-            netif,
-            esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
-            &mut dns_main as *mut _,
-        );
-    }
+    check(
+        unsafe {
+            esp_idf_sys::esp_netif_set_dns_info(
+                netif,
+                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+                &mut dns_main as *mut _,
+            )
+        },
+        "esp_netif_set_dns_info",
+    )?;
 
     log::info!(
         "[eth] static IP configured: {} / {} gw {} dns {}",
@@ -747,7 +906,9 @@ fn apply_netif_config(netif: *mut esp_idf_sys::esp_netif_obj) -> AppResult<()> {
 
 fn check(ret: esp_idf_sys::esp_err_t, ctx: &str) -> AppResult<()> {
     if ret != 0 {
-        return Err(AppError::Ethernet(format!("{ctx} failed: esp_err=0x{ret:08X}")));
+        return Err(AppError::Ethernet(format!(
+            "{ctx} failed: esp_err=0x{ret:08X}"
+        )));
     }
     Ok(())
 }

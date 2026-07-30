@@ -9,6 +9,9 @@ rustflags = ["--cfg", "espidf_time64"]
 [unstable]
 build-std = ["std", "core", "alloc", "panic_abort"]
 build-std-features = ["panic_immediate_abort"]
+# 固件统一 panic=abort；test harness 也使用 abort，避免 ESP 目标同时链接
+# panic_unwind/panic_abort 两套 core 导致 duplicate lang item。
+panic-abort-tests = true
 
 [env]
 # ESP-IDF v5.5.4 (使用本地已初始化的仓库, 避免克隆时相对子模块 URL 解析失败)

@@ -10,20 +10,38 @@
 //! - LED bus: SDA=GPIO38, SCL=GPIO37 (DI LED 0x40, DO LED 0x48)
 
 use crate::error::{AppError, AppResult};
+use core::cell::Cell;
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Timing: half-period in microseconds (~100 kHz)
-const T_HALF_US: u32 = 2; // 2μs → ~250kHz (reference firmware uses 4-6μs; we tune for speed)
+/// 保守的标准模式时序。GPIO 方向切换另有少量开销，实际总线频率不高于 100kHz。
+/// 原 C++ 固件半周期为 4-6us；ST25DV 长 EEPROM 写入优先保证 ACK 稳定性。
+const T_HALF_US: u32 = 5;
+
+// PCA9555 与 ST25DV 会创建不同 SwI2c 实例，但物理上共用两组引脚。实例内的
+// Spin 只能保护同一个驱动对象，无法阻止 NFC 与 IO 同时翻转同一 GPIO。
+static IO_BUS_LOCK: AtomicBool = AtomicBool::new(false);
+static LED_BUS_LOCK: AtomicBool = AtomicBool::new(false);
+static OTHER_BUS_LOCK: AtomicBool = AtomicBool::new(false);
 
 pub struct SwI2c {
     sda: i32,
     scl: i32,
+    in_transaction: Cell<bool>,
 }
 
 impl SwI2c {
     pub fn init(sda: i32, scl: i32) -> AppResult<Self> {
+        let this = Self {
+            sda,
+            scl,
+            in_transaction: Cell::new(false),
+        };
+        this.acquire_bus();
+
         // Configure both pins as push-pull OUTPUT initially
         // Matching reference: pinMode(pin, OUTPUT)
-        unsafe {
+        let ret = unsafe {
             // SAFETY: sda/scl 来自 config.rs::pins 编译期常量, 与其它驱动互斥.
             // mask 是 u64 GPIO 位掩码, cfg 是栈局部 &, 无别名访问, 调用后立即 ret 检查.
             let mask = (1u64 << sda) | (1u64 << scl);
@@ -34,25 +52,54 @@ impl SwI2c {
                 pull_down_en: 0u32,
                 intr_type: 0,
             };
-            let ret = esp_idf_sys::gpio_config(&cfg);
-            if ret != 0 {
-                return Err(AppError::Io(format!(
-                    "sw_i2c gpio{sda}/gpio{scl} config: esp_err=0x{ret:08X}"
-                )));
-            }
+            esp_idf_sys::gpio_config(&cfg)
+        };
+        if ret != 0 {
+            this.release_bus();
+            return Err(AppError::Io(format!(
+                "sw_i2c gpio{sda}/gpio{scl} config: esp_err=0x{ret:08X}"
+            )));
         }
-
-        let this = Self { sda, scl };
 
         // Idle state: both HIGH
         this.sda_write(true);
         this.scl_write(true);
+        this.release_bus();
 
         log::info!("[sw_i2c] init: sda={sda} scl={scl}");
         Ok(this)
     }
 
     // ---- low-level pin access ----
+
+    fn physical_bus_lock(&self) -> &'static AtomicBool {
+        match (self.sda, self.scl) {
+            (35, 36) => &IO_BUS_LOCK,
+            (38, 37) => &LED_BUS_LOCK,
+            _ => &OTHER_BUS_LOCK,
+        }
+    }
+
+    fn acquire_bus(&self) {
+        if self.in_transaction.replace(true) {
+            return; // repeated START belongs to the same transaction
+        }
+        let lock = self.physical_bus_lock();
+        while lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while lock.load(Ordering::Relaxed) {
+                spin_loop();
+            }
+        }
+    }
+
+    fn release_bus(&self) {
+        if self.in_transaction.replace(false) {
+            self.physical_bus_lock().store(false, Ordering::Release);
+        }
+    }
 
     fn delay_half(&self) {
         // SAFETY: ets_delay_us 是 ROM 提供的 CPU 空转, 无内存访问, 无副作用.
@@ -84,20 +131,14 @@ impl SwI2c {
     /// Set SDA as push-pull OUTPUT (matching `IIC_SDA_set_output()`)
     fn sda_set_output(&self) {
         unsafe {
-            esp_idf_sys::gpio_set_direction(
-                self.sda,
-                esp_idf_sys::gpio_mode_t_GPIO_MODE_OUTPUT,
-            );
+            esp_idf_sys::gpio_set_direction(self.sda, esp_idf_sys::gpio_mode_t_GPIO_MODE_OUTPUT);
         }
     }
 
     /// Set SDA as INPUT (matching `IIC_SDA_set_input()`)
     fn sda_set_input(&self) {
         unsafe {
-            esp_idf_sys::gpio_set_direction(
-                self.sda,
-                esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT,
-            );
+            esp_idf_sys::gpio_set_direction(self.sda, esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT);
         }
     }
 
@@ -105,6 +146,7 @@ impl SwI2c {
 
     /// START: SDA ↓ while SCL=H, then SCL ↓
     pub fn start(&self) {
+        self.acquire_bus();
         self.sda_set_output();
         self.sda_write(true);
         self.delay_half();
@@ -126,6 +168,7 @@ impl SwI2c {
         self.delay_half();
         self.sda_write(true);
         self.delay_half();
+        self.release_bus();
     }
 
     /// Write one byte; returns true if ACK received (slave pulls SDA LOW).

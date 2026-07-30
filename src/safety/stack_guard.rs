@@ -36,7 +36,6 @@
 //! |----------------|--------|--------------------------------------------|
 //! | sys_evt        | 4KB   | 该任务无用户回调, 仅监控 ETH/BLE 事件栈  |
 //! | udp-mcast      | 6KB   | 心跳+配置读取栈深度                       |
-//! | mb-tcp         | 16KB  | 4 端口 + 8 连接单任务状态机               |
 //! | nfc-st25       | 8KB   | loop 缓冲区栈                              |
 //! | mb-rtu-*       | 8KB   | UART 读 + handler 栈                      |
 //! | http-srv       | 12KB  | 路由分发栈 (LOOP18)                       |
@@ -225,9 +224,7 @@ macro_rules! stack_sentinel {
 /// ESP-IDF 绑定使用 `UBaseType_t = c_uint`, 我们 cast 到 u32 减少调用方工作量.
 #[inline]
 pub fn current_task_free_stack() -> u32 {
-    unsafe {
-        esp_idf_sys::uxTaskGetStackHighWaterMark2(core::ptr::null_mut()) as u32
-    }
+    unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark2(core::ptr::null_mut()) as u32 }
 }
 
 /// 读取指定 TCB 的剩余栈 (字节).

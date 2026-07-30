@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::ipv4::Ipv4Addr;
-use esp_idf_svc::netif::{EspNetif, NetifStack};
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
 use crate::config::wifi as cfg;
 use crate::error::{AppError, AppResult};
@@ -51,16 +50,12 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 
     log::info!("[wifi] initializing ESP32-S3 Wi-Fi (Station mode)...");
 
-    // 1. 创建 Wi-Fi netif (Station)
-    let netif = EspNetif::new(NetifStack::Wifi)
-        .map_err(|e| AppError::Sys(format!("wifi netif: {e:?}")))?;
-
-    // 2. 创建 BlockingWifi
-    let mut wifi = BlockingWifi::wrap(
-        esp_idf_svc::wifi::Wifi::new(netif, sys_loop.clone()),
-        std::time::Duration::from_secs(30),
-    )
-    .map_err(|e| AppError::Sys(format!("wifi wrap: {e:?}")))?;
+    // 1. 创建 EspWifi（内部创建 STA/AP netif）并包装成阻塞式状态机。
+    let modem = hal.take_wifi_modem()?;
+    let esp_wifi = EspWifi::new(modem, sys_loop.clone(), None)
+        .map_err(|e| AppError::Sys(format!("wifi init: {e:?}")))?;
+    let mut wifi = BlockingWifi::wrap(esp_wifi, sys_loop.clone())
+        .map_err(|e| AppError::Sys(format!("wifi wrap: {e:?}")))?;
 
     // 3. 配置 Station (SSID/password 从 config::wifi 读取)
     let auth = if cfg::PASSWORD.is_empty() {
@@ -69,8 +64,12 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
         AuthMethod::WPA2Personal
     };
     let client_cfg = ClientConfiguration {
-        ssid: cfg::SSID.into(),
-        password: cfg::PASSWORD.into(),
+        ssid: cfg::SSID
+            .try_into()
+            .map_err(|_| AppError::Config("wifi SSID exceeds 32 bytes".into()))?,
+        password: cfg::PASSWORD
+            .try_into()
+            .map_err(|_| AppError::Config("wifi password exceeds 64 bytes".into()))?,
         auth_method: auth,
         ..Default::default()
     };
@@ -86,41 +85,60 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     wifi.wait_netif_up()
         .map_err(|e| AppError::Sys(format!("wifi wait_netif_up: {e:?}")))?;
 
-    let ip: Ipv4Addr = wifi.sta_netif().get_ip_info().ip;
+    let ip: Ipv4Addr = wifi
+        .wifi()
+        .sta_netif()
+        .get_ip_info()
+        .map_err(|e| AppError::Sys(format!("wifi get_ip_info: {e:?}")))?
+        .ip;
     log::info!("[wifi] connected, got IP: {}", ip);
 
-    // 5. 心跳任务
-    spawn_heartbeat()?;
-
-    log::info!("[wifi] Station startup complete");
-    Ok(())
-}
-
-/// Wi-Fi 心跳任务 (后台监测链路状态)
-///
-/// 周期性检查 Wi-Fi 链路 IP 是否仍存在, 失败时记日志。
-/// 不触发系统复位 (与 eth 不同, Wi-Fi 作为备份链路, 失败可接受)。
-fn spawn_heartbeat() -> AppResult<()> {
+    // 5. 心跳任务必须持有 BlockingWifi。若 start() 返回时直接 drop(wifi)，
+    // esp-idf-svc 会析构驱动/netif，之前建立的连接随即失效。
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
         .name("wifi-heartbeat".into())
         .stack_size(crate::safety::stack_budget::WIFI_HEARTBEAT)
         .spawn(move || {
-            // LOOP14: 长期运行 pthread 必须订阅 WDT
             health::subscribe_wdt();
-            let period = std::time::Duration::from_secs(cfg::HEARTBEAT_PERIOD_S);
+            let mut was_up = true;
             loop {
                 WIFI_HB.tick();
-                // LOOP15: WDT 必须周期喂, 仅 subscribe 不 feed 10s 内触发系统复位
                 health::feed_wdt();
-                // TODO: 检查 wifi 链路状态 (netif_is_up / ip 是否丢失)
-                // 当前仅周期上报心跳, 实际链路检测待实现
-                std::thread::sleep(period);
+                let is_up = wifi.is_connected().unwrap_or(false)
+                    && wifi
+                        .wifi()
+                        .sta_netif()
+                        .get_ip_info()
+                        .map(|info| !info.ip.is_unspecified())
+                        .unwrap_or(false);
+                if is_up != was_up {
+                    if is_up {
+                        log::info!("[wifi] link restored");
+                    } else {
+                        log::warn!("[wifi] link lost; keeping other transports online");
+                    }
+                    was_up = is_up;
+                }
+
+                // 任务 WDT=10s，禁止一次 sleep 30s；分段睡眠并喂狗。
+                let mut remaining = cfg::HEARTBEAT_PERIOD_S;
+                while remaining > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    WIFI_HB.tick();
+                    health::feed_wdt();
+                    remaining -= 1;
+                }
             }
         });
     health::reset_thread_core();
     result.map_err(|e| AppError::Sys(format!("spawn wifi-heartbeat: {e}")))?;
     health::register_with_stack(&WIFI_HB, crate::safety::stack_budget::WIFI_HEARTBEAT);
-    log::info!("[wifi] heartbeat task started, period={}s", cfg::HEARTBEAT_PERIOD_S);
+    log::info!(
+        "[wifi] heartbeat task started, period={}s",
+        cfg::HEARTBEAT_PERIOD_S
+    );
+
+    log::info!("[wifi] Station startup complete");
     Ok(())
 }

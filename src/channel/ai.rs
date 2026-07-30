@@ -7,13 +7,11 @@
 
 use std::sync::Arc;
 
-
 use crate::config::ai_calib;
 use crate::error::AppResult;
 use crate::hal::Hal;
-use esp_idf_svc::timer::EspTaskTimerService;
-use crate::health::TaskHb;
 use crate::sync::MainLoopCell;
+use esp_idf_svc::timer::EspTaskTimerService;
 
 /// 采样周期 (ms)
 const SAMPLE_PERIOD_MS: u64 = 100;
@@ -29,16 +27,12 @@ pub const CHANNEL_COUNT: usize = 8;
 #[cfg(not(feature = "f4"))]
 pub const CHANNEL_COUNT: usize = 6;
 
-/// 任务心跳记录 (静态分配, main_loop 监控)
-static TASK_HB: TaskHb = TaskHb::new("ai-sample");
-
 /// 启动 AI 采样任务
 ///
 /// TODO: 假设 `hal.adc.sample(idx: usize) -> u16`，由 hal/adc 模块实现后接入。
 /// TODO: `_timer_svc` 可用于更精确的定时采样，当前用 std::thread::sleep。
 // 架构改造 Phase 2: AI 合并到 main_loop
 // 状态用 MainLoopCell 保护 (单线程访问, 无 atomic CAS 开销)
-
 
 struct AiState {
     buf: [[u16; AVG_WINDOW]; CHANNEL_COUNT],
@@ -50,72 +44,74 @@ static AI_STATE: MainLoopCell<AiState> = MainLoopCell::new();
 
 pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppResult<()> {
     // 不再创建独立 pthread. ADC driver 通过 hal.adc 访问, 状态由 main_loop 持有.
-    AI_STATE.init(AiState {
-        buf: [[0u16; AVG_WINDOW]; CHANNEL_COUNT],
-        pos: 0,
-        filled: 0,
-    });
+    AI_STATE
+        .init(AiState {
+            buf: [[0u16; AVG_WINDOW]; CHANNEL_COUNT],
+            pos: 0,
+            filled: 0,
+        })
+        .map_err(|_| crate::error::AppError::Channel("AI state busy during init".into()))?;
     let _ = hal; // 抑制 unused 警告
-    log::info!("[ai] sample task registered in main_loop (period={}ms)", SAMPLE_PERIOD_MS);
+    log::info!(
+        "[ai] sample task registered in main_loop (period={}ms)",
+        SAMPLE_PERIOD_MS
+    );
     Ok(())
 }
 
 /// main_loop 每 100ms 调用一次
 pub fn tick_ai_sample(hal: &crate::hal::Hal) {
-    let state = match AI_STATE.get_mut() {
-        Some(s) => s,
-        None => return,
-    };
+    let _ = AI_STATE.with_mut(|state| {
+        let raws: [u16; 6] = hal.adc.sample_all();
 
-    TASK_HB.tick();
-    let raws: [u16; 6] = hal.adc.sample_all();
+        // LOOP14: eFuse 工厂校准 — 在 raw 上叠加 esp_adc_cal_raw_to_voltage (mV),
+        // 然后用 mV 走 4-20mA 映射. 旧逻辑直接用 raw → 单位噪声 ±20 LSB (~40mV) 已消除.
+        // holding_buf SENSOR_MIN/MAX 仍存的是 raw LSB, 所以应用层 map_range 仍按原逻辑.
+        let _mv_per_ch: [u32; 6] = {
+            let mut arr = [0u32; 6];
+            for ch in 0..6 {
+                arr[ch] = hal.adc.raw_to_mv(raws[ch]);
+            }
+            arr
+        };
 
-    // LOOP14: eFuse 工厂校准 — 在 raw 上叠加 esp_adc_cal_raw_to_voltage (mV),
-    // 然后用 mV 走 4-20mA 映射. 旧逻辑直接用 raw → 单位噪声 ±20 LSB (~40mV) 已消除.
-    // holding_buf SENSOR_MIN/MAX 仍存的是 raw LSB, 所以应用层 map_range 仍按原逻辑.
-    let _mv_per_ch: [u32; 6] = {
-        let mut arr = [0u32; 6];
-        for ch in 0..6 {
-            arr[ch] = hal.adc.raw_to_mv(raws[ch]);
+        // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
+        // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
+        // 缺失校准 (min==max==0) 时回退到 4-20mA 线性映射 (旧逻辑)
+        let sensor_min = read_sensor_calib(true);
+        let sensor_max = read_sensor_calib(false);
+
+        for ch in 0..CHANNEL_COUNT {
+            let raw: u16 = if ch < raws.len() {
+                raws[ch]
+            } else {
+                0 // F4/F48 设备 ch6/ch7: 硬件暂未接线, 返回 0 (后续扩展 HAL 驱动时替换)
+            };
+            state.buf[ch][state.pos % AVG_WINDOW] = raw;
+            let sum: u32 = state.buf[ch].iter().map(|&v| v as u32).sum();
+            let avg = if state.filled >= AVG_WINDOW {
+                (sum >> AVG_SHIFT) as u16
+            } else {
+                (sum / state.filled.max(1) as u32) as u16
+            };
+            let cal_min = sensor_min[ch];
+            let cal_max = sensor_max[ch];
+            let scaled: u16 = if cal_min != cal_max {
+                // 校准生效: 参考固件 map(avg, cal_max, cal_min, 4095, 0)
+                map_range(avg, cal_max, cal_min, 4095, 0)
+            } else {
+                // 无校准: 回退 4-20mA 线性映射 (ADC 0..4095 → 4000..20000 mA*1000)
+                (ai_calib::MA_MIN
+                    + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX)
+                    as u16
+            };
+            crate::bus::IO.ai.set_raw(ch, avg);
+            crate::bus::IO.ai.set_scaled(ch, scaled);
         }
-        arr
-    };
-
-    // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
-    // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
-    // 缺失校准 (min==max==0) 时回退到 4-20mA 线性映射 (旧逻辑)
-    let sensor_min = read_sensor_calib(true);
-    let sensor_max = read_sensor_calib(false);
-
-    for ch in 0..CHANNEL_COUNT {
-        let raw: u16 = if ch < raws.len() {
-            raws[ch]
-        } else {
-            0 // F4/F48 设备 ch6/ch7: 硬件暂未接线, 返回 0 (后续扩展 HAL 驱动时替换)
-        };
-        state.buf[ch][state.pos % AVG_WINDOW] = raw;
-        let sum: u32 = state.buf[ch].iter().map(|&v| v as u32).sum();
-        let avg = if state.filled >= AVG_WINDOW {
-            (sum >> AVG_SHIFT) as u16
-        } else {
-            (sum / state.filled.max(1) as u32) as u16
-        };
-        let cal_min = sensor_min[ch];
-        let cal_max = sensor_max[ch];
-        let scaled: u16 = if cal_min != cal_max {
-            // 校准生效: 参考固件 map(avg, cal_max, cal_min, 4095, 0)
-            map_range(avg, cal_max, cal_min, 4095, 0)
-        } else {
-            // 无校准: 回退 4-20mA 线性映射 (ADC 0..4095 → 4000..20000 mA*1000)
-            (ai_calib::MA_MIN
-                + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX) as u16
-        };
-        crate::bus::IO.ai.set_raw(ch, avg);
-        crate::bus::IO.ai.set_scaled(ch, scaled);
-    }
-    state.pos = (state.pos + 1) % AVG_WINDOW;
-    state.filled = (state.filled + 1).min(AVG_WINDOW);
-    crate::bus::send_event(crate::bus::IoEvent::AiSampled);
+        state.pos = (state.pos + 1) % AVG_WINDOW;
+        state.filled = (state.filled + 1).min(AVG_WINDOW);
+        crate::bus::send_event(crate::bus::IoEvent::AiSampled);
+    });
 }
 
 /// 读取 SENSOR_MIN/MAX 校准值数组 (LOOP12: 返回 [u16; CHANNEL_COUNT] 同步 cfg 切换).
@@ -176,7 +172,10 @@ mod tests {
         // x 中点 → out 中点
         let mid_in = (605 + 3016) / 2;
         let mid_out = map_range(mid_in, 605, 3016, 4095, 0);
-        assert!(mid_out > 1900 && mid_out < 2100, "mid_out={mid_out} 应接近 2047");
+        assert!(
+            mid_out > 1900 && mid_out < 2100,
+            "mid_out={mid_out} 应接近 2047"
+        );
     }
 
     #[test]
