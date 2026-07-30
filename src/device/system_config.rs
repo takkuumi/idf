@@ -72,7 +72,7 @@ pub struct Rs485Config {
 
 impl Default for Rs485Config {
     /// 与实际 UART 配置一致 (rs485::port 打开 9600 baud).
-    /// Word1=0x3000 (9600bps/N/8/1/Master), Word2=1, Word3=0, Word4=1000, Word5=20
+    /// 保持寄存器 Word1=0x4001 (9600bps/N/8/1/Master)，内部 mode: 0=Master。
     fn default() -> Self {
         Self {
             baudrate: 9600,
@@ -470,50 +470,42 @@ impl SystemConfig {
                 self.ble_name[idx + 1],
             ]));
         }
-        // BLE MAC 地址 — 6 字节 → 4 个 U16 (高字节在前, 不足 8 字节用 0 填充)
-        // 已迁移到用户区 0x0FA4 (4004), 不再与 BLE NAME 冲突
-        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
-            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
-            let b0 = if idx < 6 { self.ble_mac[idx] } else { 0 };
-            let b1 = if idx + 1 < 6 {
-                self.ble_mac[idx + 1]
-            } else {
-                0
-            };
-            return Some(u16::from_be_bytes([b0, b1]));
-        }
-        // RS485 — 5端口×5字, Word1=组合格式匹配参考固件
-        for i in 0..5usize {
+        // 4000+ 属于原 C++/PC 连续逻辑区，不再放置会截断场景数据的 BLE MAC 别名。
+        // 前 3 个物理 RS485 端口。BT/NET 两个兼容块由通用 PRegBuf 保存，
+        // 不能别名到 rs485[0]，否则 PC 写 NET 会覆盖 RS485-1。
+        for i in 0..self.rs485.len() {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
             if (base..base + 5).contains(&addr) {
                 let off = (addr - base) as usize;
-                let r = if i < self.rs485.len() {
-                    &self.rs485[i]
-                } else {
-                    &self.rs485[0]
-                };
+                let r = &self.rs485[i];
                 return Some(match off {
-                    // Word 1: (baud_idx<<12)|(parity<<10)|(stop<<9)|(data<<8)|mode
+                    // PC/C++ PReg 编码与 BLE packed nibble 不同：
+                    // baud 0/4=9600, 9=115200；低字节 1=Master, 0=Slave。
                     0 => {
                         let baud_idx = match r.baudrate {
-                            1200 => 0,
-                            2400 => 1,
-                            4800 => 2,
-                            9600 => 3,
-                            19200 => 4,
-                            38400 => 5,
-                            57600 => 6,
-                            115200 => 7,
-                            230400 => 8,
-                            460800 => 9,
-                            921600 => 10,
-                            _ => 3,
+                            1200 => 1,
+                            2400 => 2,
+                            4800 => 3,
+                            9600 => 4,
+                            14400 => 5,
+                            19200 => 6,
+                            38400 => 7,
+                            57600 => 8,
+                            115200 => 9,
+                            128000 => 10,
+                            153600 => 11,
+                            230400 => 12,
+                            256000 => 13,
+                            460800 => 14,
+                            921600 => 15,
+                            _ => 4,
                         };
+                        let port_mode = if r.mode == 0 { 1u16 } else { 0u16 };
                         (baud_idx << 12)
                             | ((r.parity as u16 & 0x3) << 10)
                             | ((r.stop_bits.saturating_sub(1) as u16 & 0x1) << 9)
                             | ((if r.data_bits == 7 { 1u16 } else { 0u16 }) << 8)
-                            | (r.mode as u16 & 0xFF)
+                            | port_mode
                     }
                     1 => r.slave_addr as u16, // Word 2: Slave ID
                     2 => r.retry_count,       // Word 3: Retry count (LOOP5 修复)
@@ -523,12 +515,7 @@ impl SystemConfig {
                 });
             }
         }
-        // 未知保留区 (2239-2242, 参考固件默认 5500-5503)
-        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT)
-            .contains(&addr)
-        {
-            return Some(5500 + (addr - regs::HOLD_UNKNOWN_BASE) as u16);
-        }
+        // 2239-2242 是 PC 工具 local_port1..4，走 PRegBuf 以支持读写回环。
         // TCP COM 端口 (2243-2246)
         if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
             .contains(&addr)
@@ -625,40 +612,25 @@ impl SystemConfig {
             crate::ble_at::notify_ble_name_changed();
             return WriteResult::Persist;
         }
-        // BLE MAC — 已迁到用户区 0x0FA4 (4004, 4 regs)
-        if (regs::HOLD_BT_ADDR_BASE..regs::HOLD_BT_ADDR_BASE + 4).contains(&addr) {
-            let idx = (addr - regs::HOLD_BT_ADDR_BASE) as usize * 2;
-            let [hi, lo] = value.to_be_bytes();
-            if idx < 6 {
-                self.ble_mac[idx] = hi;
-            }
-            if idx + 1 < 6 {
-                self.ble_mac[idx + 1] = lo;
-            }
-            return WriteResult::Apply;
-        }
-        // RS485 — Word1=组合格式匹配参考固件
-        for i in 0..5usize {
+        // 4000+ 始终由调用方写入连续 PRegBuf。
+        // 前 3 个物理 RS485；后两个 BT/NET 兼容块走 PRegBuf。
+        for i in 0..self.rs485.len() {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
             if (base..base + 5).contains(&addr) {
                 let off = (addr - base) as usize;
-                let r = if i < self.rs485.len() {
-                    &mut self.rs485[i]
-                } else {
-                    &mut self.rs485[0]
-                };
+                let r = &mut self.rs485[i];
                 match off {
                     0 => {
                         let baud_idx = ((value >> 12) & 0xF) as u32;
-                        let baud_table: [u32; 11] = [
-                            1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800,
-                            921600,
+                        let baud_table: [u32; 16] = [
+                            9600, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200,
+                            128000, 153600, 230400, 256000, 460800, 921600,
                         ];
                         r.baudrate = *baud_table.get(baud_idx as usize).unwrap_or(&9600);
                         r.parity = ((value >> 10) & 0x3) as u8;
                         r.stop_bits = (((value >> 9) & 0x1) + 1) as u8;
                         r.data_bits = if (value >> 8) & 0x1 != 0 { 7 } else { 8 };
-                        r.mode = (value & 0xFF) as u8;
+                        r.mode = if value & 0xFF == 1 { 0 } else { 1 };
                     }
                     1 => r.slave_addr = value as u8,
                     2 => r.retry_count = value, // LOOP5 修复: 之前 2..=4 => {} 漏存 retry/timeout/interval
@@ -670,12 +642,7 @@ impl SystemConfig {
                 return WriteResult::Persist;
             }
         }
-        // 未知保留区 (2239-2242, 可写)
-        if (regs::HOLD_UNKNOWN_BASE..regs::HOLD_UNKNOWN_BASE + regs::HOLD_UNKNOWN_COUNT)
-            .contains(&addr)
-        {
-            return WriteResult::Ok;
-        }
+        // 2239-2242 由调用方落入 PRegBuf，不能假成功后丢弃 PC 工具写入。
         // TCP COM 端口 (2243-2246) — 运行时可写, Persist 落盘 (对齐参考固件)
         if (regs::HOLD_TCP_COM_BASE..regs::HOLD_TCP_COM_BASE + regs::HOLD_TCP_COM_COUNT)
             .contains(&addr)
@@ -1007,8 +974,8 @@ mod tests {
     #[test]
     fn test_write_reg_rs485_persist() {
         let mut cfg = SystemConfig::defaults();
-        // Word1 = 0x3000 (9600/N/8/1/Master)
-        let result = cfg.write_reg(regs::HOLD_RS485_BASE, 0x3000);
+        // PC/C++ Word1 = 0x4001 (9600/N/8/1/Master)
+        let result = cfg.write_reg(regs::HOLD_RS485_BASE, 0x4001);
         assert_eq!(result, WriteResult::Persist);
     }
 
@@ -1021,12 +988,13 @@ mod tests {
         assert_eq!(cfg.hw_version, 0x00F3);
     }
 
-    /// UNKNOWN 区 (2239-2242) 写入必须返回 Ok (保留/诊断).
+    /// PC local_port1..4 必须交给通用 PRegBuf，不能在 SystemConfig 中假成功丢弃。
     #[test]
-    fn test_write_reg_unknown_ok() {
+    fn test_write_reg_pc_client_port_falls_back_to_preg() {
         let mut cfg = SystemConfig::defaults();
         let result = cfg.write_reg(regs::HOLD_UNKNOWN_BASE, 0x1234);
-        assert_eq!(result, WriteResult::Ok);
+        assert_eq!(result, WriteResult::NotFound);
+        assert_eq!(cfg.read_reg(regs::HOLD_UNKNOWN_BASE), None);
     }
 
     /// TCP_COM 端口 (2243-2246) 写入必须持久化并可读回。
@@ -1046,12 +1014,14 @@ mod tests {
         assert_eq!(result, WriteResult::Apply);
     }
 
-    /// BT_ADDR (HOLD_BT_ADDR_BASE) 写入必须返回 Apply (BLE MAC 需重启生效).
+    /// 4000+ 是连续逻辑区，SystemConfig 必须让出给 PRegBuf。
     #[test]
-    fn test_write_reg_bt_addr_apply() {
+    fn test_user_logic_area_falls_back_to_preg() {
         let mut cfg = SystemConfig::defaults();
-        let result = cfg.write_reg(regs::HOLD_BT_ADDR_BASE, 0xAABB);
-        assert_eq!(result, WriteResult::Apply);
+        let addr = regs::HOLD_USER_BASE + 4;
+        let result = cfg.write_reg(addr, 0xAABB);
+        assert_eq!(result, WriteResult::NotFound);
+        assert_eq!(cfg.read_reg(addr), None);
     }
 
     // ========================================================================
@@ -1090,18 +1060,14 @@ mod tests {
         );
     }
 
-    /// 0x0FA4 (用户区 BLE MAC) 仍可写 (兼容遗留 master)
+    /// 0x0FA4 不得再截断 PC 场景逻辑数据。
     #[test]
-    fn test_ble_mac_at_user_area_still_writable() {
+    fn test_legacy_ble_mac_alias_no_longer_shadows_logic_data() {
         let mut cfg = SystemConfig::defaults();
+        let original = cfg.ble_mac;
         let result = cfg.write_reg(0x0FA4, 0xAABB);
-        assert_eq!(
-            result,
-            WriteResult::Apply,
-            "BLE MAC write still works at 0x0FA4 (legacy)"
-        );
-        assert_eq!(cfg.ble_mac[0], 0xAA);
-        assert_eq!(cfg.ble_mac[1], 0xBB);
+        assert_eq!(result, WriteResult::NotFound);
+        assert_eq!(cfg.ble_mac, original);
     }
 
     /// metuory 读 0x08E2 (4 regs) → 必须返回 ble_name (不是 ble_mac)
@@ -1123,13 +1089,13 @@ mod tests {
         );
     }
 
-    /// RS485 (0x08A6..0x08BD, 5 端口 × 5 字) Persist 路径完整覆盖
-    /// Word1 编码: (baud_idx<<12)|(parity<<10)|(stop<<9)|(data<<8)|mode
+    /// 物理 RS485 (0x08A6..0x08B4, 3 端口 × 5 字) Persist 路径完整覆盖。
+    /// 后两个 BT/NET 块由 PRegBuf 持久化，禁止覆盖 rs485[0]。
     #[test]
-    fn test_rs485_persist_full_5ports() {
+    fn test_rs485_persist_three_physical_ports() {
         let mut cfg = SystemConfig::defaults();
-        // 115200 / Even / 1 stop / 8 data / Master mode = (7<<12)|(2<<10)|(0<<9)|(0<<8)|0 = 0x7800
-        let word1 = 0x7800u16;
+        // PC/C++: 115200 / Even / 1 stop / 8 data / Master = 0x9801
+        let word1 = 0x9801u16;
         // idx=0, baud=115200, parity=Even, stop=1, data=8, mode=0
         let r0 = cfg.write_reg(0x08A6, word1);
         let r1 = cfg.write_reg(0x08A7, 5); // slave=5
@@ -1149,25 +1115,27 @@ mod tests {
         assert_eq!(cfg.rs485[0].data_bits, 8);
         assert_eq!(cfg.rs485[0].slave_addr, 5);
         // idx=1 (0x08AB..0x08AF)
-        let r5 = cfg.write_reg(0x08AB, 0x9800); // idx=1 baud=921600
+        let r5 = cfg.write_reg(0x08AB, 0xF000); // idx=1 baud=921600, slave
         assert_eq!(r5, WriteResult::Persist);
         assert_eq!(cfg.rs485[1].baudrate, 921600);
+        let before = cfg.rs485[0].clone();
+        assert_eq!(cfg.write_reg(0x08B5, 0x9000), WriteResult::NotFound);
+        assert_eq!(cfg.rs485[0].baudrate, before.baudrate);
+        assert_eq!(cfg.read_reg(0x08B5), None);
     }
 
     /// RS485 写入后, 立即读取必须返回相同值 (RCU RMW 闭环)
     #[test]
     fn test_rs485_write_then_read_consistency() {
         let mut cfg = SystemConfig::defaults();
-        // idx=0, baud_idx=7 (115200), parity=1 (Odd), stop=2 bits, data=7, mode=1 (Slave)
-        // 编码: (7<<12)|(1<<10)|(1<<9)|(1<<8)|1 = 0x7D01
-        cfg.write_reg(0x08A6, 0x7D01);
+        // PC/C++: baud_idx=9 (115200), Odd, 2 stop, 7 data, Master(1)
+        cfg.write_reg(0x08A6, 0x9701);
         cfg.write_reg(0x08A7, 42); // slave=42
 
         // 读回
         let w1 = cfg.read_reg(0x08A6).expect("Word1 must be Some");
         let w2 = cfg.read_reg(0x08A7).expect("Word2 must be Some");
-        // baud_idx=7, parity=1, stop=1 (from bit9 + 1), data=7 (from bit8), mode=1
-        assert_eq!(w1, 0x7D01, "round-trip word1: write 0x7D01 → read 0x7D01");
+        assert_eq!(w1, 0x9701, "PC holding encoding must round-trip exactly");
         assert_eq!(w2, 42, "round-trip word2: write 42 → read 42");
     }
 
@@ -1309,20 +1277,16 @@ mod tests {
         );
     }
 
-    /// LOOP3: BLE MAC 已从 MCA 0x08E2 迁到 0x0FA4 (metuory 1.0.78 用 0x08E2 作为 BLE NAME)
-    /// LOOP10: 更新测试断言, 匹配实际常量值
+    /// PC 与 metuory 1.0.78 共用 0x08E2 作为 BLE 节点/名称。
+    /// 0x0FA4 必须保留给 PC 连续逻辑配置，不能定义第二套别名。
     #[test]
     fn test_layout_bt_addr_matches_design() {
-        assert_eq!(
-            regs::HOLD_BT_ADDR_BASE,
-            0x0FA4,
-            "BT_ADDR 迁到用户区 0x0FA4 (metuory 0x08E2 被 BLE NAME 占用)"
-        );
         assert_eq!(
             regs::HOLD_BLE_NAME_BASE,
             0x08E2,
             "BLE_NAME 必须在 0x08E2 (metuory WRITE_BLUETOOTH_ID 0x51)"
         );
+        assert!((regs::HOLD_USER_BASE..=regs::HOLD_CFG_END).contains(&0x0FA4));
     }
 
     /// HOLD_485_ERR RO 必须返回 0 (cold boot 初值, 与 MCA 一致)

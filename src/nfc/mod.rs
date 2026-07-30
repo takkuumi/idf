@@ -638,14 +638,14 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
                             } else if regbuf_equal(rb, &nfc_words[..n_words]) {
                                 log::debug!("[nfc] snapshot matches, no sync needed");
                             } else {
-                                // LOOP13: NFC 数据有效但与本地不一致 → 用本地 dirty 决策
-                                // - HOLDING_DIRTY=true  → 本地有 Modbus/AT 写入，本地更新，备份到 NFC
-                                // - HOLDING_DIRTY=false → 本地已同步上次 NFC backup，NFC 数据更新，从 NFC 恢复
-                                let local_dirty = crate::bus::storage_state::HOLDING_DIRTY
+                                // NFC dirty 与 NVS dirty 独立：NVS 已落盘不代表 NFC 已备份。
+                                let local_dirty = crate::bus::storage_state::HOLDING_NFC_DIRTY
                                     .load(std::sync::atomic::Ordering::Acquire);
-                                if local_dirty {
+                                let nvs_valid = crate::bus::storage_state::HOLDING_NVS_VALID
+                                    .load(std::sync::atomic::Ordering::Acquire);
+                                if local_dirty || nvs_valid {
                                     log::info!(
-                                        "[nfc] local dirty + NFC differs, backing up local to NFC"
+                                        "[nfc] local authoritative + NFC differs, backing up local"
                                     );
                                     finish_backup(backup_to_nfc(&dev, rb, &mut data_buf));
                                 } else {
@@ -787,7 +787,8 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16], scratch: &mut [u8]) -> Resul
 
 fn finish_backup(result: Result<(), ()>) {
     if result.is_ok() {
-        crate::bus::storage_state::HOLDING_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+        crate::bus::storage_state::HOLDING_NFC_DIRTY
+            .store(false, std::sync::atomic::Ordering::Release);
         *NFC_STATE.lock() = NfcState::BackedUp;
     } else {
         *NFC_STATE.lock() = NfcState::Error;
@@ -926,21 +927,16 @@ fn append_ndef_text_record<const N: usize>(
 /// `memcpy((uint16_t *)g_tVar.PRegBuf, (uint16_t *)tagRead, ...)`
 /// 然后 `save_config_to_file(...)` 持久化
 ///
-/// LOOP13: restore 完成后 HOLDING_DIRTY=false (本地 = NFC 快照, 已同步).
-/// 同时触发 holding NVS 持久化 (而非仅 device_text), 对齐 holding_store 路径.
+/// restore 后 NFC dirty=false（两端已同步），但 NVS dirty 必须保持 true 直到真正落盘。
 fn restore_from_nfc(nfc_words: &[u16]) {
     use crate::bus::backends::storage_modify_holding;
 
-    // storage_modify_holding 内部置 HOLDING_DIRTY=true, 但 restore 后
-    // 本地 holding_buf = NFC 数据, 状态已同步, 需立即清 dirty.
     storage_modify_holding(|buf| {
         let n = nfc_words.len().min(buf.len());
         buf[..n].copy_from_slice(&nfc_words[..n]);
     });
 
-    // LOOP13: restore 后立即清 dirty (与 NFC 同步, 不会再被 NFC 视为"本地更新")
-    // 同时触发 NVS holding 持久化, 确保恢复的数据也落盘.
-    crate::bus::storage_state::HOLDING_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    crate::bus::storage_state::HOLDING_NFC_DIRTY.store(false, std::sync::atomic::Ordering::Release);
     crate::device::request_persist_holding();
 
     log::info!(

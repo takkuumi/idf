@@ -3,7 +3,7 @@
 //! FC=01/02/03/04 读端 + FC=05/06/0F/10 写端全部经此模块, 不再过 `Spin<Bus>`:
 //! - DI / DO / AI / AO / sys → `bus::IO` (原子 / `AtomicBits64`), 真无锁
 //! - proto / device_text / holding_buf → `STORAGE` (`Rcu<StorageSnapshot>`) RCU RMW
-//! - cfg / device_config → `CONFIG` (`Rcu<ConfigSnapshot>`) RCU RMW
+//! - 系统配置 → `CONFIG`；PC/手机逻辑配置 → 唯一 PRegBuf (`STORAGE.holding_buf`)
 //! - `proto.status` 状态机 → 独立 `AtomicU8` (`PROTO_STATUS_ATOMIC`), 不进快照 (高频写)
 //!
 //! 见 `docs/system/LEGACY_BUS_RETIRE.md` 阶段 B/C/D (退役完成).
@@ -12,14 +12,15 @@
 //! `STORAGE` / `CONFIG` 的 `Rcu::write` 假定串行执笔 (单 Modbus 任务串 / 单 DeviceActor).
 //! 多写者并发 push 同一 retire 槽可能丢一个未回收快照 (泄漏 1 帧, 极罕见) — 见 `rcu.rs`.
 
-use std::sync::Arc;
-
 use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
+use std::sync::Arc;
 
+use super::config_state::{ConfigSnapshot, config_read, config_read_with};
 use super::io_global::IO;
-use super::storage_state::{storage_read, storage_read_with, proto_status, StorageSnapshot, STORAGE};
-use super::config_state::{config_read, config_read_with, ConfigSnapshot};
+use super::storage_state::{
+    STORAGE, StorageSnapshot, proto_status, storage_read, storage_read_with,
+};
 
 // ----------------------------------------------------------------------------
 // LOOP8: RCU 写者串行化锁
@@ -29,10 +30,10 @@ use super::config_state::{config_read, config_read_with, ConfigSnapshot};
 // 多个并发写者: Modbus TCP 4 连接 + RTU + DeviceActor + RS485 master + DHCP。
 // 并发写者会导致:
 //   1. RMW 竞争丢写 (两个线程同时 clone 同一快照, 各自修改, 后写覆盖前写)
-//   2. retire_queue 溢出 (4 槽, 超过即 leak ~11KB StorageSnapshot)
+//   2. retire_queue 溢出 (4 槽, 突发覆盖会保守泄漏一个 COW 快照)
 //
 // 修复: 用 Spin<()> 短锁保护 clone-mutate-write 序列。持锁时间 = clone + mutate +
-// Rcu::write, 约数十微秒 (clone 走 heap, write 走 atomic swap)。远小于 Modbus
+// Rcu::write；快照 clone 仅增加 Arc 引用，实际修改区按需 COW。远小于 Modbus
 // 响应超时 (2s), 不会阻塞 Modbus TCP 线程。
 //
 // 注意: 这把锁是"写者串行化"锁, 与读者无关 (读者仍走 RCU 无锁读路径)。
@@ -51,12 +52,16 @@ static RCU_WRITE_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
 /// 读线圈 (DO, FC=01): 地址语义同 `Bus::read_coil`.
 #[inline]
 pub fn read_coil(addr: u16) -> Option<bool> {
-    if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
+    if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
-        return Some(IO.do_.get_bit(ch));
+        return Some(ch < hw_version::DO_COUNT && IO.do_.get_bit(ch));
     }
-    if addr < regs::DISC_DI_COUNT {
-        return Some(IO.di.get_bit(addr as usize));
+    // 原 PC 工具用 FC=01 读取 X 点，并固定请求 48 点；未安装点按 0 填充。
+    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
+        return Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize));
+    }
+    if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
+        return Some(false);
     }
     None
 }
@@ -64,8 +69,8 @@ pub fn read_coil(addr: u16) -> Option<bool> {
 /// 读离散输入 (DI, FC=02).
 #[inline]
 pub fn read_disc(addr: u16) -> Option<bool> {
-    if addr < regs::DISC_DI_COUNT {
-        Some(IO.di.get_bit(addr as usize))
+    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
+        Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize))
     } else {
         None
     }
@@ -77,9 +82,13 @@ pub fn read_disc(addr: u16) -> Option<bool> {
 
 /// 读输入寄存器 (AI + 系统状态 + 故障统计, FC=04). 地址语义同 `Bus::read_input_reg`.
 pub fn read_input_reg(addr: u16) -> Option<u16> {
-    if addr >= regs::INREG_AI_BASE && addr < regs::INREG_AI_BASE + regs::INREG_AI_COUNT {
+    if addr >= regs::INREG_AI_BASE && addr < regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT {
         let idx = (addr - regs::INREG_AI_BASE) as usize;
-        return Some(IO.ai.get_raw(idx));
+        return Some(if idx < regs::INREG_AI_COUNT as usize {
+            IO.ai.get_raw(idx)
+        } else {
+            0
+        });
     }
     if addr >= regs::INREG_AI_STATUS_BASE
         && addr < regs::INREG_AI_STATUS_BASE + regs::INREG_AI_COUNT
@@ -88,6 +97,13 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         return Some(IO.ai.get_scaled(idx));
     }
     match addr {
+        // tauri-app Meta::read 固定读取 0x0800..0x0805。
+        regs::INREG_PC_META_BASE => Some(hw_version::DO_COUNT as u16),
+        0x0801 => Some(hw_version::DI_COUNT as u16),
+        0x0802 => Some(regs::INREG_AI_COUNT),
+        0x0803 => Some(3), // 三路物理 RS485
+        0x0804 => Some(1), // 一路 LAN/W5500
+        0x0805 => Some(1), // 一路 BLE
         regs::INREG_QI_COUNT => {
             Some(((hw_version::DO_COUNT as u16) << 8) | (hw_version::DI_COUNT as u16))
         }
@@ -99,49 +115,60 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             Some(config_read_with(|cs| cs.cfg.fw_date).unwrap_or(0x0615))
         }
         // ---- BLE Android 兼容寄存器 (Modbus TCP 也可读) ----
-        regs::INREG_HW_VER => {
-            Some(config_read_with(|cs| cs.cfg.hw_version).unwrap_or(0x0100))
-        }
-        regs::INREG_IP_BASE => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[0], cs.cfg.ip[1]])).unwrap_or(0))
-        }
-        2248 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[2], cs.cfg.ip[3]])).unwrap_or(0))
-        }
-        2249 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[0], cs.cfg.mask[1]])).unwrap_or(0))
-        }
-        2250 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[2], cs.cfg.mask[3]])).unwrap_or(0))
-        }
-        2251 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[0], cs.cfg.gateway[1]])).unwrap_or(0))
-        }
-        2252 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[2], cs.cfg.gateway[3]])).unwrap_or(0))
-        }
-        regs::INREG_MAC_BASE => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[0], cs.cfg.eth_mac[1]])).unwrap_or(0))
-        }
-        2264 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[2], cs.cfg.eth_mac[3]])).unwrap_or(0))
-        }
-        2265 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[4], cs.cfg.eth_mac[5]])).unwrap_or(0))
-        }
+        regs::INREG_HW_VER => Some(config_read_with(|cs| cs.cfg.hw_version).unwrap_or(0x0100)),
+        regs::INREG_IP_BASE => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[0], cs.cfg.ip[1]])).unwrap_or(0),
+        ),
+        2248 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[2], cs.cfg.ip[3]])).unwrap_or(0),
+        ),
+        2249 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[0], cs.cfg.mask[1]]))
+                .unwrap_or(0),
+        ),
+        2250 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[2], cs.cfg.mask[3]]))
+                .unwrap_or(0),
+        ),
+        2251 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[0], cs.cfg.gateway[1]]))
+                .unwrap_or(0),
+        ),
+        2252 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[2], cs.cfg.gateway[3]]))
+                .unwrap_or(0),
+        ),
+        regs::INREG_MAC_BASE => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[0], cs.cfg.eth_mac[1]]))
+                .unwrap_or(0),
+        ),
+        2264 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[2], cs.cfg.eth_mac[3]]))
+                .unwrap_or(0),
+        ),
+        2265 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.eth_mac[4], cs.cfg.eth_mac[5]]))
+                .unwrap_or(0),
+        ),
         regs::INREG_BLE_ID_BASE => {
             // BLE 名称前 4 字节 (UTF-8 模式兼容)
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[0], cs.cfg.ble_name[1]])).unwrap_or(0))
+            Some(
+                config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[0], cs.cfg.ble_name[1]]))
+                    .unwrap_or(0),
+            )
         }
-        2275 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[2], cs.cfg.ble_name[3]])).unwrap_or(0))
-        }
-        2276 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[4], cs.cfg.ble_name[5]])).unwrap_or(0))
-        }
-        2277 => {
-            Some(config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[6], cs.cfg.ble_name[7]])).unwrap_or(0))
-        }
+        2275 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[2], cs.cfg.ble_name[3]]))
+                .unwrap_or(0),
+        ),
+        2276 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[4], cs.cfg.ble_name[5]]))
+                .unwrap_or(0),
+        ),
+        2277 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.ble_name[6], cs.cfg.ble_name[7]]))
+                .unwrap_or(0),
+        ),
         regs::INREG_RECOV_RECOVERABLE => {
             let s = recovery::stats();
             Some(s.recoverable.min(0xFFFF) as u16)
@@ -171,8 +198,8 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         // LOOP10: ringlog COUNT(0x0885)/WRITES(0x0886) 移至 FC=04 (read_input_reg),
         // 避免占用 FC=03 中的 0x0885-0x0886 (与 SN/PLACE 区连续, 也避免用户混淆)
         regs::INREG_RINGLOG_WRITES => {
-            let cnt = crate::error::ringlog::LOG_WRITE_COUNT
-                .load(std::sync::atomic::Ordering::Acquire);
+            let cnt =
+                crate::error::ringlog::LOG_WRITE_COUNT.load(std::sync::atomic::Ordering::Acquire);
             Some((cnt & 0xFFFF) as u16)
         }
         // ---- LOOP10: Ringlog 数据条目 (FC=04, 0x0887..0x08A6, 8条×4字) ----
@@ -240,25 +267,16 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         return storage_read_with(|s| s.device_text[idx]);
     }
-    // 2. CFG / device_config / holding_buf (0x0880..=0x107F)
+    // 2. CFG / PRegBuf (0x0880..=0x107F)
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
         // LOOP10 修复: ringlog 已移至 FC=04 (read_input_reg), 不再在 FC=03 中拦截
         // 旧代码 ringlog 0x0887-0x08A6 与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 重叠,
         // 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非实际配置值.
-        // 2b. device_config 子区 (2300..<2400): 来自 CONFIG.device_config
-        if addr >= 2300 && addr < 2400 {
-            // LOOP11: 零拷贝读 — device_config 含 heapless::Vec<DeviceEntry,32> (~2.5KB),
-            // 原 config_read() 在 BTC_TASK 栈上 clone 整个快照触发 Stack canary
-            // read_with 返回 Option<Option<u16>>, and_then 展平为 Option<u16>
-            if let Some(Some(v)) = config_read_with(|cs| cs.device_config.read_reg(addr)) {
-                return Some(v);
-            }
-        }
-        // 2c. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
+        // 2b. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
         if let Some(Some(v)) = config_read_with(|cs| cs.cfg.read_reg(addr)) {
             return Some(v);
         }
-        // 2d. HOLD_PXX 残余 (0x0880..=0x107F 中 CFG 未覆盖部分): 来自 STORAGE.holding_buf
+        // 2c. HOLD_PXX 残余（含 2300+ 逻辑配置）来自唯一 PRegBuf。
         let idx = (addr - regs::HOLD_PXX_BASE) as usize;
         if idx < regs::HOLD_PXX_COUNT {
             return storage_read_with(|s| s.holding_buf[idx]);
@@ -275,7 +293,9 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         } else {
             let user_idx = (idx - 48) as u16;
             if user_idx < regs::HOLD_USER_COUNT {
-                storage_read_with(|s| s.holding_buf[(regs::HOLD_USER_BASE as usize) + (user_idx as usize)])
+                let holding_idx =
+                    (regs::HOLD_USER_BASE - regs::HOLD_PXX_BASE) as usize + user_idx as usize;
+                storage_read_with(|s| s.holding_buf[holding_idx])
             } else {
                 Some(0)
             }
@@ -337,7 +357,10 @@ mod tests {
         let sn = read_hold_reg(regs::HOLD_SN_BASE);
         assert!(sn.is_some(), "FC=03 读取 SN base 0x0894 必须返回 Some");
         let place = read_hold_reg(regs::HOLD_PLACE_BASE);
-        assert!(place.is_some(), "FC=03 读取 PLACE base 0x089D 必须返回 Some");
+        assert!(
+            place.is_some(),
+            "FC=03 读取 PLACE base 0x089D 必须返回 Some"
+        );
         let hwver = read_hold_reg(regs::HOLD_HW_VER);
         assert!(hwver.is_some(), "FC=03 读取 HW_VER 0x08A5 必须返回 Some");
     }
@@ -348,10 +371,16 @@ mod tests {
     #[test]
     fn test_monitor_plc_readable_via_fc04() {
         let v = read_input_reg(regs::MONITOR_PLC_BASE);
-        assert!(v.is_some(), "FC=04 读取 MONITOR_PLC_BASE 0x7531 必须返回 Some");
+        assert!(
+            v.is_some(),
+            "FC=04 读取 MONITOR_PLC_BASE 0x7531 必须返回 Some"
+        );
         // 越界边界: 30128 = MONITOR_PLC_END
         let v_end = read_input_reg(regs::MONITOR_PLC_END);
-        assert!(v_end.is_some(), "FC=04 读取 MONITOR_PLC_END 0x75B0 必须返回 Some");
+        assert!(
+            v_end.is_some(),
+            "FC=04 读取 MONITOR_PLC_END 0x75B0 必须返回 Some"
+        );
         // 越界地址: 30129 = MONITOR_PLC_END + 1
         let v_oob = read_input_reg(regs::MONITOR_PLC_END + 1);
         assert!(v_oob.is_none(), "FC=04 读取越界 0x75B1 必须返回 None");
@@ -361,10 +390,16 @@ mod tests {
     #[test]
     fn test_control_plc_readable_via_fc03() {
         let v = read_hold_reg(regs::CONTROL_PLC_BASE);
-        assert!(v.is_some(), "FC=03 读取 CONTROL_PLC_BASE 0x9C41 必须返回 Some");
+        assert!(
+            v.is_some(),
+            "FC=03 读取 CONTROL_PLC_BASE 0x9C41 必须返回 Some"
+        );
         // 越界边界: 40300 = CONTROL_PLC_END
         let v_end = read_hold_reg(regs::CONTROL_PLC_END);
-        assert!(v_end.is_some(), "FC=03 读取 CONTROL_PLC_END 0x9D6C 必须返回 Some");
+        assert!(
+            v_end.is_some(),
+            "FC=03 读取 CONTROL_PLC_END 0x9D6C 必须返回 Some"
+        );
         // 越界地址: 40301
         let v_oob = read_hold_reg(regs::CONTROL_PLC_END + 1);
         assert!(v_oob.is_none(), "FC=03 读取越界 0x9D6D 必须返回 None");
@@ -375,6 +410,63 @@ mod tests {
     fn test_func_count_via_fc03() {
         let v = read_hold_reg(regs::FUNC_COUNT);
         assert!(v.is_some(), "FC=03 读取 FUNC_COUNT 0x08FC 必须返回 Some");
+    }
+
+    /// tauri-app DeviceMMP::read_settings 固定读取 2196 起的 83 words。
+    /// 任一中间地址返回 None 都会使 TCP 与 RTU 整块报 Illegal Data Address。
+    #[test]
+    fn test_pc_device_mmp_full_window_is_readable() {
+        for addr in regs::HOLD_PC_DEVICE_BASE..=regs::HOLD_PC_DEVICE_END {
+            assert!(
+                read_hold_reg(addr).is_some(),
+                "PC DeviceMMP address {addr} must be readable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pc_fixed_io_and_meta_windows_are_readable() {
+        for addr in 0..regs::LEGACY_POINT_WINDOW_COUNT {
+            assert!(read_coil(addr).is_some(), "PC X address {addr}");
+        }
+        for addr in regs::COIL_DO_BASE..regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT {
+            assert!(read_coil(addr).is_some(), "PC Y address {addr}");
+        }
+        for addr in regs::INREG_AI_BASE..regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT {
+            assert!(read_input_reg(addr).is_some(), "PC AI address {addr}");
+        }
+        for addr in regs::INREG_PC_META_BASE..regs::INREG_PC_META_BASE + 6 {
+            assert!(read_input_reg(addr).is_some(), "PC Meta address {addr}");
+        }
+    }
+
+    #[test]
+    fn test_pc_logic_and_text_windows_are_contiguous() {
+        for addr in regs::HOLD_DEVICE_CONFIG..=regs::HOLD_CFG_END {
+            assert!(read_hold_reg(addr).is_some(), "PC logic address {addr}");
+        }
+        for addr in regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END {
+            assert!(read_hold_reg(addr).is_some(), "PC text address {addr}");
+        }
+    }
+
+    #[test]
+    fn test_pc_logic_block_write_is_atomic_and_readable() {
+        // DeviceMMP writes logic entries in contiguous FC=16 blocks. These addresses
+        // must use the persistent PRegBuf rather than a transient configuration alias.
+        let values = [0x1122, 0x3344, 0x5566, 0x7788];
+        assert!(write_hold_regs(regs::HOLD_DEVICE_CONFIG, &values));
+        for (offset, expected) in values.iter().enumerate() {
+            assert_eq!(
+                read_hold_reg(regs::HOLD_DEVICE_CONFIG + offset as u16),
+                Some(*expected),
+                "PC logic word {offset} must round-trip"
+            );
+        }
+        assert!(
+            crate::bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire),
+            "PC logic write must schedule NVS persistence"
+        );
     }
 }
 
@@ -394,9 +486,7 @@ fn storage_clone() -> StorageSnapshot {
 
 /// 克隆当前 CONFIG 快照.
 ///
-/// LOOP11: device_config 现在是 `Arc<DeviceConfigTable>`, clone 仅原子 +1 (~5ns).
-/// 整体 clone 栈成本: SystemConfig 144B memcpy + Arc 8B 原子, 共 ~152B
-/// (原 ~2700B 降 94%). 写路径无需 Arc::make_mut (持有独立快照).
+/// ConfigSnapshot 仅含小型 SystemConfig，不携带逻辑配置大对象。
 #[inline]
 fn config_clone() -> ConfigSnapshot {
     config_read()
@@ -419,6 +509,107 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
     write_hold_reg_locked(addr, value)
 }
 
+/// 连续保持寄存器批量写。整批持有一次写者锁，保证 TCP/RTU/手机并发时不会交叉。
+pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
+    if values.is_empty() || (addr as u32) + values.len() as u32 > (u16::MAX as u32) + 1 {
+        return false;
+    }
+    let end_exclusive = addr as u32 + values.len() as u32;
+
+    // PC 逻辑文本按 60 words/chunk 写入。整块只 clone/publish/save 一次，避免
+    // 60 次 4KB 快照与同步 NVS 写导致 2s Modbus 超时和 Flash 过度磨损。
+    if addr >= regs::DEVICE_TEXT_BASE && end_exclusive <= regs::DEVICE_TEXT_END as u32 + 1 {
+        {
+            let _guard = RCU_WRITE_LOCK.lock();
+            let mut snap = storage_clone();
+            let start = (addr - regs::DEVICE_TEXT_BASE) as usize;
+            Arc::make_mut(&mut snap.device_text)[start..start + values.len()]
+                .copy_from_slice(values);
+            sync_proto_status(&mut snap);
+            STORAGE.write(snap);
+        }
+        crate::device::request_save_device_text();
+        return true;
+    }
+
+    // 基础属性和逻辑配置都位于 PRegBuf。整块只发布一次 CONFIG/STORAGE；
+    // 2300+ 完全遵循原 C++ 连续逻辑区，不再被第二套对象模型截断。
+    if addr >= regs::HOLD_CFG_BASE && end_exclusive <= regs::HOLD_CFG_END as u32 + 1 {
+        let mut request_config_persist = false;
+        let mut request_runtime_apply = false;
+        {
+            let _guard = RCU_WRITE_LOCK.lock();
+            let mut cs = config_clone();
+            let mut config_changed = false;
+            let mut config_needs_version_bump = false;
+            let mut holding_changed = false;
+            let mut holding = storage_clone();
+
+            for (offset, &value) in values.iter().enumerate() {
+                let target = addr + offset as u16;
+                // 原 C++ SLAVE_DEVICE_CONFIG=2300 到 PRegBuf 末尾是单一连续区。
+                let result = if target >= regs::HOLD_DEVICE_CONFIG {
+                    WriteResult::NotFound
+                } else {
+                    cs.cfg.write_reg(target, value)
+                };
+                match result {
+                    WriteResult::Ok => config_changed = true,
+                    WriteResult::Persist => {
+                        config_changed = true;
+                        request_config_persist = true;
+                    }
+                    WriteResult::Apply => {
+                        config_changed = true;
+                        request_config_persist = true;
+                        request_runtime_apply = true;
+                        config_needs_version_bump = true;
+                    }
+                    WriteResult::Reset => {
+                        cs.cfg = SystemConfig::defaults();
+                        config_changed = true;
+                        request_config_persist = true;
+                        request_runtime_apply = true;
+                    }
+                    WriteResult::NotFound => {
+                        let idx = (target - regs::HOLD_PXX_BASE) as usize;
+                        Arc::make_mut(&mut holding.holding_buf)[idx] = value;
+                        holding_changed = true;
+                    }
+                }
+            }
+
+            if config_changed {
+                if config_needs_version_bump {
+                    cs.cfg.cfg_version = cs.cfg.cfg_version.wrapping_add(1);
+                }
+                super::config_state::CONFIG.write(cs);
+            }
+            if holding_changed {
+                sync_proto_status(&mut holding);
+                STORAGE.write(holding);
+                super::storage_state::HOLDING_DIRTY
+                    .store(true, std::sync::atomic::Ordering::Release);
+                super::storage_state::HOLDING_NFC_DIRTY
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if request_runtime_apply {
+            crate::device::request_apply_config();
+        } else if request_config_persist {
+            crate::device::request_persist_config();
+        }
+        return true;
+    }
+
+    // 协议控制区等非 PReg 地址保留逐字语义，但整批仍禁止其它写者穿插。
+    let _guard = RCU_WRITE_LOCK.lock();
+    values
+        .iter()
+        .enumerate()
+        .all(|(offset, &value)| write_hold_reg_locked(addr.wrapping_add(offset as u16), value))
+}
+
 /// write_hold_reg 的内部实现, 调用方必须持有 RCU_WRITE_LOCK
 fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
@@ -427,26 +618,14 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         let mut snap = storage_clone();
-        snap.device_text[idx] = value;
+        Arc::make_mut(&mut snap.device_text)[idx] = value;
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
         // 触发设备文本 NVS 持久化 (Android 写入后立即落盘, 复位保留)
         crate::device::request_save_device_text();
         return true;
     }
-    // 2. device_config 子区 (2300..<2400): CONFIG RMW
-    if addr >= 2300 && addr < 2400 {
-        let mut cs = config_clone();
-        // LOOP11: Arc<DeviceConfigTable> → 用 Arc::make_mut 获取 &mut (COW)
-        if Arc::make_mut(&mut cs.device_config).write_reg(addr, value) {
-            super::config_state::CONFIG.write(cs);
-            // LOOP13: 触发 device_config NVS 持久化 (修复 store::save() 从未被调用)
-            crate::device::request_persist_device_config();
-            return true;
-        }
-        return false;
-    }
-    // 3. HOLD_CFG_BASE..=HOLD_CFG_END: CFG + holding_buf
+    // 2. HOLD_CFG_BASE..=HOLD_CFG_END: CFG + holding_buf
     //
     // WriteResult 语义 (见 device::system_config::WriteResult):
     // - Ok       : 仅 RCU, 不持久化 (诊断/只读寄存器)
@@ -464,7 +643,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
             WriteResult::Persist => {
                 // 写 RCU + 触发 NVS 持久化. 不增 cfg_version (运行时不需要重新初始化).
                 super::config_state::CONFIG.write(cs);
-                crate::device::request_apply_config();
+                crate::device::request_persist_config();
                 return true;
             }
             WriteResult::Apply => {
@@ -484,7 +663,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 // 单字写从 ~50µs 降至 ~2µs (无 heap alloc)
                 let idx = (addr - regs::HOLD_PXX_BASE) as usize;
                 if idx < regs::HOLD_PXX_COUNT {
-                    storage_modify_holding(|buf| {
+                    storage_modify_holding_locked(|buf| {
                         buf[idx] = value;
                     });
                     return true;
@@ -508,8 +687,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         let user_idx = (idx - 48) as u16;
         if user_idx < regs::HOLD_USER_COUNT {
             // LOOP14: storage_modify_holding 替代 storage_clone (性能优化)
-            let holding_idx = (regs::HOLD_USER_BASE as usize) + (user_idx as usize);
-            storage_modify_holding(|buf| {
+            let holding_idx =
+                (regs::HOLD_USER_BASE - regs::HOLD_PXX_BASE) as usize + user_idx as usize;
+            storage_modify_holding_locked(|buf| {
                 buf[holding_idx] = value;
             });
             return true;
@@ -518,7 +698,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
         let mut snap = storage_clone();
         let idx = (addr - regs::PROTO_BASE) as usize;
-        snap.proto.data[idx] = value;
+        Arc::make_mut(&mut snap.proto.data)[idx] = value;
         snap.proto.dirty = true;
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
@@ -573,7 +753,18 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         crate::io::do_::notify();
         return true;
     }
-    false
+    match addr {
+        // PC 明确下发的重启属于计划操作：先正常应答 FC=05，再由 main_loop 执行。
+        regs::COIL_RESTART | regs::COIL_LOGIC_RESTART => {
+            if value {
+                super::io_global::IO.sys.request_reset();
+            }
+            true
+        }
+        // 原 C++ M0/M1 内部位暂不驱动业务，但需保持地址兼容并正常应答。
+        regs::COIL_INTERNAL_START | regs::COIL_INTERNAL_STOP => true,
+        _ => false,
+    }
 }
 
 /// 修改 SystemConfig 部分字段后回写 CONFIG RCU. 用于 w5500 DHCP 写回等单写者场景.
@@ -624,11 +815,17 @@ pub fn storage_modify<F: FnOnce(&mut StorageSnapshot)>(f: F) {
 /// LOOP13: 修复 holding_buf 永久丢失 bug. 在 `write_hold_reg_locked` 写 holding_buf
 /// 的两个分支 (CFG NotFound + CONTROL_PLC user area) 以及 NFC restore 中使用,
 /// 避免 NVS 写路径与业务写入分散.
-pub fn storage_modify_holding<F: FnOnce(&mut Box<[u16]>)>(f: F) {
+pub fn storage_modify_holding<F: FnOnce(&mut [u16])>(f: F) {
     let _guard = RCU_WRITE_LOCK.lock();
+    storage_modify_holding_locked(f);
+}
+
+/// `storage_modify_holding` 的锁内版本；避免 Modbus 写路径重复获取非重入锁而自锁。
+fn storage_modify_holding_locked<F: FnOnce(&mut [u16])>(f: F) {
     let mut snap = storage_clone();
-    f(&mut snap.holding_buf);
+    f(Arc::make_mut(&mut snap.holding_buf));
     sync_proto_status(&mut snap);
     STORAGE.write(snap);
     super::storage_state::HOLDING_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    super::storage_state::HOLDING_NFC_DIRTY.store(true, std::sync::atomic::Ordering::Release);
 }

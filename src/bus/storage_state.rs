@@ -6,7 +6,7 @@
 //!
 //! ## 现在 (Rcu<StorageState>)
 //! - 读: lock-free 原子加载
-//! - 写: 构造新值, 原子替换 (旧值 leak)
+//! - 写: 构造新值, 原子替换并按 epoch 回收旧值
 //! - 写极少 (commit/reload), 读极多 (Modbus 请求)
 //!
 //! ## 关键优化
@@ -23,13 +23,11 @@ use super::rcu::Rcu;
 
 /// 协议存储区
 ///
-/// `data` 用 `Box<[u16]>` 而非 `Box<[u16; 1500]>`: std 对 `Box<[T]>::clone` 是
-/// alloc+memcpy heap→heap, **无栈中转**. `Box<[T; N]>::clone` 则是
-/// `Box::new((**self).clone())`, 解引用 `[T; N]` 走栈 → 11KB snapshot 在 main 栈
-/// 上会撑爆 ESP-IDF 默认 8KB main 栈 (本轮烧录实测 stack canary watchpoint命中).
+/// 大数组使用 `Arc<[u16]>`。克隆快照只增加引用计数；写者再通过
+/// `Arc::make_mut` 仅复制实际修改的数据区，避免每次 PRegBuf 写都深拷贝约 11KB。
 #[derive(Clone)]
 pub struct ProtoStore {
-    pub data: Box<[u16]>,
+    pub data: Arc<[u16]>,
     pub version: u16,
     pub length: u16,
     pub dirty: bool,
@@ -39,7 +37,7 @@ pub struct ProtoStore {
 impl Default for ProtoStore {
     fn default() -> Self {
         Self {
-            data: vec![0u16; 1500].into_boxed_slice(),
+            data: Arc::from(vec![0u16; 1500].into_boxed_slice()),
             version: 0,
             length: 0,
             dirty: false,
@@ -50,35 +48,35 @@ impl Default for ProtoStore {
 
 /// 存储快照 (不可变)
 ///
-/// 三个大数组字段均 `Box<[u16]>` — 见 [`ProtoStore`] 头注释. 整 struct 大小
-/// 缩到 ~60 字节 (3 个 Box slice 头 + 元数据), clone 全走 heap, 不再撑栈.
+/// 三个大数组字段均为 `Arc<[u16]>`；快照 clone 是固定开销，写时 COW。
 #[derive(Clone)]
 pub struct StorageSnapshot {
     pub proto: ProtoStore,
     /// 设备文本区 (5000-6999 = 2000 字)
-    pub device_text: Box<[u16]>,
+    pub device_text: Arc<[u16]>,
     /// 通用 P区保持寄存器缓冲 (0x0880..0x107F = 2048 字)
-    pub holding_buf: Box<[u16]>,
+    pub holding_buf: Arc<[u16]>,
 }
 
 impl StorageSnapshot {
     pub fn new() -> Self {
         Self {
             proto: ProtoStore::default(),
-            device_text: vec![0u16; 2000].into_boxed_slice(),
-            holding_buf: vec![0u16; 2048].into_boxed_slice(),
+            device_text: Arc::from(vec![0u16; 2000].into_boxed_slice()),
+            holding_buf: Arc::from(vec![0u16; 2048].into_boxed_slice()),
         }
     }
 }
 
 impl Default for StorageSnapshot {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 全局存储 (RCU, lock-free 读)
-pub static STORAGE: LazyLock<Rcu<StorageSnapshot>> = LazyLock::new(|| {
-    Rcu::new(StorageSnapshot::new())
-});
+pub static STORAGE: LazyLock<Rcu<StorageSnapshot>> =
+    LazyLock::new(|| Rcu::new(StorageSnapshot::new()));
 
 /// 读 (lock-free, 永远不阻塞)
 pub fn storage_read() -> Option<Arc<StorageSnapshot>> {
@@ -92,7 +90,8 @@ pub fn storage_write(snapshot: StorageSnapshot) {
 
 /// 读并执行 (无 Arc 分配)
 pub fn storage_read_with<F, R>(f: F) -> Option<R>
-where F: FnOnce(&StorageSnapshot) -> R
+where
+    F: FnOnce(&StorageSnapshot) -> R,
 {
     STORAGE.read_with(f)
 }
@@ -101,10 +100,17 @@ where F: FnOnce(&StorageSnapshot) -> R
 ///
 /// Modbus/AT/NFC 写 holding_buf 后置 true, DeviceActor 异步写入 NVS 后清 false.
 /// 使用独立 AtomicBool 而非在 StorageSnapshot 里加 bool, 原因:
-/// - holding_buf 高频写 (FC=10 一次可改 100 words), 每次 clone 11KB 快照只为翻
-///   1 个 bool 太奢侈
+/// - holding_buf 写入通过 COW 发布，不能只为翻一个 bool 再发布一代快照
 /// - NFC 仅读不写此标志, RCU 读者 (Modbus FC=03/04) 不需要它, 仅 DeviceActor 使用
 pub static HOLDING_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// holding_buf 相对 NFC 备份是否有本地新改动。不得与 `HOLDING_DIRTY` 共用：
+/// NVS 成功和 NFC 成功是两个独立提交点，任一方清除另一方的 dirty 都会造成数据回滚。
+pub static HOLDING_NFC_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// 启动时是否从至少一个通过 magic/version/CRC 校验的 NVS holding blob 恢复成功。
+/// NFC 自动冲突决策只在此值为 false 时允许用标签覆盖本机；有效 NVS 永远优先。
+pub static HOLDING_NVS_VALID: AtomicBool = AtomicBool::new(false);
 
 /// DO NVS 持久化 dirty 标志 (LOOP13).
 ///
@@ -126,6 +132,21 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_clone_shares_large_regions_until_write() {
+        let original = StorageSnapshot::new();
+        let mut cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.proto.data, &cloned.proto.data));
+        assert!(Arc::ptr_eq(&original.device_text, &cloned.device_text));
+        assert!(Arc::ptr_eq(&original.holding_buf, &cloned.holding_buf));
+
+        Arc::make_mut(&mut cloned.holding_buf)[0] = 0x55AA;
+        assert!(!Arc::ptr_eq(&original.holding_buf, &cloned.holding_buf));
+        assert!(Arc::ptr_eq(&original.proto.data, &cloned.proto.data));
+        assert!(Arc::ptr_eq(&original.device_text, &cloned.device_text));
+        assert_eq!(original.holding_buf[0], 0);
+    }
+
+    #[test]
     fn test_storage_concurrent() {
         use std::thread;
         storage_write(StorageSnapshot::new());
@@ -143,7 +164,9 @@ mod tests {
             snap.proto.length = i;
             storage_write(snap);
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
 
@@ -151,8 +174,8 @@ mod tests {
 // 阶段 B: 把 `proto.status` (commit=1 / reload=2 / failed=3) 抽到独立原子
 // ----------------------------------------------------------------------------
 //
-// 每次 Modbus 写一个 ProtoCommit/Reload 拍子就改 1 帧的 status; RCU 全量克隆 11KB
-// 太奢侈. 用专属 `AtomicU8` 让 status 成为常量开销的写路径, 与 StorageSnapshot 解耦.
+// 每次 Modbus 写一个 ProtoCommit/Reload 拍子就改 1 帧的 status；不应为此发布一代
+// RCU 快照。用专属 `AtomicU8` 让 status 成为常量开销路径。
 //
 // 快照内的 `proto.status` 字段保留 (snapshot.version 兼容), 但其读端改由 `proto_status()`
 // 取最新 atomic 值; 写端通过 `proto_status_set` 落 atomic, 写 snapshot 时同步镜像.

@@ -19,6 +19,18 @@ const RX_TIMEOUT_MS: u32 = 200;
 #[allow(non_upper_case_globals)]
 const portTICK_PERIOD_MS: u32 = 1000 / configTICK_RATE_HZ;
 
+#[inline]
+fn ms_to_ticks(ms: u64) -> u32 {
+    let period = portTICK_PERIOD_MS.max(1) as u64;
+    ms.div_ceil(period).max(1).min(u32::MAX as u64) as u32
+}
+
+#[inline]
+fn rtu_silence_us(baud: u32) -> u32 {
+    // 3.5 chars × 11 bits/char = 38.5 bit times。
+    38_500_000u32 / baud.max(1)
+}
+
 /// 单路 RS485 端口
 pub struct Rs485Port {
     cfg: Rs485Config,
@@ -28,9 +40,13 @@ impl Rs485Port {
     /// 打开一路 RS485
     pub fn open(cfg: &Rs485Config) -> AppResult<Self> {
         // 1. 配置 UART 参数
-        let mut uart_cfg = uart_config_t {
+        let uart_cfg = uart_config_t {
             baud_rate: cfg.baud as i32,
-            data_bits: (cfg.data_bits - 5) as uart_parity_t,
+            data_bits: if cfg.data_bits == 7 {
+                uart_word_length_t_UART_DATA_7_BITS
+            } else {
+                uart_word_length_t_UART_DATA_8_BITS
+            },
             parity: match cfg.parity {
                 'N' => uart_parity_t_UART_PARITY_DISABLE,
                 'E' => uart_parity_t_UART_PARITY_EVEN,
@@ -51,19 +67,23 @@ impl Rs485Port {
 
         let port = cfg.uart_port as uart_port_t;
         unsafe {
-            uart_param_config(port, &mut uart_cfg);
+            check(uart_param_config(port, &uart_cfg), "uart_param_config")?;
         }
 
         // 2. 设置引脚 (TX/RX/CTS 不用, RTS 接到 DE)
         //    当 de_pin == 255 时不配置 RTS 引脚, 仅使用普通 UART (无 DE 控制)
         unsafe {
-            let rts_pin = if cfg.de_pin != 255 { cfg.rts_pin as i32 } else { -1 };
+            let rts_pin = if cfg.de_pin != 255 {
+                cfg.rts_pin as i32
+            } else {
+                -1
+            };
             let r = uart_set_pin(
                 port,
                 cfg.tx_pin as i32,
                 cfg.rx_pin as i32,
-                rts_pin,              // RTS → DE (255 = 不配置)
-                -1,                   // CTS 不用
+                rts_pin, // RTS → DE (255 = 不配置)
+                -1,      // CTS 不用
             );
             check(r, "uart_set_pin")?;
 
@@ -75,32 +95,47 @@ impl Rs485Port {
             //    无 DE 引脚时保持默认 UART 模式 (仅 RX/TX, 无方向控制)
             if cfg.de_pin != 255 {
                 let r = uart_set_mode(port, uart_mode_t_UART_MODE_RS485_HALF_DUPLEX);
-                check(r, "uart_set_mode")?;
+                if let Err(e) = check(r, "uart_set_mode") {
+                    let _ = uart_driver_delete(port);
+                    return Err(e);
+                }
             }
 
             // 5. 启用硬件 RX 帧间隔检测 (Modbus RTU 3.5 字符时间)
             // 参数单位为字符时间 (11 bits/char), 3 表示 3 个字符静默即触发接收超时
             // 硬件会在帧结束时尽早返回 RX FIFO 数据, 显著降低主站响应延迟
             let r = uart_set_rx_timeout(port, 3);
-            check(r, "uart_set_rx_timeout")?;
+            if let Err(e) = check(r, "uart_set_rx_timeout") {
+                let _ = uart_driver_delete(port);
+                return Err(e);
+            }
         }
 
         log::info!(
             "[rs485] opened uart{} @{} bps, tx={}, rx={}, de={}",
-            cfg.uart_port, cfg.baud, cfg.tx_pin, cfg.rx_pin, cfg.de_pin
+            cfg.uart_port,
+            cfg.baud,
+            cfg.tx_pin,
+            cfg.rx_pin,
+            cfg.de_pin
         );
 
         Ok(Self { cfg: *cfg })
     }
 
     /// 发送并等待应答 (主站用)
-    pub fn send_recv(&mut self, request: &[u8], timeout_ms: u64) -> AppResult<heapless::Vec<u8, 256>> {
+    pub fn send_recv(
+        &mut self,
+        request: &[u8],
+        timeout_ms: u64,
+    ) -> AppResult<heapless::Vec<u8, 256>> {
         self.write(request)?;
         std::thread::sleep(Duration::from_millis(2)); // 切换方向延迟
         let mut buf = [0u8; 256];
         let n = self.read(&mut buf, timeout_ms)?;
         let mut out = heapless::Vec::new();
-        out.extend_from_slice(&buf[..n]).map_err(|_| AppError::Rs485("response too long".into()))?;
+        out.extend_from_slice(&buf[..n])
+            .map_err(|_| AppError::Rs485("response too long".into()))?;
         Ok(out)
     }
 
@@ -112,7 +147,18 @@ impl Rs485Port {
             return Err(AppError::Rs485(format!("write short: {n}/{}", data.len())));
         }
         // 等待发送完成 (RS485 模式下 RTS 自动在完成后释放)
-        unsafe { uart_wait_tx_done(port, 100 / portTICK_PERIOD_MS); }
+        let parity_bits = u64::from(self.cfg.parity != 'N');
+        let bits_per_char = 1 + self.cfg.data_bits as u64 + parity_bits + self.cfg.stop_bits as u64;
+        let tx_ms = (data.len() as u64)
+            .saturating_mul(bits_per_char)
+            .saturating_mul(1000)
+            .div_ceil(self.cfg.baud.max(1) as u64)
+            .saturating_add(20)
+            .min(5000);
+        check(
+            unsafe { uart_wait_tx_done(port, ms_to_ticks(tx_ms)) },
+            "uart_wait_tx_done",
+        )?;
         Ok(())
     }
 
@@ -133,14 +179,22 @@ impl Rs485Port {
 
         // 第一阶段: 等待首字节 (长超时, 利用硬件 RX 帧间隔检测尽早返回)
         while total == 0 && std::time::Instant::now() < deadline {
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .max(1)
+                .min(RX_TIMEOUT_MS as u128) as u64;
             let n = unsafe {
                 uart_read_bytes(
                     port,
                     buf.as_mut_ptr() as *mut _,
                     buf.len() as u32,
-                    RX_TIMEOUT_MS / portTICK_PERIOD_MS.max(1),
+                    ms_to_ticks(remaining_ms),
                 )
             };
+            if n < 0 {
+                return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
+            }
             if n > 0 {
                 total = n as usize;
             }
@@ -152,7 +206,7 @@ impl Rs485Port {
 
         // 第二阶段: 帧间静默判断
         // 3.5 字符时间 = 38.5 bits / 波特率, 最小 1ms 保证实时性
-        let silence_us: u32 = 3_850_000u32 / self.cfg.baud.max(1);
+        let silence_us = rtu_silence_us(self.cfg.baud);
         let silence_ms: u64 = std::cmp::max(silence_us / 1000, 1) as u64;
         let silence_dur = Duration::from_millis(silence_ms);
 
@@ -162,7 +216,10 @@ impl Rs485Port {
 
             // 检查 RX FIFO 中是否还有待读取数据 (使用标准 ESP-IDF API)
             let mut buffered: usize = 0;
-            unsafe { uart_get_buffered_data_len(port, &mut buffered); }
+            check(
+                unsafe { uart_get_buffered_data_len(port, &mut buffered) },
+                "uart_get_buffered_data_len",
+            )?;
             if buffered == 0 {
                 // 静默超时, 帧结束
                 break;
@@ -177,6 +234,9 @@ impl Rs485Port {
                     1, // 1 tick: 立即返回已有数据
                 )
             };
+            if n < 0 {
+                return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
+            }
             if n > 0 {
                 total += n as usize;
             } else {
@@ -196,7 +256,9 @@ impl Rs485Port {
 impl Drop for Rs485Port {
     fn drop(&mut self) {
         let port = self.cfg.uart_port as uart_port_t;
-        unsafe { uart_driver_delete(port); }
+        unsafe {
+            uart_driver_delete(port);
+        }
     }
 }
 
@@ -205,5 +267,23 @@ fn check(r: i32, ctx: &str) -> AppResult<()> {
         Err(AppError::Rs485(format!("{ctx}: err={r:#x}")))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_modbus_rtu_silence_uses_3_5_character_times() {
+        assert_eq!(rtu_silence_us(9600), 4010);
+        assert_eq!(rtu_silence_us(19200), 2005);
+        assert_eq!(rtu_silence_us(115200), 334);
+    }
+
+    #[test]
+    fn test_tick_conversion_never_returns_zero() {
+        assert_eq!(ms_to_ticks(0), 1);
+        assert!(ms_to_ticks(100) >= 1);
     }
 }

@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-29 (LOOP26: 固定任务栈架构 + 运行时水位闭环)
+> 最后更新: 2026-07-30 (LOOP27: PC TCP/RTU 配置兼容与 PRegBuf 持久化)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -30,7 +30,7 @@
 | 2 | 手持机显示 IP/MAC/BLE_ID | ✅ | `handle_ble_android_read_command` (LOOP2) |
 | 3 | 硬件信息确认 | ✅ | `docs/pinmap.md` 重写 (ESP32-S3R2) |
 | 4 | 无锁测试 + 栈估算 | ✅ | 127 测试 + 架构合并消除栈风险 |
-| 5 | Modbus TCP 完整测试 | 🟡 | FC=03/04 通过; FC=06/10 写响应丢失 (后续) |
+| 5 | Modbus TCP/RTU 协议兼容 | 🟡 | 编译与帧级回归通过；待目标设备 + tauri-app 实机验证 |
 | 6 | log/ 目录 + 详细日志 | ✅ | 7 子目录 + SUMMARY |
 | 7 | mesh 清理 | ✅ | 死代码已删 |
 | 8 | 引脚核对 | ✅ | pinmap.md 1:1 对齐 |

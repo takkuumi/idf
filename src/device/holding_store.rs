@@ -20,14 +20,15 @@
 //! # 与 proto blob 的差异
 //!
 //! proto blob 数据 3000 字节, holding_buf 4096 字节. 同样 8B header,
-//! 总 blob 4102 字节. CRC32 覆盖 data 区不含 header.
+//! 总 blob 4104 字节. CRC32 覆盖 data 区不含 header.
 
-use std::sync::atomic::Ordering;
+use std::sync::{LazyLock, atomic::Ordering};
 
 use esp_idf_svc::nvs::EspDefaultNvs;
 
+use crate::bus::storage_state::{HOLDING_DIRTY, HOLDING_NVS_VALID, storage_read_with};
 use crate::error::{AppError, AppResult};
-use crate::bus::storage_state::{HOLDING_DIRTY, storage_read_with};
+use crate::sync::Spin;
 
 // ---- NVS keys ----
 /// blob A (header + 4096B data)
@@ -49,51 +50,51 @@ pub const HOLDING_WORDS: usize = 2048;
 /// holding_buf 字节数
 pub const HOLDING_DATA_BYTES: usize = HOLDING_WORDS * 2; // 4096
 /// blob 完整大小
-pub const HOLDING_BLOB_TOTAL: usize = HOLDING_HEADER_BYTES + HOLDING_DATA_BYTES; // 4102
+pub const HOLDING_BLOB_TOTAL: usize = HOLDING_HEADER_BYTES + HOLDING_DATA_BYTES; // 4104
+
+/// 保存/加载共用工作区。4104B 超过 ALWAYSINTERNAL 阈值，优先进入 PSRAM；
+/// 首次分配后永久复用，NVS 周期内不再反复申请大块内部堆。
+static HOLDING_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
+    LazyLock::new(|| Spin::new(vec![0u8; HOLDING_BLOB_TOTAL].into_boxed_slice()));
 
 /// 把当前 holding_buf (RCU 快照) 写入 NVS A/B 双 blob.
 ///
 /// - 若 `HOLDING_DIRTY == false` 则直接 return Ok(()) (无变化, 跳过写).
-/// - 持有 RCU 读锁克隆数据 → 序列化 → A/B 切换写 → 清 dirty.
+/// - 在短 RCU reader 内直接序列化到复用缓冲 → A/B 切换写。
 /// - 写失败时保留 dirty 标志 (下次 actor idle 重试).
 pub fn save_to_nvs() -> AppResult<()> {
-    if !HOLDING_DIRTY.load(Ordering::Acquire) {
+    // 先消费当前 dirty。若保存期间又发生写入，写者会重新置 true，不能在保存
+    // 结束时无条件清除，否则会丢失并发写入的下一次持久化机会。
+    if !HOLDING_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(());
     }
 
-    // 1. 从 RCU 读出当前 holding_buf (克隆到本地 Vec, 避免抢 RCU 锁时阻塞 Modbus)
-    let data: Vec<u16> = match storage_read_with(|s| s.holding_buf.to_vec()) {
-        Some(v) => v,
-        None => {
-            log::warn!("[holding] RCU storage unavailable, persist skipped");
-            return Ok(());
-        }
-    };
-
-    if data.len() != HOLDING_WORDS {
-        log::warn!(
-            "[holding] unexpected holding_buf length {} (expected {}), persist skipped",
-            data.len(),
-            HOLDING_WORDS
-        );
-        return Ok(());
-    }
-
-    // 2. 序列化为 blob
-    let mut blob = [0u8; HOLDING_BLOB_TOTAL];
+    // 1. 直接序列化，避免先深拷贝 4KB holding 再创建 4KB blob。
+    let mut blob = HOLDING_BLOB_BUFFER.lock();
+    blob.fill(0);
     blob[0..2].copy_from_slice(&HOLDING_MAGIC.to_le_bytes());
     blob[2..4].copy_from_slice(&HOLDING_BLOB_VERSION.to_le_bytes());
-    // crc 字段稍后填
-    let mut data_bytes = [0u8; HOLDING_DATA_BYTES];
-    for (i, &v) in data.iter().enumerate() {
-        let be = v.to_le_bytes();
-        data_bytes[2 * i..2 * i + 2].copy_from_slice(&be);
+    let encoded = storage_read_with(|s| {
+        if s.holding_buf.len() != HOLDING_WORDS {
+            return false;
+        }
+        for (i, &v) in s.holding_buf.iter().enumerate() {
+            let bytes = v.to_le_bytes();
+            let off = HOLDING_HEADER_BYTES + 2 * i;
+            blob[off..off + 2].copy_from_slice(&bytes);
+        }
+        true
+    })
+    .unwrap_or(false);
+    if !encoded {
+        log::warn!("[holding] RCU storage unavailable or invalid length");
+        HOLDING_DIRTY.store(true, Ordering::Release);
+        return Ok(());
     }
-    let crc = crate::device::crc32(&data_bytes);
+    let crc = crate::device::crc32(&blob[HOLDING_HEADER_BYTES..]);
     blob[4..8].copy_from_slice(&crc.to_le_bytes());
-    blob[HOLDING_HEADER_BYTES..].copy_from_slice(&data_bytes);
 
-    // 3. A/B 切换写入 (复用 proto 模式)
+    // 2. A/B 切换写入 (复用 proto 模式)
     let write_result = crate::device::try_with_nvs_mut(|nvs| -> AppResult<()> {
         let active = nvs.get_u8(NVS_KEY_ACTIVE).ok().flatten().unwrap_or(0);
         let write_key = if active == 0 {
@@ -103,24 +104,26 @@ pub fn save_to_nvs() -> AppResult<()> {
         };
         let new_active = if active == 0 { 1u8 } else { 0u8 };
 
-        nvs.set_blob(write_key, &blob)
+        nvs.set_blob(write_key, blob.as_ref())
             .map_err(|e| AppError::Config(format!("nvs set_blob {write_key}: {e:?}")))?;
         nvs.set_u8(NVS_KEY_ACTIVE, new_active)
             .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
         Ok(())
     });
 
-    // 4. 仅在 NVS 写入明确成功时清 dirty; Some(Err) 和 None 都保留,
+    // 3. 仅在 NVS 写入明确成功时清 dirty; Some(Err) 和 None 都保留,
     //    否则一次 flash/NVS 瞬态错误会让未落盘数据永久失去重试机会.
     match &write_result {
         Some(Ok(())) => {
-            HOLDING_DIRTY.store(false, Ordering::Release);
+            HOLDING_NVS_VALID.store(true, Ordering::Release);
             log::debug!("[holding] persisted {} words to NVS", HOLDING_WORDS);
         }
         Some(Err(e)) => {
+            HOLDING_DIRTY.store(true, Ordering::Release);
             log::warn!("[holding] NVS write failed: {e}, dirty retained for retry");
         }
         None => {
+            HOLDING_DIRTY.store(true, Ordering::Release);
             log::warn!("[holding] NVS unavailable, dirty retained for retry");
         }
     }
@@ -142,21 +145,25 @@ pub fn load_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
     };
 
     if let Some(data) = try_load_one(nvs, first)? {
+        HOLDING_NVS_VALID.store(true, Ordering::Release);
         return Ok(data);
     }
     log::warn!("[holding] active blob corrupted/missing, trying inactive");
     if let Some(data) = try_load_one(nvs, second)? {
+        HOLDING_NVS_VALID.store(true, Ordering::Release);
         return Ok(data);
     }
     log::warn!("[holding] both blobs corrupted/missing, using defaults");
+    HOLDING_NVS_VALID.store(false, Ordering::Release);
     Ok(vec![0u16; HOLDING_WORDS])
 }
 
 /// 从指定 NVS blob key 读取并校验, 成功则返回 Some(Vec<u16>), 失败返回 None.
 fn try_load_one(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<Vec<u16>>> {
-    let mut buf = [0u8; HOLDING_BLOB_TOTAL];
+    let mut buf = HOLDING_BLOB_BUFFER.lock();
+    buf.fill(0);
     let blob = nvs
-        .get_blob(key, &mut buf)
+        .get_blob(key, buf.as_mut())
         .map_err(|e| AppError::Config(format!("nvs get_blob {key}: {e:?}")))?;
     let bytes = match blob {
         Some(b) if b.len() == HOLDING_BLOB_TOTAL => b,
@@ -178,7 +185,11 @@ fn try_load_one(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<Vec<u16>>> {
     let stored_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let calc_crc = crate::device::crc32(&bytes[HOLDING_HEADER_BYTES..]);
     if stored_crc != calc_crc {
-        log::warn!("[holding] CRC mismatch in {key}: stored={:#x} calc={:#x}", stored_crc, calc_crc);
+        log::warn!(
+            "[holding] CRC mismatch in {key}: stored={:#x} calc={:#x}",
+            stored_crc,
+            calc_crc
+        );
         return Ok(None);
     }
 
@@ -190,7 +201,11 @@ fn try_load_one(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<Vec<u16>>> {
             bytes[HOLDING_HEADER_BYTES + 2 * i + 1],
         ]);
     }
-    log::info!("[holding] loaded {} words from NVS key '{}'", HOLDING_WORDS, key);
+    log::info!(
+        "[holding] loaded {} words from NVS key '{}'",
+        HOLDING_WORDS,
+        key
+    );
     Ok(Some(data))
 }
 
@@ -202,7 +217,7 @@ mod tests {
     fn test_holding_constants() {
         assert_eq!(HOLDING_WORDS, 2048);
         assert_eq!(HOLDING_DATA_BYTES, 4096);
-        assert_eq!(HOLDING_BLOB_TOTAL, 4102);
+        assert_eq!(HOLDING_BLOB_TOTAL, 4104);
         assert_eq!(HOLDING_HEADER_BYTES, 8);
         assert_eq!(HOLDING_MAGIC, 0x4842);
     }
@@ -257,6 +272,9 @@ mod tests {
 
         let stored_crc = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
         let calc_crc = crate::device::crc32(&blob[HOLDING_HEADER_BYTES..]);
-        assert_ne!(stored_crc, calc_crc, "CRC mismatch should detect corruption");
+        assert_ne!(
+            stored_crc, calc_crc,
+            "CRC mismatch should detect corruption"
+        );
     }
 }

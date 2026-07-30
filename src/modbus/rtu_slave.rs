@@ -137,3 +137,32 @@ fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> heap
     let _ = out.push((crc >> 8) as u8);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rtu_read_response_has_exact_length_before_crc() {
+        let response = build_response(&BusBackend, 1, 0x03, &[0x08, 0xA5, 0, 1]);
+        assert_eq!(response.len(), 7); // slave + func + byte_count + word + CRC
+        assert_eq!(&response[..3], &[1, 0x03, 0x02]);
+        let n = response.len();
+        assert_eq!(
+            u16::from_le_bytes([response[n - 2], response[n - 1]]),
+            modbus_crc16(&response[..n - 2])
+        );
+    }
+
+    #[test]
+    fn test_pc_device_mmp_83_word_rtu_response() {
+        let response = build_response(&BusBackend, 1, 0x03, &[0x08, 0x94, 0, 83]);
+        assert_eq!(response.len(), 1 + 2 + 83 * 2 + 2);
+        assert_eq!(&response[..3], &[1, 0x03, 166]);
+        let n = response.len();
+        assert_eq!(
+            u16::from_le_bytes([response[n - 2], response[n - 1]]),
+            modbus_crc16(&response[..n - 2])
+        );
+    }
+}

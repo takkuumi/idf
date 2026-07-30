@@ -46,6 +46,35 @@ impl Default for Rs485Config {
 }
 
 impl Rs485Config {
+    fn apply_saved_port(mut self, index: usize) -> Self {
+        if let Some((baud, data_bits, parity, stop_bits)) =
+            crate::bus::config_state::config_read_with(|state| {
+                let saved = state.cfg.rs485.get(index)?;
+                Some((
+                    saved.baudrate,
+                    saved.data_bits,
+                    saved.parity,
+                    saved.stop_bits,
+                ))
+            })
+            .flatten()
+        {
+            self.baud = match baud {
+                1200 | 2400 | 4800 | 9600 | 14400 | 19200 | 38400 | 57600 | 115200 | 128000
+                | 153600 | 230400 | 256000 | 460800 | 921600 => baud,
+                _ => 9600,
+            };
+            self.data_bits = if data_bits == 7 { 7 } else { 8 };
+            self.parity = match parity {
+                1 => 'O',
+                2 => 'E',
+                _ => 'N',
+            };
+            self.stop_bits = if stop_bits == 2 { 2 } else { 1 };
+        }
+        self
+    }
+
     /// 从 `config::modbus::rtu_master` 构造 (RS485 #0 = UART1)
     pub fn from_rtu_master() -> Self {
         use crate::config::pins as p;
@@ -60,6 +89,7 @@ impl Rs485Config {
             stop_bits: rtu_master::STOP_BITS,
             rts_pin: p::RS485_0_DE,
         }
+        .apply_saved_port(0)
     }
 
     /// 从 `config::modbus::rtu_slave` 构造 (RS485 #1 = UART2)
@@ -78,6 +108,7 @@ impl Rs485Config {
             stop_bits: rtu_slave::STOP_BITS,
             rts_pin: p::RS485_1_DE,
         }
+        .apply_saved_port(1)
     }
 
     /// 构造 RS485 #2 (第 3 端口 = UART0, 对齐参考固件 RS485-3)
@@ -98,5 +129,6 @@ impl Rs485Config {
             // RS485-2 无 DE 引脚 (255), 使用 UART 内置 RS485 模式时 RTS=-1 即不启用自动 DE
             rts_pin: p::RS485_2_DE,
         }
+        .apply_saved_port(2)
     }
 }

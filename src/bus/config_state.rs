@@ -20,40 +20,33 @@ use std::sync::LazyLock;
 
 use super::rcu::Rcu;
 use crate::device::system_config::SystemConfig;
-use crate::device_config::DeviceConfigTable;
 
 /// 单个配置快照 (不可变)
 ///
-/// LOOP11: `device_config` 用 `Arc<DeviceConfigTable>` 而非内联, 使 clone 成本从
-/// ~2700B (DeviceConfigTable 内联 heapless::Vec<DeviceEntry,32> ≈ 2.5KB 栈拷贝)
-/// 降到 ~152B (SystemConfig 144B memcpy + Arc 原子 +1). 根治 BTC_TASK 栈溢出.
-///
-/// 与 `StorageSnapshot` 的 `Box<[u16]>` 模式同源: 大字段移堆, clone 走引用计数/heap,
-/// 不经栈. 用 `Arc` 而非 `Box` 因 DeviceConfigTable 需多线程共享读, `Arc::clone`
-/// 是原子 +1 无堆分配, `Box::clone` 仍要 2.5KB heap→heap memcpy.
+/// PC、RTU、TCP 与手机 B0-B3 的逻辑配置全部共用
+/// `StorageSnapshot::holding_buf` 中的原 C++ PRegBuf 布局。
 #[derive(Clone)]
 pub struct ConfigSnapshot {
     pub cfg: SystemConfig,
-    pub device_config: Arc<DeviceConfigTable>,
 }
 
 impl ConfigSnapshot {
     pub fn new() -> Self {
         Self {
             cfg: SystemConfig::defaults(),
-            device_config: Arc::new(DeviceConfigTable::default()),
         }
     }
 }
 
 impl Default for ConfigSnapshot {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 全局配置 (RCU, lock-free 读)
-pub static CONFIG: LazyLock<Rcu<ConfigSnapshot>> = LazyLock::new(|| {
-    Rcu::new(ConfigSnapshot::new())
-});
+pub static CONFIG: LazyLock<Rcu<ConfigSnapshot>> =
+    LazyLock::new(|| Rcu::new(ConfigSnapshot::new()));
 
 /// 读 (lock-free, 永远不阻塞)
 /// 返回 Arc 让调用方可以安全持有 (即使 RCU 被更新, 引用仍有效)
@@ -68,7 +61,8 @@ pub fn config_write(snapshot: ConfigSnapshot) {
 
 /// 读并执行 (无 Arc 分配, 用于大对象快速访问)
 pub fn config_read_with<F, R>(f: F) -> Option<R>
-where F: FnOnce(&ConfigSnapshot) -> R
+where
+    F: FnOnce(&ConfigSnapshot) -> R,
 {
     CONFIG.read_with(f)
 }
@@ -104,7 +98,9 @@ mod tests {
         for _ in 0..10 {
             config_write(ConfigSnapshot::new());
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

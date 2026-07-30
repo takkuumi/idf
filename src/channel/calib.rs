@@ -43,7 +43,6 @@ fn finish_calib() {
 /// 机制: 每次重启仅校准一个通道。遍历所有通道，
 /// 找到第一个 min=0 且 max=0 的通道进行校准。
 pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
-
     // 读取现有校准值 (从 RCU STORAGE 快照的 holding_buf)
     let holding = crate::bus::storage_state::storage_read()
         .map(|s| s.holding_buf.clone())
@@ -108,7 +107,10 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
 
     log::info!(
         "[adc-calib] AI{}: raw_min={} raw_max={} samples={}",
-        ch, raw_min, raw_max, samples
+        ch,
+        raw_min,
+        raw_max,
+        samples
     );
 
     // 有效性检查 (对齐参考固件: SENSOR_MIN-100 < min < SENSOR_MIN+200)
@@ -123,13 +125,19 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
     if !smin_ok {
         log::warn!(
             "[adc-calib] AI{} min={} 不在有效范围 ({}..{}), 跳过 min",
-            ch, raw_min, min_lo, min_hi
+            ch,
+            raw_min,
+            min_lo,
+            min_hi
         );
     }
     if !smax_ok {
         log::warn!(
             "[adc-calib] AI{} max={} 不在有效范围 ({}..{}), 跳过 max",
-            ch, raw_max, max_lo, max_hi
+            ch,
+            raw_max,
+            max_lo,
+            max_hi
         );
     }
 
@@ -140,23 +148,21 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
     }
 
     // 写入保持寄存器 (RCU STORAGE 快照, actor 异步落盘 NVS)
-    crate::bus::backends::storage_modify(|snap| {
+    crate::bus::backends::storage_modify_holding(|holding| {
         let base_min = (crate::config::regs::HOLD_SENSOR_MIN_BASE as usize)
             .saturating_sub(crate::config::regs::HOLD_CFG_BASE as usize);
         let base_max = (crate::config::regs::HOLD_SENSOR_MAX_BASE as usize)
             .saturating_sub(crate::config::regs::HOLD_CFG_BASE as usize);
 
         if smin_ok {
-            snap.holding_buf[base_min + ch] = raw_min;
+            holding[base_min + ch] = raw_min;
         }
         if smax_ok {
-            snap.holding_buf[base_max + ch] = raw_max;
+            holding[base_max + ch] = raw_max;
         }
-        snap.proto.dirty = true;
     });
 
-    // 触发 device_text 持久化 (触发 actor 将 dirty snapshot 落盘)
-    crate::device::request_save_device_text();
+    crate::device::request_persist_holding();
 
     log::info!(
         "[adc-calib] AI{} 校准完成: min={} max={} → 保持寄存器 [{},{}]",

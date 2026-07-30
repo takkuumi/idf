@@ -18,9 +18,6 @@ use crate::health::{self, TaskHb};
 use crate::modbus::shared::modbus_crc16;
 use crate::rs485::{Rs485Config, Rs485Port};
 
-/// 失败重试次数 (不含首次)
-const MAX_RETRY: u32 = 0; // 无从站时不重试, 避免长时间阻塞
-
 /// 任务心跳记录 (静态分配, main_loop 监控)
 static TASK_HB: TaskHb = TaskHb::new("mb-rtu-master");
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -54,6 +51,16 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     }
     let port_cfg = Rs485Config::from_rtu_master();
     let mut port = Rs485Port::open(&port_cfg)?;
+    let (max_retry, timeout_ms, poll_interval_ms) =
+        crate::bus::config_state::config_read_with(|state| {
+            let saved = &state.cfg.rs485[0];
+            (
+                saved.retry_count.min(5) as u32,
+                saved.timeout_ms.clamp(20, 5000) as u64,
+                saved.interval_ms.clamp(20, 5000) as u64,
+            )
+        })
+        .unwrap_or((0, cfg::TIMEOUT_MS, cfg::POLL_INTERVAL_MS));
 
     health::set_next_thread_core(health::CORE_NET);
     let result = std::thread::Builder::new()
@@ -68,17 +75,17 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 // LOOP15: 必须喂 WDT, 重试 + 轮询周期累加可能 > 10s 触发复位
                 crate::health::feed_wdt();
                 for item in POLL_TABLE {
-                    if let Err(e) = poll_with_retry(&mut port, *item) {
+                    if let Err(e) = poll_with_retry(&mut port, *item, max_retry, timeout_ms) {
                         log::warn!(
                             "[mb-rtu-master] poll slave={} fc={:02x} failed after {} retries: {}",
                             item.slave,
                             item.func,
-                            MAX_RETRY,
+                            max_retry,
                             e
                         );
                     }
                 }
-                std::thread::sleep(Duration::from_millis(cfg::POLL_INTERVAL_MS));
+                std::thread::sleep(Duration::from_millis(poll_interval_ms));
             }
         });
     health::reset_thread_core();
@@ -91,10 +98,15 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
 }
 
 /// 带重试的轮询: 失败重试 MAX_RETRY 次, 间隔 100ms
-fn poll_with_retry(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
+fn poll_with_retry(
+    port: &mut Rs485Port,
+    item: PollItem,
+    max_retry: u32,
+    timeout_ms: u64,
+) -> AppResult<()> {
     let mut last_err: Option<crate::error::AppError> = None;
-    for attempt in 0..=MAX_RETRY {
-        match poll_once(port, item) {
+    for attempt in 0..=max_retry {
+        match poll_once(port, item, timeout_ms) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 log::debug!("[mb-rtu-master] attempt {} failed: {}", attempt + 1, e);
@@ -106,9 +118,9 @@ fn poll_with_retry(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
     Err(last_err.unwrap_or_else(|| crate::error::AppError::Modbus("unknown".into())))
 }
 
-fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
+fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult<()> {
     let req = build_request(item);
-    let resp = match port.send_recv(&req, cfg::TIMEOUT_MS) {
+    let resp = match port.send_recv(&req, timeout_ms) {
         Ok(r) => r,
         Err(_) => {
             // LOOP14: 主站通信错误 (超时) → 累加 RS485_1_COMERR
@@ -186,22 +198,24 @@ fn poll_once(port: &mut Rs485Port, item: PollItem) -> AppResult<()> {
 
         // 写回 bus 协议存储区 (如果指定了 dest_reg)
         if let Some(dest_start) = item.dest_reg {
-            let mut written = 0u16;
-            for (i, &v) in regs.iter().enumerate() {
-                let addr = dest_start.wrapping_add(i as u16);
-                if (addr >= crate::config::regs::PROTO_BASE)
-                    && (addr < crate::config::regs::PROTO_END)
-                {
-                    let idx = (addr - crate::config::regs::PROTO_BASE) as usize;
-                    // 阶段 B: 无锁 RMW — clone snap → 修改 proto.data[idx] → Rcu::write
-                    crate::bus::backends::storage_modify(|snap| {
-                        snap.proto.data[idx] = v;
-                        snap.proto.dirty = true;
-                        snap.proto.status = crate::bus::proto_status();
-                    });
-                    written += 1;
-                }
-            }
+            let start = dest_start.saturating_sub(crate::config::regs::PROTO_BASE) as usize;
+            let written = if dest_start >= crate::config::regs::PROTO_BASE
+                && start < crate::config::regs::PROTO_COUNT as usize
+            {
+                let count = regs
+                    .len()
+                    .min(crate::config::regs::PROTO_COUNT as usize - start);
+                // 整帧只发布一次，禁止逐寄存器 COW 造成持续 3KB heap 抖动。
+                crate::bus::backends::storage_modify(|snap| {
+                    let data = std::sync::Arc::make_mut(&mut snap.proto.data);
+                    data[start..start + count].copy_from_slice(&regs[..count]);
+                    snap.proto.dirty = true;
+                    snap.proto.status = crate::bus::proto_status();
+                });
+                count as u16
+            } else {
+                0
+            };
             if written > 0 {
                 log::debug!(
                     "[mb-rtu-master] wrote {} regs to RCU storage at {:#06X}",

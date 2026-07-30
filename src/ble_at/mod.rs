@@ -1489,17 +1489,16 @@ fn handle_handheld_config_text(
             } else {
                 addr
             };
+            let mut values: heapless::Vec<u16, 120> = heapless::Vec::new();
             for i in 0..count {
                 let off = 5 + i * 2;
                 let value = u16::from_be_bytes([pdu[off], pdu[off + 1]]);
-                let target = if func == 0xB3 {
-                    write_addr.saturating_add(i as u16)
-                } else {
-                    write_addr.saturating_add(i as u16)
-                };
-                if !crate::bus::backends::write_hold_reg(target, value) {
+                if values.push(value).is_err() {
                     return false;
                 }
+            }
+            if !crate::bus::backends::write_hold_regs(write_addr, &values) {
+                return false;
             }
         }
         _ => return false,

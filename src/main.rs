@@ -29,7 +29,6 @@ mod bus;
 mod channel;
 mod config;
 mod device;
-mod device_config;
 mod error;
 mod ethernet;
 mod hal;

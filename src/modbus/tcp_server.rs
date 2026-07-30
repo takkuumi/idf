@@ -379,6 +379,26 @@ mod tests {
     }
 
     #[test]
+    fn test_mbap_read_response_has_exact_length_no_trailing_zero() {
+        let request = [0x12, 0x35, 0, 0, 0, 6, 1, 0x03, 0x08, 0xA5, 0, 1];
+        let mut response = [0u8; MAX_ADU_SIZE];
+        let len = build_response(&request, &BusBackend, &mut response).expect("response");
+        assert_eq!(len, 11);
+        assert_eq!(&response[4..6], &[0, 5]); // unit(1) + PDU(4)
+        assert_eq!(&response[7..9], &[0x03, 0x02]);
+    }
+
+    #[test]
+    fn test_pc_device_mmp_83_word_tcp_response() {
+        let request = [0x22, 0x13, 0, 0, 0, 6, 1, 0x03, 0x08, 0x94, 0, 83];
+        let mut response = [0u8; MAX_ADU_SIZE];
+        let len = build_response(&request, &BusBackend, &mut response).expect("response");
+        assert_eq!(len, 7 + 2 + 83 * 2);
+        assert_eq!(u16::from_be_bytes([response[4], response[5]]), 169);
+        assert_eq!(&response[7..9], &[0x03, 166]);
+    }
+
+    #[test]
     fn test_tcp_port_set_validation() {
         assert!(ports_are_valid(&[502, 503, 504, 5002]));
         assert!(!ports_are_valid(&[502, 502, 504, 5002]));

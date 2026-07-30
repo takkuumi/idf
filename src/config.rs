@@ -349,11 +349,25 @@ pub mod wifi {
 pub mod regs {
     use crate::config::hw_version;
 
+    // ---- PC 配置工具兼容窗口 ----
+    // tauri-app 固定批量读取 X0..X47 / Y0..Y47 / A0..A7，再根据设备能力裁剪显示。
+    // 即使 F16 只有 16 DI/DO、4 AI，也必须对未安装点返回 0，不能让整笔 Modbus
+    // 请求因跨越实际硬件点数而失败。
+    pub const LEGACY_POINT_WINDOW_COUNT: u16 = 48;
+    pub const LEGACY_AI_WINDOW_COUNT: u16 = 8;
+    pub const INREG_PC_META_BASE: u16 = 0x0800;
+    pub const INREG_PC_META_COUNT: u16 = 6;
+
     // ---- 线圈 (Coil, FC=01/05/15) - DO 输出 ----
     // 参考固件: REG_D01 = 0x200, 编号 1-16 (F16) 或 1-48 (F48)
     pub const COIL_DO_BASE: u16 = 0x0200;
     pub const COIL_DO_COUNT: u16 = hw_version::DO_COUNT as u16;
     pub const COIL_DO_END: u16 = COIL_DO_BASE + COIL_DO_COUNT;
+    // 原 C++/PC 工具内部控制线圈。
+    pub const COIL_INTERNAL_START: u16 = 0x0400;
+    pub const COIL_INTERNAL_STOP: u16 = 0x0401;
+    pub const COIL_RESTART: u16 = 0x0402;
+    pub const COIL_LOGIC_RESTART: u16 = 0x0403;
 
     // ---- 离散输入 (Discrete Input, FC=02) - DI 输入 ----
     // 参考固件: REG_T01 = 0x0000, 编号 1-16 (F16)
@@ -425,7 +439,8 @@ pub mod regs {
     pub const HOLD_PLACE_COUNT: u16 = 8;
     // 硬件版本 (2213)
     pub const HOLD_HW_VER: u16 = 2213;
-    // RS485 配置 (2214-2238, 5 ports × 5 words)
+    // 串口配置 (2214-2238, 5 ports × 5 words): 前 3 组是物理 RS485，
+    // 后 2 组是原 C++/PC 工具保留的 BT/NET 逻辑端口。
     pub const HOLD_RS485_BASE: u16 = 2214;
     pub const HOLD_RS485_STRIDE: u16 = 5;
     // 保留/未知 (2239-2242, 参考固件默认 5500-5503)
@@ -447,13 +462,8 @@ pub mod regs {
     // 主站 COM 数量 + IP (2269-2273)
     pub const HOLD_MASTER_COM: u16 = 2269;
     pub const HOLD_MASTER_IP_BASE: u16 = 2270;
-    // 蓝牙地址 (2274-2277)
-    // 蓝牙 MAC — 移到用户区 0x0FA4 (4004, 4 words) 避开 metuory 0x08E2 BLE NAME 冲突
-    // 0x08E2 在 metuory 1.0.78 中是 BLE 名称 (WRITE_BLUETOOTH_ID 0x51), 不是 BLE MAC
-    pub const HOLD_BT_ADDR_BASE: u16 = 0x0FA4;
-    // BLE 名称 — metuory 1.0.78 用 0x08E2 (4 words = 8 bytes) 读写 (WRITE_BLUETOOTH_ID 0x51)
-    // MCA C++ 参考固件此处是 BLE MAC, 但 metuory Android 把它当 BLE NAME (蓝牙 ID 显示),
-    // 故本系统优先 BLE NAME 在 0x08E2, BLE MAC 移到 0x0FA4 保留兼容性
+    // BLE 节点/名称 — PC DeviceMMP 与 metuory 1.0.78 均读写 0x08E2..0x08E5。
+    // 0x0FA4 位于 PC 逻辑配置连续区，严禁再放置 BLE MAC 别名。
     pub const HOLD_BLE_NAME_BASE: u16 = 0x08E2;
     pub const HOLD_BLE_NAME_COUNT: u16 = 4;
     // 传感器标定 (2280-2295, 8 sensors × 2 values)
@@ -470,6 +480,10 @@ pub mod regs {
     pub const HOLD_PXX_BASE: u16 = HOLD_CFG_BASE; // = 0x0880
     pub const HOLD_PXX_END: u16 = HOLD_CFG_END; // = 0x107F
     pub const HOLD_PXX_COUNT: usize = (HOLD_PXX_END - HOLD_PXX_BASE + 1) as usize;
+    /// PC DeviceMMP 固定从 2196 开始读写 83 words（最后一个地址 2278）。
+    pub const HOLD_PC_DEVICE_BASE: u16 = HOLD_SN_BASE;
+    pub const HOLD_PC_DEVICE_COUNT: u16 = 83;
+    pub const HOLD_PC_DEVICE_END: u16 = HOLD_PC_DEVICE_BASE + HOLD_PC_DEVICE_COUNT - 1;
 
     // ---- 设备文本区 (5000-6999, 2000 字) ----
     pub const DEVICE_TEXT_BASE: u16 = 5000;
@@ -488,9 +502,7 @@ pub mod regs {
     pub const PROTO_MAGIC: u16 = PROTO_END + 5;
 
     // ---- 设备功能区 (Android 1.0.78: 0x08FC = count, 0x08FE+ = config) ----
-    // 0x08FC: 设备功能条目计数 (复用 device_config::stored_count, 1 reg)
-    // 0x08FE+ 的 TLV 详细配置暂未实现 (Android 0xB2/0xB3 暂不支持),
-    // Android 0xB0 读 0x08FC 返回 0 表示 "无自定义功能", app 退化为基础 IO 界面.
+    // 0x08FC: 设备功能条目计数；后续变长配置与 PC 逻辑区共用 PRegBuf。
     pub const FUNC_COUNT: u16 = 0x08FC;
 
     // ---- 设备文本区 (Android 1.0.78: 0x1388 = meta, 0x138A+ = data) ----
@@ -547,6 +559,8 @@ mod tests {
         // 验证关键寄存器地址与 MCA_F16V2_1_F48_BLE.ino 一致
         // REG_D01 = 0x0200
         assert_eq!(regs::COIL_DO_BASE, 0x0200);
+        assert_eq!(regs::COIL_RESTART, 0x0402);
+        assert_eq!(regs::COIL_LOGIC_RESTART, 0x0403);
         // REG_T01 = 0x0000 (离散输入起点)
         assert_eq!(regs::DISC_DI_BASE, 0x0000);
         // REG_A01 = 0x0080 (AI 起点)
@@ -575,8 +589,8 @@ mod tests {
         assert_eq!(regs::HOLD_MAC_BASE, 2263);
         // SLAVE_REG_MASTER_COM = 2269
         assert_eq!(regs::HOLD_MASTER_COM, 2269);
-        // BT_ADDR 已迁到用户区 0x0FA4 (4004), 避开 metuory BLE NAME 0x08E2
-        assert_eq!(regs::HOLD_BT_ADDR_BASE, 0x0FA4);
+        // PC/手机共用的 BLE 节点/名称起点
+        assert_eq!(regs::HOLD_BLE_NAME_BASE, 0x08E2);
         // SLAVE_SERSOR_MIN = 2280
         assert_eq!(regs::HOLD_SENSOR_MIN_BASE, 2280);
         // SLAVE_SERSOR_MAX = 2288
@@ -597,7 +611,9 @@ mod tests {
         assert!(regs::HOLD_GW_BASE < regs::HOLD_DNS_BASE);
         assert!(regs::HOLD_DNS_BASE < regs::HOLD_MAC_BASE);
         assert!(regs::HOLD_MAC_BASE < regs::HOLD_MASTER_COM);
-        assert!(regs::HOLD_MASTER_COM < regs::HOLD_BT_ADDR_BASE);
+        assert!(regs::HOLD_MASTER_COM < regs::HOLD_BLE_NAME_BASE);
+        assert_eq!(regs::HOLD_PC_DEVICE_BASE, 2196);
+        assert_eq!(regs::HOLD_PC_DEVICE_END, 2278);
     }
 
     #[test]

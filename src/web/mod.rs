@@ -1334,14 +1334,13 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
     let cfg_base = regs::HOLD_CFG_BASE as usize;
     let base_min_idx = base_min - cfg_base + ch;
     let base_max_idx = base_max - cfg_base + ch;
-    crate::bus::backends::storage_modify(|snap| {
-        if base_min_idx < snap.holding_buf.len() {
-            snap.holding_buf[base_min_idx] = min_v;
+    crate::bus::backends::storage_modify_holding(|holding| {
+        if base_min_idx < holding.len() {
+            holding[base_min_idx] = min_v;
         }
-        if base_max_idx < snap.holding_buf.len() {
-            snap.holding_buf[base_max_idx] = max_v;
+        if base_max_idx < holding.len() {
+            holding[base_max_idx] = max_v;
         }
-        snap.proto.dirty = true;
     });
     crate::device::request_persist_holding();
     log::info!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);

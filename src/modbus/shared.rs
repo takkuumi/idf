@@ -13,6 +13,8 @@
 
 /// Modbus 读寄存器最大数量 (FC=03/04 标准限制 125)
 pub const MAX_REGS_PER_READ: usize = 125;
+/// Modbus FC=16 标准最大写寄存器数 (PDU 253B: 1+2+2+1+123*2)
+pub const MAX_REGS_PER_WRITE: usize = 123;
 /// Modbus 读线圈最大数量 (FC=01/02)
 pub const MAX_BITS_PER_READ: usize = 2000;
 /// PDU 输出缓冲区大小 (253 字节 PDU + 余量)
@@ -152,19 +154,12 @@ impl ModbusBackend for BusBackend {
     }
 
     fn write_multiple_registers(&self, addr: u16, values: &[u16]) -> bool {
-        // 阶段 B: 循环 backends::write_hold_reg (RCU RMW)
+        // 整批共用一次写者锁，避免 PC 配置工具的 60-word 块被其它写者穿插。
         let last = (addr as u32) + (values.len() as u32);
         if last > (u16::MAX as u32) + 1 {
             return false;
         }
-        let mut ok = true;
-        for (i, &v) in values.iter().enumerate() {
-            if !crate::bus::backends::write_hold_reg(addr.wrapping_add(i as u16), v) {
-                ok = false;
-                break;
-            }
-        }
-        ok
+        crate::bus::backends::write_hold_regs(addr, values)
     }
 }
 
@@ -364,6 +359,9 @@ where
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let bits = f(backend, addr, count);
+    if bits.len() != count as usize {
+        return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
+    }
     let byte_count = ((count as usize) + 7) / 8;
     // out[0] = func (由 handle_pdu 填写), out[1] = byte_count, out[2..] = data
     // 注意: 调用方会在 out 开头写 func, 所以我们写 body 部分
@@ -383,7 +381,8 @@ where
             out[2 + i / 8] |= 1 << (i % 8);
         }
     }
-    PduResult::Ok(2 + byte_count)
+    // body = byte_count(1) + packed bits(N)，不含 out[0] 的功能码。
+    PduResult::Ok(1 + byte_count)
 }
 
 fn read_regs_pdu<B, F>(backend: &B, pdu: &[u8], f: F, out: &mut [u8; PDU_BUF_SIZE]) -> PduResult
@@ -400,6 +399,9 @@ where
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     let regs = f(backend, addr, count);
+    if regs.len() != count as usize {
+        return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
+    }
     out[0] = 0; // func 占位
     out[1] = (regs.len() * 2) as u8;
     for (i, r) in regs.iter().enumerate() {
@@ -408,7 +410,8 @@ where
         out[off] = bytes[0];
         out[off + 1] = bytes[1];
     }
-    PduResult::Ok(2 + regs.len() * 2)
+    // body = byte_count(1) + register bytes(N)，不含 out[0] 的功能码。
+    PduResult::Ok(1 + regs.len() * 2)
 }
 
 fn write_single_coil_pdu<B: ModbusBackend>(
@@ -434,7 +437,7 @@ fn write_single_coil_pdu<B: ModbusBackend>(
     out[2] = pdu[1];
     out[3] = pdu[2];
     out[4] = pdu[3];
-    PduResult::Ok(5)
+    PduResult::Ok(4)
 }
 
 fn write_single_reg_pdu<B: ModbusBackend>(
@@ -456,7 +459,7 @@ fn write_single_reg_pdu<B: ModbusBackend>(
     out[2] = pdu[1];
     out[3] = pdu[2];
     out[4] = pdu[3];
-    PduResult::Ok(5)
+    PduResult::Ok(4)
 }
 
 fn write_multi_coils_pdu<B: ModbusBackend>(
@@ -492,7 +495,7 @@ fn write_multi_coils_pdu<B: ModbusBackend>(
     out[2] = pdu[1];
     out[3] = pdu[2];
     out[4] = pdu[3];
-    PduResult::Ok(5)
+    PduResult::Ok(4)
 }
 
 fn write_multi_regs_pdu<B: ModbusBackend>(
@@ -506,8 +509,8 @@ fn write_multi_regs_pdu<B: ModbusBackend>(
     let addr = u16::from_be_bytes([pdu[0], pdu[1]]);
     let count = u16::from_be_bytes([pdu[2], pdu[3]]);
     let byte_count = pdu[4] as usize;
-    // LOOP9: count 范围校验 (对齐 read_regs_pdu: count==0 或 count>125 非法)
-    if count == 0 || count as usize > MAX_REGS_PER_READ {
+    // FC=16 标准上限 123；125 仅适用于 FC=03/04 读取。
+    if count == 0 || count as usize > MAX_REGS_PER_WRITE {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     if pdu.len() != 5 + byte_count || byte_count != count as usize * 2 {
@@ -527,7 +530,7 @@ fn write_multi_regs_pdu<B: ModbusBackend>(
     out[2] = pdu[1];
     out[3] = pdu[2];
     out[4] = pdu[3];
-    PduResult::Ok(5)
+    PduResult::Ok(4)
 }
 
 /// 构造异常响应 body: [0x80|func, code]
@@ -653,6 +656,53 @@ mod tests {
     }
 
     #[test]
+    fn test_read_response_rejects_incomplete_backend_range() {
+        struct EmptyBackend;
+        impl ModbusBackend for EmptyBackend {
+            fn read_coils(&self, _: u16, _: u16) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
+                heapless::Vec::new()
+            }
+            fn read_discrete_inputs(
+                &self,
+                _: u16,
+                _: u16,
+            ) -> heapless::Vec<bool, MAX_BITS_PER_READ> {
+                heapless::Vec::new()
+            }
+            fn read_holding_registers(
+                &self,
+                _: u16,
+                _: u16,
+            ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
+                heapless::Vec::new()
+            }
+            fn read_input_registers(
+                &self,
+                _: u16,
+                _: u16,
+            ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
+                heapless::Vec::new()
+            }
+            fn write_single_coil(&self, _: u16, _: bool) -> bool {
+                false
+            }
+            fn write_single_register(&self, _: u16, _: u16) -> bool {
+                false
+            }
+            fn write_multiple_coils(&self, _: u16, _: &[bool]) -> bool {
+                false
+            }
+            fn write_multiple_registers(&self, _: u16, _: &[u16]) -> bool {
+                false
+            }
+        }
+
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&EmptyBackend, 0x03, &[0, 0, 0, 1], &mut out);
+        assert_eq!(&out[..n], &[0x83, exc::ILLEGAL_DATA_ADDRESS]);
+    }
+
+    #[test]
     fn test_write_single_register_pdu() {
         let backend = DummyBackend::new();
         let pdu = [0x00, 0x05, 0x00, 0xCA];
@@ -762,6 +812,16 @@ mod tests {
         assert_eq!(out[0], 0x90);
         assert_eq!(out[1], exc::ILLEGAL_DATA_VALUE);
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_write_multi_regs_above_standard_123_rejected() {
+        let backend = DummyBackend::new();
+        // 124 regs 已超过 FC=16 PDU 的 253-byte 上限，无需提供 data 即应先拒绝。
+        let pdu = [0x00, 0x00, 0x00, 0x7C, 0xF8];
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&backend, 0x10, &pdu, &mut out);
+        assert_eq!(&out[..n], &[0x90, exc::ILLEGAL_DATA_VALUE]);
     }
 
     #[test]
