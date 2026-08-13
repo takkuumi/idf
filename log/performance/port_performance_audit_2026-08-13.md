@@ -127,3 +127,25 @@
 - TCP 每 5ms 全局请求预算由 2 收紧为 1；已有 TX flush、超时检查和客户端轮转
   不受预算限制，弱网恢复和8连接公平性保持。
 - 同口径 8 客户端 x 50 次 FC03 125 words 实机对比将在完整重烧后补录。
+
+## LwIP PSRAM A/B 与栈遥测收敛（LOOP34）
+
+- 固件：`66aa7693b181`；硬件：ESP32-S3 rev 0.2、8MB Flash、2MB PSRAM。
+- 启用 `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` 后，LwIP 通用动态对象优先使用
+  PSRAM，内部 SRAM 不足时的历史低水位由 `6311B` 提升并稳定在约 `39KB`；
+  W5500 DMA 缓冲和 pthread 栈仍保持内部内存分配。
+- 同口径并发压力：8 客户端各 50 次 FC03，地址 `0x0880`、125 words，端口
+  502/503/504/5002 各两连接，结果 `400/400`；平均 `39.20ms`，最大
+  `123.65ms`。并发 20 次认证 `/getsystemstatus` 结果 `20/20`，平均
+  `99.93ms`，最大 `152.38ms`。
+- 压力后总 heap `2054KB`、历史最低 `2053KB`；内部 SRAM 当前约 `40KB`、
+  历史最低约 `39KB`。未见 W5500/LwIP 错误、连接失败、panic、stack canary、
+  pthread 创建失败或复位。
+- 7 个用户任务全部采样成功，最低剩余栈为 UDP `4300B`；最高占用为 NFC 40%，
+  其次 RTU master 39%、UDP 30%、RTU slave 29%，所有任务均满足剩余栈
+  `>=1024B` 且占用 `<90%`。
+- 每分钟逐任务输出 7 行栈日志会让 debug housekeeping 单次达到约 `66ms`，属于
+  诊断串口阻塞而非业务耗时。健康状态现压缩为单行汇总，低水位任务仍逐项 ERROR，
+  不改变采样、告警阈值、协议或 IO 行为。
+- 默认、F3、F4 `cargo check` 与 `cargo test --bin gateway --no-run` 均通过，
+  **0 error, 0 warning**。

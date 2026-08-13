@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-13 (LOOP32: 实机运行诊断与构建追溯)
+> 最后更新: 2026-08-13 (LOOP34: LwIP 内存余量与遥测调度)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,21 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP34 LwIP 内部 SRAM 余量与遥测调度（2026-08-13）
+
+- [x] 启用 `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`，LwIP 通用动态对象优先使用
+  PSRAM、失败时回退内部 SRAM；W5500 DMA 与任务栈的内存属性保持不变。
+- [x] 真实设备完成 8 并发客户端、400 次标准最大 FC03（125 words）回归，
+  `400/400` 成功；四个 Modbus TCP 端口均参与测试。
+- [x] 同期完成 20 次认证 Web 状态查询，`20/20` 成功，无 W5500/LwIP、panic、
+  stack canary、pthread 或复位异常。
+- [x] 内部 SRAM 历史最低值由约 `6.3KB` 提升到约 `39KB`，为 7x24 运行中的
+  瞬时网络分配、ISR/DMA 和系统任务保留了更可靠的余量。
+- [x] 全部 7 个用户任务高水位满足 `min_free >= 4300B`、`used <= 40%`，本轮不
+  继续缩栈，避免短时测量不足以覆盖 OTA、BLE 重连和异常恢复路径的风险。
+- [x] 栈遥测由健康时逐任务多行输出改为单行汇总；低于 1024B 或使用率达到 90%
+  的任务仍逐项 ERROR，消除 debug 串口日志制造的约 66ms 调度尖峰。
 
 ## LOOP33 实机热点定向收敛（2026-08-13）
 

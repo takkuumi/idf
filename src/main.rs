@@ -522,8 +522,8 @@ fn main_loop(
                 ota_validation_done = confirm_new_firmware();
             }
 
-            // LOOP8: 每 60s 打印内存/运行时间。完整栈表每 10 分钟打印，
-            // 避免 7 行串口 INFO 每分钟阻塞 main-loop 并制造端口延迟尖峰。
+            // LOOP8: 每 60s 打印内存/运行时间。栈水位健康状态压缩为一行汇总，
+            // 避免逐任务串口 INFO 阻塞 main-loop 并制造端口延迟尖峰。
             if tick % (60000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
                 let free_heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
                 let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };

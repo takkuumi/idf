@@ -322,13 +322,20 @@ pub fn print_core_assignment() {
     }
 }
 
-/// 打印所有真实用户任务的历史最小剩余栈。
+/// 汇总所有真实用户任务的历史最小剩余栈。
 ///
 /// ESP-IDF 的 `uxTaskGetStackHighWaterMark2` 返回字节，不是标准 FreeRTOS 文档中的 word。
+/// 健康时只输出一行汇总，避免串口逐任务打印阻塞 main-loop；低水位任务仍逐项告警。
 /// 只告警和记录，绝不因低水位主动重启设备。
 pub fn print_stack_watermarks() {
     let n = REGISTRY.count.load(Ordering::Acquire);
-    log::info!("=== Task Stack Watermarks ===");
+    let mut sampled = 0u32;
+    let mut low = 0u32;
+    let mut min_free = u32::MAX;
+    let mut min_free_task = "-";
+    let mut max_used_pct = 0u32;
+    let mut max_used_task = "-";
+
     for i in 0..n {
         let ptr = REGISTRY.tasks[i].load(Ordering::Acquire);
         if ptr.is_null() {
@@ -344,7 +351,17 @@ pub fn print_stack_watermarks() {
             esp_idf_sys::uxTaskGetStackHighWaterMark2(handle as esp_idf_sys::TaskHandle_t) as u32
         };
         let used_pct = size.saturating_sub(free).saturating_mul(100) / size;
+        sampled += 1;
+        if free < min_free {
+            min_free = free;
+            min_free_task = task.name;
+        }
+        if used_pct > max_used_pct {
+            max_used_pct = used_pct;
+            max_used_task = task.name;
+        }
         if free < 1024 || used_pct >= 90 {
+            low += 1;
             log::error!(
                 "[stack] LOW task={} size={}B min_free={}B used={}%",
                 task.name,
@@ -352,14 +369,20 @@ pub fn print_stack_watermarks() {
                 free,
                 used_pct
             );
-        } else {
-            log::info!(
-                "[stack] task={} size={}B min_free={}B used={}%",
-                task.name,
-                size,
-                free,
-                used_pct
-            );
         }
+    }
+
+    if sampled == 0 {
+        log::warn!("[stack] no task watermark available");
+    } else {
+        log::info!(
+            "[stack] tasks={} low={} min_free={}B min_task={} max_used={}% max_task={}",
+            sampled,
+            low,
+            min_free,
+            min_free_task,
+            max_used_pct,
+            max_used_task
+        );
     }
 }
