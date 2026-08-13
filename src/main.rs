@@ -533,6 +533,15 @@ fn confirm_new_firmware() -> bool {
         return false;
     }
 
+    // ESP-IDF 明确规定 factory 分区不支持 esp_ota_get_state_partition，
+    // 返回 ESP_ERR_NOT_SUPPORTED。factory 本身也没有待确认/回滚状态，直接完成检查，
+    // 避免健康窗口后每秒重复查询并产生永久告警。
+    let subtype = unsafe { (*partition).subtype };
+    if !is_ota_app_subtype(subtype) {
+        log::debug!("[main] OTA: running factory app, confirmation not required");
+        return true;
+    }
+
     // 查询分区状态
     let mut state: esp_idf_sys::esp_ota_img_states_t = 0;
     let ret = unsafe { esp_idf_sys::esp_ota_get_state_partition(partition, &mut state) };
@@ -571,9 +580,16 @@ fn ota_state_needs_confirmation(state: esp_idf_sys::esp_ota_img_states_t) -> boo
     state == esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
 }
 
+#[inline]
+fn is_ota_app_subtype(subtype: esp_idf_sys::esp_partition_subtype_t) -> bool {
+    (esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_APP_OTA_MIN
+        ..esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_APP_OTA_MAX)
+        .contains(&subtype)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ota_state_needs_confirmation;
+    use super::{is_ota_app_subtype, ota_state_needs_confirmation};
 
     #[test]
     fn test_ota_pending_verify_uses_esp_idf_enum() {
@@ -585,6 +601,19 @@ mod tests {
         ));
         assert!(!ota_state_needs_confirmation(
             esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_ABORTED
+        ));
+    }
+
+    #[test]
+    fn test_only_ota_app_subtypes_need_state_lookup() {
+        assert!(!is_ota_app_subtype(
+            esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_APP_FACTORY
+        ));
+        assert!(is_ota_app_subtype(
+            esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_APP_OTA_0
+        ));
+        assert!(is_ota_app_subtype(
+            esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_APP_OTA_1
         ));
     }
 }

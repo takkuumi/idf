@@ -41,8 +41,8 @@
 //! - WDT 喂狗 + 任务心跳防止线程假死
 //! - NFC 仅作为冗余备份, 不破坏 NVS 数据
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use std::{ops::Deref, ops::DerefMut, ptr::NonNull};
 
@@ -84,6 +84,20 @@ pub enum NfcState {
     Restored,
     /// 错误 (I2C 失败 / 标签无响应)
     Error,
+}
+
+impl NfcState {
+    /// 稳定的维护 API 状态名称，避免把 Debug 表示暴露为外部协议。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Init => "Init",
+            Self::Detected => "Detected",
+            Self::BackedUp => "BackedUp",
+            Self::Restored => "Restored",
+            Self::Error => "Error",
+        }
+    }
 }
 
 static NFC_STATE: LazyLock<Spin<NfcState>> = LazyLock::new(|| Spin::new(NfcState::Idle));
@@ -611,8 +625,8 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
     let mut retry_cooldown_ticks = 0u16;
     let mut retry_level = 0usize;
     const RETRY_TICKS: [u16; 3] = [6, 24, 60]; // 30s, 120s, 300s
-                                               // 两个有界工作区由 start() 显式分配到 PSRAM 并移交本任务，循环内持续复用。
-                                               // LOOP9: 订阅硬件 WDT, 否则 feed_wdt() 高频报 "task not found" 刷屏
+    // 两个有界工作区由 start() 显式分配到 PSRAM 并移交本任务，循环内持续复用。
+    // LOOP9: 订阅硬件 WDT, 否则 feed_wdt() 高频报 "task not found" 刷屏
     health::subscribe_wdt();
 
     loop {
@@ -660,7 +674,12 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
             present = true;
         }
         let active_dev = dev.as_ref().expect("NFC device checked above");
-        *NFC_STATE.lock() = NfcState::Detected;
+        {
+            let mut state = NFC_STATE.lock();
+            if matches!(*state, NfcState::Idle | NfcState::Init) {
+                *state = NfcState::Detected;
+            }
+        }
 
         // 2. 打开 I2C 安全会话
         if active_dev.open_i2c_session().is_err() {
@@ -708,7 +727,7 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
                 (NFC_CMD_RESTORE, Some(_)) => {
                     log::info!("[nfc] manual restore executing");
                     match active_dev.read_eeprom(NFC_BLOB_DATA_ADDR, &mut data_buf) {
-                        Ok(_) if legacy_snapshot_valid(&data_buf) => {
+                        Ok(_) if snapshot_valid_for_restore(&data_buf) => {
                             snapshot_examined = true;
                             bytes_to_words(&data_buf, &mut nfc_words);
                             restore_from_nfc(&nfc_words);
@@ -1067,6 +1086,15 @@ fn legacy_snapshot_valid(data: &[u8]) -> bool {
     marker != [0; 6] && marker != [b'0'; 6] && data.iter().any(|&b| b != 0xFF)
 }
 
+/// 显式恢复允许原 C++ 的无头原始快照，但拒绝出厂空白数据。
+/// 原 C++ 快照用 50..55 的非零标记辅助识别；真实 holding_buf 的这些字节
+/// 可能合法地全为零，而且 NFC 需要支持掉电后、跨设备恢复，不能依赖 RAM CRC。
+/// 恢复只由认证 POST + 用户确认触发，自动流程仍不会用 NFC 覆盖本机。
+fn snapshot_valid_for_restore(data: &[u8]) -> bool {
+    legacy_snapshot_valid(data)
+        || (data.iter().any(|&b| b != 0x00) && data.iter().any(|&b| b != 0xFF))
+}
+
 /// 比较 holding_buf 与 NFC 备份数据是否一致 (仅比较 NFC 覆盖的前 N words)
 ///
 /// LOOP9: 旧实现 `a.len() == b.len()` 恒 false (holding_buf=2048 vs nfc=880),
@@ -1114,6 +1142,16 @@ mod tests {
     }
 
     #[test]
+    fn test_nfc_state_api_names_are_stable() {
+        assert_eq!(NfcState::Idle.as_str(), "Idle");
+        assert_eq!(NfcState::Init.as_str(), "Init");
+        assert_eq!(NfcState::Detected.as_str(), "Detected");
+        assert_eq!(NfcState::BackedUp.as_str(), "BackedUp");
+        assert_eq!(NfcState::Restored.as_str(), "Restored");
+        assert_eq!(NfcState::Error.as_str(), "Error");
+    }
+
+    #[test]
     fn test_st25_i2c_addr() {
         assert_eq!(ST25DV_DATA_ADDR_7BIT, 0x53);
         assert_eq!(ST25DV_SYSTEM_ADDR_7BIT, 0x57);
@@ -1152,6 +1190,15 @@ mod tests {
         assert!(legacy_snapshot_valid(&data));
         data.fill(0xFF);
         assert!(!legacy_snapshot_valid(&data));
+    }
+
+    #[test]
+    fn test_restore_snapshot_rejects_only_blank_eeprom() {
+        assert!(!snapshot_valid_for_restore(&[0u8; 64]));
+        assert!(!snapshot_valid_for_restore(&[0xFFu8; 64]));
+        let mut data = [0u8; 64];
+        data[0] = 1;
+        assert!(snapshot_valid_for_restore(&data));
     }
 
     #[test]

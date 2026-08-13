@@ -11,6 +11,9 @@
 //! | POST | `/login` | 登录 `{username, pwd}` → JSON `{type, code, data}` |
 //! | GET | `/getsysteminfo` | 设备信息 (name/manufacturer/model/version) |
 //! | POST | `/updatesysteminfoconfig` | 更新设备信息 |
+//! | GET | `/getnfcstatus` | 查询 NFC 维护状态 |
+//! | POST | `/nfcbackup` | 触发配置备份到 NFC |
+//! | POST | `/nfcrestore` | 触发从 NFC 恢复配置 |
 //! | GET | `/getportconfig` | RS485 端口配置 (3 路) |
 //! | POST | `/updateportconfig` | 更新 RS485 端口配置 |
 //! | GET | `/getiodata` | DI/DO/AI 实时数据 |
@@ -756,6 +759,9 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
                 "/getsensorconfig" => handle_get_sensor_config(&mut stream, &req),
                 "/updatesensorconfig" => handle_update_sensor_config(&mut stream, &req),
                 "/getsystemstatus" => handle_get_system_status(&mut stream, &req),
+                "/getnfcstatus" => handle_get_nfc_status(&mut stream, &req),
+                "/nfcbackup" => handle_nfc_backup(&mut stream, &req),
+                "/nfcrestore" => handle_nfc_restore(&mut stream, &req),
                 "/reboot" => handle_reboot(&mut stream, &req),
                 "/updatepwd" => handle_update_password(&mut stream, &req),
                 _ => send_json(&mut stream, 404, &json_response("error", "404")),
@@ -980,9 +986,13 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     let addressinfo = req.form_field("addressinfo");
     let sn = req.form_field("sn");
     let ble_name = req.form_field("bloothaddress");
-    if addressinfo.as_ref().is_some_and(|value| value.as_bytes().len() > 16)
+    if addressinfo
+        .as_ref()
+        .is_some_and(|value| value.as_bytes().len() > 16)
         || sn.as_ref().is_some_and(|value| value.as_bytes().len() > 32)
-        || ble_name.as_ref().is_some_and(|value| value.as_bytes().len() > 8)
+        || ble_name
+            .as_ref()
+            .is_some_and(|value| value.as_bytes().len() > 8)
     {
         return send_json(
             stream,
@@ -1268,6 +1278,47 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
     send_json(stream, 200, &json)
 }
 
+fn handle_get_nfc_status(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    if req.method != "GET" {
+        return send_json(stream, 405, &json_response("getnfcstatus", "405"));
+    }
+    let json = format!(
+        r#"{{"type":"getnfcstatus","code":"0","msg":"","data":{{"started":{},"state":"{}"}}}}"#,
+        crate::nfc::is_started(),
+        crate::nfc::state().as_str(),
+    );
+    send_json(stream, 200, &json)
+}
+
+fn handle_nfc_backup(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    handle_nfc_command(stream, req, "nfcbackup", crate::nfc::backup_now)
+}
+
+fn handle_nfc_restore(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
+    handle_nfc_command(stream, req, "nfcrestore", crate::nfc::restore_now)
+}
+
+fn handle_nfc_command(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    response_type: &str,
+    command: fn() -> crate::error::AppResult<()>,
+) -> std::io::Result<()> {
+    if req.method != "POST" {
+        return send_json(stream, 405, &json_response(response_type, "405"));
+    }
+    if !crate::nfc::is_started() {
+        return send_json(stream, 503, &json_response(response_type, "0x01000004"));
+    }
+    match command() {
+        Ok(()) => send_json(stream, 200, &json_response(response_type, "0")),
+        Err(error) => {
+            log::error!("[http] {} request failed: {}", response_type, error);
+            send_json(stream, 500, &json_response(response_type, "0x01000003"))
+        }
+    }
+}
+
 /// GET /getiodata
 fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
     let di_bits = IO.di.load_bits();
@@ -1302,14 +1353,10 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         crate::modbus::shared::RS485_STATS.master_active() as u8,
         crate::modbus::shared::RS485_STATS.slave_active() as u8,
         (unsafe {
-            esp_idf_sys::gpio_get_level(
-                crate::config::pins::FIB1_PIN as esp_idf_sys::gpio_num_t,
-            )
+            esp_idf_sys::gpio_get_level(crate::config::pins::FIB1_PIN as esp_idf_sys::gpio_num_t)
         } == 0) as u8,
         (unsafe {
-            esp_idf_sys::gpio_get_level(
-                crate::config::pins::FIB2_PIN as esp_idf_sys::gpio_num_t,
-            )
+            esp_idf_sys::gpio_get_level(crate::config::pins::FIB2_PIN as esp_idf_sys::gpio_num_t)
         } == 0) as u8,
     );
 
@@ -1795,10 +1842,24 @@ mod tests {
             "用户设置",
             "系统维护",
         ] {
-            assert!(pages::INDEX_HTML.contains(label), "missing navigation: {label}");
+            assert!(
+                pages::INDEX_HTML.contains(label),
+                "missing navigation: {label}"
+            );
         }
         assert!(pages::INDEX_HTML.contains("工业测控执行器管理系统"));
         assert!(pages::LOGIN_HTML.contains("工业控制器登录界面"));
+    }
+
+    #[test]
+    fn test_nfc_maintenance_controls_are_present() {
+        for endpoint in ["/getnfcstatus", "/nfcbackup", "/nfcrestore"] {
+            assert!(
+                pages::INDEX_HTML.contains(endpoint),
+                "missing endpoint: {endpoint}"
+            );
+        }
+        assert!(pages::INDEX_HTML.contains("confirm("));
     }
 
     // ---- LOOP11: 会话管理回归测试 ----

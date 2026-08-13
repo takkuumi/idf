@@ -181,6 +181,17 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
   <!-- 系统维护面板 -->
   <div id="p-maint" class="hidden">
     <div class="card">
+      <h2>NFC 配置维护</h2>
+      <div class="row">
+        <div class="field"><label>NFC 服务</label><input id="nfc_started" disabled></div>
+        <div class="field"><label>NFC 状态</label><input id="nfc_state" disabled></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="nfcBackup()">备份配置</button>
+        <button class="btn btn-w" onclick="nfcRestore()">恢复配置</button>
+      </div>
+    </div>
+    <div class="card">
       <h2>固件升级 (OTA)</h2>
       <p style="font-size:13px;color:var(--dim);margin-bottom:12px">选择 .bin 固件文件后点击上传, 设备将自动重启.</p>
       <input type="file" id="ota_file" accept=".bin" style="font-size:13px;margin-bottom:10px">
@@ -472,6 +483,35 @@ async function changePwd() {
   } catch(e) { toast('修改失败: ' + e, false); }
 }
 
+async function pollNfcStatus() {
+  try {
+    const r = await fetch('/getnfcstatus');
+    const j = await r.json();
+    if (!j.data) return;
+    $('#nfc_started').value = j.data.started ? '已启动' : '未启动';
+    $('#nfc_state').value = j.data.state || 'Unknown';
+  } catch(e) { console.error('nfc status', e); }
+}
+
+async function nfcBackup() {
+  try {
+    const r = await fetch('/nfcbackup', { method: 'POST' });
+    const j = await r.json();
+    toast(j.code === '0' ? 'NFC 备份请求已提交' : 'NFC 备份失败: ' + j.code, j.code === '0');
+    setTimeout(pollNfcStatus, 5500);
+  } catch(e) { toast('NFC 备份失败: ' + e, false); }
+}
+
+async function nfcRestore() {
+  if (!confirm('确认用 NFC 快照覆盖当前设备配置?')) return;
+  try {
+    const r = await fetch('/nfcrestore', { method: 'POST' });
+    const j = await r.json();
+    toast(j.code === '0' ? 'NFC 恢复请求已提交' : 'NFC 恢复失败: ' + j.code, j.code === '0');
+    setTimeout(pollNfcStatus, 5500);
+  } catch(e) { toast('NFC 恢复失败: ' + e, false); }
+}
+
 // OTA upload
 async function uploadOta() {
   const file = $('#ota_file').files[0];
@@ -518,5 +558,7 @@ pollIO();
 pollTimer = setInterval(pollIO, 1500);
 pollStatus();
 const statusTimer = setInterval(pollStatus, 2000);
+pollNfcStatus();
+const nfcStatusTimer = setInterval(pollNfcStatus, 5000);
 </script>
 </body></html>

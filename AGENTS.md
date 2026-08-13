@@ -20,6 +20,10 @@ cargo build
 
 # 编译 + 烧录（必须带 --no-skip 强制重写所有块）
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    --bootloader target/xtensa-esp32s3-espidf/debug/bootloader.bin \
+    --partition-table partitions.csv --partition-table-offset 0x8000 \
+    --target-app-partition factory --erase-parts otadata \
+    --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
     target/xtensa-esp32s3-espidf/debug/gateway
 
 # 串口监控（按 Ctrl+R 重置芯片）
@@ -89,4 +93,5 @@ P0: 根本修复 pthread Stack canary + ENOMEM
 - **设备 ID 默认值**：`src/device/system_config.rs::defaults()`（SN、IP、MAC）。
 - **引脚分配**：必须改 `src/config.rs::pins` 而非硬件层；改动后同步 `docs/pinmap.md`。
 - **禁止修改**：`/Users/takumi/Workspace/esp-idf`、`/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE`、`/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78`。
-- **烧录前**：`cargo build` + `espflash flash --no-skip`；**监控用 Ctrl+R 重置**，不进入下载模式。
+- **烧录前**：`cargo build` + 上述完整 `espflash flash --no-skip` 命令；禁止只传 ELF，
+  否则 espflash 会生成默认单 factory 分区表并破坏 OTA 布局。**监控用 Ctrl+R 重置**，不进入下载模式。
