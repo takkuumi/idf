@@ -151,7 +151,7 @@ embuild = { version = "0.33", features = ["espidf"] }  # build-dependencies
 ### `sdkconfig.defaults`（ESP-IDF 配置）
 
 关键配置项（详见文件本身）：
-- Flash: QIO 80MHz 8MB
+- Flash: DIO 40MHz 8MB（真实硬件已验证，禁止使用 QIO/80MHz）
 - PSRAM: Quad 80MHz 2MB
 - BLE: `CONFIG_BT_BLUEDROID_ENABLED=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLUEDROID` 已废弃）
 - BLE Mesh: `CONFIG_BLE_MESH=y`（v5.5.4 重命名，旧名 `CONFIG_BT_BLE_MESH` 已废弃）

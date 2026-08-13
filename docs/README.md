@@ -44,10 +44,17 @@
 cargo build
 ```
 
+正式客户交付请使用 Release 构建和固定交付清单，详见
+[固件编译与客户交付指南](DELIVERY_BUILD.md)。
+
 ## 烧录
 
 ```bash
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    --bootloader target/xtensa-esp32s3-espidf/debug/bootloader.bin \
+    --partition-table partitions.csv --partition-table-offset 0x8000 \
+    --target-app-partition factory --erase-parts otadata \
+    --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
     target/xtensa-esp32s3-espidf/debug/gateway
 ```
 
