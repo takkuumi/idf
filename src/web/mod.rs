@@ -495,7 +495,7 @@ fn send_response(
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         status_text,
         content_type,
@@ -528,7 +528,7 @@ fn send_json_with_cookie(
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nSet-Cookie: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nSet-Cookie: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         status_text,
         cookie,
@@ -929,7 +929,14 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
             cfg.name.fill(0);
             cfg.name[..name_bytes.len()].copy_from_slice(name_bytes);
         });
-        crate::device::request_apply_config();
+        if let Err(error) = crate::device::apply_config_sync() {
+            log::error!("[http] system info persist failed: {error}");
+            return send_json(
+                stream,
+                500,
+                &json_response("updatesysteminfoconfig", "0x01000003"),
+            );
+        }
         let _ = crate::nfc::backup_now();
     }
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
@@ -1048,6 +1055,16 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         );
     }
 
+    let network_changed = config_read_with(|cs| {
+        let cfg = &cs.cfg;
+        cfg.ip != ip
+            || cfg.mask != mask
+            || cfg.gateway != gw
+            || dns.is_some_and(|value| cfg.dns != value)
+            || cfg.dhcp
+    })
+    .unwrap_or(true);
+
     crate::bus::backends::config_modify(|cfg| {
         cfg.ip = ip;
         cfg.mask = mask;
@@ -1089,14 +1106,26 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         gw[3],
     );
 
-    // 持久化 + NFC 备份
-    crate::device::request_apply_config();
+    // Web 保存必须在确认 NVS 成功后再返回；网络重配延后到响应发出之后，
+    // 避免修改本机 IP 时当前 HTTP 连接先被拆除而让页面误报保存失败。
+    if let Err(error) = crate::device::apply_config_sync() {
+        log::error!("[http] network config persist failed: {error}");
+        return send_json(
+            stream,
+            500,
+            &json_response("updatenetworkconfig", "0x01000003"),
+        );
+    }
     if ble_name.is_some() {
         crate::ble_at::notify_ble_name_changed();
     }
     let _ = crate::nfc::backup_now();
-
-    send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
+    let response = send_json(stream, 200, &json_response("updatenetworkconfig", "0"));
+    if response.is_ok() && network_changed {
+        #[cfg(feature = "ethernet-w5500")]
+        crate::ethernet::w5500::request_reconfigure();
+    }
+    response
 }
 
 /// C++ 固件波特率索引表（与 handleGetPortConfig 中 (PRegBuf[reg] >> 12) & 0x0F 完全一致，
@@ -1258,8 +1287,16 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         interval
     );
 
-    // 配置类写入应通过 SystemConfig 持久化 (走 ApplyConfig), 而非 device_text (那只是文本快照).
-    crate::device::request_apply_config();
+    // 三个端口由 Web 连续提交。端口保存只落盘，不得重配 W5500，否则第一个
+    // 请求会中断后两个请求，造成页面提示成功但仅端口 1 实际保存。
+    if let Err(error) = crate::device::apply_config_sync() {
+        log::error!("[http] RS485 port config persist failed: {error}");
+        return send_json(
+            stream,
+            500,
+            &json_response("updateportconfig", "0x01000003"),
+        );
+    }
     let _ = crate::nfc::backup_now();
     send_json(stream, 200, &json_response("updateportconfig", "0"))
 }
@@ -1535,10 +1572,17 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
         let take = name_bytes.len().min(8);
         cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
     });
-    // 立即触发 GAP 名更新 (无需重启)
-    crate::ble_at::notify_ble_name_changed();
     log::info!("[http] update BLE name: {:?}", name);
-    crate::device::request_apply_config();
+    if let Err(error) = crate::device::apply_config_sync() {
+        log::error!("[http] BLE config persist failed: {error}");
+        return send_json(
+            stream,
+            500,
+            &json_response("updatebleconfig", "0x01000003"),
+        );
+    }
+    // 只有 NVS 已确认保存后才更新 GAP 名，避免持久化失败时运行值与重启值不一致。
+    crate::ble_at::notify_ble_name_changed();
     send_json(stream, 200, &json_response("updatebleconfig", "0"))
 }
 
@@ -1659,6 +1703,7 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
         log::info!("[http] web password updated");
     } else {
         log::warn!("[http] password save failed (NVS unavailable)");
+        return send_json(stream, 500, &json_response("updatepwd", "0x01000003"));
     }
 
     send_json(stream, 200, &json_response("updatepwd", "0"))
@@ -1913,6 +1958,18 @@ mod tests {
             );
         }
         assert!(pages::INDEX_HTML.contains("confirm("));
+    }
+
+    #[test]
+    fn test_io_page_uses_numeric_order_and_one_based_labels() {
+        assert!(pages::INDEX_HTML.contains("Number(a.slice('di_addr_'.length))"));
+        assert!(pages::INDEX_HTML.contains("Number(a.slice('do_addr_'.length))"));
+        assert!(pages::INDEX_HTML.contains("<span>DI${n + 1}</span>"));
+        assert!(pages::INDEX_HTML.contains("<span>DO${n + 1}</span>"));
+        assert!(
+            pages::INDEX_HTML.contains("onchange=\"toggleDO(${n},this.checked)\""),
+            "display must be one-based without changing the zero-based control address"
+        );
     }
 
     // ---- LOOP11: 会话管理回归测试 ----

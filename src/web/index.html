@@ -153,8 +153,11 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <h2>设备标识</h2>
       <div class="row">
         <div class="field"><label>SN 序列号</label><input id="n_sn" maxlength="32"></div>
-        <div class="field"><label>位置/桩号</label><input id="n_loc"></div>
+        <div class="field"><label>位置/桩号</label><input id="n_loc" maxlength="16"></div>
         <div class="field"><label>蓝牙地址</label><input id="n_ble" maxlength="8"></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="saveNet()">保存设备标识</button>
       </div>
     </div>
   </div>
@@ -388,11 +391,12 @@ async function pollIO() {
     // DI
     let diHtml = '';
     if (d.di_data) {
-      const keys = Object.keys(d.di_data).sort();
+      const keys = Object.keys(d.di_data).sort((a, b) =>
+        Number(a.slice('di_addr_'.length)) - Number(b.slice('di_addr_'.length)));
       keys.forEach(k => {
-        const n = k.replace('di_addr_', '');
+        const n = Number(k.slice('di_addr_'.length));
         const on = d.di_data[k];
-        diHtml += `<div class="io-item"><span class="led ${on?'on':''}"></span><span>DI${n}</span></div>`;
+        diHtml += `<div class="io-item"><span class="led ${on?'on':''}"></span><span>DI${n + 1}</span></div>`;
       });
     }
     $('#di_list').innerHTML = diHtml;
@@ -400,13 +404,14 @@ async function pollIO() {
     // DO
     let doHtml = '';
     if (d.do_data) {
-      const keys = Object.keys(d.do_data).sort();
+      const keys = Object.keys(d.do_data).sort((a, b) =>
+        Number(a.slice('do_addr_'.length)) - Number(b.slice('do_addr_'.length)));
       keys.forEach(k => {
-        const n = k.replace('do_addr_', '');
+        const n = Number(k.slice('do_addr_'.length));
         const on = d.do_data[k];
         doHtml += `<div class="io-item">
           <label class="tgl"><input type="checkbox" ${on?'checked':''} onchange="toggleDO(${n},this.checked)">
-          <span class="slider"></span></label><span>DO${n}</span></div>`;
+          <span class="slider"></span></label><span>DO${n + 1}</span></div>`;
       });
     }
     $('#do_list').innerHTML = doHtml;

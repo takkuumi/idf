@@ -12,6 +12,21 @@
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
+## LOOP35 Web 保存与 DI/DO 顺序修复（2026-08-14）
+
+- [x] Web 配置写入改为同步确认 NVS commit 后才返回成功；NVS 不可用或写失败时
+  返回明确错误，不再出现页面提示已保存但重启后丢失。
+- [x] 系统信息、RS485 端口和 BLE 名称保存不再误触发 W5500 重配；三路 RS485
+  连续 POST 不会在端口 1 保存后中断端口 2/3。
+- [x] 网络配置仅在 IP、掩码、网关、DNS 或 DHCP 状态实际变化后请求运行时重配，
+  并在 HTTP 成功响应发出后执行；只修改 SN、位置或 BLE 名称不会断开 Web。
+- [x] 所有 HTML/JSON 响应增加 `Cache-Control: no-store`，避免浏览器缓存旧配置。
+- [x] DI/DO 键按数字索引排序，页面按 `DI1..N`、`DO1..N` 显示；DO 控制仍提交
+  内部 0 基地址，Modbus 线圈和硬件位序保持不变。
+- [x] 设备标识卡片增加就近保存按钮，位置字段长度与后端 16 字节边界一致。
+- [x] 默认、F3、F4 `cargo check` 和测试编译通过，0 warning；实机持久化与重启
+  回归将在本提交完整烧录后记录。
+
 ## LOOP34 LwIP 内部 SRAM 余量与遥测调度（2026-08-13）
 
 - [x] 启用 `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`，LwIP 通用动态对象优先使用
