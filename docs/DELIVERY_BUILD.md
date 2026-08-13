@@ -113,6 +113,16 @@ espflash save-image --chip esp32s3 \
   gateway-factory.bin
 ```
 
+生成后必须检查应用镜像不超过单个 OTA 分区 `0x240000`（2,359,296 字节）：
+
+```bash
+app_bytes=$(stat -f '%z' gateway-factory.bin) # Linux 使用: stat -c '%s'
+test "$app_bytes" -le $((0x240000))
+```
+
+2026-08-13 的完整业务 release 基线为 `1,626,928B`，约占 OTA 槽 69.0%，剩余
+`732,368B`。体积回归应与该基线比较；debug ELF 不作为交付体积指标。
+
 同一个 `gateway-factory.bin` 可以作为 Web OTA 的应用镜像内容，但交付包中应复制并使用不同文件名区分用途：
 
 ```text

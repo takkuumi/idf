@@ -1,6 +1,7 @@
 // 构建脚本：调用 embuild 编排 ESP-IDF
 fn main() {
     embuild::espidf::sysenv::output();
+    validate_production_envelope();
 
     // 设置编译期常量供代码使用
     println!("cargo:rustc-cfg=esp32s3");
@@ -41,6 +42,74 @@ fn main() {
     if std::env::var("CARGO_FEATURE_F4").is_ok() {
         println!("cargo:rustc-cfg=feature_f4");
     }
+}
+
+/// Reject builds whose generated firmware would violate the verified hardware
+/// and resource envelope. These are product invariants, not optional tuning.
+fn validate_production_envelope() {
+    const SDKCONFIG: &str = "sdkconfig.defaults";
+    const PARTITIONS: &str = "partitions.csv";
+    println!("cargo:rerun-if-changed={SDKCONFIG}");
+    println!("cargo:rerun-if-changed={PARTITIONS}");
+
+    let sdk = std::fs::read_to_string(SDKCONFIG)
+        .unwrap_or_else(|e| panic!("cannot read {SDKCONFIG}: {e}"));
+    require_config(&sdk, "CONFIG_ESP_MAIN_TASK_STACK_SIZE", "32768");
+    require_config(&sdk, "CONFIG_SPIRAM_SIZE", "2097152");
+    require_config(&sdk, "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL", "65536");
+    require_config(&sdk, "CONFIG_LWIP_MAX_SOCKETS", "20");
+    require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHMODE_DIO", "y");
+    require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHFREQ_40M", "y");
+    require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHSIZE_8MB", "y");
+
+    let partitions = std::fs::read_to_string(PARTITIONS)
+        .unwrap_or_else(|e| panic!("cannot read {PARTITIONS}: {e}"));
+    require_partition(&partitions, "nvs", 0x9000, 0x6000);
+    require_partition(&partitions, "factory", 0x20000, 0x240000);
+    require_partition(&partitions, "ota_0", 0x260000, 0x240000);
+    require_partition(&partitions, "ota_1", 0x4A0000, 0x240000);
+}
+
+fn require_config(config: &str, key: &str, expected: &str) {
+    let actual = config.lines().find_map(|line| {
+        let line = line.trim();
+        (!line.starts_with('#'))
+            .then(|| line.split_once('='))
+            .flatten()
+            .filter(|(name, _)| *name == key)
+            .map(|(_, value)| value.trim())
+    });
+    assert_eq!(
+        actual,
+        Some(expected),
+        "production envelope violation: {key} must be {expected}"
+    );
+}
+
+fn require_partition(csv: &str, name: &str, expected_offset: u32, expected_size: u32) {
+    let row = csv.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let mut fields = line.split(',').map(str::trim);
+        (fields.next()? == name).then(|| {
+            let _partition_type = fields.next()?;
+            let _subtype = fields.next()?;
+            let offset = parse_hex(fields.next()?)?;
+            let size = parse_hex(fields.next()?)?;
+            Some((offset, size))
+        })?
+    });
+    assert_eq!(
+        row,
+        Some((expected_offset, expected_size)),
+        "production partition violation: {name} must be at {expected_offset:#X}, size {expected_size:#X}"
+    );
+}
+
+fn parse_hex(value: &str) -> Option<u32> {
+    u32::from_str_radix(value.strip_prefix("0x")?, 16).ok()
 }
 
 /// 校验 feature 组合是否合法, 不合法则 panic 中断编译

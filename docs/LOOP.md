@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-13 (LOOP29: OTA 分区迁移与 ST25DV16KC 实机纠偏)
+> 最后更新: 2026-08-13 (LOOP30: 工业架构资源边界收口)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,18 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP30 工业架构资源边界收口（2026-08-13）
+
+- `build.rs` 对真实 ESP32-S3R2 硬件建立构建硬门槛：2MB PSRAM、64KB internal
+  reserve、20 sockets、DIO/40MHz/8MB Flash、旧 NVS 地址和三个 2.25MB 应用分区。
+  任一关键配置漂移都会中止构建，防止未经实机验证的配置进入客户固件。
+- Modbus TCP 架构文档与当前实现统一：四监听端口、8 个固定客户端、260B 标准最大
+  ADU、5ms 非阻塞轮询、每 tick 全局 2 个请求、keepalive 与监听器退避恢复。
+- 完整业务 release 应用镜像实测 `1,626,928B`，约占单 OTA 槽 69.0%；静态内部
+  DRAM `.data + .bss = 53,853B`。交付文档增加 OTA 槽容量硬检查和体积回归基线。
+- 默认、F3、F4 编译检查与 `cargo test --bin gateway --no-run` 通过；本轮不修改
+  BLE/Modbus/Web/NFC/OTA 协议和寄存器映射。
 
 ## LOOP29 实机纠偏（2026-08-13）
 

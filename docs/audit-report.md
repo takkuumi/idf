@@ -278,23 +278,27 @@ let silence_ms: u64 = std::cmp::max(silence_us / 1000, 1) as u64;
 
 ### 3.3 [重要] TCP 连接管理可加强
 
-**现状**：Modbus TCP Server 监听 502 端口，最大 4 连接，每连接独立线程。
+**现状**：Modbus TCP Server 监听 502/503/504/5002 四个端口，最多 8 个固定客户端
+状态由 main_loop 非阻塞轮询，不为连接创建 pthread。
 
 **代码位置**：[src/modbus/tcp_server.rs](file:///Users/ling/Workspace/idf/src/modbus/tcp_server.rs) 第 67-136 行
 
 **当前机制**：
-- `set_read_timeout(2000ms)` → 空闲超过 2s 触发 `WouldBlock` → 主动关闭释放名额
-- `CONN_COUNT` 原子计数，超限拒绝新连接
-- 错误处理：`UnexpectedEof` / 其他错误均 `return Ok(())` 关闭连接
+- 空闲 5 分钟、半帧 30 秒、发送背压 5 秒的绝对超时主动释放连接槽
+- `MAX_CONNECTIONS=8`，启动期一次性预留客户端状态，运行中不扩容
+- 每轮全局最多处理 2 个业务请求、最多 accept 2 个连接，客户端轮转调度
+- `CONN_COUNT` 原子计数，超限拒绝新连接并限频记录
 
 **潜在问题**：
 1. **已修复 SO_KEEPALIVE**：已建立连接显式启用 keepalive（空闲 30s、探测 10s、3 次失败），并保留应用层空闲/半帧/发送绝对超时作为兜底。
 2. **连接拒绝无响应**：超限时 `drop(s)` 直接关闭，客户端收 RST 但无 Modbus 异常响应 (规范允许，但 SCADA 可能误报)。
 3. **`CONN_COUNT` 竞态**：`fetch_add` 后立即 `load`，并发场景下 id 可能不连续 (仅影响日志，功能正确)。
 
-**建议**：
-- 在 `handle_conn` 中设置 `stream.set_nonblocking(false)` + 配置 keepalive (需 `libc::setsockopt`)
-- 拒绝连接时可选发送 Modbus Exception (SLAVE_DEVICE_FAILURE) 后再关闭
+**补充结论**：
+- 已在连接建立时设置 `SO_KEEPALIVE`、`TCP_KEEPIDLE/INTVL/KEEPCNT`；细项失败时保留
+  应用层超时兜底，避免不同 LwIP 构建造成兼容性回归。
+- 超限连接直接关闭符合 Modbus TCP 服务器资源耗尽时的常见实现；不伪造业务异常帧，
+  防止上位机将资源拒绝误判为从站业务故障。
 
 ---
 

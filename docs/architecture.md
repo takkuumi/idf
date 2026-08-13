@@ -12,9 +12,12 @@
 - `.dram0.bss` 结束至 DRAM 段末：`172,280B (168.24KB)`，这是当前连续内部
   DRAM heap 候选区，不等于启动完成后的 `esp_get_free_heap_size()`。
 - `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536` 为 DMA/内部专用申请保留 64KB。
+- `build.rs` 将 2MB PSRAM、64KB internal reserve、20 sockets、DIO/40MHz/8MB、
+  NVS 地址和三个 2.25MB 应用分区设为构建硬门槛；配置漂移会直接中止构建。
 - pthread 默认 `stack_alloc_caps` 是 `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`；启用
   `FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` 不会自动把 Rust pthread 栈迁到 PSRAM。
-- release raw app 镜像为 `1,600,240B`，占 2.25MB OTA 槽约 67.8%；发布配置保持
+- 2026-08-13 release raw app 镜像为 `1,626,928B`，占 2.25MB OTA 槽约 69.0%；
+  ELF 中静态内部 DRAM 为 `.data 25,821B + .bss 28,032B = 53,853B`。发布配置保持
   `-O3`、fat LTO、单 codegen unit、strip 和 abort panic，未以牺牲实时性换取更小代码。
 
 ## 根因
@@ -51,11 +54,15 @@
 ## 固定连接状态机
 
 Modbus TCP 默认 502/503/504/5002，端口寄存器 2243-2246 持久化后可在运行时重绑；
-保留 8 连接上限、5 分钟 idle 回收、2 秒发送背压超时和原 MBAP/PDU 格式。连接建立
+保留 8 连接上限、5 分钟 idle 回收、5 秒发送背压绝对超时和原 MBAP/PDU 格式。连接建立
 只在预留 `Vec<Client>` 中增加状态，不创建 pthread。状态机由 main_loop 每 5ms
 非阻塞轮询；一次性预留失败会返回启动错误，运行中不扩容。单连接每轮最多处理
-4 个流水请求，每个周期限制 accept 数量，写端背压有独立超时，异常客户端不能
-无限占用调度循环。
+4 个流水请求，但全局每轮最多执行 2 个业务请求；accept 每轮最多 2 个，监听器和
+客户端采用轮转游标，异常客户端不能饿死其它连接或无限占用调度循环。
+
+监听器异常会在 1 秒后重绑，连续失败按 5 秒退避；连接显式启用 TCP keepalive
+（30 秒空闲、10 秒探测、3 次失败），若底层构建不支持细项则降级到应用层超时，
+不会拒绝本可正常工作的客户端。
 
 连接状态总分配超过 4KB，按当前 `SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 策略进入
 PSRAM；socket和 DMA 仍保留在 internal SRAM。NFC 的两个 4KB 工作区也通过 capability
