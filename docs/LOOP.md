@@ -787,3 +787,26 @@ just test-compile    # 仅编译测试 binary
 ### 必须继续的实机验证
 
 静态检查不能证明 7x24 可靠性或 Android 端到端兼容。烧录后需执行至少 72 小时浸泡测试，并覆盖：反复 BLE 连接/断开、低 MTU 配置写、W5500 拔插、RS485 无从站、NVS 写失败注入和 Modbus TCP 持续读写。记录格式见 `log/ble/compat_stability_2026-07-28.md`。
+
+## LOOP30 BLE/NFC/OTA 最终实机回归 (2026-08-13)
+
+### 修复
+
+- BLE 三条心跳路径统一返回 Android 需要的 slave、运行状态和 6-byte BLE MAC，恢复连接后的首次属性同步。
+- 新增认证 NFC 状态、备份、恢复 Web API 和维护界面；恢复必须 POST 且界面二次确认。
+- NFC 完成状态保持可观测，原始 1760-byte 快照支持跨重启恢复，同时拒绝全 0/全 `0xFF` 空标签。
+- factory 分区跳过不支持的 OTA 状态查询，消除每秒 `ESP_ERR_NOT_SUPPORTED` 告警；OTA 分区仍保留 30 秒健康确认与回滚保护。
+- 烧录命令显式指定 Bootloader、OTA 分区表、factory 槽和 8MB DIO 参数，禁止只传 ELF 破坏分区布局。
+
+### 实机结果
+
+- 手持机 BLE 18 项读取全部通过，OTA 后再次通过。
+- PC Modbus TCP 四端口、标准 FC03 125、83-word 配置写回、逻辑/文本区全部通过，OTA 后再次通过。
+- NFC 备份、恢复及跨重启恢复通过；Web 认证和 HTTP 方法限制通过。
+- Web OTA 写入 `ota_0@0x260000`，30 秒后确认 VALID，工具复位后仍从 ota_0 启动。
+- 栈峰值: NFC 40%、RTU master 39%、UDP 30%、HTTP 23%、main 15%；free heap 约 2.0 MiB，无 pthread/stack canary/panic。
+
+### 未完成
+
+- 缺少独立 USB-RS485 适配器，PC RTU 实物闭环未验证。
+- 未完成 72 小时浸泡，不能据短期回归宣称 7x24 已被时间验证。
