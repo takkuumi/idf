@@ -8,7 +8,7 @@
 //! ## 无堆分配设计 (7×24 稳定性)
 //!
 //! 所有 PDU 处理函数使用固定大小栈缓冲区替代 `Vec<u8>`。
-//! 位读/写直接处理压缩位图；寄存器读使用 `heapless::Vec`。
+//! 位读/写直接处理压缩位图；寄存器读直接编码到最终 PDU 缓冲区。
 //! 这消除了 Modbus 热路径上的所有堆分配，防止长期运行时的 heap 碎片化。
 
 /// Modbus Application Protocol v1.1b3 的 PDU 最大长度。
@@ -33,12 +33,8 @@ pub const PDU_BUF_SIZE: usize = MODBUS_MAX_PDU_LEN;
 pub trait ModbusBackend {
     fn read_coil(&self, addr: u16) -> Option<bool>;
     fn read_discrete_input(&self, addr: u16) -> Option<bool>;
-    fn read_holding_registers(
-        &self,
-        addr: u16,
-        count: u16,
-    ) -> heapless::Vec<u16, MAX_REGS_PER_READ>;
-    fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>;
+    fn encode_holding_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool;
+    fn encode_input_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool;
     fn write_single_coil(&self, addr: u16, value: bool) -> bool;
     fn write_single_register(&self, addr: u16, value: u16) -> bool;
     fn write_multiple_coils(&self, addr: u16, count: u16, packed_values: &[u8]) -> bool;
@@ -59,30 +55,26 @@ impl ModbusBackend for BusBackend {
         crate::bus::backends::read_disc(addr)
     }
 
-    fn read_holding_registers(
-        &self,
-        addr: u16,
-        count: u16,
-    ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-        crate::bus::backends::read_hold_regs(addr, count)
+    fn encode_holding_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
+        crate::bus::backends::encode_hold_regs_be(addr, count, out)
     }
 
-    fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-        let mut v = heapless::Vec::new();
-        if count == 0 {
-            return v;
+    fn encode_input_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
+        if out.len() != count as usize * 2 {
+            return false;
         }
         let last = (addr as u32) + (count as u32) - 1;
         if last > u16::MAX as u32 {
-            return v;
+            return false;
         }
         for i in 0..count {
             let Some(value) = crate::bus::backends::read_input_reg(addr.wrapping_add(i)) else {
-                return heapless::Vec::new();
+                return false;
             };
-            let _ = v.push(value);
+            let offset = i as usize * 2;
+            out[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
         }
-        v
+        true
     }
 
     fn write_single_coil(&self, addr: u16, value: bool) -> bool {
@@ -319,8 +311,18 @@ pub fn handle_pdu<B: ModbusBackend>(
     let result = match func {
         0x01 => read_bits_pdu(backend, pdu, |b, a| b.read_coil(a), out),
         0x02 => read_bits_pdu(backend, pdu, |b, a| b.read_discrete_input(a), out),
-        0x03 => read_regs_pdu(backend, pdu, |b, a, c| b.read_holding_registers(a, c), out),
-        0x04 => read_regs_pdu(backend, pdu, |b, a, c| b.read_input_registers(a, c), out),
+        0x03 => read_regs_pdu(
+            backend,
+            pdu,
+            |b, a, c, dst| b.encode_holding_registers(a, c, dst),
+            out,
+        ),
+        0x04 => read_regs_pdu(
+            backend,
+            pdu,
+            |b, a, c, dst| b.encode_input_registers(a, c, dst),
+            out,
+        ),
         0x05 => write_single_coil_pdu(backend, pdu, out),
         0x06 => write_single_reg_pdu(backend, pdu, out),
         0x0F => write_multi_coils_pdu(backend, pdu, out),
@@ -395,7 +397,7 @@ where
 fn read_regs_pdu<B, F>(backend: &B, pdu: &[u8], f: F, out: &mut [u8; PDU_BUF_SIZE]) -> PduResult
 where
     B: ModbusBackend,
-    F: Fn(&B, u16, u16) -> heapless::Vec<u16, MAX_REGS_PER_READ>,
+    F: Fn(&B, u16, u16, &mut [u8]) -> bool,
 {
     if pdu.len() != 4 {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
@@ -408,20 +410,14 @@ where
     if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
         return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
     }
-    let regs = f(backend, addr, count);
-    if regs.len() != count as usize {
+    let byte_count = count as usize * 2;
+    if !f(backend, addr, count, &mut out[2..2 + byte_count]) {
         return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
     }
     out[0] = 0; // func 占位
-    out[1] = (regs.len() * 2) as u8;
-    for (i, r) in regs.iter().enumerate() {
-        let off = 2 + i * 2;
-        let bytes = r.to_be_bytes();
-        out[off] = bytes[0];
-        out[off + 1] = bytes[1];
-    }
+    out[1] = byte_count as u8;
     // body = byte_count(1) + register bytes(N)，不含 out[0] 的功能码。
-    PduResult::Ok(1 + regs.len() * 2)
+    PduResult::Ok(1 + byte_count)
 }
 
 fn write_single_coil_pdu<B: ModbusBackend>(
@@ -597,27 +593,27 @@ mod tests {
         fn read_discrete_input(&self, addr: u16) -> Option<bool> {
             self.disc.get(addr as usize).copied()
         }
-        fn read_holding_registers(
-            &self,
-            addr: u16,
-            count: u16,
-        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-            let mut v = heapless::Vec::new();
-            for i in 0..count {
-                let _ = v.push(self.holding[(addr + i) as usize]);
+        fn encode_holding_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
+            if out.len() != count as usize * 2 {
+                return false;
             }
-            v
+            for i in 0..count {
+                let offset = i as usize * 2;
+                out[offset..offset + 2]
+                    .copy_from_slice(&self.holding[(addr + i) as usize].to_be_bytes());
+            }
+            true
         }
-        fn read_input_registers(
-            &self,
-            addr: u16,
-            count: u16,
-        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-            let mut v = heapless::Vec::new();
-            for i in 0..count {
-                let _ = v.push(self.input_reg[(addr + i) as usize]);
+        fn encode_input_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
+            if out.len() != count as usize * 2 {
+                return false;
             }
-            v
+            for i in 0..count {
+                let offset = i as usize * 2;
+                out[offset..offset + 2]
+                    .copy_from_slice(&self.input_reg[(addr + i) as usize].to_be_bytes());
+            }
+            true
         }
         fn write_single_coil(&self, _addr: u16, _value: bool) -> bool {
             true
@@ -642,23 +638,17 @@ mod tests {
         fn read_discrete_input(&self, _: u16) -> Option<bool> {
             Some(false)
         }
-        fn read_holding_registers(
-            &self,
-            _: u16,
-            count: u16,
-        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-            let mut values = heapless::Vec::new();
-            for _ in 0..count {
-                let _ = values.push(0xA55A);
+        fn encode_holding_registers(&self, _: u16, count: u16, out: &mut [u8]) -> bool {
+            if out.len() != count as usize * 2 {
+                return false;
             }
-            values
+            for chunk in out.chunks_exact_mut(2) {
+                chunk.copy_from_slice(&0xA55Au16.to_be_bytes());
+            }
+            true
         }
-        fn read_input_registers(
-            &self,
-            _: u16,
-            count: u16,
-        ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-            self.read_holding_registers(0, count)
+        fn encode_input_registers(&self, _: u16, count: u16, out: &mut [u8]) -> bool {
+            self.encode_holding_registers(0, count, out)
         }
         fn write_single_coil(&self, _: u16, _: bool) -> bool {
             true
@@ -698,19 +688,11 @@ mod tests {
             fn read_discrete_input(&self, _: u16) -> Option<bool> {
                 None
             }
-            fn read_holding_registers(
-                &self,
-                _: u16,
-                _: u16,
-            ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-                heapless::Vec::new()
+            fn encode_holding_registers(&self, _: u16, _: u16, _: &mut [u8]) -> bool {
+                false
             }
-            fn read_input_registers(
-                &self,
-                _: u16,
-                _: u16,
-            ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-                heapless::Vec::new()
+            fn encode_input_registers(&self, _: u16, _: u16, _: &mut [u8]) -> bool {
+                false
             }
             fn write_single_coil(&self, _: u16, _: bool) -> bool {
                 false
@@ -759,6 +741,19 @@ mod tests {
         assert_eq!(n, 252); // func + byte_count + ceil(2000 / 8)
         assert_eq!(out[1], 250);
         assert!(out[2..n].iter().all(|&byte| byte == 0xFF));
+    }
+
+    #[test]
+    fn test_standard_maximum_register_read_encodes_directly() {
+        let mut out = [0u8; PDU_BUF_SIZE];
+        let n = handle_pdu(&FullRangeBackend, 0x03, &[0, 0, 0, 125], &mut out);
+        assert_eq!(n, 252); // func + byte_count + 125 words
+        assert_eq!(out[1], 250);
+        assert!(
+            out[2..n]
+                .chunks_exact(2)
+                .all(|word| word == 0xA55Au16.to_be_bytes())
+        );
     }
 
     #[test]

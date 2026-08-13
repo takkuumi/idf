@@ -115,20 +115,6 @@ static TASK_HB: TaskHb = TaskHb::new("ble-at");
 static RX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
     LazyLock::new(|| Spin::new(heapless::String::new()));
 
-/// 二进制响应队列 (由 GATT 写回调填充, main loop 发送)
-static BINARY_TX: LazyLock<Spin<heapless::Vec<u8, 2048>>> =
-    LazyLock::new(|| Spin::new(heapless::Vec::new()));
-/// 二进制请求重组缓冲区。Android 在 MTU 协商失败时仍可能把一个协议帧拆为多次
-/// GATT Write；必须先完整重组再校验 CRC，不能落入 AT 文本通道。
-static BINARY_RX: LazyLock<Spin<heapless::Vec<u8, 512>>> =
-    LazyLock::new(|| Spin::new(heapless::Vec::new()));
-/// BTC 回调只负责重组并入队；Modbus/配置/NVS 业务统一在 main_loop 执行。
-struct BinaryRequest {
-    frame: heapless::Vec<u8, BLE_BINARY_FRAME_MAX>,
-    conn_id: u16,
-    epoch: u32,
-}
-static BINARY_REQUESTS: MpscRing<BinaryRequest, 4> = MpscRing::new();
 /// BLE notify 丢弃帧计数器 (Modbus 寄存器 0x0108 暴露)
 static BINARY_TX_DROPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Android requests MTU 512. A complete Modbus PDU can hold 253 bytes, so
@@ -137,6 +123,111 @@ const BLE_RESPONSE_PDU_MAX: usize = 253;
 const BLE_RESPONSE_DATA_MAX: usize = BLE_RESPONSE_PDU_MAX - 2;
 const BLE_BINARY_FRAME_MAX: usize = 512;
 const BLE_BINARY_PDU_MAX: usize = BLE_BINARY_FRAME_MAX - 8;
+/// 最大下行帧为 outer header(6) + slave(1) + Modbus PDU(253)
+/// + inner CRC(2) + outer CRC(2) = 264B，保留 8B 余量。
+const BLE_TX_FRAME_MAX: usize = 272;
+const BLE_TX_SLOT_COUNT: usize = 8;
+const BLE_RX_SLOT_COUNT: usize = 4;
+const BLE_SLOT_NONE: u8 = u8::MAX;
+
+type TxBleFrame = heapless::Vec<u8, BLE_TX_FRAME_MAX>;
+type RxBleFrame = heapless::Vec<u8, BLE_BINARY_FRAME_MAX>;
+
+struct TxFrame {
+    bytes: TxBleFrame,
+    offset: usize,
+}
+
+impl TxFrame {
+    const fn new() -> Self {
+        Self {
+            bytes: TxBleFrame::new(),
+            offset: 0,
+        }
+    }
+}
+
+/// 固定帧环：保持业务帧边界和顺序，分片发送只推进 offset，不搬移剩余字节。
+struct TxFrameRing {
+    slots: [TxFrame; BLE_TX_SLOT_COUNT],
+    head: usize,
+    len: usize,
+}
+
+impl TxFrameRing {
+    const fn new() -> Self {
+        Self {
+            slots: [const { TxFrame::new() }; BLE_TX_SLOT_COUNT],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn try_push(&mut self, frame: TxBleFrame) -> bool {
+        if self.len == BLE_TX_SLOT_COUNT {
+            return false;
+        }
+        let index = (self.head + self.len) % BLE_TX_SLOT_COUNT;
+        self.slots[index] = TxFrame {
+            bytes: frame,
+            offset: 0,
+        };
+        self.len += 1;
+        true
+    }
+
+    fn front_mut(&mut self) -> Option<&mut TxFrame> {
+        (self.len != 0).then(|| &mut self.slots[self.head])
+    }
+
+    fn pop_front(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        self.slots[self.head].bytes.clear();
+        self.slots[self.head].offset = 0;
+        self.head = (self.head + 1) % BLE_TX_SLOT_COUNT;
+        self.len -= 1;
+    }
+
+    fn clear(&mut self) {
+        while self.len != 0 {
+            self.pop_front();
+        }
+        self.head = 0;
+    }
+}
+
+static BINARY_TX: Spin<TxFrameRing> = Spin::new(TxFrameRing::new());
+
+const RX_FREE: u8 = 0;
+const RX_ASSEMBLING: u8 = 1;
+const RX_READY: u8 = 2;
+const RX_PROCESSING: u8 = 3;
+
+struct BinaryRxSlot {
+    state: AtomicU8,
+    frame: Spin<RxBleFrame>,
+    conn_id: AtomicU16,
+    epoch: std::sync::atomic::AtomicU32,
+}
+
+impl BinaryRxSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(RX_FREE),
+            frame: Spin::new(RxBleFrame::new()),
+            conn_id: AtomicU16::new(0xFFFF),
+            epoch: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+static BINARY_RX_SLOTS: [BinaryRxSlot; BLE_RX_SLOT_COUNT] =
+    [const { BinaryRxSlot::new() }; BLE_RX_SLOT_COUNT];
+static ACTIVE_RX_SLOT: AtomicU8 = AtomicU8::new(BLE_SLOT_NONE);
+/// 队列只传递静态槽索引，完整帧所有权留在槽中，不复制512B请求对象。
+static BINARY_REQUESTS: MpscRing<u8, 5> = MpscRing::new();
 /// ATT 默认 MTU 为 23；notification value 最多为协商 MTU - opcode/handle 3 字节。
 const BLE_ATT_MTU_MIN: u16 = 23;
 const BLE_LOCAL_MTU: u16 = 500;
@@ -613,7 +704,7 @@ unsafe extern "C" fn gatts_event_cb(
             // 心跳业务数据必须与请求应答完全一致。Android parseHeartbeat 把
             // func 后的数据解析为 slave + runStatus + terminal(6-byte MAC)。
             let pdu = build_heartbeat_pdu(1);
-            let mut frame: heapless::Vec<u8, 18> = heapless::Vec::new();
+            let mut frame = TxBleFrame::new();
             let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]); // tx_id=0, proto_id=0
             let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
             let _ = frame.extend_from_slice(&pdu);
@@ -621,13 +712,11 @@ unsafe extern "C" fn gatts_event_cb(
             let _ = frame.push(crc as u8);
             let _ = frame.push((crc >> 8) as u8);
             // Android 首次 connect 后能立即收到心跳, 不用等 ~10s 周期心跳.
-            if let Some(mut btx) = BINARY_TX.try_lock() {
-                if btx.len() + frame.len() <= 2048 {
-                    let _ = btx.extend_from_slice(&frame);
-                    log::info!("[ble_at] connect heartbeat queued ({} bytes)", frame.len());
-                } else {
-                    log::warn!("[ble_at] BINARY_TX full, connect heartbeat dropped");
-                }
+            let frame_len = frame.len();
+            if enqueue_tx_frame(frame) {
+                log::info!("[ble_at] connect heartbeat queued ({} bytes)", frame_len);
+            } else {
+                log::warn!("[ble_at] BINARY_TX full, connect heartbeat dropped");
             }
         }
         ESP_GATTS_DISCONNECT_EVT => {
@@ -958,7 +1047,7 @@ pub fn process_tick() {
     }
     if CONNECTION_BUFFERS_DIRTY.swap(false, Ordering::AcqRel) {
         BINARY_TX.lock().clear();
-        BINARY_RX.lock().clear();
+        clear_binary_rx_slots();
         RX_BUFFER.lock().clear();
         log::debug!("[ble_at] stale connection buffers cleared");
     }
@@ -977,17 +1066,8 @@ pub fn process_tick() {
     }
 
     // GATT 回调投递的二进制请求在 main 任务处理，隔离 Bluedroid BTC 栈。
-    if let Some(request) = BINARY_REQUESTS.dequeue() {
-        if request.conn_id == conn_id_raw
-            && request.epoch == CONNECTION_EPOCH.load(Ordering::Acquire)
-        {
-            let _ = try_handle_binary_protocol(&request.frame, request.conn_id, 0);
-        } else {
-            log::debug!(
-                "[ble_at] dropping stale request for conn_id={}",
-                request.conn_id
-            );
-        }
+    if let Some(slot_index) = BINARY_REQUESTS.dequeue() {
+        process_binary_request_slot(slot_index, conn_id_raw);
     }
 
     // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
@@ -1011,7 +1091,7 @@ pub fn process_tick() {
     }
     if let Some(resp) = at_response {
         // 把 AT 文本响应包装成 BLE 帧 (tx_id=0, proto_id=0)
-        let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
+        let mut frame = TxBleFrame::new();
         let _ = frame.extend_from_slice(&0u16.to_be_bytes());
         let _ = frame.extend_from_slice(&0u16.to_be_bytes());
         let bytes = resp.as_bytes();
@@ -1021,12 +1101,8 @@ pub fn process_tick() {
         let crc = modbus_crc16(&frame[..frame.len()]);
         let _ = frame.push(crc as u8);
         let _ = frame.push((crc >> 8) as u8);
-        if let Some(mut btx) = BINARY_TX.try_lock() {
-            if btx.len() + frame.len() <= 2048 {
-                let _ = btx.extend_from_slice(&frame);
-            } else {
-                log::warn!("[ble_at] AT response too long, dropping");
-            }
+        if !enqueue_tx_frame(frame) {
+            log::warn!("[ble_at] AT response too long, dropping");
         }
     }
 
@@ -1038,18 +1114,15 @@ pub fn process_tick() {
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
     if n % HEARTBEAT_TICKS == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
         let pdu = build_heartbeat_pdu(1);
-        let mut frame: heapless::Vec<u8, 18> = heapless::Vec::new();
+        let mut frame = TxBleFrame::new();
         let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]);
         let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
         let _ = frame.extend_from_slice(&pdu);
         let crc = crate::modbus::shared::modbus_crc16(&frame);
         let _ = frame.push(crc as u8);
         let _ = frame.push((crc >> 8) as u8);
-        if let Some(mut btx) = BINARY_TX.try_lock() {
-            if btx.len() + frame.len() <= btx.capacity() {
-                let _ = btx.extend_from_slice(&frame);
-                log::debug!("[ble_at] periodic heartbeat queued");
-            }
+        if enqueue_tx_frame(frame) {
+            log::debug!("[ble_at] periodic heartbeat queued");
         }
     }
 
@@ -1069,18 +1142,15 @@ fn send_next_notification(gatts_if_raw: u8, conn_id: u16, tx_handle: u16) {
     let mtu = NEGOTIATED_MTU.load(Ordering::Acquire);
     let payload_limit = usize::from(mtu.saturating_sub(3)).clamp(1, BLE_ATT_PAYLOAD_MAX);
     let epoch = CONNECTION_EPOCH.load(Ordering::Acquire);
-    let mut chunk = [0u8; BLE_ATT_PAYLOAD_MAX];
-    let chunk_len = {
-        let Some(btx) = BINARY_TX.try_lock() else {
-            return;
-        };
-        let len = btx.len().min(payload_limit);
-        chunk[..len].copy_from_slice(&btx[..len]);
-        len
-    };
-    if chunk_len == 0 {
+    let Some(mut queue) = BINARY_TX.try_lock() else {
         return;
-    }
+    };
+    let Some(frame) = queue.front_mut() else {
+        return;
+    };
+    let remaining = &mut frame.bytes[frame.offset..];
+    let chunk_len = remaining.len().min(payload_limit);
+    let chunk = &mut remaining[..chunk_len];
 
     let ret = unsafe {
         esp_idf_sys::esp_ble_gatts_send_indicate(
@@ -1106,15 +1176,15 @@ fn send_next_notification(gatts_if_raw: u8, conn_id: u16, tx_handle: u16) {
     if CONN_ID.load(Ordering::Acquire) == conn_id
         && CONNECTION_EPOCH.load(Ordering::Acquire) == epoch
     {
-        let mut btx = BINARY_TX.lock();
-        let consumed = chunk_len.min(btx.len());
-        let remaining = btx.len() - consumed;
-        btx.as_mut_slice().rotate_left(consumed);
-        btx.truncate(remaining);
+        frame.offset += chunk_len;
+        let frame_remaining = frame.bytes.len() - frame.offset;
+        if frame_remaining == 0 {
+            queue.pop_front();
+        }
         log::debug!(
-            "[ble_at] notify submitted: {} bytes, queued={}",
-            consumed,
-            remaining
+            "[ble_at] notify submitted: {} bytes, frame_remaining={}",
+            chunk_len,
+            frame_remaining
         );
     }
 }
@@ -1197,25 +1267,99 @@ fn binary_frame_total_len(data: &[u8]) -> Option<usize> {
     Some(6 + length + 2)
 }
 
+fn claim_binary_rx_slot(conn_id: u16) -> Option<u8> {
+    for (index, slot) in BINARY_RX_SLOTS.iter().enumerate() {
+        if slot
+            .state
+            .compare_exchange(RX_FREE, RX_ASSEMBLING, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            slot.frame.lock().clear();
+            slot.conn_id.store(conn_id, Ordering::Release);
+            slot.epoch
+                .store(CONNECTION_EPOCH.load(Ordering::Acquire), Ordering::Release);
+            return Some(index as u8);
+        }
+    }
+    None
+}
+
+fn release_binary_rx_slot(index: u8) {
+    let Some(slot) = BINARY_RX_SLOTS.get(index as usize) else {
+        return;
+    };
+    slot.frame.lock().clear();
+    slot.conn_id.store(0xFFFF, Ordering::Release);
+    slot.state.store(RX_FREE, Ordering::Release);
+}
+
+fn clear_binary_rx_slots() {
+    ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+    while BINARY_REQUESTS.dequeue().is_some() {}
+    for index in 0..BLE_RX_SLOT_COUNT {
+        release_binary_rx_slot(index as u8);
+    }
+}
+
+fn process_binary_request_slot(index: u8, current_conn_id: u16) {
+    let Some(slot) = BINARY_RX_SLOTS.get(index as usize) else {
+        return;
+    };
+    if slot
+        .state
+        .compare_exchange(RX_READY, RX_PROCESSING, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let conn_id = slot.conn_id.load(Ordering::Acquire);
+    let epoch = slot.epoch.load(Ordering::Acquire);
+    if conn_id == current_conn_id && epoch == CONNECTION_EPOCH.load(Ordering::Acquire) {
+        let frame = slot.frame.lock();
+        let _ = try_handle_binary_protocol(&frame, conn_id, 0);
+        drop(frame);
+    } else {
+        log::debug!("[ble_at] dropping stale request for conn_id={}", conn_id);
+    }
+    release_binary_rx_slot(index);
+}
+
 /// 将一或多次 GATT Write 重组为完整的 Android 协议帧。
 /// 返回 true 表示输入属于二进制协议（包括等待后续分片），false 才交给 AT 文本处理。
 fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
-    let mut rx = match BINARY_RX.try_lock() {
-        Some(rx) => rx,
-        None => return false,
-    };
-
     // AT 命令以 "AT" 开头；其余输入按二进制帧进行累积，支持头部自身被拆分。
-    if rx.is_empty() && (data.starts_with(b"AT") || data == b"A") {
+    let mut index = ACTIVE_RX_SLOT.load(Ordering::Acquire);
+    if index == BLE_SLOT_NONE && (data.starts_with(b"AT") || data == b"A") {
         return false;
     }
+    if index == BLE_SLOT_NONE {
+        let Some(claimed) = claim_binary_rx_slot(conn_id) else {
+            log::warn!("[ble_at] binary RX slots full, dropping input");
+            BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
+        index = claimed;
+        ACTIVE_RX_SLOT.store(index, Ordering::Release);
+    }
+    let Some(slot) = BINARY_RX_SLOTS.get(index as usize) else {
+        ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+        return true;
+    };
+    let mut rx = match slot.frame.try_lock() {
+        Some(rx) => rx,
+        None => return true,
+    };
     if rx.len() + data.len() > rx.capacity() {
         log::warn!("[ble_at] binary RX overflow, dropping partial frame");
-        rx.clear();
+        drop(rx);
+        ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+        release_binary_rx_slot(index);
         return true;
     }
     if rx.extend_from_slice(data).is_err() {
-        rx.clear();
+        drop(rx);
+        ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+        release_binary_rx_slot(index);
         return true;
     }
 
@@ -1226,7 +1370,9 @@ fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
         Some(expected) if expected <= rx.capacity() => expected,
         _ => {
             log::warn!("[ble_at] invalid binary frame length, dropping input");
-            rx.clear();
+            drop(rx);
+            ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+            release_binary_rx_slot(index);
             return true;
         }
     };
@@ -1235,22 +1381,18 @@ fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
     }
     if rx.len() != expected {
         log::warn!("[ble_at] binary RX contains trailing bytes, dropping frame");
-        rx.clear();
+        drop(rx);
+        ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+        release_binary_rx_slot(index);
         return true;
     }
-
-    let mut frame = heapless::Vec::new();
-    let copied = frame.extend_from_slice(&rx).is_ok();
-    rx.clear();
     drop(rx);
-    let request = BinaryRequest {
-        frame,
-        conn_id,
-        epoch: CONNECTION_EPOCH.load(Ordering::Acquire),
-    };
-    if !copied || !BINARY_REQUESTS.try_enqueue(request) {
+    ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
+    slot.state.store(RX_READY, Ordering::Release);
+    if !BINARY_REQUESTS.try_enqueue(index) {
         log::warn!("[ble_at] binary request queue full, dropping frame");
         BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+        release_binary_rx_slot(index);
     }
     true
 }
@@ -2822,7 +2964,7 @@ pub fn send_di_status_report(conn_id: u16) {
 }
 
 fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
-    let mut frame: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let mut frame = TxBleFrame::new();
     let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
     let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
     let length = pdu_data.len() as u16;
@@ -2840,33 +2982,28 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
     );
     // 放入二进制响应队列，由 main loop 按协商 MTU 分片发送。
     // 关键: 不在 GATT 回调中直接 send_indicate!
-    if let Some(mut btx) = BINARY_TX.try_lock() {
-        // queue size 2048 bytes, 容纳约 30+ 帧 (每帧 ~60 bytes)
-        if btx.len() + frame.len() <= 2048 {
-            let _ = btx.extend_from_slice(&frame);
-        } else {
-            // 队列满: 丢弃并计数 (Modbus 可查询)
-            let drops = BINARY_TX_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            // 每 10 次丢弃才记日志, 避免日志洪水
-            if drops % 10 == 1 {
-                log::warn!(
-                    "[ble_at] binary TX full, dropped frame #{} ({} bytes, queue={} bytes)",
-                    drops,
-                    frame.len(),
-                    btx.len()
-                );
-                // 记录为可恢复故障
-                crate::error::recovery::record_failure(
-                    crate::error::recovery::Severity::Recoverable,
-                    "ble_at",
-                    &format!("BLE notify dropped (count={})", drops),
-                );
-            }
+    let frame_len = frame.len();
+    if !enqueue_tx_frame(frame) {
+        let drops = BINARY_TX_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if drops % 10 == 1 {
+            log::warn!(
+                "[ble_at] binary TX full, dropped frame #{} ({} bytes)",
+                drops,
+                frame_len
+            );
+            crate::error::recovery::record_failure(
+                crate::error::recovery::Severity::Recoverable,
+                "ble_at",
+                &format!("BLE notify dropped (count={})", drops),
+            );
         }
-    } else {
-        // 锁失败: 记录但不丢弃
-        log::warn!("[ble_at] BINARY_TX lock failed, frame skipped");
     }
+}
+
+fn enqueue_tx_frame(frame: TxBleFrame) -> bool {
+    BINARY_TX
+        .try_lock()
+        .is_some_and(|mut queue| queue.try_push(frame))
 }
 
 /// 获取 BLE notify 丢弃帧计数 (供 Modbus 状态查询)
@@ -3024,6 +3161,34 @@ mod tests {
         assert_eq!(pdu.len(), 10);
         assert_eq!(&pdu[..4], &[1, 0x11, 1, 1]);
         assert!(pdu[4..].iter().any(|&byte| byte != 0));
+    }
+
+    #[test]
+    fn test_tx_frame_ring_preserves_fifo_without_memmove() {
+        let mut ring = TxFrameRing::new();
+        for value in 0..BLE_TX_SLOT_COUNT as u8 {
+            let mut frame = TxBleFrame::new();
+            frame.push(value).unwrap();
+            assert!(ring.try_push(frame));
+        }
+        assert!(!ring.try_push(TxBleFrame::new()));
+        for expected in 0..BLE_TX_SLOT_COUNT as u8 {
+            let front = ring.front_mut().unwrap();
+            assert_eq!(front.bytes.as_slice(), &[expected]);
+            front.offset = front.bytes.len();
+            ring.pop_front();
+        }
+        assert!(ring.front_mut().is_none());
+    }
+
+    #[test]
+    fn test_ble_fixed_slots_cover_protocol_maxima() {
+        const MAX_WRAPPED_RTU_RESPONSE: usize = 6 + 1 + BLE_RESPONSE_PDU_MAX + 2 + 2;
+        assert_eq!(MAX_WRAPPED_RTU_RESPONSE, 264);
+        assert!(BLE_TX_FRAME_MAX >= MAX_WRAPPED_RTU_RESPONSE);
+        assert_eq!(BLE_BINARY_FRAME_MAX, 512);
+        assert_eq!(BLE_TX_SLOT_COUNT * BLE_TX_FRAME_MAX, 2176);
+        assert_eq!(BLE_RX_SLOT_COUNT, 4);
     }
 }
 

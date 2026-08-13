@@ -81,3 +81,17 @@
 - FC03 125 words 和 FC10 123 words 的平均/P95/P99 响应时间。
 - TCP + BLE + Web + RTU + DI/DO/AI/AO 并发时的丢包、队列丢弃和 WDT/stack 水位。
 - 拔除 F3/F4 I2C 外设时 TCP 仍可响应，且不发生非计划重启。
+
+## 固定缓冲与复制收敛（2026-08-13）
+
+- FC03/04 后端直接把最多 125 个寄存器编码到最终 PDU 缓冲，移除约 250B
+  `heapless::Vec<u16>` 中间栈对象和第二次序列化遍历；FC03 整批仍只登记一次
+  CONFIG/STORAGE RCU 读者，响应快照一致性不变。
+- BLE TX 从 2KB 连续字节队列改为 8 个 272B 固定帧槽。ATT 分片只推进槽内
+  `offset`，不再将整个剩余队列 `rotate_left`，也不再复制到 497B 临时分片数组。
+- BLE RX 使用 4 个 512B 静态重组槽；BTC 回调完成帧后只向 main-loop 队列传递
+  1B 槽索引，不再复制完整 512B 请求对象。连接 epoch 和断线清理语义保持不变。
+- Web 请求方法、路径、Cookie、请求行和 header 行改为固定容量；仅保留业务实际
+  使用的 Cookie/Content-Length，不再为最多 32 个 header 分配键值 String。
+- Web URL/form 解码使用固定字节缓冲并在完成后校验 UTF-8，中文设备名、厂家名和
+  位置字段兼容性保持不变；通用 JSON 响应使用固定 128B 字符串。

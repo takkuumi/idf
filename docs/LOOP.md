@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-13 (LOOP30: 工业架构资源边界收口)
+> 最后更新: 2026-08-13 (LOOP31: 协议热路径固定缓冲与复制收敛)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,24 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP31 协议热路径固定缓冲与复制收敛（2026-08-13）
+
+- Modbus FC03/04 将最多 125 个寄存器直接编码到最终 PDU，移除约 250B 中间
+  寄存器数组和第二次序列化；FC03 在一次 CONFIG/STORAGE RCU 快照内完成整批读取。
+- BLE TX 改为 `8 x 272B` 固定帧环，ATT 分片只推进帧内 offset，不再执行
+  `rotate_left` 或复制到 497B 临时分片；队列满时仍按整帧拒绝并记录丢弃计数。
+- BLE RX 改为 `4 x 512B` 静态重组槽，BTC 回调完成帧后仅向 main-loop 传递
+  1B 槽索引；连接 ID、连接 epoch、CRC 和断线清理规则保持不变。
+- Web 方法、路径、Cookie、请求行、header 行和表单解码改为固定容量；只保留业务
+  使用的 Cookie/Content-Length。普通 body 仍按声明长度读取但硬限 16KB，OTA 保持流式。
+- 未修改寄存器地址、Modbus PDU/MBAP、BLE 外层帧/事务号/CRC、Web 路由/字段名、
+  NFC、OTA、IO 或持久化格式，手机、PC、TCP、RTU 的协议表面保持不变。
+- 默认、F3、F4 `cargo check`、测试编译和 release 构建通过，0 warning；release
+  应用镜像 `1,637,648B`，占 2.25MB OTA 槽约 69.4%，较 LOOP30 增加 10,720B；
+  静态内部 DRAM `.data + .bss = 53,501B`，较 LOOP30 减少 352B。
+- 本轮未烧录。BLE 手持机、Web、Modbus TCP/RTU 的真实设备回归及 72 小时并发浸泡
+  仍是客户发布前硬门槛，构建通过不代表这些实机项目已完成。
 
 ## LOOP30 工业架构资源边界收口（2026-08-13）
 

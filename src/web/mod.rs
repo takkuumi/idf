@@ -69,6 +69,11 @@ const MAX_OTA_SIZE: usize = 0x24_0000;
 /// HTTP 头总量和字段数量上限，避免大量短 header 消耗 PSRAM。
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_HEADER_COUNT: usize = 32;
+const MAX_HTTP_METHOD: usize = 8;
+const MAX_HTTP_PATH: usize = 192;
+const MAX_COOKIE_VALUE: usize = 512;
+const MAX_FORM_VALUE: usize = 256;
+const JSON_RESPONSE_MAX: usize = 128;
 /// 默认用户名
 const DEFAULT_USERNAME: &str = "admin";
 /// 默认密码 (NVS 未保存时使用)
@@ -385,19 +390,18 @@ fn server_loop() {
 
 /// 解析后的 HTTP 请求
 struct HttpRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
+    method: heapless::String<MAX_HTTP_METHOD>,
+    path: heapless::String<MAX_HTTP_PATH>,
+    cookie: heapless::String<MAX_COOKIE_VALUE>,
     body: Vec<u8>,
 }
 
 impl HttpRequest {
     /// 获取指定 header 值
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        name.eq_ignore_ascii_case("Cookie")
+            .then_some(self.cookie.as_str())
+            .filter(|value| !value.is_empty())
     }
 
     /// 检查 Cookie 中是否有有效的会话 token.
@@ -421,50 +425,49 @@ impl HttpRequest {
     }
 
     /// 从 body 中解析 URL 编码的表单字段
-    fn form_field(&self, name: &str) -> Option<String> {
+    fn form_field(&self, name: &str) -> Option<heapless::String<MAX_FORM_VALUE>> {
         let body = std::str::from_utf8(&self.body).ok()?;
         for pair in body.split('&') {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
             let val = parts.next().unwrap_or("");
             if key == name {
-                return Some(url_decode(val));
+                return url_decode_into(val);
             }
         }
         None
     }
 }
 
-/// URL 解码 (处理 %XX 和 +)
-fn url_decode(s: &str) -> String {
-    let mut result = Vec::new();
+fn url_decode_bounded(s: &str) -> Option<heapless::String<MAX_HTTP_PATH>> {
+    url_decode_into(s)
+}
+
+fn url_decode_into<const N: usize>(s: &str) -> Option<heapless::String<N>> {
     let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(
-                    core::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"),
-                    16,
-                ) {
-                    result.push(b);
-                    i += 3;
-                } else {
-                    result.push(bytes[i]);
-                    i += 1;
-                }
+    let mut decoded = heapless::Vec::<u8, N>::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = core::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+                index += 3;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?).ok()?;
             }
             b'+' => {
-                result.push(b' ');
-                i += 1;
+                index += 1;
+                decoded.push(b' ').ok()?;
             }
-            _ => {
-                result.push(bytes[i]);
-                i += 1;
+            byte => {
+                index += 1;
+                decoded.push(byte).ok()?;
             }
         }
     }
-    String::from_utf8_lossy(&result).into_owned()
+    let text = core::str::from_utf8(&decoded).ok()?;
+    let mut out = heapless::String::new();
+    out.push_str(text).ok()?;
+    Some(out)
 }
 
 // ============================================================================
@@ -547,31 +550,52 @@ fn send_redirect(stream: &mut TcpStream, location: &str) -> std::io::Result<()> 
 
 /// 构建标准 JSON 响应 (对齐参考固件 returnResponseJson,
 /// 包含 `msg` 字段以兼容旧前端 WebIndex.cpp error 提示)
-fn json_response(response_type: &str, code: &str) -> String {
-    format!(
+fn json_response(response_type: &str, code: &str) -> heapless::String<JSON_RESPONSE_MAX> {
+    use core::fmt::Write as _;
+    let mut out = heapless::String::new();
+    let result = write!(
+        out,
         r#"{{"type":"{}","code":"{}","msg":"","data":{{}}}}"#,
         response_type, code
-    )
+    );
+    debug_assert!(result.is_ok());
+    out
 }
 
 /// 有界读取一行。`BufRead::read_line` 只有在返回后才能检查长度，攻击者若一直不发
 /// 换行会让 String 无界增长；Take 将单行实际读取量限制为 MAX_HEADER_LINE + 1。
 fn read_bounded_header_line(
     reader: &mut BufReader<TcpStream>,
-    line: &mut String,
+    line: &mut heapless::String<MAX_HEADER_LINE>,
 ) -> std::io::Result<usize> {
     line.clear();
-    let n = reader
-        .by_ref()
-        .take((MAX_HEADER_LINE + 1) as u64)
-        .read_line(line)?;
-    if line.len() > MAX_HEADER_LINE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "http header line too long",
-        ));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+        let take = available
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len() + take > line.capacity() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "http header line too long",
+            ));
+        }
+        let text = core::str::from_utf8(&available[..take]).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "http header is not utf-8")
+        })?;
+        let complete = text.ends_with('\n');
+        line.push_str(text).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "http header line too long")
+        })?;
+        reader.consume(take);
+        if complete {
+            return Ok(line.len());
+        }
     }
-    Ok(n)
 }
 
 /// 解析请求行 + headers (不含 body)
@@ -585,23 +609,33 @@ fn parse_request_headers(
 ) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
     let mut reader = BufReader::new(stream);
     // 读请求行 (限制长度)
-    let mut request_line = String::new();
+    let mut request_line = heapless::String::<MAX_HEADER_LINE>::new();
     if read_bounded_header_line(&mut reader, &mut request_line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "empty http request",
         ));
     }
-    let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
-    let method = parts.first().unwrap_or(&"").to_string();
-    let path_raw = parts.get(1).unwrap_or(&"/");
-    let path = url_decode(path_raw);
+    let mut parts = request_line.trim().splitn(3, ' ');
+    let method_raw = parts.next().unwrap_or("");
+    let path_raw = parts.next().unwrap_or("/");
+    let method = heapless::String::try_from(method_raw).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "http method too long")
+    })?;
+    let path = url_decode_bounded(path_raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "http path too long or invalid",
+        )
+    })?;
 
     // 读 Headers (每行限制长度)
-    let mut headers = Vec::new();
+    let mut cookie = heapless::String::<MAX_COOKIE_VALUE>::new();
+    let mut content_length = 0usize;
+    let mut header_count = 0usize;
     let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
+        let mut line = heapless::String::<MAX_HEADER_LINE>::new();
         if read_bounded_header_line(&mut reader, &mut line)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -619,28 +653,33 @@ fn parse_request_headers(
         if trimmed.is_empty() {
             break;
         }
-        if headers.len() >= MAX_HEADER_COUNT {
+        if header_count >= MAX_HEADER_COUNT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "too many http headers",
             ));
         }
+        header_count += 1;
         if let Some((k, v)) = trimmed.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
+            let name = k.trim();
+            let value = v.trim();
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = value.parse().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Content-Length")
+                })?;
+            } else if name.eq_ignore_ascii_case("Cookie") {
+                cookie.push_str(value).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Cookie too long")
+                })?;
+            }
         }
     }
-
-    let content_length: usize = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
 
     Ok((
         HttpRequest {
             method,
             path,
-            headers,
+            cookie,
             body: Vec::new(),
         },
         content_length,
@@ -801,7 +840,7 @@ fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()
     if username != DEFAULT_USERNAME {
         return send_json(stream, 200, &json_response("login", "0x01000001"));
     }
-    if pwd != actual_pwd {
+    if pwd.as_str() != actual_pwd {
         return send_json(stream, 200, &json_response("login", "0x01000002"));
     }
     // LOOP11: 返回 200 JSON + 随机 token Cookie (不再 301 空 body, 否则
@@ -869,13 +908,13 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
     );
     let mut info = load_web_system_info();
     if let Some(value) = devicename {
-        info.device_name = value;
+        info.device_name = value.as_str().to_owned();
     }
     if let Some(value) = manufacturer {
-        info.manufacturer = value;
+        info.manufacturer = value.as_str().to_owned();
     }
     if let Some(value) = model {
-        info.model = value;
+        info.model = value.as_str().to_owned();
     }
     if !save_web_system_info(&info) {
         return send_json(
@@ -1605,7 +1644,7 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
 
     let actual_pwd = load_web_password();
 
-    if old_pwd != actual_pwd {
+    if old_pwd.as_str() != actual_pwd {
         return send_json(stream, 200, &json_response("updatepwd", "0x00010001"));
     }
 
@@ -1808,10 +1847,16 @@ mod tests {
 
     #[test]
     fn test_url_decode() {
-        assert_eq!(url_decode("hello%20world"), "hello world");
-        assert_eq!(url_decode("a+b"), "a b");
-        assert_eq!(url_decode("abc"), "abc");
-        assert_eq!(url_decode("%41%42%43"), "ABC");
+        assert_eq!(
+            url_decode_into::<32>("hello%20world").unwrap(),
+            "hello world"
+        );
+        assert_eq!(url_decode_into::<32>("a+b").unwrap(), "a b");
+        assert_eq!(url_decode_into::<32>("abc").unwrap(), "abc");
+        assert_eq!(url_decode_into::<32>("%41%42%43").unwrap(), "ABC");
+        assert_eq!(url_decode_into::<32>("%E8%BF%88%E9%94%90").unwrap(), "迈锐");
+        assert!(url_decode_into::<3>("abcd").is_none());
+        assert!(url_decode_into::<32>("%FF").is_none());
     }
 
     #[test]

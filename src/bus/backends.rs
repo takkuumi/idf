@@ -261,32 +261,29 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
 /// PC 工具常连续读取 60/83/125 words。旧路径每字都重复进入两个
 /// RCU epoch，125 words 最多产生 250 组原子登记/退出。保持同一快照
 /// 同时提升吞吐和响应数据的一致性。
-pub fn read_hold_regs(
-    addr: u16,
-    count: u16,
-) -> heapless::Vec<u16, { crate::modbus::shared::MAX_REGS_PER_READ }> {
-    let mut values = heapless::Vec::new();
-    if count == 0 || count as usize > values.capacity() {
-        return values;
+pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
+    if count == 0 || out.len() != count as usize * 2 {
+        return false;
     }
     if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
-        return values;
+        return false;
     }
     let Some(config) = CONFIG.read() else {
-        return values;
+        return false;
     };
     let Some(storage) = STORAGE.read() else {
-        return values;
+        return false;
     };
     for offset in 0..count {
         let Some(value) =
             read_hold_reg_from_snapshots(addr.wrapping_add(offset), &config, &storage)
         else {
-            return heapless::Vec::new();
+            return false;
         };
-        let _ = values.push(value);
+        let byte_offset = offset as usize * 2;
+        out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
     }
-    values
+    true
 }
 
 fn read_hold_reg_from_snapshots(
@@ -408,11 +405,14 @@ mod tests {
 
     #[test]
     fn test_bulk_holding_read_supports_standard_fc03_maximum() {
-        let values = read_hold_regs(regs::HOLD_CFG_BASE, 125);
-        assert_eq!(values.len(), 125);
-        assert_eq!(values[0], read_hold_reg(regs::HOLD_CFG_BASE).unwrap());
+        let mut encoded = [0u8; 250];
+        assert!(encode_hold_regs_be(regs::HOLD_CFG_BASE, 125, &mut encoded));
         assert_eq!(
-            values[124],
+            u16::from_be_bytes([encoded[0], encoded[1]]),
+            read_hold_reg(regs::HOLD_CFG_BASE).unwrap()
+        );
+        assert_eq!(
+            u16::from_be_bytes([encoded[248], encoded[249]]),
             read_hold_reg(regs::HOLD_CFG_BASE + 124).unwrap()
         );
     }

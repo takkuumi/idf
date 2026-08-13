@@ -83,14 +83,30 @@ FC=01/02/0F 不再将标准最大 2,000 位展开为 `heapless::Vec<bool, 2000>`
 写入响应位图，写入直接消费请求位图。单次 Modbus 调用由此移除约 2KB 临时栈对象，
 仍保留全部标准数量上限。
 
+FC=03/04 同样直接把最多 125 个寄存器编码到最终 PDU，不再构造约 250B 的中间
+`heapless::Vec<u16, 125>` 或执行第二次序列化。FC03 整批读取只持有一组
+CONFIG/STORAGE RCU 快照，避免同一响应跨配置世代，寄存器地址和返回字节序不变。
+
 ## BLE 栈隔离
 
-BTC 回调只执行：GATT 写响应、最多 512 字节分片重组、固定 4 槽 MPSC 入队。
+BTC 回调只执行：GATT 写响应、最多 512 字节分片重组、固定 4 槽所有权转移。
 Modbus/手持机兼容命令在 main_loop 消费，原事务 ID、CRC、长度字段和通知帧格式不变。
 业务请求和 notification 按 10ms 调度；广播自愈仍为 5s，心跳仍为 10s。
 因此 `metuory-wireless-management-app-1.0.78` 的协议表面不变，而业务调用深度不再
-叠加到 BTC_TASK。下行通知按实际协商的 `ATT_MTU - 3` 无堆分片，拥塞/API 失败时
-保留队列；手机端 `CommandCodecUtil.decodeList()` 已确认可跨 notification 重组。
+叠加到 BTC_TASK。RX 的 4 个 512B 静态槽在完整帧就绪后仅向 main-loop 队列传递
+1B 槽索引，不复制请求帧；连接 ID 和 epoch 阻止旧连接数据进入新连接。
+
+下行使用 `8 x 272B` 固定帧环，保留完整业务帧 FIFO 边界；按实际协商的
+`ATT_MTU - 3` 分片时只推进槽内 offset，不搬移剩余队列，也不构造临时分片副本。
+拥塞/API 失败时保留原帧；手机端 `CommandCodecUtil.decodeList()` 已确认可跨
+notification 重组。ESP-IDF Bluedroid 在 API 返回前仍执行其内部必要深拷贝。
+
+## Web 有界解析
+
+HTTP 方法、路径、Cookie、请求行、header 行和表单字段采用固定容量缓冲；解析器
+只保留业务使用的 Cookie 与 Content-Length，不再为最多 32 个 header 构造动态键值。
+URL/form 解码先写入有界字节缓冲，再一次性校验 UTF-8，中文配置字段保持兼容。
+普通请求 body 仍按声明长度分配但硬限 16KB；OTA 保持流式写入，不缓存完整镜像。
 
 ## 服务恢复与 OTA 生效门槛
 
