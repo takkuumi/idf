@@ -550,7 +550,11 @@ fn main_loop(
                     );
                 }
             }
-            if tick % (600_000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            #[cfg(debug_assertions)]
+            let stack_report_period_ms = 60_000;
+            #[cfg(not(debug_assertions))]
+            let stack_report_period_ms = 600_000;
+            if tick % (stack_report_period_ms / MAIN_LOOP_PERIOD_MS as u32) == 0 {
                 health::print_stack_watermarks();
             }
             #[cfg(debug_assertions)]

@@ -88,6 +88,7 @@ fn validate_production_envelope() {
         .unwrap_or_else(|e| panic!("cannot read {SDKCONFIG}: {e}"));
     require_config(&sdk, "CONFIG_ESP_MAIN_TASK_STACK_SIZE", "32768");
     require_config(&sdk, "CONFIG_SPIRAM_SIZE", "2097152");
+    require_config(&sdk, "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP", "y");
     require_config(&sdk, "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL", "65536");
     require_config(&sdk, "CONFIG_LWIP_MAX_SOCKETS", "20");
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHMODE_DIO", "y");

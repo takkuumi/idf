@@ -57,6 +57,8 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_MODE_QUAD=y
 # <4KB 走内部 SRAM (栈/小型 struct/Mutex 等), >=4KB 走 PSRAM
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# LwIP socket/PCB/mbox 动态对象优先进入 PSRAM；W5500 DMA 与 pthread 栈仍为 internal。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # LOOP23: 保留 64KB 内部 SRAM 不被 PSRAM 分配占用.
 # 原值 16384 (16KB) 在 BLE+WiFi+ETH 同时运行时, 内部 SRAM 高度碎片化,
 # 导致 ESP-IDF SPI master 的 setup_dma_priv_buffer() 在申请 1536B 临时
