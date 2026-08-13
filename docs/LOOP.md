@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-07-30 (LOOP28: 标准 Modbus 报文上限与热路径栈优化)
+> 最后更新: 2026-08-13 (LOOP29: OTA 分区迁移与 ST25DV16KC 实机纠偏)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,13 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP29 实机纠偏（2026-08-13）
+
+- 真实设备旧分区表只有 `factory@0x10000`，没有 `ota_0/ota_1`，Web OTA 因此返回 500；新布局保留旧 `nvs@0x9000`，增加 `factory/ota_0/ota_1` 和 `otadata`。
+- 板载 NFC 实测 `IC_REF=0x26`、`MEM_SIZE=0x01FF`、`BLOCK=0x03`，器件为 ST25DV16KC（2KB），原 C++ 也以 `0x07FF` 为末地址。LOOP12 的 64KC/`0x1FFF` 扩容结论错误并已撤销，快照严格恢复为 `0x0120..0x07FF`、1760 字节、880 words。
+- NFC 线程保留已探测的 I2C 实例；空快照只完整读取和记录一次，配置变更、显式备份/恢复仍立即执行，通信错误按 30/120/300 秒退避。
+- 截至本记录，编译与短期实机 Web/Modbus/OTA 轮换曾通过；2026-08-13 当前串口未连接，新的兼容 NVS 分区迁移尚待设备重新接入后完成最终烧录与 OTA 闭环复测。
 
 ## 系统迭代 - 5 角色
 
@@ -209,8 +216,7 @@ main_loop (20ms tick)
 ## 烧录
 
 ```bash
-cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway
+just flash
 ```
 
 详细: [`docs/FLASH.md`](FLASH.md)
@@ -463,7 +469,7 @@ espflash reset --port /dev/cu.usbserial-1430
 ### 已知限制 (不在本 LOOP 范围)
 - Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
 - BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析)
-- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份)
+- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份)，与当时误判的容量记录相关，已在 LOOP29 纠正为 ST25DV16KC 实际容量
 - AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
 - eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
 
@@ -566,7 +572,7 @@ espflash reset --port /dev/cu.usbserial-1430
 - Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
 - BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析) — 影响 0xB4-B7 DEVICE_TEXT 多包流程
 - DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 子协议未实现 — 需自定义 read/write arm
-- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — ST25DV64KC EEPROM 容量限制
+- NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — 历史记录，器件型号曾误判为 ST25DV64KC
 - AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
 - MONITOR_PLC (30001-30128) / CONTROL_PLC (40001-40300) 区未实现 — 仅老 SCADA 系统需要
 - eth heartbeat 仅检测 IP 非零, 拔线后 DHCP lease 保留导致检测延迟
@@ -700,7 +706,7 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 | 1 | BLE 分片重组 (>MTU 0xB4-B7) | ⏸️ LOOP13 待办 | 无 MCA 参考协议，需 Android BLE write trace 逆向 |
 | 2 | DEVICE_FUNCTION 0xB0/B1 (FUNC_COUNT) | ✅ **LOOP12 已实施** | 复用 `read_hold_reg(0x08FC)`, 25 行 |
 | 2b | DEVICE_FUNCTION 0xB2/B3 (TLV config) | ⏸️ LOOP13 待办 | 需 TLV entry 设计 + 0x08FE+ 冲突解决 (3-5 天) |
-| 3 | NFC blob 仅 880 words | ✅ **LOOP12 已消除** | `MEMORY_END=0x1FFF`, 容量 3824 words (4×) |
+| 3 | NFC blob 仅 880 words | ✅ **LOOP29 已按实机纠正** | ST25DV16KC: `MEMORY_END=0x07FF`, 0x0120..0x07FF 共 1760 字节/880 words，与原 C++ 对齐 |
 | 4 | AI 通道数硬编码 6 (F4 8 通道) | ✅ **LOOP12 已实施** | cfg 切换: f4=8 通道, 其它=6 通道 |
 | 5 | MONITOR_PLC/CONTROL_PLC 区未实现 | ✅ **LOOP12 已实施** | DI/DO/AI/holding_buf 别名映射 |
 | 6 | eth heartbeat 拔线延迟 | ✅ **LOOP12 已实施** | 订阅 `ETHERNET_EVENT_DISCONNECTED`, 秒级检测 |
@@ -714,7 +720,7 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 - **PLC 别名区**: `config.rs` 新增 4 个常量 (0x7531-0x75B0 / 0x9C41-0x9D6C); `backends.rs` 新增 read/write range arm, 映射到 DI/DO/AI/holding_buf
 - **F4 8 通道 AI**: `io_state.rs::AiState` [6]→[8]; `io_global.rs` LazyLock 6→8; `channel/ai.rs::CHANNEL_COUNT` cfg; `read_sensor_calib` 同步返回类型
 - **DEVICE_FUNCTION 0xB0/0xB1**: `ble_at/mod.rs` 新增 arm, READ/WRITE FUNC_COUNT (0x08FC) 经 `backends::read_hold_reg/write_hold_reg`
-- **NFC EEPROM 扩容**: `MEMORY_END` 0x07FF→0x1FFF, 备份容量 880→3824 words (覆盖 holding_buf 2048 words 完整)
+- **NFC EEPROM 容量纠正**: 实机为 ST25DV16KC，撤销此前 0x1FFF/3824 words 的错误扩容结论，恢复 0x07FF/880 words 原 C++ 布局
 
 ### 不实施项 (3 个, 文档化保留)
 - **BLE 分片重组**: 协议规范未知, 需 Android 端 BLE write trace 逆向
@@ -733,7 +739,7 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 - `src/bus/io_state.rs`, `src/bus/io_global.rs`: AiState [6]→[8]
 - `src/channel/ai.rs`: CHANNEL_COUNT cfg + read_sensor_calib 同步
 - `src/ble_at/mod.rs`: 0xB0/B1 arm
-- `src/nfc/mod.rs`: MEMORY_END 扩容 + 栈数组→vec! 修复
+- `src/nfc/mod.rs`: ST25DV16KC 容量纠正、ACK polling、I2C 实例复用和栈数组优化
 - `src/hal/mod.rs`: sw_i2c 兼容 f3/f4 feature (NFC bit-bang I2C 需要)
 
 ### 烧录命令 (跨平台 justfile)

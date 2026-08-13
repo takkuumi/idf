@@ -541,10 +541,10 @@ fn confirm_new_firmware() -> bool {
         return false;
     }
 
-    // ESP_OTA_IMG_PENDING_VERIFY = 2 (新固件待确认)
-    // 如状态不是 PENDING_VERIFY (如 factory 启动 / 已确认), 直接返回
-    const ESP_OTA_IMG_PENDING_VERIFY: esp_idf_sys::esp_ota_img_states_t = 2;
-    if state != ESP_OTA_IMG_PENDING_VERIFY {
+    // 必须使用当前 ESP-IDF 绑定常量，禁止手写枚举数值。IDF v5.5 中
+    // PENDING_VERIFY=1、VALID=2；曾误写为 2，导致新镜像永远得不到确认，
+    // 下一次复位必然被 bootloader 回滚。
+    if !ota_state_needs_confirmation(state) {
         log::debug!(
             "[main] OTA: state={} (not pending verify), skip confirm",
             state
@@ -563,5 +563,28 @@ fn confirm_new_firmware() -> bool {
             ret
         );
         false
+    }
+}
+
+#[inline]
+fn ota_state_needs_confirmation(state: esp_idf_sys::esp_ota_img_states_t) -> bool {
+    state == esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ota_state_needs_confirmation;
+
+    #[test]
+    fn test_ota_pending_verify_uses_esp_idf_enum() {
+        assert!(ota_state_needs_confirmation(
+            esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+        ));
+        assert!(!ota_state_needs_confirmation(
+            esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_VALID
+        ));
+        assert!(!ota_state_needs_confirmation(
+            esp_idf_sys::esp_ota_img_states_t_ESP_OTA_IMG_ABORTED
+        ));
     }
 }

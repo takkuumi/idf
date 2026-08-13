@@ -110,6 +110,8 @@ fn handle_request(
         return Ok(());
     }
 
+    crate::modbus::shared::RS485_STATS.mark_slave_ok();
+
     let func = req[1];
     let resp = build_response(backend, slave, func, &req[2..n - 2]);
 

@@ -72,9 +72,102 @@ const DEFAULT_PASSWORD: &str = "admin123";
 /// NVS 密码 key
 const NVS_KEY_WEB_PWD: &str = "web_pwd";
 const NVS_KEY_WEB_PWD_FLAG: &str = "web_pwd_f";
+/// 原 MCA `/SystemInfo.txt` 的三个字段改为单个定长 NVS blob，避免掉电时只更新部分字段。
+const NVS_KEY_WEB_SYSTEM_INFO: &str = "web_sysinfo";
+const WEB_SYSTEM_INFO_FIELD_LEN: usize = 63;
+const WEB_SYSTEM_INFO_BLOB_LEN: usize = (WEB_SYSTEM_INFO_FIELD_LEN + 1) * 3;
+#[cfg(feature = "f4")]
+const MCA_WEB_VERSION: &str = "F4";
+#[cfg(not(feature = "f4"))]
+const MCA_WEB_VERSION: &str = "F3";
 
 /// 会话有效期 (秒): 24 小时 (与 Cookie Max-Age 一致)
 const SESSION_TTL_SECS: u64 = 86400;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WebSystemInfo {
+    device_name: String,
+    manufacturer: String,
+    model: String,
+}
+
+fn valid_web_system_text(value: &str) -> bool {
+    value.len() <= WEB_SYSTEM_INFO_FIELD_LEN
+        && !value.as_bytes().contains(&0)
+        && !value.chars().any(char::is_control)
+}
+
+fn encode_web_system_info(info: &WebSystemInfo) -> Option<[u8; WEB_SYSTEM_INFO_BLOB_LEN]> {
+    if !valid_web_system_text(&info.device_name)
+        || !valid_web_system_text(&info.manufacturer)
+        || !valid_web_system_text(&info.model)
+    {
+        return None;
+    }
+
+    let mut blob = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
+    for (index, value) in [&info.device_name, &info.manufacturer, &info.model]
+        .iter()
+        .enumerate()
+    {
+        let offset = index * (WEB_SYSTEM_INFO_FIELD_LEN + 1);
+        let bytes = value.as_bytes();
+        blob[offset] = bytes.len() as u8;
+        blob[offset + 1..offset + 1 + bytes.len()].copy_from_slice(bytes);
+    }
+    Some(blob)
+}
+
+fn decode_web_system_info(blob: &[u8]) -> Option<WebSystemInfo> {
+    if blob.len() != WEB_SYSTEM_INFO_BLOB_LEN {
+        return None;
+    }
+    let mut fields: [String; 3] = core::array::from_fn(|_| String::new());
+    for (index, field) in fields.iter_mut().enumerate() {
+        let offset = index * (WEB_SYSTEM_INFO_FIELD_LEN + 1);
+        let length = blob[offset] as usize;
+        if length > WEB_SYSTEM_INFO_FIELD_LEN {
+            return None;
+        }
+        *field = core::str::from_utf8(&blob[offset + 1..offset + 1 + length])
+            .ok()?
+            .to_string();
+    }
+    Some(WebSystemInfo {
+        device_name: core::mem::take(&mut fields[0]),
+        manufacturer: core::mem::take(&mut fields[1]),
+        model: core::mem::take(&mut fields[2]),
+    })
+}
+
+fn load_web_system_info() -> WebSystemInfo {
+    let fallback = WebSystemInfo {
+        device_name: "工业测控执行器".to_string(),
+        manufacturer: String::new(),
+        model: "MR-MCA-200".to_string(),
+    };
+    crate::device::try_with_nvs(|nvs| {
+        let mut blob = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
+        nvs.get_blob(NVS_KEY_WEB_SYSTEM_INFO, &mut blob)
+            .ok()
+            .flatten()
+            .and_then(decode_web_system_info)
+    })
+    .flatten()
+    .unwrap_or(fallback)
+}
+
+fn save_web_system_info(info: &WebSystemInfo) -> bool {
+    let Some(blob) = encode_web_system_info(info) else {
+        return false;
+    };
+    matches!(
+        crate::device::try_with_nvs_mut(|nvs| nvs
+            .set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
+            .map_err(|e| format!("{e:?}"))),
+        Some(Ok(()))
+    )
+}
 
 // ============================================================================
 // LOOP11: 会话管理 (替代硬编码 ESPSESSIONID=1)
@@ -705,26 +798,25 @@ fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()
 
 /// GET /getsysteminfo — 对齐 C++ handleGetSystemInfo: devicename/manufacturer/model/version
 fn handle_get_system_info(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
-    let json = match config_read_with(|cs| {
+    let Some((address_info, fw_ver, hw_ver, fw_date)) = config_read_with(|cs| {
         let cfg = &cs.cfg;
-        let device_name = cfg.name_str();
-        let fw_ver = cfg.fw_version;
-        let hw_ver = cfg.hw_version;
-        let fw_date = cfg.fw_date;
-        format!(
-            r#"{{"type":"getsysteminfo","code":"0","msg":"","data":{{"devicename":"{}","manufacturer":"","model":"F16","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}","addressinfo":"{}"}}}}"#,
-            escape_json(&device_name),
-            fw_ver / 100,
-            (fw_ver % 100) / 10,
-            fw_ver % 10,
-            fw_date,
-            hw_ver,
-            escape_json(&device_name),
-        )
-    }) {
-        Some(j) => j,
-        None => return send_json(stream, 500, &json_response("getsysteminfo", "500")),
+        (cfg.name_str(), cfg.fw_version, cfg.hw_version, cfg.fw_date)
+    }) else {
+        return send_json(stream, 500, &json_response("getsysteminfo", "500"));
     };
+    let info = load_web_system_info();
+    let json = format!(
+        r#"{{"type":"getsysteminfo","code":"0","msg":"","data":{{"devicename":"{}","manufacturer":"{}","model":"{}","version":"V{}.{}.{}.{}","hw_version":"0x{:04X}","addressinfo":"{}"}}}}"#,
+        escape_json(&info.device_name),
+        escape_json(&info.manufacturer),
+        escape_json(&info.model),
+        fw_ver / 100,
+        (fw_ver % 100) / 10,
+        fw_ver % 10,
+        fw_date,
+        hw_ver,
+        escape_json(&address_info),
+    );
     send_json(stream, 200, &json)
 }
 
@@ -738,14 +830,21 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
     let model = req.form_field("model");
     let addressinfo = req.form_field("addressinfo");
 
-    // C++ WebServer 要求 devicename/manufacturer/model 三字段；Rust 当前
-    // SystemConfig 没有独立 manufacturer/model 存储槽，仍接受并保留协议兼容，
-    // devicename/addressinfo 映射到原有 name 字段.
-    if devicename.is_none() && addressinfo.is_none() {
+    if devicename.is_none() && manufacturer.is_none() && model.is_none() && addressinfo.is_none() {
         return send_json(
             stream,
             200,
             &json_response("updatesysteminfoconfig", "0x01000001"),
+        );
+    }
+    if addressinfo
+        .as_ref()
+        .is_some_and(|value| value.as_bytes().len() > 16)
+    {
+        return send_json(
+            stream,
+            200,
+            &json_response("updatesysteminfoconfig", "0x01000003"),
         );
     }
     log::info!(
@@ -754,17 +853,32 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
         manufacturer,
         model
     );
-    let name = addressinfo.or(devicename).unwrap_or_default();
-    let name_bytes: Vec<u8> = name.as_bytes().to_vec();
-    crate::bus::backends::config_modify(|cfg| {
-        let take = name_bytes.len().min(cfg.name.len());
-        cfg.name[..take].copy_from_slice(&name_bytes[..take]);
-        for b in &mut cfg.name[take..] {
-            *b = 0;
-        }
-    });
-    crate::device::request_apply_config();
-    let _ = crate::nfc::backup_now();
+    let mut info = load_web_system_info();
+    if let Some(value) = devicename {
+        info.device_name = value;
+    }
+    if let Some(value) = manufacturer {
+        info.manufacturer = value;
+    }
+    if let Some(value) = model {
+        info.model = value;
+    }
+    if !save_web_system_info(&info) {
+        return send_json(
+            stream,
+            200,
+            &json_response("updatesysteminfoconfig", "0x01000003"),
+        );
+    }
+    if let Some(name) = addressinfo {
+        let name_bytes = name.as_bytes();
+        crate::bus::backends::config_modify(|cfg| {
+            cfg.name.fill(0);
+            cfg.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        });
+        crate::device::request_apply_config();
+        let _ = crate::nfc::backup_now();
+    }
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
 }
 
@@ -796,8 +910,9 @@ fn handle_get_network_config(stream: &mut TcpStream, _req: &HttpRequest) -> std:
         );
         let sn = cfg.sn_str();
         let name = cfg.name_str();
+        let ble_name = cfg.ble_name_str();
         format!(
-            r#"{{"type":"getnetworkconfig","code":"0","msg":"","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{},"version":"F16","bloothaddress":""}}}}"#,
+            r#"{{"type":"getnetworkconfig","code":"0","msg":"","data":{{"ip":"{}","mask":"{}","gateway":"{}","dns":"{}","mac":"{}","sn":"{}","addressinfo":"{}","dhcp":{},"version":"{}","bloothaddress":"{}"}}}}"#,
             ip,
             mask,
             gw,
@@ -806,6 +921,8 @@ fn handle_get_network_config(stream: &mut TcpStream, _req: &HttpRequest) -> std:
             escape_json(&sn),
             escape_json(&name),
             if cfg.dhcp { 1 } else { 0 },
+            MCA_WEB_VERSION,
+            escape_json(&ble_name),
         )
     }) {
         Some(j) => j,
@@ -834,11 +951,10 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         ])
     };
 
-    let parsed = || -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
+    let parsed = || -> Option<([u8; 4], [u8; 4], [u8; 4], Option<[u8; 4]>)> {
         let ip = parse_ip(&req.form_field("ip")?)?;
         let mask = parse_ip(&req.form_field("mask")?)?;
         let gw = parse_ip(&req.form_field("gateway")?)?;
-        let dns = parse_ip(&req.form_field("dns")?)?;
         if ip == [0; 4] || ip[0] == 0 || ip[0] >= 224 || mask == [0; 4] {
             return None;
         }
@@ -847,6 +963,10 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         if inverted & inverted.wrapping_add(1) != 0 {
             return None; // netmask 必须是连续的 1 后接连续的 0
         }
+        let dns = match req.form_field("dns") {
+            Some(value) => Some(parse_ip(&value)?),
+            None => None,
+        };
         Some((ip, mask, gw, dns))
     };
     let Some((ip, mask, gw, dns)) = parsed() else {
@@ -857,25 +977,44 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         );
     };
 
+    let addressinfo = req.form_field("addressinfo");
+    let sn = req.form_field("sn");
+    let ble_name = req.form_field("bloothaddress");
+    if addressinfo.as_ref().is_some_and(|value| value.as_bytes().len() > 16)
+        || sn.as_ref().is_some_and(|value| value.as_bytes().len() > 32)
+        || ble_name.as_ref().is_some_and(|value| value.as_bytes().len() > 8)
+    {
+        return send_json(
+            stream,
+            200,
+            &json_response("updatenetworkconfig", "0x01000003"),
+        );
+    }
+
     crate::bus::backends::config_modify(|cfg| {
         cfg.ip = ip;
         cfg.mask = mask;
         cfg.gateway = gw;
-        cfg.dns = dns;
+        if let Some(dns) = dns {
+            cfg.dns = dns;
+        }
         cfg.dhcp = false; // 手动设置后 DHCP 关闭
+        if let Some(addressinfo) = addressinfo.as_ref() {
+            let bytes = addressinfo.as_bytes();
+            cfg.name.fill(0);
+            cfg.name[..bytes.len()].copy_from_slice(bytes);
+        }
+        if let Some(sn) = sn.as_ref() {
+            let bytes = sn.as_bytes();
+            cfg.sn.fill(0);
+            cfg.sn[..bytes.len()].copy_from_slice(bytes);
+        }
+        if let Some(ble_name) = ble_name.as_ref() {
+            let bytes = ble_name.as_bytes();
+            cfg.ble_name.fill(0);
+            cfg.ble_name[..bytes.len()].copy_from_slice(bytes);
+        }
     });
-
-    // 更新 addressinfo (位置/桩号)
-    if let Some(addr) = req.form_field("addressinfo") {
-        let bytes = addr.as_bytes();
-        crate::bus::backends::config_modify(|cfg| {
-            let take = bytes.len().min(cfg.name.len());
-            cfg.name[..take].copy_from_slice(&bytes[..take]);
-            for b in &mut cfg.name[take..] {
-                *b = 0;
-            }
-        });
-    }
 
     log::info!(
         "[http] update network: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
@@ -895,6 +1034,9 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
 
     // 持久化 + NFC 备份
     crate::device::request_apply_config();
+    if ble_name.is_some() {
+        crate::ble_at::notify_ble_name_changed();
+    }
     let _ = crate::nfc::backup_now();
 
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
@@ -1130,6 +1272,46 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
 fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Result<()> {
     let di_bits = IO.di.load_bits();
     let do_bits = IO.do_.load_bits();
+    let ble_connected = {
+        #[cfg(feature = "ble-at")]
+        {
+            crate::ble_at::has_client()
+        }
+        #[cfg(not(feature = "ble-at"))]
+        {
+            false
+        }
+    };
+    let ethernet_link = {
+        #[cfg(feature = "ethernet-w5500")]
+        {
+            crate::ethernet::w5500::link_up()
+        }
+        #[cfg(not(feature = "ethernet-w5500"))]
+        {
+            false
+        }
+    };
+    // 与原 MCA `states_led[0..7]` 字段保持相同的顺序: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2.
+    // 485 状态与原 MCA 一样表示最近一次有效通信脉冲；累计错误只在诊断页显示。
+    let state_data = format!(
+        r#""state_addr_0":1,"state_addr_1":{},"state_addr_2":{},"state_addr_3":{},"state_addr_4":{},"state_addr_5":{},"state_addr_6":{},"state_addr_7":{}"#,
+        (IO.sys.get_uptime() & 1) as u8,
+        ble_connected as u8,
+        ethernet_link as u8,
+        crate::modbus::shared::RS485_STATS.master_active() as u8,
+        crate::modbus::shared::RS485_STATS.slave_active() as u8,
+        (unsafe {
+            esp_idf_sys::gpio_get_level(
+                crate::config::pins::FIB1_PIN as esp_idf_sys::gpio_num_t,
+            )
+        } == 0) as u8,
+        (unsafe {
+            esp_idf_sys::gpio_get_level(
+                crate::config::pins::FIB2_PIN as esp_idf_sys::gpio_num_t,
+            )
+        } == 0) as u8,
+    );
 
     // DI/DO 状态数组 (对齐参考固件: di_addr_0..15, do_addr_0..15)
     let mut di_data = String::new();
@@ -1175,8 +1357,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     }
 
     let json = format!(
-        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}}}}}}"#,
-        di_data, do_data, ai_data, ai_max, ai_min,
+        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}}}}}}"#,
+        state_data, di_data, do_data, ai_data, ai_max, ai_min,
     );
     send_json(stream, 200, &json)
 }
@@ -1575,6 +1757,48 @@ mod tests {
         assert_eq!(url_decode("a+b"), "a b");
         assert_eq!(url_decode("abc"), "abc");
         assert_eq!(url_decode("%41%42%43"), "ABC");
+    }
+
+    #[test]
+    fn test_web_system_info_round_trip() {
+        let info = WebSystemInfo {
+            device_name: "工业测控执行器".to_string(),
+            manufacturer: "迈锐".to_string(),
+            model: "MR-MCA-200".to_string(),
+        };
+        let encoded = encode_web_system_info(&info).expect("valid system info must encode");
+        assert_eq!(encoded.len(), WEB_SYSTEM_INFO_BLOB_LEN);
+        assert_eq!(decode_web_system_info(&encoded), Some(info));
+    }
+
+    #[test]
+    fn test_web_system_info_rejects_oversized_or_corrupt_data() {
+        let oversized = WebSystemInfo {
+            device_name: "x".repeat(WEB_SYSTEM_INFO_FIELD_LEN + 1),
+            manufacturer: String::new(),
+            model: String::new(),
+        };
+        assert!(encode_web_system_info(&oversized).is_none());
+
+        let mut corrupt = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
+        corrupt[0] = (WEB_SYSTEM_INFO_FIELD_LEN + 1) as u8;
+        assert!(decode_web_system_info(&corrupt).is_none());
+    }
+
+    #[test]
+    fn test_mac_web_navigation_names_are_present() {
+        for label in [
+            "系统信息",
+            "设备基本信息",
+            "端口设置",
+            "I/O口信息",
+            "用户设置",
+            "系统维护",
+        ] {
+            assert!(pages::INDEX_HTML.contains(label), "missing navigation: {label}");
+        }
+        assert!(pages::INDEX_HTML.contains("工业测控执行器管理系统"));
+        assert!(pages::LOGIN_HTML.contains("工业控制器登录界面"));
     }
 
     // ---- LOOP11: 会话管理回归测试 ----

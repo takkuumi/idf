@@ -1,289 +1,156 @@
-# 烧录指南 (ESP32-S3 工业网关)
+# 烧录与 OTA 指南（ESP32-S3 工业网关）
 
-> 最后更新: 2026-07-24 (LOOP7 BLE 名字同步修复后)
-> 工具: `espflash 4.5.0` (cargo install espflash)
-> 串口: `/dev/cu.usbserial-1430`
-> 芯片: ESP32-S3 (Xtensa LX7 双核, 8MB Flash, 2MB PSRAM)
+> 最后更新：2026-08-13
+>
+> 已验证硬件：ESP32-S3、8MB Flash、2MB PSRAM
+>
+> 默认串口：`/dev/cu.usbserial-1430`
 
----
+## 1. 固定 Flash 参数
 
-## 一、前置条件
+真实设备已验证以下参数，烧录工具不得覆盖为 QIO/80MHz：
+
+- Flash mode：DIO
+- Flash frequency：40MHz
+- Flash size：8MB
+- Bootloader：`0x0000`
+- Partition table：`0x8000`
+- 首次串口烧录目标：`factory`
+
+QIO/80MHz 会使当前硬件在二级 Bootloader 加载阶段触发
+`ets_loader.c:78` / `TG0WDT_SYS_RST` 循环复位。
+
+## 2. 生产分区布局
+
+| 分区 | Offset | Size | 用途 |
+|---|---:|---:|---|
+| nvs | `0x9000` | `0x6000` | 系统配置（兼容旧设备原地址） |
+| phy_init | `0xF000` | `0x1000` | RF 校准 |
+| otadata | `0x10000` | `0x2000` | OTA 选择与回滚状态 |
+| nvs_keys | `0x17000` | `0x1000` | NVS 密钥预留 |
+| factory | `0x20000` | `0x240000` | 串口烧录应用 |
+| ota_0 | `0x260000` | `0x240000` | OTA 槽 0 |
+| ota_1 | `0x4A0000` | `0x240000` | OTA 槽 1 |
+| coredump | `0x6E0000` | `0x10000` | 崩溃转储 |
+| ble_mesh | `0x6F0000` | `0x10000` | BLE Mesh NVS |
+| storage | `0x700000` | `0x100000` | 文件存储 |
+
+分区源文件为项目根目录的 `partitions.csv`。禁止只依赖设备上遗留的分区表；旧设备可能仍是单 factory 布局，在该布局下 OTA 必然失败。迁移时保留 `nvs@0x9000`，不得全擦，否则会丢失业务配置。
+
+## 3. 标准完整烧录
+
+推荐使用项目命令：
 
 ```bash
-# 1. 安装 espflash (一次性)
-cargo install espflash --locked
-
-# 2. 安装 ldproxy (rust esp-idf 依赖)
-cargo install ldproxy
-
-# 3. 确认工具
-cargo --version
-espflash --version    # espflash 4.5+
-
-# 4. 确认串口权限
-ls -la /dev/cu.usbserial-1430
-# 如无权限: sudo chmod 666 /dev/cu.usbserial-1430
+just flash
 ```
 
----
-
-## 二、烧录命令
-
-### 2.1 标准完整烧录 (推荐)
+等价的非交互命令如下：
 
 ```bash
-cd /Users/takumi/Workspace/idf
-cargo build && \
-espflash flash --port /dev/cu.usbserial-1430 \
-    --no-skip \
+cargo build --bin gateway
+
+espflash flash --port /dev/cu.usbserial-1430 --no-skip \
+    --bootloader target/xtensa-esp32s3-espidf/debug/bootloader.bin \
+    --partition-table partitions.csv \
+    --partition-table-offset 0x8000 \
+    --target-app-partition factory \
+    --erase-parts otadata \
+    --flash-mode dio \
+    --flash-freq 40mhz \
+    --flash-size 8mb \
     target/xtensa-esp32s3-espidf/debug/gateway
 ```
 
-| 参数 | 作用 |
-|---|---|
-| `--port /dev/cu.usbserial-1430` | 串口路径 (macOS) |
-| `--no-skip` | **强制重写所有 flash 块** (即使 checksum 相同). 若不加, 重复烧同一版本会快速跳过 (4秒就退) |
-| `target/.../gateway` | ELF 镜像, espflash 自动提取 bootloader / partition-table / app 三段 |
+`--erase-parts otadata` 只清除 OTA 启动选择，使本次串口写入的 factory 镜像立即生效；不会清除 NVS 业务配置。
 
-### 2.2 强制全擦后烧录 (如烧录失败/固件异常)
+配置或 Flash 参数变化后，先清理 ESP-IDF 生成缓存：
 
 ```bash
-espflash erase-flash --port /dev/cu.usbserial-1430
-espflash flash --port /dev/cu.usbserial-1430 --no-skip target/.../gateway
+rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*
+cargo build --bin gateway
 ```
 
-### 2.3 烧录后立即监控
+## 4. 全擦烧录
+
+仅在 Flash 布局迁移或存储损坏时使用：
 
 ```bash
-espflash flash --port /dev/cu.usbserial-1430 --no-skip target/.../gateway && \
-espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
+just full-flash
 ```
 
-进入 monitor 后:
-- `Ctrl+R` — 重置芯片 (看 `rst:` 重启日志)
-- `Ctrl+C` — 退出 monitor
+全擦会不可恢复地删除 NVS 配置、BLE Mesh 数据、OTA 状态和存储文件。执行前必须备份需要保留的数据。普通升级不要全擦。
 
----
-
-## 三、可能遇到的问题
-
-### 3.1 `Failed to connect to the device`
-
-**原因**: 芯片残留 ROM 监控或 DTR/RTS 没复位.
-
-**解决**:
-
-```bash
-pkill -9 -f espflash
-pkill -9 -f expect
-sleep 2
-espflash flash --port /dev/cu.usbserial-1430 --no-skip target/.../gateway
-```
-
-如仍失败:
-- 按住 BOOT 按钮, 然后插拔 USB
-- 或按住 BOOT 后按一下 EN/RST 按钮
-
-### 3.2 烧录到 17.45% 后无输出
-
-**原因**: 上一次烧入的固件正在运行, 干扰握手.
-
-**解决**: 加 `--no-skip` + 确保 monitor 已完全退出.
-
-### 3.3 `Stack canary watchpoint triggered (sys_evt)` → 设备重启
-
-**触发场景**: `IP_EVENT_ETH_GOT_IP` 回调执行了过多元代码.
-
-**已修复**: commit `8e148ef` 把 `ip_event_cb` 改为极简版 (只 post 事件, 不做 RCU 写), 重活在 main_loop.
-
-**自检方法**:
-```bash
-espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
-# 看到 [eth] main loop: IP assigned xxx.xxx.xxx.xxx 即为正常
-# 看到 Guru Meditation Error 即复发
-```
-
-### 3.4 烧录后看不到日志 (115200 串口)
+## 5. 串口监控
 
 ```bash
 espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
-# 必须显式 --monitor-baud 115200, 否则 espflash 默认用 chip 实际波特率
 ```
 
----
+- `Ctrl+R`：复位芯片并查看完整启动日志。
+- `Ctrl+C`：退出监控并释放串口。
+- 烧录前必须退出所有串口监控进程，否则可能出现 `Failed to connect to the device`。
 
-## 四、烧录产物清单
-
-`cargo build` 产物在 `target/xtensa-esp32s3-espidf/debug/`:
-
-| 文件 | 大小 | 烧录位置 | 说明 |
-|---|---|---|---|
-| `gateway` | ~22 MB ELF | 0x10000 (app) | 应用镜像 |
-| `bootloader.bin` | ~22 KB | 0x0000 | 2nd stage bootloader |
-| `partition-table.bin` | ~3 KB | 0x8000 | 分区表 (含 nvs, phy_init, factory) |
-
-当前分区布局:
-
-```
-Label          Type   Offset    Size
-nvs            0x01   0x9000    24 KB   (WiFi/BLE 配置存储)
-phy_init       0x01   0xf000     4 KB   (RF 校准)
-factory        0x00   0x10000    8 MB   (应用)
-```
-
----
-
-## 五、完整工作流 (一键脚本)
+若连接失败，先确认端口占用：
 
 ```bash
-cd /Users/takumi/Workspace/idf
-cargo build 2>&1 | tail -5
-espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway 2>&1 | tail -10
-espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
+lsof /dev/cu.usbserial-1430
+espflash list-ports
 ```
 
-后台记录日志:
+必要时手动进入下载模式：按住 BOOT，短按 RST/EN，再松开 BOOT。
+
+## 6. Web OTA 测试
+
+生成“仅应用”OTA 镜像，禁止使用包含 Bootloader/分区表的 merge 镜像：
 
 ```bash
-expect -c '
-  set timeout 60
-  log_file -a /tmp/gateway.log
-  spawn /Users/takumi/.cargo/bin/espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
-  expect "Commands:" { send "\x12" }
-  interact
-'
+cargo build --bin gateway
+espflash save-image --chip esp32s3 \
+    --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+    target/xtensa-esp32s3-espidf/debug/gateway \
+    /tmp/gateway-ota.bin
 ```
 
----
-
-## 六、最近一次成功烧录记录
-
-| 项 | 值 |
-|---|---|
-| 时间 | 2026-07-21 22:48 |
-| Binary | `target/xtensa-esp32s3-espidf/debug/gateway` 21,958,808 bytes |
-| Commit | `8e148ef` fix(eth): sys_evt Stack canary panic |
-| ESP-IDF | v5.5.4 |
-| Flash size | 8 MB |
-| 烧录耗时 | ~30 秒 (--no-skip 强制重写) |
-| 验证 | 设备启动 24 秒+ 无 panic, 主循环 tick 正常 |
-| 已分配 IP | 192.168.51.140 |
-
----
-
-## 七、下次烧录命令 (拷贝即用)
+登录 Web 系统维护页上传 `/tmp/gateway-ota.bin`，或者直接调用：
 
 ```bash
-cargo build && espflash flash --port /dev/cu.usbserial-1430 --no-skip target/xtensa-esp32s3-espidf/debug/gateway
+curl --fail --show-error \
+    -H 'Cookie: ESPSESSIONID=<登录返回的会话>' \
+    -H 'Content-Type: application/octet-stream' \
+    --data-binary @/tmp/gateway-ota.bin \
+    http://<设备IP>/updateota
 ```
 
----
+成功响应：
 
-## 八、LOOP7 后烧录流程更新
-
-### 8.1 完整烧录流程 (强制刷入完整固件)
-
-```bash
-# 1. 完整擦除 flash
-espflash erase-flash --port /dev/cu.usbserial-1430
-
-# 2. 烧录 bootloader + 分区表 + app
-espflash flash --port /dev/cu.usbserial-1430 --no-skip     target/xtensa-esp32s3-espidf/debug/gateway
-
-# 3. 硬复位 (DTR 拉低 500ms 让 EN 断电, 见 §8.2)
-python3 -c "
-import serial, time
-ser = serial.Serial('/dev/cu.usbserial-1430', 115200, timeout=1)
-ser.dtr = True; time.sleep(0.5); ser.dtr = False
-time.sleep(15)  # 等设备冷启动 + DHCP
-ser.close()
-"
-
-# 4. 找 IP
-python3 -c "
-import serial, time, re
-ser = serial.Serial('/dev/cu.usbserial-1430', 115200, timeout=1)
-end = time.time() + 10; buf = b''
-while time.time() < end:
-    try: d = ser.read(4096); buf += d if d else b''
-    except: pass
-ser.close()
-m = re.search(rb'ip: ([\d.]+)', buf)
-print(m.group(1).decode() if m else 'NO IP')
-"
+```json
+{"type":"updateota","code":"0","msg":"","data":{}}
 ```
 
-### 8.2 DTR/RTS 硬复位详解 (LOOP7 实测)
+完整 OTA 验证必须覆盖：
 
-| 状态 | 操作 | 时序 |
-|------|------|------|
-| 软复位 (DTR pulse 100ms) | `ser.dtr = True; sleep(0.1); ser.dtr = False` | 通常不够, esp32s3 + CH340 在反复擦除后失灵 |
-| 半硬复位 (RTS 高电平) | `ser.rts = True; sleep(0.5); ser.rts = False` | 触发 BOOT 引脚高, 可能进入下载模式 |
-| **完全断电 (推荐)** | `ser.dtr = True; sleep(0.5); ser.dtr = False` | DTR 接 EN 引脚, 拉低断电, **必触发 POR** |
-| 完全拔 USB | 物理操作 | 等 5 秒, 100% 可靠 |
+1. 上传后设备切换到非当前 OTA 槽并重启。
+2. 新镜像启动状态为 `PENDING_VERIFY`。
+3. 固件稳定运行 30 秒后调用 ESP-IDF 接口确认镜像为 `VALID`。
+4. 再次复位仍从同一 OTA 槽启动，不能回滚到旧镜像。
+5. Web、TCP 502/503/504/5002、BLE、RTU 和 IO 状态在升级后继续可用。
 
-### 8.3 LOOP7 验证烧录
+## 7. 启动验收
 
-```bash
-# 烧录后验证 BLE 名字写入路径
-# 1. 读默认
-python3 -c "
-import socket, struct
-def mb(pdu, ip='192.168.51.140'):
-    s = socket.socket(); s.settimeout(3)
-    try: s.connect((ip, 502)); s.sendall(struct.pack('>HHHB', 1, 0, len(pdu)+1, 1) + pdu); import time; time.sleep(0.3); r = s.recv(256); return r
-    finally: s.close()
-r = mb(struct.pack('>BHH', 0x03, 0x08E2, 4))
-print(r.hex())
-# 期望: cfg 默认 'Mesh' (0x4d 0x00 0x65 0x00 0x73 0x00 0x68 0x00)
-# MBAP + 0x03 + 长度 4 + Mesh 字节
+启动日志至少应确认：
 
-# 2. 写 'XY' (2 字符)
-name = 'XY'.encode('utf-16-be') + b'\x00' * 6
-regs = [struct.unpack('>H', name[i:i+2])[0] for i in range(0, 8, 2)]
-pdu = struct.pack('>BHHB', 0x10, 0x08E2, 4, 8)
-for r in regs: pdu += struct.pack('>H', r)
-rsp = mb(pdu)
-print('write:', 'OK' if rsp else 'FAIL')
-
-# 3. 读回
-r = mb(struct.pack('>BHH', 0x03, 0x08E2, 4))
-body = r[7:]
-length = body[1]
-sn = body[2:2+length]
-print(f'cfg.ble_name = {sn.decode("utf-16-be").rstrip(chr(0))!r}')
-# 期望: 'XY' (LOOP7 修复前是 '', 修复后是 'XY')
+```text
+Boot SPI Speed : 40MHz
+SPI Mode       : DIO
+SPI Flash Size : 8MB
 ```
 
-### 8.4 烧录失败常见问题
+同时检查无以下异常：
 
-| 症状 | 原因 | 解决 |
-|------|------|------|
-| 烧录后 App version 还是旧 | esp-idf-sys 没重链接 | `touch build.rs && rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-* && cargo build` |
-| 烧录后设备没 IP | DTR/RTS 软复位失灵 | 用 §8.2 DTR 500ms 完全断电复位 |
-| 烧录后设备不启动 | erase-flash 后 W5500 SPI 卡住 | 完全拔 USB 重插 5 秒 |
-| `Failed to open serial port` | 上一个进程占用了 | 关闭 espflash monitor / minicom / putty |
-| `Wrong boot mode detected (0x13)!` | ESP32 进入了下载模式 | 短按 RST 重新上电, 不要按 BOOT |
+- `Guru Meditation Error`
+- `Stack canary watchpoint triggered`
+- `Failed to create task`
+- `abort()` / 非计划性复位
 
-### 8.5 烧录 + 重置一键命令 (LOOP7 验证通过)
-
-```bash
-# 一键完整烧录 + 硬复位 + 找 IP
-ESPFLASH=espflash && SER=/dev/cu.usbserial-1430 && espflash erase-flash --port $SER && espflash flash --port $SER --no-skip target/xtensa-esp32s3-espidf/debug/gateway && python3 -c "
-import serial, time
-ser = serial.Serial('$SER', 115200, timeout=1)
-ser.dtr = True; time.sleep(0.5); ser.dtr = False
-time.sleep(15)
-ser.close()
-" && python3 -c "
-import serial, time, re
-ser = serial.Serial('$SER', 115200, timeout=1)
-end = time.time() + 10; buf = b''
-while time.time() < end:
-    try: d = ser.read(4096); buf += d if d else b''
-    except: pass
-ser.close()
-m = re.search(rb'ip: ([\d.]+)', buf)
-print(f'设备 IP: {m.group(1).decode() if m else "NO IP"}')"
-```
+单次启动和 OTA 闭环不能替代 72 小时以上的持续浸泡测试；7×24 能力需要长期压力数据证明。

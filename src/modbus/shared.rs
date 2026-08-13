@@ -169,12 +169,18 @@ pub fn modbus_crc16(data: &[u8]) -> u16 {
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Web 状态灯保留最近一次有效通信的时间窗。原 MCA 每轮扫描先灭灯，收到有效帧
+/// 后点亮；1 秒窗口在 500ms 页面轮询下可见，同时不会把历史成功永久显示为在线。
+const RS485_ACTIVITY_WINDOW_MS: u32 = 1_000;
+
 /// RS485 通信/应用错误计数器 (无锁原子, 全局静态)
 pub struct Rs485Stats {
     pub master_comerr: AtomicU32, // 0x0880
     pub master_apperr: AtomicU32, // 0x0881
     pub slave_comerr: AtomicU32,  // 0x0882
     pub slave_apperr: AtomicU32,  // 0x0883
+    master_last_ok_ms: AtomicU32,
+    slave_last_ok_ms: AtomicU32,
 }
 
 impl Rs485Stats {
@@ -184,6 +190,8 @@ impl Rs485Stats {
             master_apperr: AtomicU32::new(0),
             slave_comerr: AtomicU32::new(0),
             slave_apperr: AtomicU32::new(0),
+            master_last_ok_ms: AtomicU32::new(0),
+            slave_last_ok_ms: AtomicU32::new(0),
         }
     }
 
@@ -234,6 +242,45 @@ impl Rs485Stats {
     pub fn inc_slave_apperr(&self) {
         self.slave_apperr.fetch_add(1, Ordering::Relaxed);
     }
+
+    #[inline]
+    fn uptime_ms() -> u32 {
+        // 低 32 位约 49.7 天回绕，wrapping_sub 可在回绕前后保持窗口判断正确。
+        (unsafe { esp_idf_sys::esp_timer_get_time() } as u64 / 1_000) as u32
+    }
+
+    #[inline]
+    pub fn mark_master_ok(&self) {
+        self.master_last_ok_ms
+            .store(Self::uptime_ms().max(1), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn mark_slave_ok(&self) {
+        self.slave_last_ok_ms
+            .store(Self::uptime_ms().max(1), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn master_active(&self) -> bool {
+        activity_is_recent(
+            self.master_last_ok_ms.load(Ordering::Relaxed),
+            Self::uptime_ms(),
+        )
+    }
+
+    #[inline]
+    pub fn slave_active(&self) -> bool {
+        activity_is_recent(
+            self.slave_last_ok_ms.load(Ordering::Relaxed),
+            Self::uptime_ms(),
+        )
+    }
+}
+
+#[inline]
+fn activity_is_recent(last_ms: u32, now_ms: u32) -> bool {
+    last_ms != 0 && now_ms.wrapping_sub(last_ms) <= RS485_ACTIVITY_WINDOW_MS
 }
 
 /// 全局 RS485 错误计数静态实例
@@ -734,6 +781,14 @@ mod tests {
         assert_eq!(MODBUS_TCP_MAX_MBAP_LENGTH, 254);
         assert_eq!(MODBUS_TCP_MAX_ADU_LEN, 260);
         assert_eq!(PDU_BUF_SIZE, MODBUS_MAX_PDU_LEN);
+    }
+
+    #[test]
+    fn test_rs485_activity_window_handles_timeout_and_wraparound() {
+        assert!(!activity_is_recent(0, 500));
+        assert!(activity_is_recent(500, 1_500));
+        assert!(!activity_is_recent(500, 1_501));
+        assert!(activity_is_recent(u32::MAX - 200, 300));
     }
 
     #[test]

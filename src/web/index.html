@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>控制面板 - ESP32-S3 网关</title>
+<title>工业测控执行器管理系统</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0f1419;--card:#1a1f26;--border:#2a3340;--text:#e0e0e0;--dim:#7a8a9a;
@@ -31,7 +31,7 @@ border-radius:5px;color:var(--text);font-size:13px;outline:none}
 .btn-p{background:var(--accent);color:#fff}.btn-p:hover{opacity:.85}
 .btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
 .btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
-.di-list,.do-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
+.di-list,.do-list,.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
 .io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
 .led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
 .led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
@@ -64,7 +64,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2">
       <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/>
       <line x1="12" y1="17" x2="12" y2="21"/></svg>
-    <h1>IoT Gateway</h1>
+    <h1>工业测控执行器管理系统</h1>
     <span class="ver" id="fw_ver"></span>
   </div>
   <a href="/logout">退出登录</a>
@@ -72,14 +72,36 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 
 <div class="wrap">
   <div class="tabs">
-    <div class="tab active" data-t="io">I/O 数据</div>
-    <div class="tab" data-t="net">网络配置</div>
-    <div class="tab" data-t="port">RS485 端口</div>
-    <div class="tab" data-t="sys">系统设置</div>
+    <div class="tab active" data-t="sysinfo">系统信息</div>
+    <div class="tab" data-t="net">设备基本信息</div>
+    <div class="tab" data-t="port">端口设置</div>
+    <div class="tab" data-t="io">I/O口信息</div>
+    <div class="tab" data-t="user">用户设置</div>
+    <div class="tab" data-t="maint">系统维护</div>
+  </div>
+
+  <!-- 系统信息面板 -->
+  <div id="p-sysinfo">
+    <div class="card">
+      <h2>系统信息</h2>
+      <div class="row">
+        <div class="field"><label>设备名称</label><input id="s_devicename" maxlength="63"></div>
+        <div class="field"><label>制造商</label><input id="s_manufacturer" maxlength="63"></div>
+        <div class="field"><label>型号</label><input id="s_model" maxlength="63"></div>
+        <div class="field"><label>固件版本</label><input id="s_version" disabled></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="saveSystemInfo()">保存系统信息</button>
+      </div>
+    </div>
   </div>
 
   <!-- I/O 数据面板 -->
-  <div id="p-io">
+  <div id="p-io" class="hidden">
+    <div class="card">
+      <h2>设备状态</h2>
+      <div class="state-list" id="state_list"></div>
+    </div>
     <div class="card">
       <h2>数字输入 (DI)</h2>
       <div class="di-list" id="di_list"></div>
@@ -130,11 +152,9 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     <div class="card">
       <h2>设备标识</h2>
       <div class="row">
-        <div class="field"><label>SN 序列号</label><input id="n_sn" disabled></div>
+        <div class="field"><label>SN 序列号</label><input id="n_sn" maxlength="32"></div>
         <div class="field"><label>位置/桩号</label><input id="n_loc"></div>
-      </div>
-      <div class="nav">
-        <button class="btn btn-p" onclick="saveSys()">保存设备信息</button>
+        <div class="field"><label>蓝牙地址</label><input id="n_ble" maxlength="8"></div>
       </div>
     </div>
   </div>
@@ -144,8 +164,8 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     <div class="card" id="port_cards"></div>
   </div>
 
-  <!-- 系统设置面板 -->
-  <div id="p-sys" class="hidden">
+  <!-- 用户设置面板 -->
+  <div id="p-user" class="hidden">
     <div class="card">
       <h2>修改密码</h2>
       <div class="row">
@@ -156,6 +176,10 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <button class="btn btn-w" onclick="changePwd()">修改密码</button>
       </div>
     </div>
+  </div>
+
+  <!-- 系统维护面板 -->
+  <div id="p-maint" class="hidden">
     <div class="card">
       <h2>固件升级 (OTA)</h2>
       <p style="font-size:13px;color:var(--dim);margin-bottom:12px">选择 .bin 固件文件后点击上传, 设备将自动重启.</p>
@@ -178,7 +202,7 @@ const $$ = s => document.querySelectorAll(s);
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.remove('active'));
   t.classList.add('active');
-  ['io','net','port','sys'].forEach(k => {
+  ['sysinfo','net','port','io','user','maint'].forEach(k => {
     $('#p-' + k).classList.toggle('hidden', k !== t.dataset.t);
   });
 });
@@ -198,8 +222,10 @@ async function loadSysInfo() {
     const j = await r.json();
     if (j.data) {
       $('#fw_ver').textContent = j.data.version || '';
-      $('#n_sn').value = j.data.sn || '';
-      $('#n_loc').value = j.data.addressinfo || '';
+      $('#s_devicename').value = j.data.devicename || '';
+      $('#s_manufacturer').value = j.data.manufacturer || '';
+      $('#s_model').value = j.data.model || '';
+      $('#s_version').value = j.data.version || '';
     }
   } catch(e) { console.error('sysinfo', e); }
 }
@@ -216,6 +242,8 @@ async function loadNet() {
       $('#n_dns').value = j.data.dns || '';
       $('#n_mac').value = j.data.mac || '';
       $('#n_dhcp').value = j.data.dhcp ? '已启用' : '未启用';
+      $('#n_sn').value = j.data.sn || '';
+      $('#n_ble').value = j.data.bloothaddress || '';
       if (j.data.addressinfo) $('#n_loc').value = j.data.addressinfo;
     }
   } catch(e) { console.error('net', e); }
@@ -229,7 +257,9 @@ async function saveNet() {
       mask: $('#n_mask').value,
       gateway: $('#n_gw').value,
       dns: $('#n_dns').value,
-      addressinfo: $('#n_loc').value
+      addressinfo: $('#n_loc').value,
+      sn: $('#n_sn').value,
+      bloothaddress: $('#n_ble').value
     });
     const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
     const j = await r.json();
@@ -238,15 +268,16 @@ async function saveNet() {
 }
 
 // Save system info
-async function saveSys() {
+async function saveSystemInfo() {
   try {
     const fd = new URLSearchParams({
-      devicename: '',
-      addressinfo: $('#n_loc').value
+      devicename: $('#s_devicename').value,
+      manufacturer: $('#s_manufacturer').value,
+      model: $('#s_model').value
     });
     const r = await fetch('/updatesysteminfoconfig', { method: 'POST', body: fd });
     const j = await r.json();
-    toast(j.code === '0' ? '设备信息已保存' : '保存失败: ' + j.code, j.code === '0');
+    toast(j.code === '0' ? '系统信息已保存' : '保存失败: ' + j.code, j.code === '0');
   } catch(e) { toast('保存失败: ' + e, false); }
 }
 
@@ -335,6 +366,13 @@ async function pollIO() {
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
+
+    // 原 MAC 页面固定显示 8 个状态灯: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2。
+    const stateNames = ['PWR', 'RUN', 'BT', 'LAN', '485_1', '485_2', 'FIB1', 'FIB2'];
+    $('#state_list').innerHTML = stateNames.map((name, i) => {
+      const on = d.state_data && d.state_data['state_addr_' + i];
+      return `<div class="io-item"><span class="led ${on ? 'on' : ''}"></span><span>${name}</span></div>`;
+    }).join('');
 
     // DI
     let diHtml = '';

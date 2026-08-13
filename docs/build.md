@@ -164,15 +164,15 @@ embuild = { version = "0.33", features = ["espidf"] }  # build-dependencies
 | 分区 | 类型 | 偏移 | 大小 | 用途 |
 |------|------|------|------|------|
 | nvs | data nvs | 0x9000 | 24 KB | 系统 NVS |
-| nvs_keys | data nvs_keys | 0xF000 | 4 KB | NVS 加密密钥 |
-| phy_init | data phy | 0x10000 | 4 KB | PHY 校准数据 |
-| factory | app factory | 0x10000 | 2.25 MB | 出厂固件 |
+| phy_init | data phy | 0xF000 | 4 KB | PHY 校准数据 |
+| otadata | data ota | 0x10000 | 8 KB | OTA 选择分区 |
+| nvs_keys | data nvs_keys | 0x17000 | 4 KB | NVS 加密密钥 |
+| factory | app factory | 0x20000 | 2.25 MB | 出厂固件 |
 | ota_0 | app ota_0 | 0x260000 | 2.25 MB | OTA 升级槽 0 |
 | ota_1 | app ota_1 | 0x4A0000 | 2.25 MB | OTA 升级槽 1 |
-| otadata | data ota | 0x6E0000 | 8 KB | OTA 选择分区 |
-| ble_mesh | data nvs | 0x6E2000 | 32 KB | BLE Mesh 独立 NVS |
-| coredump | data coredump | 0x6EA000 | 64 KB | 崩溃转储 |
-| storage | data fat | 0x6FA000 | 1 MB | FAT 文件系统 |
+| coredump | data coredump | 0x6E0000 | 64 KB | 崩溃转储 |
+| ble_mesh | data nvs | 0x6F0000 | 64 KB | BLE Mesh 独立 NVS |
+| storage | data fat | 0x700000 | 1 MB | FAT 文件系统 |
 
 ## 构建环境变量
 
@@ -307,7 +307,7 @@ cargo run --release
 esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX --baud 921600 \
     write_flash 0x0   target/xtensa-esp32s3-espidf/release/bootloader.bin \
                     0x8000 target/xtensa-esp32s3-espidf/release/partition-table.bin \
-                    0x10000 target/xtensa-esp32s3-espidf/release/gateway
+                    0x20000 target/xtensa-esp32s3-espidf/release/gateway
 ```
 
 ## 监控

@@ -8,6 +8,9 @@ export PORT      := env_var_or_default("ESPFLASH_PORT", "/dev/cu.usbserial-1430"
 export SERIAL    := PORT
 export ELF_DEBUG   := "target/xtensa-esp32s3-espidf/debug/gateway"
 export ELF_RELEASE := "target/xtensa-esp32s3-espidf/release/gateway"
+export BOOTLOADER_DEBUG := "target/xtensa-esp32s3-espidf/debug/bootloader.bin"
+export BOOTLOADER_RELEASE := "target/xtensa-esp32s3-espidf/release/bootloader.bin"
+export PARTITIONS := "partitions.csv"
 export MONITOR_BAUD := "115200"
 export TOOLCHAIN_PREFIX := "/Users/takumi/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin"
 export XTENSA_GCC  := TOOLCHAIN_PREFIX + "/xtensa-esp-elf-gcc"
@@ -59,25 +62,45 @@ flash: build
     @echo "  等 1 秒, 看到 'ESP-ROM:' 提示后再烧录"
     @echo ""
     @read _
-    espflash flash --port {{PORT}} --no-skip {{ELF_DEBUG}}
+    espflash flash --port {{PORT}} --no-skip \
+        --bootloader {{BOOTLOADER_DEBUG}} \
+        --partition-table {{PARTITIONS}} --partition-table-offset 0x8000 \
+        --target-app-partition factory --erase-parts otadata \
+        --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+        {{ELF_DEBUG}}
 
 # ───── 6. 标准烧录 (Release 版) ─────
 flash-release: build-release
     @echo "⚠ 手动进下载模式: 按住 BOOT, 短按 RST, 松开 BOOT"
     @read _
-    espflash flash --port {{PORT}} --no-skip {{ELF_RELEASE}}
+    espflash flash --port {{PORT}} --no-skip \
+        --bootloader {{BOOTLOADER_RELEASE}} \
+        --partition-table {{PARTITIONS}} --partition-table-offset 0x8000 \
+        --target-app-partition factory --erase-parts otadata \
+        --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+        {{ELF_RELEASE}}
 
 # ───── 7. 不擦直接重烧 (最快, 跳过已识别区块) ─────
 flash-skip:
     @echo "⚠ 手动进下载模式: 按住 BOOT, 短按 RST, 松开 BOOT"
     @read _
-    espflash flash --port {{PORT}} {{ELF_DEBUG}}
+    espflash flash --port {{PORT}} \
+        --bootloader {{BOOTLOADER_DEBUG}} \
+        --partition-table {{PARTITIONS}} --partition-table-offset 0x8000 \
+        --target-app-partition factory --erase-parts otadata \
+        --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+        {{ELF_DEBUG}}
 
 # ───── 8. 烧录 + 立即监视 ─────
 flash-monitor: build
     @echo "⚠ 手动进下载模式: 按住 BOOT, 短按 RST, 松开 BOOT"
     @read _
-    espflash flash --port {{PORT}} --no-skip --monitor {{ELF_DEBUG}}
+    espflash flash --port {{PORT}} --no-skip --monitor \
+        --bootloader {{BOOTLOADER_DEBUG}} \
+        --partition-table {{PARTITIONS}} --partition-table-offset 0x8000 \
+        --target-app-partition factory --erase-parts otadata \
+        --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+        {{ELF_DEBUG}}
 
 # ───── 9. 只监视 (烧完后再开 monitor) ─────
 monitor:
@@ -114,7 +137,12 @@ full-flash: build
     echo "  ⚠ 再次按住 BOOT, 短按 RST, 松开 BOOT"
     echo ""
     read -p "按 Enter 继续 (或 Ctrl+C 取消) "
-    espflash flash --port {{PORT}} --no-skip {{ELF_DEBUG}}
+    espflash flash --port {{PORT}} --no-skip \
+        --bootloader {{BOOTLOADER_DEBUG}} \
+        --partition-table {{PARTITIONS}} --partition-table-offset 0x8000 \
+        --target-app-partition factory \
+        --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
+        {{ELF_DEBUG}}
 
     echo ""
     echo "═══ 步骤 3/5: 硬复位 (DTR 拉低 500ms) ═══"

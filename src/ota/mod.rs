@@ -8,7 +8,7 @@
 //! factory    app   factory  0x020000  0x240000  (2.25MB)
 //! ota_0      app   ota_0    0x260000  0x240000  (2.25MB, 升级槽 0)
 //! ota_1      app   ota_1    0x4A0000  0x240000  (2.25MB, 升级槽 1)
-//! otadata    data  ota      0x018000  0x002000  (记录当前启动分区)
+//! otadata    data  ota      0x010000  0x002000  (记录当前启动分区)
 //! ```
 //!
 //! # 升级流程

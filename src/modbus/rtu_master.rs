@@ -226,6 +226,8 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         }
     }
 
+    crate::modbus::shared::RS485_STATS.mark_master_ok();
+
     Ok(())
 }
 

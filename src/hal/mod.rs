@@ -87,6 +87,26 @@ impl Hal {
         // GPIO 仅管理辅助引脚 (ETH_INT, ETH_RST, RS485_DE)
         let gpio = GpioBank::init(pins.eth_int, pins.eth_rst, pins.rs485_de, None)?;
 
+        // 原 MCA 在 setup() 中将 GPIO39/40 配置为普通输入后再读取光纤检测状态。
+        // 该配置属于硬件初始化职责，不能放到 Web 请求热路径中反复执行。
+        {
+            use esp_idf_sys::{gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_INPUT};
+            let cfg = gpio_config_t {
+                pin_bit_mask: (1u64 << crate::config::pins::FIB1_PIN)
+                    | (1u64 << crate::config::pins::FIB2_PIN),
+                mode: gpio_mode_t_GPIO_MODE_INPUT,
+                pull_up_en: 0,
+                pull_down_en: 0,
+                intr_type: 0,
+            };
+            let ret = unsafe { gpio_config(&cfg) };
+            if ret != 0 {
+                return Err(AppError::Io(format!(
+                    "fiber input gpio config: esp_err=0x{ret:08X}"
+                )));
+            }
+        }
+
         // F3/F4 版本: 初始化 I2C IO 扩展 (MCP23017)
         // I2C 引脚 (GPIO21 SDA + GPIO33 SCL) 在 F3/F4 版本下从原 DI 释放
         #[cfg(any(feature = "f3", feature = "f4"))]
