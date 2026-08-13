@@ -716,7 +716,7 @@ AT+VERSION                      → OK <name> v<x.x>
 - [ ] 异常响应中 `slave` 参数已包含在 `out` 中，但 `exc_response` 返回 `[func|0x80, code]` 只有 2 字节，需确认外层拼装逻辑
 
 ### [modbus/tcp_server.rs](../src/modbus/tcp_server.rs) - TCP Server
-- [x] keepalive 已实现：通过 `set_read_timeout` + `WouldBlock` 检测，空闲超 RX_TIMEOUT_MS 的连接主动关闭，释放 MAX_CONNECTIONS 名额
+- [x] keepalive 已实现：socket 显式设置 `SO_KEEPALIVE`/`TCP_KEEP*`，并通过非阻塞轮询、空闲/半帧/发送绝对超时主动释放连接槽
 - [x] `read_exact` 失败已区分：`WouldBlock` = keepalive 超时，`UnexpectedEof` = 对端正常关闭，其他 = 读错误，均记日志后关闭
 - [ ] 无 MBAP transaction_id 一致性校验
 

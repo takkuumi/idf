@@ -6,6 +6,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,11 @@ const MAX_REQUESTS_PER_POLL: usize = 4;
 /// 服务器每个 5ms tick 的总请求预算。单连接流水仍最多 4 帧，
 /// 但所有连接共享预算，避免 8 个客户端在同一轮执行 32 次后端事务。
 const MAX_REQUESTS_PER_TICK: usize = 2;
+/// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
+const MAX_ACCEPTS_PER_TICK: usize = 2;
+const LISTENER_RECOVERY_DELAY: Duration = Duration::from_secs(1);
+const LISTENER_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
+const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const _: () = assert!(MAX_ADU_SIZE == MBAP_PREFIX_LEN + MAX_MBAP_LENGTH);
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -42,6 +48,8 @@ struct Client {
     tx_len: usize,
     tx_sent: usize,
     last_activity: Instant,
+    partial_frame_started: Option<Instant>,
+    tx_started: Option<Instant>,
 }
 
 const CLIENT_STATE_ALLOCATION_BYTES: usize = std::mem::size_of::<Client>() * cfg::MAX_CONNECTIONS;
@@ -51,6 +59,11 @@ impl Client {
     fn new(id: u32, peer: SocketAddr, stream: TcpStream) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
+        if let Err(error) = configure_keepalive(&stream) {
+            // keepalive 是半开连接回收增强项；某些旧 LwIP 构建可能不支持
+            // TCP_KEEP* 细项，不能因此拒绝一个本可正常服务的客户端。
+            log::warn!("[mb-tcp] keepalive setup for {peer} incomplete: {error}");
+        }
         Ok(Self {
             id,
             peer,
@@ -61,20 +74,22 @@ impl Client {
             tx_len: 0,
             tx_sent: 0,
             last_activity: Instant::now(),
+            partial_frame_started: None,
+            tx_started: None,
         })
     }
 
     /// 返回 false 表示连接应关闭。每轮只完成有限工作，避免单客户端饿死其他连接。
     fn poll(&mut self, backend: &BusBackend, budget: &mut usize) -> bool {
         for _ in 0..MAX_REQUESTS_PER_POLL {
-            if *budget == 0 {
-                break;
-            }
             if !self.flush_tx() {
                 return false;
             }
             // socket 发送窗口已满，保留响应并立即让出，不继续读新请求。
             if self.tx_len != 0 {
+                break;
+            }
+            if *budget == 0 {
                 break;
             }
 
@@ -89,6 +104,9 @@ impl Client {
             match self.stream.read(&mut self.rx[self.rx_len..]) {
                 Ok(0) => return false,
                 Ok(n) => {
+                    if self.rx_len == 0 {
+                        self.partial_frame_started = Some(Instant::now());
+                    }
                     self.rx_len += n;
                     self.last_activity = Instant::now();
                 }
@@ -116,6 +134,20 @@ impl Client {
     }
 
     fn is_timed_out(&self) -> bool {
+        if self
+            .partial_frame_started
+            .is_some_and(|started| {
+                started.elapsed() >= Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS)
+            })
+        {
+            return true;
+        }
+        if self
+            .tx_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(cfg::TX_TIMEOUT_MS))
+        {
+            return true;
+        }
         let timeout_ms = if self.tx_len == 0 {
             cfg::IDLE_TIMEOUT_MS
         } else {
@@ -143,6 +175,7 @@ impl Client {
         if self.tx_len != 0 {
             self.tx_len = 0;
             self.tx_sent = 0;
+            self.tx_started = None;
         }
         true
     }
@@ -155,7 +188,7 @@ impl Client {
         let protocol = u16::from_be_bytes([self.rx[2], self.rx[3]]);
         let length = u16::from_be_bytes([self.rx[4], self.rx[5]]) as usize;
         if protocol != 0 || !(2..=MAX_MBAP_LENGTH).contains(&length) {
-            log::warn!(
+            log::debug!(
                 "[mb-tcp] conn_id={} invalid MBAP protocol={} length={}",
                 self.id,
                 protocol,
@@ -175,10 +208,54 @@ impl Client {
         };
         self.tx_len = response_len;
         self.tx_sent = 0;
+        self.tx_started = Some(Instant::now());
 
         self.rx.copy_within(request_len..self.rx_len, 0);
         self.rx_len -= request_len;
+        if self.rx_len == 0 {
+            self.partial_frame_started = None;
+        }
         true
+    }
+}
+
+fn configure_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let fd = stream.as_raw_fd();
+    set_socket_option(fd, esp_idf_sys::SOL_SOCKET, esp_idf_sys::SO_KEEPALIVE, 1)?;
+    set_socket_option(
+        fd,
+        esp_idf_sys::IPPROTO_TCP,
+        esp_idf_sys::TCP_KEEPIDLE,
+        cfg::KEEPALIVE_IDLE_S,
+    )?;
+    set_socket_option(
+        fd,
+        esp_idf_sys::IPPROTO_TCP,
+        esp_idf_sys::TCP_KEEPINTVL,
+        cfg::KEEPALIVE_INTERVAL_S,
+    )?;
+    set_socket_option(
+        fd,
+        esp_idf_sys::IPPROTO_TCP,
+        esp_idf_sys::TCP_KEEPCNT,
+        cfg::KEEPALIVE_COUNT,
+    )
+}
+
+fn set_socket_option(fd: i32, level: u32, name: u32, value: i32) -> std::io::Result<()> {
+    let result = unsafe {
+        esp_idf_sys::lwip_setsockopt(
+            fd,
+            level as i32,
+            name as i32,
+            &value as *const _ as *const _,
+            std::mem::size_of_val(&value) as u32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -187,6 +264,11 @@ struct TcpServerState {
     clients: Vec<Client>,
     active_ports: [u16; 4],
     next_port_check: Instant,
+    client_cursor: usize,
+    listener_cursor: usize,
+    listener_rebind_due: Option<Instant>,
+    next_reject_log: Instant,
+    rejected_connections: u32,
 }
 
 static SERVER_STATE: MainLoopCell<TcpServerState> = MainLoopCell::new();
@@ -220,6 +302,11 @@ pub fn start() -> AppResult<()> {
             clients,
             active_ports: ports,
             next_port_check: Instant::now(),
+            client_cursor: 0,
+            listener_cursor: 0,
+            listener_rebind_due: None,
+            next_reject_log: Instant::now(),
+            rejected_connections: 0,
         })
         .map_err(|_| AppError::Modbus("TCP state busy during init".into()))?;
     log::info!(
@@ -233,8 +320,10 @@ pub fn start() -> AppResult<()> {
 /// main_loop 每 5ms 调用一次。所有 socket 均为 nonblocking，每轮工作有界。
 pub fn tick_tcp_server() {
     let _ = SERVER_STATE.with_mut(|state| {
-        if Instant::now() >= state.next_port_check {
-            state.next_port_check = Instant::now() + Duration::from_secs(1);
+        let now = Instant::now();
+        recover_listeners_if_due(state, now);
+        if now >= state.next_port_check {
+            state.next_port_check = now + Duration::from_secs(1);
             let desired = configured_ports();
             if desired != state.active_ports {
                 if !ports_are_valid(&desired) {
@@ -247,6 +336,8 @@ pub fn tick_tcp_server() {
                     match bind_ports(&desired, &mut state.listeners) {
                         Ok(()) => {
                             state.active_ports = desired;
+                            state.listener_cursor = 0;
+                            state.listener_rebind_due = None;
                             log::info!("[mb-tcp] listeners rebound: {:?}", state.active_ports);
                         }
                         Err((port, e)) => {
@@ -264,26 +355,80 @@ pub fn tick_tcp_server() {
                                     rollback_port,
                                     rollback_error
                                 );
+                                schedule_listener_recovery(state, now);
                             }
                         }
                     }
                 }
             }
+            if state.listeners.len() != state.active_ports.len()
+                || state
+                    .listeners
+                    .iter()
+                    .any(|listener| !matches!(listener.take_error(), Ok(None)))
+            {
+                schedule_listener_recovery(state, now);
+            }
         }
-        accept_pending(&state.listeners, &mut state.clients);
+        if accept_pending(state, now) {
+            schedule_listener_recovery(state, now);
+        }
 
         let mut request_budget = MAX_REQUESTS_PER_TICK;
-        let mut i = 0;
-        while i < state.clients.len() {
-            if state.clients[i].poll(&BusBackend, &mut request_budget) {
-                i += 1;
-            } else {
+        let client_count = state.clients.len();
+        let start = state.client_cursor.min(client_count.saturating_sub(1));
+        let mut dead = [false; cfg::MAX_CONNECTIONS];
+        for offset in 0..client_count {
+            let index = (start + offset) % client_count;
+            // 每个客户端每轮最多消费一个全局请求额度；发送已有响应和超时检查
+            // 不受额度影响，避免前序繁忙连接让后序连接永久饥饿。
+            let mut client_budget = request_budget.min(1);
+            let before = client_budget;
+            if !state.clients[index].poll(&BusBackend, &mut client_budget) {
+                dead[index] = true;
+            }
+            request_budget -= before - client_budget;
+        }
+        let next_id = if client_count == 0 {
+            None
+        } else {
+            Some(state.clients[(start + MAX_REQUESTS_PER_TICK) % client_count].id)
+        };
+        for i in (0..client_count).rev() {
+            if dead[i] {
                 let client = state.clients.swap_remove(i);
                 log::debug!("[mb-tcp] conn_id={} from {} closed", client.id, client.peer);
                 CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        state.client_cursor = next_id
+            .and_then(|id| state.clients.iter().position(|client| client.id == id))
+            .unwrap_or(0);
     });
+}
+
+fn schedule_listener_recovery(state: &mut TcpServerState, now: Instant) {
+    if state.listener_rebind_due.is_none() {
+        state.listener_rebind_due = Some(now + LISTENER_RECOVERY_DELAY);
+        log::warn!("[mb-tcp] listener fault detected; recovery scheduled");
+    }
+}
+
+fn recover_listeners_if_due(state: &mut TcpServerState, now: Instant) {
+    if !state.listener_rebind_due.is_some_and(|due| now >= due) {
+        return;
+    }
+    match bind_ports(&state.active_ports, &mut state.listeners) {
+        Ok(()) => {
+            state.listener_cursor = 0;
+            state.listener_rebind_due = None;
+            log::info!("[mb-tcp] listeners recovered: {:?}", state.active_ports);
+        }
+        Err((port, error)) => {
+            state.listener_rebind_due = Some(now + LISTENER_RECOVERY_BACKOFF);
+            log::warn!("[mb-tcp] listener recovery :{} failed: {}", port, error);
+        }
+    }
 }
 
 fn configured_ports() -> [u16; 4] {
@@ -315,38 +460,54 @@ fn bind_ports(
     Ok(())
 }
 
-fn accept_pending(listeners: &[TcpListener], clients: &mut Vec<Client>) {
-    for listener in listeners {
-        // 每端口每轮处理有限数量，持续 SYN/accept 洪泛不能饿死现有连接和 WDT。
-        for _ in 0..cfg::MAX_CONNECTIONS {
-            match listener.accept() {
-                Ok((stream, peer)) if clients.len() >= cfg::MAX_CONNECTIONS => {
+fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
+    let listener_count = state.listeners.len();
+    if listener_count == 0 {
+        return true;
+    }
+    let mut accepted = 0;
+    let mut faulted = false;
+    for offset in 0..listener_count {
+        if accepted >= MAX_ACCEPTS_PER_TICK {
+            break;
+        }
+        let index = (state.listener_cursor + offset) % listener_count;
+        match state.listeners[index].accept() {
+            Ok((stream, _peer)) if state.clients.len() >= cfg::MAX_CONNECTIONS => {
+                state.rejected_connections = state.rejected_connections.saturating_add(1);
+                if now >= state.next_reject_log {
                     log::warn!(
-                        "[mb-tcp] rejected {peer} (max={} reached)",
-                        cfg::MAX_CONNECTIONS
+                        "[mb-tcp] max connections reached; rejected={} in interval",
+                        state.rejected_connections
                     );
-                    drop(stream);
+                    state.rejected_connections = 0;
+                    state.next_reject_log = now + REJECT_LOG_INTERVAL;
                 }
-                Ok((stream, peer)) => {
+                drop(stream);
+                accepted += 1;
+            }
+            Ok((stream, peer)) => {
+                accepted += 1;
                     let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
                     match Client::new(id, peer, stream) {
                         Ok(client) => {
-                            clients.push(client);
-                            CONN_COUNT.store(clients.len() as u32, Ordering::Relaxed);
+                            state.clients.push(client);
+                            CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
                             log::debug!("[mb-tcp] conn_id={id} from {peer} accepted");
                         }
                         Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
                     }
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    log::warn!("[mb-tcp] accept: {e}");
-                    break;
-                }
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                log::warn!("[mb-tcp] accept: {e}");
+                faulted = true;
             }
         }
     }
+    state.listener_cursor = (state.listener_cursor + 1) % listener_count;
+    faulted
 }
 
 fn build_response(
@@ -382,6 +543,9 @@ mod tests {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
         assert_eq!(MAX_REQUESTS_PER_POLL, 4);
         assert_eq!(MAX_REQUESTS_PER_TICK, 2);
+        assert_eq!(MAX_ACCEPTS_PER_TICK, 2);
+        assert!(cfg::PARTIAL_FRAME_TIMEOUT_MS < cfg::IDLE_TIMEOUT_MS);
+        assert!(cfg::KEEPALIVE_COUNT > 0);
         assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
     }
 

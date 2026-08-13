@@ -330,7 +330,14 @@ pub mod modbus {
         /// 已建立连接的空闲回收时间。原 2 秒“读超时”不能直接当连接空闲超时，
         /// 否则常见 PLC/SCADA 长连接在两次轮询间就被服务端主动断开。
         pub const IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
-        pub const TX_TIMEOUT_MS: u64 = 2000;
+        /// 弱网下完整 MBAP 帧的接收上限。计时从首字节开始，后续零散字节不续期，
+        /// 防止 slowloris 客户端永久占用固定的 8 个连接槽。
+        pub const PARTIAL_FRAME_TIMEOUT_MS: u64 = 30_000;
+        pub const TX_TIMEOUT_MS: u64 = 5000;
+        /// TCP keepalive 用于回收拔线、客户端断电等未发送 FIN/RST 的半开连接。
+        pub const KEEPALIVE_IDLE_S: i32 = 30;
+        pub const KEEPALIVE_INTERVAL_S: i32 = 10;
+        pub const KEEPALIVE_COUNT: i32 = 3;
     }
 }
 

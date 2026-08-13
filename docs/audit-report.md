@@ -288,7 +288,7 @@ let silence_ms: u64 = std::cmp::max(silence_us / 1000, 1) as u64;
 - 错误处理：`UnexpectedEof` / 其他错误均 `return Ok(())` 关闭连接
 
 **潜在问题**：
-1. **未启用 SO_KEEPALIVE**：若客户端 TCP 半开连接 (如断电/网线拔出但未发 FIN)，`read_exact` 会一直阻塞到 read_timeout (2s) 触发。sdkconfig 已启用 `CONFIG_LWIP_TCP_KEEPALIVE=y`，但代码未设置 socket keepalive 选项。
+1. **已修复 SO_KEEPALIVE**：已建立连接显式启用 keepalive（空闲 30s、探测 10s、3 次失败），并保留应用层空闲/半帧/发送绝对超时作为兜底。
 2. **连接拒绝无响应**：超限时 `drop(s)` 直接关闭，客户端收 RST 但无 Modbus 异常响应 (规范允许，但 SCADA 可能误报)。
 3. **`CONN_COUNT` 竞态**：`fetch_add` 后立即 `load`，并发场景下 id 可能不连续 (仅影响日志，功能正确)。
 
@@ -614,7 +614,7 @@ pub mod i2c_bus;
 
 | 优先级 | 建议 | 说明 |
 |--------|------|------|
-| 高 | TCP keepalive 配置 | `modbus/tcp_server.rs` 设置 `SO_KEEPALIVE`，检测半开连接 |
+| 已完成 | TCP keepalive 配置 | `modbus/tcp_server.rs` 设置 `SO_KEEPALIVE` + `TCP_KEEPIDLE/INTVL/KEEPCNT`，并有应用层超时兜底 |
 | 高 | 轮询表从 NVS 加载 | `modbus/rtu_master.rs` 当前硬编码，应支持运行时配置 |
 | 中 | Wi-Fi 配置动态化 | `config/wifi` 当前常量，应从 SystemConfig 加载 |
 | 中 | 日志级别动态调节完善 | 当前 Modbus 寄存器 0x0106 可调，需确认所有任务生效 |
