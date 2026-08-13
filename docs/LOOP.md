@@ -190,13 +190,13 @@ esp_core_dump_flash: Save core dump to flash...
 ## 架构 (Phase 2 完成)
 
 ```
-main_loop (20ms tick)
-├── tick_tcp_server()            # 20ms, 4 端口/8 连接非阻塞状态机
+main_loop (5ms network tick)
+├── tick_tcp_server()            # 5ms, 4 端口/8 连接非阻塞状态机
 ├── tick_di_scan(&hal)           # 20ms, 合并 di-scan pthread
-├── tick_do_output(&hal)         # 20ms dirty 消费 + 10s 兜底
-├── tick_ai/ao(&hal)             # 100ms (5 分频)
-├── ble_at::process_tick()       # 100ms (5 分频)
-└── tick_eth_heartbeat()         # 5s (250 分频)
+├── tick_do_output(&hal)         # 5ms dirty 消费 + 10s 兜底
+├── tick_ai/ao(&hal)             # 100ms
+├── ble_at::process_tick()       # 10ms
+└── tick_eth_heartbeat()         # 5s
 
 3 个核心协议/状态 pthread 任务:
 - DeviceActor (NVS 持久化, 16KB 栈)

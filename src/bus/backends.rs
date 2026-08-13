@@ -16,11 +16,9 @@ use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
 use std::sync::Arc;
 
-use super::config_state::{ConfigSnapshot, config_read, config_read_with};
+use super::config_state::{CONFIG, ConfigSnapshot, config_read, config_read_with};
 use super::io_global::IO;
-use super::storage_state::{
-    STORAGE, StorageSnapshot, proto_status, storage_read, storage_read_with,
-};
+use super::storage_state::{STORAGE, StorageSnapshot, proto_status, storage_read};
 
 // ----------------------------------------------------------------------------
 // LOOP8: RCU 写者串行化锁
@@ -253,6 +251,49 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
 
 /// 读保持寄存器 (FC=03). 等价 `Bus::read_hold_reg`, 但走 `STORAGE`/`CONFIG` RCU.
 pub fn read_hold_reg(addr: u16) -> Option<u16> {
+    let config = CONFIG.read()?;
+    let storage = STORAGE.read()?;
+    read_hold_reg_from_snapshots(addr, &config, &storage)
+}
+
+/// 批量读保持寄存器，整个 FC03 请求只登记一次 CONFIG/STORAGE RCU 读者。
+///
+/// PC 工具常连续读取 60/83/125 words。旧路径每字都重复进入两个
+/// RCU epoch，125 words 最多产生 250 组原子登记/退出。保持同一快照
+/// 同时提升吞吐和响应数据的一致性。
+pub fn read_hold_regs(
+    addr: u16,
+    count: u16,
+) -> heapless::Vec<u16, { crate::modbus::shared::MAX_REGS_PER_READ }> {
+    let mut values = heapless::Vec::new();
+    if count == 0 || count as usize > values.capacity() {
+        return values;
+    }
+    if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
+        return values;
+    }
+    let Some(config) = CONFIG.read() else {
+        return values;
+    };
+    let Some(storage) = STORAGE.read() else {
+        return values;
+    };
+    for offset in 0..count {
+        let Some(value) =
+            read_hold_reg_from_snapshots(addr.wrapping_add(offset), &config, &storage)
+        else {
+            return heapless::Vec::new();
+        };
+        let _ = values.push(value);
+    }
+    values
+}
+
+fn read_hold_reg_from_snapshots(
+    addr: u16,
+    config: &ConfigSnapshot,
+    storage: &StorageSnapshot,
+) -> Option<u16> {
     // LOOP14: RS485 错误计数器 (0x0880-0x0883) 前置拦截 — 必须早于 SystemConfig 兜底,
     // 否则 read_hold_reg 落入 holding_buf 返回陈旧 NVS 值. metuory 仪表盘读取此值做诊断.
     match addr {
@@ -265,7 +306,7 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
     // 1. device_text (5000..=6999): 来自 STORAGE (Rcu 主存)
     if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
-        return storage_read_with(|s| s.device_text[idx]);
+        return storage.device_text.get(idx).copied();
     }
     // 2. CFG / PRegBuf (0x0880..=0x107F)
     if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
@@ -273,13 +314,13 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
         // 旧代码 ringlog 0x0887-0x08A6 与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 重叠,
         // 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非实际配置值.
         // 2b. SystemConfig 子寄存器 (_CFG_BASE..=_CFG_END 子集): 来自 CONFIG.cfg
-        if let Some(Some(v)) = config_read_with(|cs| cs.cfg.read_reg(addr)) {
+        if let Some(v) = config.cfg.read_reg(addr) {
             return Some(v);
         }
         // 2c. HOLD_PXX 残余（含 2300+ 逻辑配置）来自唯一 PRegBuf。
         let idx = (addr - regs::HOLD_PXX_BASE) as usize;
         if idx < regs::HOLD_PXX_COUNT {
-            return storage_read_with(|s| s.holding_buf[idx]);
+            return storage.holding_buf.get(idx).copied();
         }
         return Some(0);
     }
@@ -295,7 +336,7 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
             if user_idx < regs::HOLD_USER_COUNT {
                 let holding_idx =
                     (regs::HOLD_USER_BASE - regs::HOLD_PXX_BASE) as usize + user_idx as usize;
-                storage_read_with(|s| s.holding_buf[holding_idx])
+                storage.holding_buf.get(holding_idx).copied()
             } else {
                 Some(0)
             }
@@ -304,14 +345,14 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
     // 3. PROTO 区 (0x4000..<PROTO_END): 来自 STORAGE.proto
     if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
         let idx = (addr - regs::PROTO_BASE) as usize;
-        return storage_read_with(|s| s.proto.data[idx]);
+        return storage.proto.data.get(idx).copied();
     }
     // 4. Proto 控制字 (PROTO_COMMIT..=PROTO_MAGIC)
     match addr {
         regs::PROTO_COMMIT => Some(0),
         regs::PROTO_RELOAD => Some(0),
-        regs::PROTO_VERSION => storage_read_with(|s| s.proto.version),
-        regs::PROTO_LENGTH => storage_read_with(|s| s.proto.length),
+        regs::PROTO_VERSION => Some(storage.proto.version),
+        regs::PROTO_LENGTH => Some(storage.proto.length),
         regs::PROTO_STATUS => Some(proto_status() as u16),
         regs::PROTO_MAGIC => Some(crate::device::PROTO_MAGIC),
         _ => None,
@@ -363,6 +404,17 @@ mod tests {
         );
         let hwver = read_hold_reg(regs::HOLD_HW_VER);
         assert!(hwver.is_some(), "FC=03 读取 HW_VER 0x08A5 必须返回 Some");
+    }
+
+    #[test]
+    fn test_bulk_holding_read_supports_standard_fc03_maximum() {
+        let values = read_hold_regs(regs::HOLD_CFG_BASE, 125);
+        assert_eq!(values.len(), 125);
+        assert_eq!(values[0], read_hold_reg(regs::HOLD_CFG_BASE).unwrap());
+        assert_eq!(
+            values[124],
+            read_hold_reg(regs::HOLD_CFG_BASE + 124).unwrap()
+        );
     }
 
     // ---- LOOP12 回归测试 ----

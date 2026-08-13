@@ -1,6 +1,6 @@
 //! DO 数字输出
 //!
-//! - main_loop 每 20ms 检查 `BUS.do_.bits`，变化时更新 PCA9555 输出
+//! - main_loop 每 5ms 检查 `BUS.do_.bits`，变化时更新 PCA9555 输出
 //! - Modbus/业务写入后调用 `notify()` 置 dirty，下一周期刷新
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,7 @@ pub fn notify() {
 
 // 架构改造 Phase 2: DO 输出合并到 main_loop
 // 原始: 独立 pthread 1ms tick + notify 事件驱动
-// 改造后: main_loop 20ms poll + dirty 标志 (Modbus 写入时置位)
+// 改造后: main_loop 5ms poll + dirty 标志 (Modbus 写入时置位)
 
 struct DoState {
     last: u64,
@@ -50,7 +50,7 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
     Ok(())
 }
 
-/// main_loop 每 20ms 调用一次，dirty 标志提供事件驱动效果。
+/// main_loop 每 5ms 调用一次，dirty 标志提供事件驱动效果。
 pub fn tick_do_output(hal: &Hal) {
     let _ = DO_STATE.with_mut(|state| {
         let dirty = DO_DIRTY.swap(false, Ordering::Acquire);

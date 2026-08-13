@@ -38,7 +38,7 @@
 //! - 单线程 accept + 短连接 (连接处理 ~10ms, 无需线程池)
 //! - 响应体手写 JSON (零分配, 不依赖 serde/serde_json)
 //! - 收发缓冲区 4KB (足够单条 HTTP 请求/响应)
-//! - 非阻塞 accept, 每 100ms 轮询一次 (主线程 poll 模式)
+//! - 非阻塞 accept, 每 10ms 轮询一次 (独立 HTTP 任务)
 
 mod pages;
 
@@ -56,6 +56,8 @@ use crate::health::{self, TaskHb};
 
 /// HTTP 端口 (对齐参考固件: server(80))
 const HTTP_PORT: u16 = 80;
+/// 无连接时的 accept 轮询周期，兼顾新连接延迟与 CPU 让出。
+const ACCEPT_POLL_MS: u64 = 10;
 /// 收发缓冲区大小 (流式 OTA/header 读取的单块大小)
 const BUF_SIZE: usize = 4096;
 /// 单条 HTTP header 行最大字节数 (防止恶意超长 header → OOM)
@@ -347,6 +349,10 @@ fn server_loop() {
 
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        log::warn!("[http] set TCP_NODELAY failed: {}", e);
+                        continue;
+                    }
                     if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(3))) {
                         log::warn!("[http] set read timeout failed: {}", e);
                         continue;
@@ -360,7 +366,9 @@ fn server_loop() {
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
+                    // 10ms 可将 Web 新连接的额外延迟控制在人机界面无感范围，
+                    // 同时保留 sleep 让出 CPU，避免无连接时忙轮询。
+                    std::thread::sleep(Duration::from_millis(ACCEPT_POLL_MS));
                 }
                 Err(e) => {
                     log::warn!("[http] accept error: {}", e);

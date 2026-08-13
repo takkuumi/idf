@@ -64,21 +64,7 @@ impl ModbusBackend for BusBackend {
         addr: u16,
         count: u16,
     ) -> heapless::Vec<u16, MAX_REGS_PER_READ> {
-        let mut v = heapless::Vec::new();
-        if count == 0 {
-            return v;
-        }
-        let last = (addr as u32) + (count as u32) - 1;
-        if last > u16::MAX as u32 {
-            return v;
-        }
-        for i in 0..count {
-            let Some(value) = crate::bus::backends::read_hold_reg(addr.wrapping_add(i)) else {
-                return heapless::Vec::new();
-            };
-            let _ = v.push(value);
-        }
-        v
+        crate::bus::backends::read_hold_regs(addr, count)
     }
 
     fn read_input_registers(&self, addr: u16, count: u16) -> heapless::Vec<u16, MAX_REGS_PER_READ> {

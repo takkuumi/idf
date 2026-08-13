@@ -7,9 +7,8 @@
 //! 改为直接调用 ESP-IDF C API (uart_param_config / uart_set_pin / uart_set_mode)
 //! 以获得完整控制。回调通过 esp_idf_sys::uart_write_bytes / uart_read_bytes。
 
-use std::time::Duration;
-
 use esp_idf_sys::*;
+use std::time::Duration;
 
 use crate::error::{AppError, AppResult};
 use crate::rs485::config::Rs485Config;
@@ -130,7 +129,6 @@ impl Rs485Port {
         timeout_ms: u64,
     ) -> AppResult<heapless::Vec<u8, 256>> {
         self.write(request)?;
-        std::thread::sleep(Duration::from_millis(2)); // 切换方向延迟
         let mut buf = [0u8; 256];
         let n = self.read(&mut buf, timeout_ms)?;
         let mut out = heapless::Vec::new();

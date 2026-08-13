@@ -944,9 +944,10 @@ pub fn process_tick() {
         static TICK_DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let tick = TICK_DIV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data
+        // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data。
+        const ADV_RETRY_TICKS: u32 = 5_000 / crate::config::BLE_PROCESS_PERIOD_MS as u32;
         // LOOP17: 统一使用 config_adv_data() 入口 (与 start/update_gap_device_name 一致)
-        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && tick % 50 == 0 {
+        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && tick % ADV_RETRY_TICKS == 0 {
             log::warn!("[ble_at] advertising not active, retrying config_adv_data");
             config_adv_data();
         }
@@ -1029,12 +1030,13 @@ pub fn process_tick() {
         }
     }
 
-    // 每 100 次主循环 (~10s) 将心跳完整帧排到响应之后。所有帧必须经过同一
+    // 每 ~10s 将心跳完整帧排到响应之后。所有帧必须经过同一
     // 字节流队列，禁止在大帧的 ATT 分片之间插入另一条通知。
     use std::sync::atomic::{AtomicU16, Ordering};
+    const HEARTBEAT_TICKS: u16 = (10_000 / crate::config::BLE_PROCESS_PERIOD_MS) as u16;
     static HB_DIV: AtomicU16 = AtomicU16::new(0);
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
-    if n % 100 == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
+    if n % HEARTBEAT_TICKS == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
         let pdu = build_heartbeat_pdu(1);
         let mut frame: heapless::Vec<u8, 18> = heapless::Vec::new();
         let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]);

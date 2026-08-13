@@ -69,6 +69,8 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         .spawn(move || {
             // LOOP14: 所有长期运行 pthread 必须订阅 WDT
             health::subscribe_wdt();
+            let mut last_warn = std::time::Instant::now() - Duration::from_secs(10);
+            let mut suppressed_warns = 0u32;
             loop {
                 // 心跳: 每轮询周期一次
                 TASK_HB.tick();
@@ -76,13 +78,19 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 crate::health::feed_wdt();
                 for item in POLL_TABLE {
                     if let Err(e) = poll_with_retry(&mut port, *item, max_retry, timeout_ms) {
-                        log::warn!(
-                            "[mb-rtu-master] poll slave={} fc={:02x} failed after {} retries: {}",
-                            item.slave,
-                            item.func,
-                            max_retry,
-                            e
-                        );
+                        suppressed_warns = suppressed_warns.saturating_add(1);
+                        if last_warn.elapsed() >= Duration::from_secs(10) {
+                            log::warn!(
+                                "[mb-rtu-master] poll slave={} fc={:02x} failed after {} retries: {} (suppressed={})",
+                                item.slave,
+                                item.func,
+                                max_retry,
+                                e,
+                                suppressed_warns.saturating_sub(1)
+                            );
+                            last_warn = std::time::Instant::now();
+                            suppressed_warns = 0;
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(poll_interval_ms));
@@ -111,7 +119,9 @@ fn poll_with_retry(
             Err(e) => {
                 log::debug!("[mb-rtu-master] attempt {} failed: {}", attempt + 1, e);
                 last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(100));
+                if attempt < max_retry {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }

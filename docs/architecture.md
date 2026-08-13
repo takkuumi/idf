@@ -1,6 +1,6 @@
 # ESP32-S3R2 任务与内存架构
 
-> 更新：2026-07-30。容量数字来自最终 `cargo build` 生成的 sdkconfig 和 linker map。
+> 更新：2026-08-13。容量数字来自最终 `cargo build` 生成的 sdkconfig 和 linker map。
 
 ## 硬件容量边界
 
@@ -32,7 +32,7 @@
 
 | 用户任务 | 栈 | 数量 | 调度职责 |
 |---|---:|---:|---|
-| main | 32KB | 1 | 20ms tick、TCP/IO、100ms AI/AO/BLE 分频、健康监控 |
+| main | 32KB | 1 | 5ms TCP/DO、10ms BLE、20ms DI、100ms AI/AO、健康监控 |
 | DeviceActor | 16KB | 1 | NVS 串行持久化；3010B blob 已移至 PSRAM 缓冲 |
 | mb-rtu-master | 8KB | 1 | RS485 主站 |
 | mb-rtu-slave | 8KB | 1 | RS485 从站 |
@@ -52,9 +52,10 @@
 
 Modbus TCP 默认 502/503/504/5002，端口寄存器 2243-2246 持久化后可在运行时重绑；
 保留 8 连接上限、5 分钟 idle 回收、2 秒发送背压超时和原 MBAP/PDU 格式。连接建立
-只在预留 `Vec<Client>` 中增加状态，不创建 pthread。状态机由 main_loop 每 20ms
-非阻塞轮询；一次性预留失败会返回启动错误，运行中不扩容。每个周期限制 accept
-数量，写端背压有独立超时，异常客户端不能无限占用调度循环。
+只在预留 `Vec<Client>` 中增加状态，不创建 pthread。状态机由 main_loop 每 5ms
+非阻塞轮询；一次性预留失败会返回启动错误，运行中不扩容。单连接每轮最多处理
+4 个流水请求，每个周期限制 accept 数量，写端背压有独立超时，异常客户端不能
+无限占用调度循环。
 
 连接状态总分配超过 4KB，按当前 `SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 策略进入
 PSRAM；socket和 DMA 仍保留在 internal SRAM。NFC 的两个 4KB 工作区也通过 capability
@@ -79,6 +80,7 @@ FC=01/02/0F 不再将标准最大 2,000 位展开为 `heapless::Vec<bool, 2000>`
 
 BTC 回调只执行：GATT 写响应、最多 512 字节分片重组、固定 4 槽 MPSC 入队。
 Modbus/手持机兼容命令在 main_loop 消费，原事务 ID、CRC、长度字段和通知帧格式不变。
+业务请求和 notification 按 10ms 调度；广播自愈仍为 5s，心跳仍为 10s。
 因此 `metuory-wireless-management-app-1.0.78` 的协议表面不变，而业务调用深度不再
 叠加到 BTC_TASK。下行通知按实际协商的 `ATT_MTU - 3` 无堆分片，拥塞/API 失败时
 保留队列；手机端 `CommandCodecUtil.decodeList()` 已确认可跨 notification 重组。

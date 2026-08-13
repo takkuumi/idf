@@ -1,6 +1,6 @@
 //! Modbus TCP Server（四端口、主循环多连接状态机）。
 //!
-//! 所有监听 socket 和最多 8 个客户端都由 main_loop 的 20ms 非阻塞 tick 处理。
+//! 所有监听 socket 和最多 8 个客户端都由 main_loop 的 5ms 非阻塞 tick 处理。
 //! 模块不创建 pthread，因此不再申请 16KB internal SRAM 任务栈，连接建立也不会
 //! 增加任务数量。MBAP/PDU 格式和四个监听端口保持不变。
 
@@ -20,6 +20,12 @@ const MBAP_PREFIX_LEN: usize = 6;
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MBAP_LENGTH: usize = MODBUS_TCP_MAX_MBAP_LENGTH;
 const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
+/// 同一连接在单次 5ms tick 内最多处理的流水请求数。
+/// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 8 客户端公平调度。
+const MAX_REQUESTS_PER_POLL: usize = 4;
+/// 服务器每个 5ms tick 的总请求预算。单连接流水仍最多 4 帧，
+/// 但所有连接共享预算，避免 8 个客户端在同一轮执行 32 次后端事务。
+const MAX_REQUESTS_PER_TICK: usize = 2;
 const _: () = assert!(MAX_ADU_SIZE == MBAP_PREFIX_LEN + MAX_MBAP_LENGTH);
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -59,37 +65,47 @@ impl Client {
     }
 
     /// 返回 false 表示连接应关闭。每轮只完成有限工作，避免单客户端饿死其他连接。
-    fn poll(&mut self, backend: &BusBackend) -> bool {
-        if !self.flush_tx() {
-            return false;
-        }
-
-        if self.tx_len == 0 && !self.process_buffered_request(backend) {
-            return false;
-        }
-        if self.tx_len != 0 {
-            return self.flush_tx() && !self.is_timed_out();
-        }
-
-        match self.stream.read(&mut self.rx[self.rx_len..]) {
-            Ok(0) => return false,
-            Ok(n) => {
-                self.rx_len += n;
-                self.last_activity = Instant::now();
+    fn poll(&mut self, backend: &BusBackend, budget: &mut usize) -> bool {
+        for _ in 0..MAX_REQUESTS_PER_POLL {
+            if *budget == 0 {
+                break;
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => {
-                log::debug!("[mb-tcp] conn_id={} read: {}", self.id, e);
+            if !self.flush_tx() {
                 return false;
             }
-        }
+            // socket 发送窗口已满，保留响应并立即让出，不继续读新请求。
+            if self.tx_len != 0 {
+                break;
+            }
 
-        if self.tx_len == 0 && !self.process_buffered_request(backend) {
-            return false;
-        }
-        if self.tx_len != 0 && !self.flush_tx() {
-            return false;
+            if !self.process_buffered_request(backend) {
+                return false;
+            }
+            if self.tx_len != 0 {
+                *budget = budget.saturating_sub(1);
+                continue;
+            }
+
+            match self.stream.read(&mut self.rx[self.rx_len..]) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    self.rx_len += n;
+                    self.last_activity = Instant::now();
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    log::debug!("[mb-tcp] conn_id={} read: {}", self.id, e);
+                    return false;
+                }
+            }
+
+            if !self.process_buffered_request(backend) {
+                return false;
+            }
+            if self.tx_len != 0 {
+                *budget = budget.saturating_sub(1);
+            }
         }
 
         if self.is_timed_out() {
@@ -214,7 +230,7 @@ pub fn start() -> AppResult<()> {
     Ok(())
 }
 
-/// main_loop 每 20ms 调用一次。所有 socket 均为 nonblocking，每轮工作有界。
+/// main_loop 每 5ms 调用一次。所有 socket 均为 nonblocking，每轮工作有界。
 pub fn tick_tcp_server() {
     let _ = SERVER_STATE.with_mut(|state| {
         if Instant::now() >= state.next_port_check {
@@ -256,13 +272,14 @@ pub fn tick_tcp_server() {
         }
         accept_pending(&state.listeners, &mut state.clients);
 
+        let mut request_budget = MAX_REQUESTS_PER_TICK;
         let mut i = 0;
         while i < state.clients.len() {
-            if state.clients[i].poll(&BusBackend) {
+            if state.clients[i].poll(&BusBackend, &mut request_budget) {
                 i += 1;
             } else {
                 let client = state.clients.swap_remove(i);
-                log::info!("[mb-tcp] conn_id={} from {} closed", client.id, client.peer);
+                log::debug!("[mb-tcp] conn_id={} from {} closed", client.id, client.peer);
                 CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -316,7 +333,7 @@ fn accept_pending(listeners: &[TcpListener], clients: &mut Vec<Client>) {
                         Ok(client) => {
                             clients.push(client);
                             CONN_COUNT.store(clients.len() as u32, Ordering::Relaxed);
-                            log::info!("[mb-tcp] conn_id={id} from {peer} accepted");
+                            log::debug!("[mb-tcp] conn_id={id} from {peer} accepted");
                         }
                         Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
                     }
@@ -363,6 +380,8 @@ mod tests {
     #[test]
     fn test_tcp_uses_one_bounded_main_loop_state() {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
+        assert_eq!(MAX_REQUESTS_PER_POLL, 4);
+        assert_eq!(MAX_REQUESTS_PER_TICK, 2);
         assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
     }
 

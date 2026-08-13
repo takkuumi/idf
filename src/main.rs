@@ -54,7 +54,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_sys::{self as _};
 
-use crate::config::MAIN_LOOP_PERIOD_MS;
+use crate::config::{BLE_PROCESS_PERIOD_MS, MAIN_LOOP_PERIOD_MS};
 use crate::error::AppResult;
 use crate::hal::Hal;
 
@@ -296,18 +296,26 @@ fn main_loop(
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
     let start = std::time::Instant::now();
     let mut next_tick = start;
+    let mut max_work_us = 0u64;
+    let mut deadline_miss_count = 0u32;
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
     // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
 
     loop {
+        let loop_started = std::time::Instant::now();
         tick = tick.wrapping_add(1);
         MAIN_HB.tick();
 
-        // 每个周期喂狗 (20ms), 远小于 WDT 超时 10s
+        // 每个周期喂狗 (5ms), 远小于 WDT 超时 10s
         health::feed_wdt();
 
-        // 20ms 基准调度；AI/AO 按 5 分频保持 100ms 周期。
+        // 网络请求先于慢速 I2C/ADC 路径执行。这样即使外设异常接近
+        // 交易超时边界，已到达的 TCP 请求也不会被压在本轮硬件访问之后。
+        #[cfg(feature = "modbus-tcp")]
+        crate::modbus::tcp_server::tick_tcp_server();
+
+        // 5ms 网络基准调度；AI/AO 分频保持 100ms 周期。
         if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             #[cfg(feature = "ai-ao")]
             {
@@ -316,15 +324,17 @@ fn main_loop(
             }
         }
 
-        // DI 每 20ms 去抖；DO 每 20ms 消费 dirty，10s 另有兜底同步。
-        #[cfg(feature = "io-di-do")]
-        crate::io::di::tick_di_scan(&hal);
+        // DI 仍按 20ms 去抖，避免网络提速后把 I2C 轮询负载放大 4 倍。
+        if tick % (20 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            #[cfg(feature = "io-di-do")]
+            crate::io::di::tick_di_scan(&hal);
+        }
+
+        // DO dirty 检查是单原子操作，每 5ms 运行；只有值变化才访问 I2C。
+        // 这使 TCP/RTU/BLE/Web 点位控制到物理输出的额外调度延迟不超过 5ms。
         #[cfg(feature = "io-di-do")]
         crate::io::do_::tick_do_output(&hal);
 
-        // Modbus TCP 使用同一个非阻塞主调度，不再创建 16KB pthread。
-        #[cfg(feature = "modbus-tcp")]
-        crate::modbus::tcp_server::tick_tcp_server();
         // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
         #[cfg(feature = "io-di-do")]
         {
@@ -337,8 +347,8 @@ fn main_loop(
             crate::ethernet::w5500::tick_eth_heartbeat();
         }
 
-        // BLE 通知发送保持 100ms 周期，替代独立线程。
-        if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        // BLE 请求与通知按 10ms 调度，避免手持机配置命令额外等待 100ms。
+        if tick % (BLE_PROCESS_PERIOD_MS as u32 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             #[cfg(feature = "ble-at")]
             ble_at::process_tick();
         }
@@ -456,26 +466,44 @@ fn main_loop(
                 ota_validation_done = confirm_new_firmware();
             }
 
-            // LOOP8: 每 60s 打印内存使用 (7×24 运维监控)
+            // LOOP8: 每 60s 打印内存/运行时间。完整栈表每 10 分钟打印，
+            // 避免 7 行串口 INFO 每分钟阻塞 main-loop 并制造端口延迟尖峰。
             if tick % (60000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
                 let free_heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
                 let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };
                 log::info!(
-                    "[mem] free_heap={}KB min_heap={}KB uptime={}s",
+                    "[main] uptime={}s free_heap={}KB min_heap={}KB tick={}",
+                    uptime,
                     free_heap / 1024,
                     min_heap / 1024,
-                    uptime
+                    tick
                 );
-                health::print_stack_watermarks();
                 if free_heap < 20 * 1024 {
                     log::error!("[mem] LOW MEMORY WARNING: free_heap < 20KB!");
                 }
             }
-
-            log::info!("[main] uptime={}s tick={}", uptime, tick);
+            if tick % (600_000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+                health::print_stack_watermarks();
+            }
         }
 
-        // 以绝对 deadline 调度，避免“业务耗时 + 固定 sleep”使 20ms 周期持续漂移。
+        let work_us = loop_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        max_work_us = max_work_us.max(work_us);
+        if work_us > MAIN_LOOP_PERIOD_MS * 1_000 {
+            deadline_miss_count = deadline_miss_count.saturating_add(1);
+        }
+        if tick % (60_000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            log::info!(
+                "[perf] main_loop period={}ms max_work={}us deadline_miss={}",
+                MAIN_LOOP_PERIOD_MS,
+                max_work_us,
+                deadline_miss_count
+            );
+            max_work_us = 0;
+            deadline_miss_count = 0;
+        }
+
+        // 以绝对 deadline 调度，避免“业务耗时 + 固定 sleep”使 5ms 周期持续漂移。
         next_tick += period;
         let now = std::time::Instant::now();
         if let Some(remaining) = next_tick.checked_duration_since(now) {

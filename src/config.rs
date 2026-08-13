@@ -18,8 +18,15 @@
 pub const APP_NAME: &str = "esp32s3-iot-gateway";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 主循环周期 (ms)
-pub const MAIN_LOOP_PERIOD_MS: u64 = 20;
+/// 主循环网络调度周期 (ms)。
+///
+/// TCP socket 是非阻塞状态机，5ms tick 把单请求额外调度延迟从
+/// 0..20ms 收紧到 0..5ms。DI/DO、AI/AO 和 BLE 在 main_loop 中继续按各自
+/// 分频周期执行，不因网络提速而增加硬件总线负载。
+pub const MAIN_LOOP_PERIOD_MS: u64 = 5;
+/// BLE 请求处理和 notification 发送周期。贴近常见 7.5ms BLE 连接间隔，
+/// 同时保留 main_loop 的其他实时任务预算。
+pub const BLE_PROCESS_PERIOD_MS: u64 = 10;
 
 // ----------------------------------------------------------------------------
 // GPIO 引脚分配 (ESP32-S3R2)
@@ -314,7 +321,7 @@ pub mod modbus {
     ///
     /// 内存优化: 由 `tcp_server::tick_tcp_server` 在 main-loop 多路复用所有端口，
     /// 而非每端口一个监听线程 (LOOP8 曾因第 5 个 pthread 触发 ENOMEM 而裁剪到 1 端口).
-    /// 20ms tick + 非阻塞 accept 不再需要额外任务栈。
+    /// 5ms tick + 非阻塞 accept 不再需要额外任务栈。
     pub mod tcp {
         /// 默认 4 端口 (对齐参考固件 ext_tcp_port1..4 = {502,503,504,5002}).
         /// 运行时端口可由 Modbus 写 HOLD_TCP_COM_BASE..3 (2243-2246) 动态修改.
@@ -654,6 +661,8 @@ mod tests {
     #[test]
     fn test_app_metadata() {
         assert_eq!(APP_NAME, "esp32s3-iot-gateway");
-        assert_eq!(MAIN_LOOP_PERIOD_MS, 20);
+        assert_eq!(MAIN_LOOP_PERIOD_MS, 5);
+        assert_eq!(BLE_PROCESS_PERIOD_MS, 10);
+        assert_eq!(BLE_PROCESS_PERIOD_MS % MAIN_LOOP_PERIOD_MS, 0);
     }
 }
