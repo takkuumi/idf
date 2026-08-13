@@ -86,6 +86,31 @@ impl BusI2c {
         Ok(())
     }
 
+    /// PCA9555 寄存器指针会自动递增；一次事务连续写两个端口，减少软件 I2C
+    /// START/地址/寄存器开销，并保证双端口更新属于同一总线事务。
+    fn write_regs2(&self, addr: u8, reg: u8, data: [u8; 2]) -> AppResult<()> {
+        let i2c = self.i2c.lock();
+        i2c.start();
+        if !i2c.write_byte(addr) {
+            i2c.stop();
+            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK addr")));
+        }
+        if !i2c.write_byte(reg) {
+            i2c.stop();
+            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK reg")));
+        }
+        for byte in data {
+            if !i2c.write_byte(byte) {
+                i2c.stop();
+                return Err(AppError::Io(format!(
+                    "I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK data"
+                )));
+            }
+        }
+        i2c.stop();
+        Ok(())
+    }
+
     fn read_reg(&self, addr: u8, reg: u8) -> AppResult<u8> {
         let i2c = self.i2c.lock();
         i2c.start();
@@ -106,6 +131,28 @@ impl BusI2c {
         i2c.stop();
         Ok(val)
     }
+
+    /// 连续读取 input port 0/1。第一个字节回 ACK，第二个字节回 NACK 后 STOP。
+    fn read_regs2(&self, addr: u8, reg: u8) -> AppResult<[u8; 2]> {
+        let i2c = self.i2c.lock();
+        i2c.start();
+        if !i2c.write_byte(addr) {
+            i2c.stop();
+            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK addr")));
+        }
+        if !i2c.write_byte(reg) {
+            i2c.stop();
+            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK reg")));
+        }
+        i2c.start();
+        if !i2c.write_byte(addr | 1) {
+            i2c.stop();
+            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK read")));
+        }
+        let data = [i2c.read_byte(true), i2c.read_byte(false)];
+        i2c.stop();
+        Ok(data)
+    }
 }
 
 // ============================================================================
@@ -119,6 +166,8 @@ pub struct Pca9555Duo {
     last_io: Spin<(u8, u8)>,
     /// Last written LED port values (inverted), for incremental write
     last_led: Spin<(u8, u8)>,
+    /// Last raw DI values mirrored to the DI LED expander.
+    last_di_led: Spin<(u8, u8)>,
     status_led: Spin<u8>,
 }
 
@@ -174,6 +223,7 @@ impl Pca9555Duo {
             do_cache: AtomicU16::new(0x0000),
             last_io: Spin::new((0x00, 0x00)),
             last_led: Spin::new((0xFF, 0xFF)), // init=off matches LED init above
+            last_di_led: Spin::new((0xFF, 0xFF)),
             status_led: Spin::new(other_led),
         })
     }
@@ -219,8 +269,13 @@ impl Pca9555Duo {
 
     /// Update DI LEDs from raw input values.
     fn update_di_leds(&self, port0: u8, port1: u8) -> AppResult<()> {
-        self.led_bus.write_reg(ADDR_DI_LED, REG_OUTPUT_0, port0)?;
-        self.led_bus.write_reg(ADDR_DI_LED, REG_OUTPUT_1, port1)?;
+        let mut last = self.last_di_led.lock();
+        if *last == (port0, port1) {
+            return Ok(());
+        }
+        self.led_bus
+            .write_regs2(ADDR_DI_LED, REG_OUTPUT_0, [port0, port1])?;
+        *last = (port0, port1);
         Ok(())
     }
 }
@@ -230,8 +285,7 @@ impl DigitalIo for Pca9555Duo {
     fn do_count(&self) -> usize { 16 }
 
     fn read_di_all(&self) -> AppResult<u64> {
-        let raw0 = self.io_bus.read_reg(ADDR_DI_IO, REG_INPUT_0)?;
-        let raw1 = self.io_bus.read_reg(ADDR_DI_IO, REG_INPUT_1)?;
+        let [raw0, raw1] = self.io_bus.read_regs2(ADDR_DI_IO, REG_INPUT_0)?;
 
         // Update DI LEDs with raw value (matching reference: savedata = backdata)
         let _ = self.update_di_leds(raw0, raw1);

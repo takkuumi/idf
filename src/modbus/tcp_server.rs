@@ -24,9 +24,9 @@ const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
 /// 同一连接在单次 5ms tick 内最多处理的流水请求数。
 /// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 8 客户端公平调度。
 const MAX_REQUESTS_PER_POLL: usize = 4;
-/// 服务器每个 5ms tick 的总请求预算。单连接流水仍最多 4 帧，
-/// 但所有连接共享预算，避免 8 个客户端在同一轮执行 32 次后端事务。
-const MAX_REQUESTS_PER_TICK: usize = 2;
+/// 服务器每个 5ms tick 的总请求预算。标准最大 FC03 响应实机峰值约 6ms，
+/// 因此每轮只执行一个业务请求；已有响应发送和超时检查仍会轮询所有客户端。
+const MAX_REQUESTS_PER_TICK: usize = 1;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
 const LISTENER_RECOVERY_DELAY: Duration = Duration::from_secs(1);
@@ -542,7 +542,7 @@ mod tests {
     fn test_tcp_uses_one_bounded_main_loop_state() {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
         assert_eq!(MAX_REQUESTS_PER_POLL, 4);
-        assert_eq!(MAX_REQUESTS_PER_TICK, 2);
+        assert_eq!(MAX_REQUESTS_PER_TICK, 1);
         assert_eq!(MAX_ACCEPTS_PER_TICK, 2);
         assert!(cfg::PARTIAL_FRAME_TIMEOUT_MS < cfg::IDLE_TIMEOUT_MS);
         assert!(cfg::KEEPALIVE_COUNT > 0);

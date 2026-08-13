@@ -542,7 +542,7 @@ fn main_loop(
                     internal_min / 1024,
                     tick
                 );
-                if internal_free < 32 * 1024 {
+                if internal_free < 32 * 1024 || internal_min < 32 * 1024 {
                     log::error!(
                         "[mem] LOW INTERNAL SRAM: free={}B min={}B",
                         internal_free,

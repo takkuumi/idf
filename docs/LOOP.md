@@ -12,6 +12,21 @@
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
+## LOOP33 实机热点定向收敛（2026-08-13）
+
+- debug 九阶段遥测在 8 连接、400 次 FC03 125 words + Web 查询压力下定位到：
+  DI 峰值 `14,064us`、TCP 峰值 `12,254us`，首分钟产生 181 次 5ms deadline miss；
+  BLE 仅 `282us`、AI/AO `848us`，不是当前瓶颈。
+- F16 PCA9555 DI 扫描此前每 20ms 执行 2 次输入读 + 2 次 DI LED 写，共 4 个
+  软件 I2C 事务。现利用 PCA9555 寄存器自动递增，将双端口输入合并为一次连续读；
+  DI LED 仅在原始值变化时执行一次连续双字节写。采样周期、去抖、位序和 LED 语义不变。
+- Modbus TCP 全局业务预算由每 5ms 2 个请求收紧为 1 个；所有客户端每轮仍执行
+  发送、超时和公平轮转，四端口、8 连接及 FC03 125 words 标准上限不变。
+- internal SRAM 当前值或历史最低值低于 32KB 均告警。首轮压力实测当前约 35KB、
+  历史最低 18KB，说明不能用约 2MB 的含 PSRAM 总 heap 代替片上内存监控。
+- 默认、F3、F4 check、测试编译和 release 构建通过；真实设备同口径压力对比待本
+  提交完整重烧后记录。
+
 ## LOOP32 实机运行诊断与构建追溯（2026-08-13）
 
 - 使用完整分区命令将 LOOP31 固件写入真实 ESP32-S3 rev 0.2（8MB Flash、2MB
@@ -57,7 +72,7 @@
   reserve、20 sockets、DIO/40MHz/8MB Flash、旧 NVS 地址和三个 2.25MB 应用分区。
   任一关键配置漂移都会中止构建，防止未经实机验证的配置进入客户固件。
 - Modbus TCP 架构文档与当前实现统一：四监听端口、8 个固定客户端、260B 标准最大
-  ADU、5ms 非阻塞轮询、每 tick 全局 2 个请求、keepalive 与监听器退避恢复。
+  ADU、5ms 非阻塞轮询、当前每 tick 全局 1 个请求、keepalive 与监听器退避恢复。
 - 完整业务 release 应用镜像实测 `1,626,928B`，约占单 OTA 槽 69.0%；静态内部
   DRAM `.data + .bss = 53,853B`。交付文档增加 OTA 槽容量硬检查和体积回归基线。
 - 默认、F3、F4 编译检查与 `cargo test --bin gateway --no-run` 通过；本轮不修改
