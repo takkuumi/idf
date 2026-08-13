@@ -610,20 +610,13 @@ unsafe extern "C" fn gatts_event_cb(
             // Android BLEDataSyncManager.onStateConnected 会发心跳命令,
             // 但有时 Service 未发现, 写入失败, 导致数据流卡死。
             // 我们主动发心跳, 触发 Android 的 onHeartbeatChanged → readHardwareInfo
-            let hb = {
-                use std::sync::atomic::{AtomicU16, Ordering};
-                static HB: AtomicU16 = AtomicU16::new(0);
-                HB.fetch_add(1, Ordering::Relaxed)
-            };
-            // 用 BLE 帧格式: tx_id=0, proto_id=0, pdu_data=[unit=1, func=0x11, hb_hi, hb_lo]
-            let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = frame.extend_from_slice(&[0u8, 0]); // tx_id=0
-            let _ = frame.extend_from_slice(&[0u8, 0]); // proto_id=0
-            let _ = frame.extend_from_slice(&4u16.to_be_bytes()); // length=4
-            let _ = frame.push(1); // unit
-            let _ = frame.push(0x11); // func=heartbeat
-            let _ = frame.push((hb >> 8) as u8);
-            let _ = frame.push((hb & 0xFF) as u8);
+            // 心跳业务数据必须与请求应答完全一致。Android parseHeartbeat 把
+            // func 后的数据解析为 slave + runStatus + terminal(6-byte MAC)。
+            let pdu = build_heartbeat_pdu(1);
+            let mut frame: heapless::Vec<u8, 18> = heapless::Vec::new();
+            let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]); // tx_id=0, proto_id=0
+            let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+            let _ = frame.extend_from_slice(&pdu);
             let crc = modbus_crc16(&frame[..frame.len()]);
             let _ = frame.push(crc as u8);
             let _ = frame.push((crc >> 8) as u8);
@@ -1040,23 +1033,20 @@ pub fn process_tick() {
     // 字节流队列，禁止在大帧的 ATT 分片之间插入另一条通知。
     use std::sync::atomic::{AtomicU16, Ordering};
     static HB_DIV: AtomicU16 = AtomicU16::new(0);
-    static HB_SEQ: AtomicU16 = AtomicU16::new(0);
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
     if n % 100 == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
-        let seq = HB_SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut frame: heapless::Vec<u8, 16> = heapless::Vec::new();
-        let _ = frame.extend_from_slice(&[0u8, 0, 0, 0, 0, 4]);
-        let _ = frame.push(1);
-        let _ = frame.push(0x11);
-        let _ = frame.push((seq >> 8) as u8);
-        let _ = frame.push((seq & 0xFF) as u8);
+        let pdu = build_heartbeat_pdu(1);
+        let mut frame: heapless::Vec<u8, 18> = heapless::Vec::new();
+        let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]);
+        let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+        let _ = frame.extend_from_slice(&pdu);
         let crc = crate::modbus::shared::modbus_crc16(&frame);
         let _ = frame.push(crc as u8);
         let _ = frame.push((crc >> 8) as u8);
         if let Some(mut btx) = BINARY_TX.try_lock() {
             if btx.len() + frame.len() <= btx.capacity() {
                 let _ = btx.extend_from_slice(&frame);
-                log::debug!("[ble_at] heartbeat #{} queued", seq);
+                log::debug!("[ble_at] periodic heartbeat queued");
             }
         }
     }
@@ -1181,12 +1171,16 @@ fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> b
 //       crc_begin = pdu_end - 2
 //       PDU (转 Modbus RTU) = data[6..crc_begin]
 //       即 unit_id + func + data, 与 Modbus RTU slave 帧一致
-// 心跳帧 func == 0x11, 直接回递增序列, 不进入 Modbus 通路
+// 心跳帧 func == 0x11, 返回运行状态与 BLE MAC, 不进入 Modbus 通路
 
-fn heartbeat_counter() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static HB: AtomicU16 = AtomicU16::new(0);
-    HB.fetch_add(1, Ordering::Relaxed)
+fn build_heartbeat_pdu(unit: u8) -> [u8; 10] {
+    let mut mac = [0u8; 6];
+    unsafe {
+        esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2);
+    } // ESP_MAC_BT=2
+    [
+        unit, 0x11, unit, 0x01, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    ]
 }
 
 /// 返回完整手持机二进制帧所需字节数。None 表示头部尚不完整或长度非法。
@@ -1316,29 +1310,15 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         // metuory parseHeartbeat: slave=data[0], runStatus=data[1], terminal=data[2..]
         // pdu_data = [unit, func=0x11, slave_addr, runStatus, terminal(6)] = 10 字节
         // BLE 帧: 2+2+2+10+2 = 18 字节
-        let hb = heartbeat_counter();
-        let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
-        let _ = rsp.push(unit); // pdu[0] = unit_id (Modbus slave addr)
-        let _ = rsp.push(func); // pdu[1] = func = 0x11
-        let _ = rsp.push(unit); // pdu[2] = slave address (echo unit)
-        let _ = rsp.push(0x01); // pdu[3] = runStatus = 1 (运行中)
-        // terminal: 6 字节 BLE MAC (设备标识, metuory 存入 BLEDataSyncModel)
-        let mut mac = [0u8; 6];
-        unsafe {
-            esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2);
-        } // ESP_MAC_BT=2
-        for b in mac {
-            let _ = rsp.push(b);
-        }
+        let rsp = build_heartbeat_pdu(unit);
         log::debug!(
-            "[ble_at] heartbeat: hb_seq={} mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            hb,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+            "[ble_at] heartbeat: terminal={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            rsp[4],
+            rsp[5],
+            rsp[6],
+            rsp[7],
+            rsp[8],
+            rsp[9]
         );
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
@@ -3037,14 +3017,11 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_counter_increments() {
-        // 多次调用, 验证计数器递增
-        let a = heartbeat_counter();
-        let b = heartbeat_counter();
-        let c = heartbeat_counter();
-        // b > a, c > b
-        assert!(b > a);
-        assert!(c > b);
+    fn test_heartbeat_payload_matches_android_parser() {
+        let pdu = build_heartbeat_pdu(1);
+        assert_eq!(pdu.len(), 10);
+        assert_eq!(&pdu[..4], &[1, 0x11, 1, 1]);
+        assert!(pdu[4..].iter().any(|&byte| byte != 0));
     }
 }
 
@@ -3213,15 +3190,10 @@ mod tests_ble_cmd {
 
     #[test]
     fn test_heartbeat_response_format() {
-        // 心跳帧: func=0x11, response = [unit][0x11][hb_hi][hb_lo]
-        // 我们的 send_ble_frame 会包装成 BLE 帧
+        // Android parseHeartbeat 期望 func 后为 slave/runStatus/terminal MAC。
         let tx_id: u16 = 0x1234;
         let proto_id: u16 = 0x5678;
-        let unit: u8 = 1;
-        let hb: u16 = 0x0042;
-        let mut pdu = vec![unit, 0x11];
-        pdu.push((hb >> 8) as u8);
-        pdu.push((hb & 0xFF) as u8);
+        let pdu = build_heartbeat_pdu(1);
 
         // 构造 BLE 帧
         let mut frame = Vec::new();
@@ -3239,7 +3211,9 @@ mod tests_ble_cmd {
         assert_eq!(len as usize, pdu.len());
         assert_eq!(func, 0x11);
         assert!(crc_ok);
-        assert_eq!(pdu_data, pdu);
+        assert_eq!(pdu_data, pdu.as_slice());
+        assert_eq!(&pdu_data[2..4], &[1, 1]);
+        assert_eq!(pdu_data[4..].len(), 6);
     }
 
     #[test]
