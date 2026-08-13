@@ -59,6 +59,56 @@ use crate::error::AppResult;
 use crate::hal::Hal;
 
 static MAIN_HB: health::TaskHb = health::TaskHb::new("main");
+const BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
+
+struct MainLoopPerf {
+    #[cfg(debug_assertions)]
+    phase_peaks_us: [u64; 9],
+}
+
+impl MainLoopPerf {
+    const fn new() -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            phase_peaks_us: [0; 9],
+        }
+    }
+
+    #[inline]
+    fn measure<F>(&mut self, phase: usize, operation: F)
+    where
+        F: FnOnce(),
+    {
+        #[cfg(debug_assertions)]
+        let started = std::time::Instant::now();
+        operation();
+        #[cfg(debug_assertions)]
+        {
+            let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.phase_peaks_us[phase] = self.phase_peaks_us[phase].max(elapsed);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = phase;
+    }
+
+    #[cfg(debug_assertions)]
+    fn record_elapsed(&mut self, phase: usize, started: std::time::Instant) {
+        let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.phase_peaks_us[phase] = self.phase_peaks_us[phase].max(elapsed);
+    }
+
+    fn log_and_reset(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let p = &self.phase_peaks_us;
+            log::info!(
+                "[perf] phase_peak_us tcp={} ai_ao={} di={} do={} persist={} eth={} ble={} events={} housekeeping={}",
+                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
+            );
+            self.phase_peaks_us.fill(0);
+        }
+    }
+}
 
 fn main() -> AppResult<()> {
     // 1. 初始化日志
@@ -66,6 +116,7 @@ fn main() -> AppResult<()> {
 
     log::info!("================================================");
     log::info!("{} v{}", config::APP_NAME, config::APP_VERSION);
+    log::info!("[build] id={BUILD_ID}");
     log::info!("ESP32-S3R2 IoT Gateway starting...");
     log::info!("================================================");
 
@@ -298,6 +349,7 @@ fn main_loop(
     let mut next_tick = start;
     let mut max_work_us = 0u64;
     let mut deadline_miss_count = 0u32;
+    let mut perf = MainLoopPerf::new();
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
     // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
@@ -313,50 +365,51 @@ fn main_loop(
         // 网络请求先于慢速 I2C/ADC 路径执行。这样即使外设异常接近
         // 交易超时边界，已到达的 TCP 请求也不会被压在本轮硬件访问之后。
         #[cfg(feature = "modbus-tcp")]
-        crate::modbus::tcp_server::tick_tcp_server();
+        perf.measure(0, crate::modbus::tcp_server::tick_tcp_server);
 
         // 5ms 网络基准调度；AI/AO 分频保持 100ms 周期。
         if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             #[cfg(feature = "ai-ao")]
-            {
+            perf.measure(1, || {
                 crate::channel::ai::tick_ai_sample(&hal);
                 crate::channel::ao::tick_ao_output(&hal);
-            }
+            });
         }
 
         // DI 仍按 20ms 去抖，避免网络提速后把 I2C 轮询负载放大 4 倍。
         if tick % (20 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             #[cfg(feature = "io-di-do")]
-            crate::io::di::tick_di_scan(&hal);
+            perf.measure(2, || crate::io::di::tick_di_scan(&hal));
         }
 
         // DO dirty 检查是单原子操作，每 5ms 运行；只有值变化才访问 I2C。
         // 这使 TCP/RTU/BLE/Web 点位控制到物理输出的额外调度延迟不超过 5ms。
         #[cfg(feature = "io-di-do")]
-        crate::io::do_::tick_do_output(&hal);
+        perf.measure(3, || crate::io::do_::tick_do_output(&hal));
 
         // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
         #[cfg(feature = "io-di-do")]
-        {
+        perf.measure(4, || {
             let now_ms = unsafe { esp_idf_sys::esp_timer_get_time() } as u64 / 1000;
             crate::device::persist_do_bits_throttled(now_ms as u32);
-        }
+        });
 
         // ETH 心跳 5s，取消独立 pthread。
         if tick % (5000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
-            crate::ethernet::w5500::tick_eth_heartbeat();
+            perf.measure(5, crate::ethernet::w5500::tick_eth_heartbeat);
         }
 
         // BLE 请求与通知按 10ms 调度，避免手持机配置命令额外等待 100ms。
         if tick % (BLE_PROCESS_PERIOD_MS as u32 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
             #[cfg(feature = "ble-at")]
-            ble_at::process_tick();
+            perf.measure(6, ble_at::process_tick);
         }
 
         // 消费 IO 事件 (避免事件队列满, 触发重置丢失关键状态变化)
         // 阶段 3: DI 变化触发 BLE notify (REPORT_COM_INPUT_IO_STATUS 0x94, Android tx_id=0x01)
-        while let Some(event) = crate::bus::event_bus::recv_event() {
-            match event {
+        perf.measure(7, || {
+            while let Some(event) = crate::bus::event_bus::recv_event() {
+                match event {
                 crate::bus::IoEvent::DiChanged => {
                     // DI 变化: 发 BLE 通知给 Android, 走 BINARY_TX 队列异步发送
                     #[cfg(feature = "ble-at")]
@@ -394,11 +447,14 @@ fn main_loop(
                         c.dhcp = true;
                     });
                 }
+                }
             }
-        }
+        });
 
         // 每 1s 更新 uptime + 检查任务心跳
         if tick % (1000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            #[cfg(debug_assertions)]
+            let housekeeping_started = std::time::Instant::now();
             let uptime = start.elapsed().as_secs() as u32;
             // 阶段 A: uptime 写 + reset-request 读 全过 bus::IO.sys (原子), 无锁
             crate::bus::IO.sys.set_uptime(uptime);
@@ -471,20 +527,34 @@ fn main_loop(
             if tick % (60000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
                 let free_heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
                 let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };
+                let internal_caps =
+                    esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+                let internal_free =
+                    unsafe { esp_idf_sys::heap_caps_get_free_size(internal_caps) };
+                let internal_min =
+                    unsafe { esp_idf_sys::heap_caps_get_minimum_free_size(internal_caps) };
                 log::info!(
-                    "[main] uptime={}s free_heap={}KB min_heap={}KB tick={}",
+                    "[main] uptime={}s heap={}KB min={}KB internal={}KB internal_min={}KB tick={}",
                     uptime,
                     free_heap / 1024,
                     min_heap / 1024,
+                    internal_free / 1024,
+                    internal_min / 1024,
                     tick
                 );
-                if free_heap < 20 * 1024 {
-                    log::error!("[mem] LOW MEMORY WARNING: free_heap < 20KB!");
+                if internal_free < 32 * 1024 {
+                    log::error!(
+                        "[mem] LOW INTERNAL SRAM: free={}B min={}B",
+                        internal_free,
+                        internal_min
+                    );
                 }
             }
             if tick % (600_000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
                 health::print_stack_watermarks();
             }
+            #[cfg(debug_assertions)]
+            perf.record_elapsed(8, housekeeping_started);
         }
 
         let work_us = loop_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -499,6 +569,7 @@ fn main_loop(
                 max_work_us,
                 deadline_miss_count
             );
+            perf.log_and_reset();
             max_work_us = 0;
             deadline_miss_count = 0;
         }

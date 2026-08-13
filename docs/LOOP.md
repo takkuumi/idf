@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-13 (LOOP31: 协议热路径固定缓冲与复制收敛)
+> 最后更新: 2026-08-13 (LOOP32: 实机运行诊断与构建追溯)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,27 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP32 实机运行诊断与构建追溯（2026-08-13）
+
+- 使用完整分区命令将 LOOP31 固件写入真实 ESP32-S3 rev 0.2（8MB Flash、2MB
+  PSRAM），factory 镜像最终从 `0x20000` 完整加载，NVS 未擦除。
+- 四个 Modbus TCP 端口 502/503/504/5002 均完成 FC03 标准最大 125 words 实机
+  读取，返回 125 个寄存器且首尾数据一致；非法连续地址正确返回异常响应。
+- Web 默认账户登录成功，`getsysteminfo/getnetworkconfig/getportconfig/getiodata/
+  getsystemstatus/getnfcstatus` 六个只读接口均返回 HTTP 200，中文 UTF-8 正常。
+- 设备连续运行 240 秒，无重启、stack canary、pthread 创建失败、EMFILE 或服务
+  停滞；空闲总 heap 稳定约 2054KB，历史最低约 2038KB。RTU1 未连接从站时告警
+  已按 10 秒聚合，通信错误计数仍逐次保留。
+- 首次调试时误把 `espflash` 返回会话号当作写入完成并提前终止进程，factory 尾段
+  未写完，bootloader 正确拒绝该镜像并回退旧 `ota_0`。后续必须等待烧录进程自然
+  退出，并以 bootloader 完整加载全部 segment 为成功判据。
+- 新增每分钟 internal SRAM 当前/历史最低水位，直接监控 pthread 与 DMA 依赖的
+  片上内存；debug 固件增加 main-loop 九阶段峰值耗时，release 中编译移除计时开销。
+- ESP-IDF App version 固定为 `2.2.1`，Rust 固件另嵌入当前 Git HEAD/dirty 标识，
+  避免 CMake 子构建缓存显示旧提交号，提升客户现场镜像追溯能力。
+- 本轮没有写配置、线圈或 OTA；BLE 手持机交互、真实 RTU 从站和 OTA 闭环仍需单独
+  实机验证，不能由上述只读测试替代。
 
 ## LOOP31 协议热路径固定缓冲与复制收敛（2026-08-13）
 

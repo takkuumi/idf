@@ -95,3 +95,22 @@
   使用的 Cookie/Content-Length，不再为最多 32 个 header 分配键值 String。
 - Web URL/form 解码使用固定字节缓冲并在完成后校验 UTF-8，中文设备名、厂家名和
   位置字段兼容性保持不变；通用 JSON 响应使用固定 128B 字符串。
+
+## LOOP31 固件实机只读回归（2026-08-13）
+
+- 硬件：ESP32-S3 rev 0.2、8MB Flash、2MB PSRAM；静态 IP `192.168.51.221`。
+- factory 镜像完整加载，W5500、BLE GATT、UDP、NFC、Web、RTU master/slave、
+  Modbus TCP 四端口均启动；约 9.9 秒进入 5ms main-loop。
+- FC03 `0x0880 + 125 words` 在 502/503/504/5002 全部成功，四端口返回相同首尾值
+  `0x009D/0x0013`。`0x0800 + 125` 跨未映射地址时四端口均返回标准异常响应。
+- Web 使用默认 `admin/admin123` 登录；系统、网络、端口、IO、运行状态、NFC 六个
+  查询接口均为 HTTP 200，中文系统名称未出现 UTF-8 截断或替换。
+- 240 秒观察期无重启、stack canary、pthread 创建失败、EMFILE、WDT 或任务停滞；
+  总 free heap 约 2054KB，minimum heap 约 2038KB。最后一分钟 main-loop
+  `max_work=4626us`、`deadline_miss=0`。
+- 前三分钟曾见 `max_work=9637us/deadline_miss=4`，现增加 debug-only 九阶段峰值
+  统计以区分 TCP、AI/AO、DI、DO、持久化、ETH、BLE、事件和 housekeeping。
+- 总 heap 主要由 PSRAM 构成，不能证明 pthread/DMA 余量；新增 internal SRAM
+  当前值和历史最低值，每分钟输出并在低于 32KB 时告警。
+- 首次烧录被调试端提前终止，bootloader 报 factory segment 尾部 `0xffffffff` 并
+  安全回退 ota_0。完整重烧后 factory 全部六个 segment 校验并正常启动。

@@ -2,6 +2,7 @@
 fn main() {
     embuild::espidf::sysenv::output();
     validate_production_envelope();
+    emit_build_identity();
 
     // 设置编译期常量供代码使用
     println!("cargo:rustc-cfg=esp32s3");
@@ -44,6 +45,37 @@ fn main() {
     }
 }
 
+/// ESP-IDF 的 CMake 子构建可能复用旧 `PROJECT_VER` 缓存。Rust 主程序额外嵌入
+/// 当前仓库提交号，确保现场日志能够准确追溯实际业务固件。
+fn emit_build_identity() {
+    use std::process::Command;
+
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        }
+    }
+
+    let revision = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
+    let suffix = if dirty { "-dirty" } else { "" };
+    println!("cargo:rustc-env=GATEWAY_BUILD_ID={revision}{suffix}");
+}
+
 /// Reject builds whose generated firmware would violate the verified hardware
 /// and resource envelope. These are product invariants, not optional tuning.
 fn validate_production_envelope() {
@@ -61,6 +93,8 @@ fn validate_production_envelope() {
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHMODE_DIO", "y");
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHFREQ_40M", "y");
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHSIZE_8MB", "y");
+    require_config(&sdk, "CONFIG_APP_PROJECT_VER_FROM_CONFIG", "y");
+    require_config(&sdk, "CONFIG_APP_PROJECT_VER", "\"2.2.1\"");
 
     let partitions = std::fs::read_to_string(PARTITIONS)
         .unwrap_or_else(|e| panic!("cannot read {PARTITIONS}: {e}"));
