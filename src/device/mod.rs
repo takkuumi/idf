@@ -61,6 +61,8 @@ pub enum DeviceCmd {
     PersistMeshKeys { net_idx: u16, app_idx: u16 },
     /// LOOP13: 异步持久化 holding_buf 到 NVS (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
     PersistHolding,
+    /// Web“保存并重启”: 只有系统配置成功落盘后才请求复位。
+    PersistConfigAndReset,
 }
 
 /// DeviceActor: 单线程消费 DeviceCmd, 独占 NVS/commit/reload 状态.
@@ -136,6 +138,18 @@ impl Actor for DeviceActor {
                     log::error!("[device] holding persist failed: {e}");
                 }
             }
+            DeviceCmd::PersistConfigAndReset => match apply_config() {
+                Ok(()) => {
+                    log::info!("[device] config persisted; reset requested by Web UI");
+                    crate::bus::IO.sys.request_reset();
+                }
+                Err(e) => {
+                    CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+                    log::error!(
+                        "[device] config persist before reset failed: {e}; reset cancelled"
+                    );
+                }
+            },
         }
     }
 
@@ -568,6 +582,11 @@ pub fn request_reload() {
 /// 请求应用配置 (由 Modbus 写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 调用)
 pub fn request_persist_config() {
     CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// 异步落盘当前系统配置，且仅在落盘成功后复位。
+pub fn request_persist_config_and_reset() {
+    DEVICE_ACTOR.send(DeviceCmd::PersistConfigAndReset);
 }
 
 /// 持久化并通知需要运行时重配的外设。普通 SN/位置/RS485 数据落盘不得扰动网络。

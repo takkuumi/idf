@@ -200,7 +200,8 @@ pub fn persist_pending_system_info() -> Result<bool, String> {
         .lock()
         .map_err(|_| "web system info cache poisoned".to_string())?
         .clone();
-    let blob = encode_web_system_info(&info).ok_or_else(|| "invalid web system info".to_string())?;
+    let blob =
+        encode_web_system_info(&info).ok_or_else(|| "invalid web system info".to_string())?;
     let result = crate::device::try_with_nvs_mut(|nvs| {
         nvs.set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
             .map_err(|e| format!("{e:?}"))
@@ -1041,35 +1042,94 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         ])
     };
 
-    let parsed = || -> Option<([u8; 4], [u8; 4], [u8; 4], Option<[u8; 4]>)> {
-        let ip = parse_ip(&req.form_field("ip")?)?;
-        let mask = parse_ip(&req.form_field("mask")?)?;
-        let gw = parse_ip(&req.form_field("gateway")?)?;
+    let ip_field = req.form_field("ip");
+    let mask_field = req.form_field("mask");
+    let gateway_field = req.form_field("gateway");
+    let dns_field = req.form_field("dns");
+    let addressinfo = req.form_field("addressinfo");
+    let sn = req.form_field("sn");
+    let ble_name = req.form_field("bloothaddress");
+
+    // 旧 Web/PC/手持机仍可一次提交全部字段；新 Web 可以单独保存设备标识，
+    // 避免用户只点击“保存设备基本信息”却隐式提交尚未确认的网络修改。
+    let has_network_fields = ip_field.is_some()
+        || mask_field.is_some()
+        || gateway_field.is_some()
+        || dns_field.is_some();
+    let network = if has_network_fields {
+        let (Some(ip_text), Some(mask_text), Some(gateway_text)) = (
+            ip_field.as_ref(),
+            mask_field.as_ref(),
+            gateway_field.as_ref(),
+        ) else {
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000001"),
+            );
+        };
+        let Some(ip) = parse_ip(ip_text.as_str()) else {
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000003"),
+            );
+        };
+        let Some(mask) = parse_ip(mask_text.as_str()) else {
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000003"),
+            );
+        };
+        let Some(gw) = parse_ip(gateway_text.as_str()) else {
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000003"),
+            );
+        };
         if ip == [0; 4] || ip[0] == 0 || ip[0] >= 224 || mask == [0; 4] {
-            return None;
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000003"),
+            );
         }
         let mask_u32 = u32::from_be_bytes(mask);
         let inverted = !mask_u32;
         if inverted & inverted.wrapping_add(1) != 0 {
-            return None; // netmask 必须是连续的 1 后接连续的 0
+            return send_json(
+                stream,
+                200,
+                &json_response("updatenetworkconfig", "0x01000003"),
+            );
         }
-        let dns = match req.form_field("dns") {
-            Some(value) => Some(parse_ip(&value)?),
+        let dns = match dns_field.as_ref() {
+            Some(value) => match parse_ip(value.as_str()) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    return send_json(
+                        stream,
+                        200,
+                        &json_response("updatenetworkconfig", "0x01000003"),
+                    );
+                }
+            },
             None => None,
         };
         Some((ip, mask, gw, dns))
+    } else {
+        None
     };
-    let Some((ip, mask, gw, dns)) = parsed() else {
+
+    if network.is_none() && addressinfo.is_none() && sn.is_none() && ble_name.is_none() {
         return send_json(
             stream,
             200,
-            &json_response("updatenetworkconfig", "0x01000003"),
+            &json_response("updatenetworkconfig", "0x01000001"),
         );
-    };
-
-    let addressinfo = req.form_field("addressinfo");
-    let sn = req.form_field("sn");
-    let ble_name = req.form_field("bloothaddress");
+    }
     if addressinfo
         .as_ref()
         .is_some_and(|value| value.as_bytes().len() > 16)
@@ -1086,13 +1146,15 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     }
 
     crate::bus::backends::config_modify(|cfg| {
-        cfg.ip = ip;
-        cfg.mask = mask;
-        cfg.gateway = gw;
-        if let Some(dns) = dns {
-            cfg.dns = dns;
+        if let Some((ip, mask, gw, dns)) = network {
+            cfg.ip = ip;
+            cfg.mask = mask;
+            cfg.gateway = gw;
+            if let Some(dns) = dns {
+                cfg.dns = dns;
+            }
+            cfg.dhcp = false; // 手动设置后 DHCP 关闭
         }
-        cfg.dhcp = false; // 手动设置后 DHCP 关闭
         if let Some(addressinfo) = addressinfo.as_ref() {
             let bytes = addressinfo.as_bytes();
             cfg.name.fill(0);
@@ -1110,21 +1172,25 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         }
     });
 
-    log::info!(
-        "[http] update network: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
-        ip[0],
-        ip[1],
-        ip[2],
-        ip[3],
-        mask[0],
-        mask[1],
-        mask[2],
-        mask[3],
-        gw[0],
-        gw[1],
-        gw[2],
-        gw[3],
-    );
+    if let Some((ip, mask, gw, _)) = network {
+        log::info!(
+            "[http] update network: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            mask[0],
+            mask[1],
+            mask[2],
+            mask[3],
+            gw[0],
+            gw[1],
+            gw[2],
+            gw[3],
+        );
+    } else {
+        log::info!("[http] update device identity");
+    }
 
     // Web 请求线程只更新 RCU 并投递合并持久化标志，禁止在 socket 线程同步写
     // NVS/Flash；网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
@@ -1665,7 +1731,11 @@ fn handle_reboot(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<(
         return send_json(stream, 405, &json_response("reboot", "405"));
     }
     send_json(stream, 200, &json_response("reboot", "0"))?;
-    crate::bus::IO.sys.request_reset();
+    if req.form_field("after_config_save").as_deref() == Some("1") {
+        crate::device::request_persist_config_and_reset();
+    } else {
+        crate::bus::IO.sys.request_reset();
+    }
     Ok(())
 }
 
@@ -1923,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mac_web_navigation_names_are_present() {
+    fn test_web_feature_names_are_preserved_after_navigation_grouping() {
         for label in [
             "系统信息",
             "设备基本信息",
@@ -1942,6 +2012,31 @@ mod tests {
     }
 
     #[test]
+    fn test_web_navigation_is_grouped_into_four_workspaces() {
+        for workspace in ["monitor", "config", "port", "maint"] {
+            assert!(
+                pages::INDEX_HTML.contains(&format!("data-t=\"{workspace}\"")),
+                "missing workspace: {workspace}"
+            );
+            assert!(
+                pages::INDEX_HTML.contains(&format!("id=\"p-{workspace}\"")),
+                "missing workspace panel: {workspace}"
+            );
+        }
+        assert_eq!(pages::INDEX_HTML.matches("data-t=\"").count(), 4);
+    }
+
+    #[test]
+    fn test_web_read_only_values_and_save_actions_are_distinct() {
+        assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"s_version\""));
+        assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"n_mac\""));
+        assert!(pages::INDEX_HTML.contains("onclick=\"saveNetwork()\""));
+        assert!(pages::INDEX_HTML.contains("onclick=\"saveIdentity()\""));
+        assert!(pages::INDEX_HTML.contains("网络参数已保存，重启设备后生效"));
+        assert!(pages::INDEX_HTML.contains("设备基本信息已保存"));
+    }
+
+    #[test]
     fn test_nfc_maintenance_controls_are_present() {
         for endpoint in ["/getnfcstatus", "/nfcbackup", "/nfcrestore"] {
             assert!(
@@ -1957,6 +2052,13 @@ mod tests {
         assert!(pages::INDEX_HTML.contains("重启设备"));
         assert!(pages::INDEX_HTML.contains("/reboot"));
         assert!(pages::INDEX_HTML.contains("rebootDevice()"));
+    }
+
+    #[test]
+    fn test_config_sections_offer_persist_before_reboot_actions() {
+        assert!(pages::INDEX_HTML.contains("保存网络参数并重启"));
+        assert!(pages::INDEX_HTML.contains("保存端口配置并重启"));
+        assert!(pages::INDEX_HTML.contains("after_config_save: '1'"));
     }
 
     #[test]

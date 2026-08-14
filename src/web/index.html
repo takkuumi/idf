@@ -17,16 +17,24 @@ background:var(--card);border-bottom:1px solid var(--border);position:sticky;top
 .top a{color:var(--accent);font-size:13px;text-decoration:none}
 .top a:hover{text-decoration:underline}
 .wrap{max-width:1200px;margin:0 auto;padding:16px}
-.tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid var(--border)}
-.tab{padding:10px 18px;font-size:13px;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
-.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin-bottom:16px;padding:4px;
+background:#141920;border:1px solid var(--border);border-radius:7px}
+.tab{min-height:40px;padding:9px 12px;font-size:13px;color:var(--dim);cursor:pointer;text-align:center;
+border:1px solid transparent;border-radius:5px;transition:.2s;display:flex;align-items:center;justify-content:center}
+.tab:hover{color:var(--text);background:#1c232c}
+.tab.active{color:#fff;background:#253548;border-color:#3c5b7d}
 .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:14px}
 .card h2{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
 .field label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
 .field input,.field select{width:100%;padding:8px 10px;background:#141920;border:1px solid var(--border);
 border-radius:5px;color:var(--text);font-size:13px;outline:none}
-.field input:focus,.field select:focus{border-color:var(--accent)}
+.field input:not(:disabled),.field select:not(:disabled){background:#101820;border-color:#455568}
+.field input:not(:disabled):hover,.field select:not(:disabled):hover{border-color:#60758c}
+.field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(74,158,255,.14)}
+.read-value{display:flex;align-items:center;width:100%;min-height:36px;padding:8px 10px;background:#252b32;
+border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflow-wrap:anywhere}
+.read-value::before{content:"";width:6px;height:6px;border-radius:50%;background:#657483;margin-right:8px;flex-shrink:0}
 .btn{padding:9px 20px;border:none;border-radius:5px;font-size:13px;font-weight:500;cursor:pointer;transition:.2s}
 .btn-p{background:var(--accent);color:#fff}.btn-p:hover{opacity:.85}
 .btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
@@ -47,6 +55,9 @@ border-radius:5px;color:var(--text);font-size:13px;outline:none}
 .ai-val{font-size:18px;font-weight:600;min-width:42px;text-align:right;font-variant-numeric:tabular-nums}
 .ai-ma{font-size:11px;color:var(--dim);min-width:50px}
 .nav{display:flex;gap:10px;margin-top:14px}
+.port-card{padding:14px 0;border-bottom:1px solid var(--border)}
+.port-card:first-of-type{padding-top:0}.port-card:last-of-type{border-bottom:0;padding-bottom:0}
+.port-card h3{font-size:13px;color:var(--accent);margin-bottom:10px}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:6px;font-size:13px;
 transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 .toast.show{transform:translateY(0);opacity:1}
@@ -54,7 +65,11 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 .toast.err{background:#3d1a1a;color:var(--red);border:1px solid #5c2a2a}
 .ota-bar{height:8px;background:#2a3340;border-radius:4px;margin:10px 0;overflow:hidden}
 .ota-bar i{display:block;height:100%;background:var(--accent);border-radius:4px;width:0;transition:width .3s}
-@media(max-width:640px){.row{grid-template-columns:1fr}.tabs{overflow-x:auto}}
+@media(max-width:640px){
+  .top{padding:12px}.top h1{font-size:14px}.top .ver{display:none}.wrap{padding:10px}
+  .row{grid-template-columns:1fr}.tabs{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .card{padding:15px}.nav{flex-wrap:wrap}.nav .btn{flex:1;min-width:130px}
+}
 .hidden{display:none}
 </style>
 </head>
@@ -73,34 +88,16 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 
 <div class="wrap">
   <div class="tabs">
-    <div class="tab active" data-t="sysinfo">系统信息</div>
-    <div class="tab" data-t="net">设备基本信息</div>
-    <div class="tab" data-t="port">端口设置</div>
-    <div class="tab" data-t="io">I/O口信息</div>
-    <div class="tab" data-t="user">用户设置</div>
+    <div class="tab active" data-t="monitor">运行监控</div>
+    <div class="tab" data-t="config">基本配置</div>
+    <div class="tab" data-t="port">通信设置</div>
     <div class="tab" data-t="maint">系统维护</div>
   </div>
 
-  <!-- 系统信息面板 -->
-  <div id="p-sysinfo">
+  <!-- 运行监控面板 -->
+  <div id="p-monitor">
     <div class="card">
-      <h2>系统信息</h2>
-      <div class="row">
-        <div class="field"><label>设备名称</label><input id="s_devicename" maxlength="63"></div>
-        <div class="field"><label>制造商</label><input id="s_manufacturer" maxlength="63"></div>
-        <div class="field"><label>型号</label><input id="s_model" maxlength="63"></div>
-        <div class="field"><label>固件版本</label><input id="s_version" disabled></div>
-      </div>
-      <div class="nav">
-        <button class="btn btn-p" onclick="saveSystemInfo()">保存系统信息</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- I/O 数据面板 -->
-  <div id="p-io" class="hidden">
-    <div class="card">
-      <h2>设备状态</h2>
+      <h2>I/O口信息 · 设备状态</h2>
       <div class="state-list" id="state_list"></div>
     </div>
     <div class="card">
@@ -112,30 +109,42 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <div class="do-list" id="do_list"></div>
     </div>
     <div class="card">
-      <h2>运行状态</h2>
-      <div class="row" id="runtime_status">
-        <div class="field"><label for="st_uptime">运行时间</label><input id="st_uptime" disabled></div>
-        <div class="field"><label for="st_eth">以太网链路</label><input id="st_eth" disabled></div>
-        <div class="field"><label for="st_ble">BLE 连接</label><input id="st_ble" disabled></div>
-        <div class="field"><label for="st_udp">UDP 组播</label><input id="st_udp" disabled></div>
-        <div class="field"><label for="st_rtu1_com">RS485-1 通信错误</label><input id="st_rtu1_com" disabled></div>
-        <div class="field"><label for="st_rtu1_app">RS485-1 应用错误</label><input id="st_rtu1_app" disabled></div>
-        <div class="field"><label for="st_rtu2_com">RS485-2 通信错误</label><input id="st_rtu2_com" disabled></div>
-        <div class="field"><label for="st_rtu2_app">RS485-2 应用错误</label><input id="st_rtu2_app" disabled></div>
-        <div class="field"><label for="st_recovery">恢复模式</label><input id="st_recovery" disabled></div>
-        <div class="field"><label for="st_heap">剩余堆内存</label><input id="st_heap" disabled></div>
-        <div class="field"><label for="st_reset">复位次数</label><input id="st_reset" disabled></div>
-        <div class="field"><label for="st_reason">复位原因</label><input id="st_reason" disabled></div>
-      </div>
-    </div>
-    <div class="card">
       <h2>模拟输入 (AI)</h2>
       <div id="ai_list"></div>
     </div>
+    <div class="card">
+      <h2>运行状态</h2>
+      <div class="row" id="runtime_status">
+        <div class="field"><label>运行时间</label><output class="read-value" id="st_uptime">-</output></div>
+        <div class="field"><label>以太网链路</label><output class="read-value" id="st_eth">-</output></div>
+        <div class="field"><label>BLE 连接</label><output class="read-value" id="st_ble">-</output></div>
+        <div class="field"><label>UDP 组播</label><output class="read-value" id="st_udp">-</output></div>
+        <div class="field"><label>RS485-1 通信错误</label><output class="read-value" id="st_rtu1_com">-</output></div>
+        <div class="field"><label>RS485-1 应用错误</label><output class="read-value" id="st_rtu1_app">-</output></div>
+        <div class="field"><label>RS485-2 通信错误</label><output class="read-value" id="st_rtu2_com">-</output></div>
+        <div class="field"><label>RS485-2 应用错误</label><output class="read-value" id="st_rtu2_app">-</output></div>
+        <div class="field"><label>恢复模式</label><output class="read-value" id="st_recovery">-</output></div>
+        <div class="field"><label>剩余堆内存</label><output class="read-value" id="st_heap">-</output></div>
+        <div class="field"><label>复位次数</label><output class="read-value" id="st_reset">-</output></div>
+        <div class="field"><label>复位原因</label><output class="read-value" id="st_reason">-</output></div>
+      </div>
+    </div>
   </div>
 
-  <!-- 网络配置面板 -->
-  <div id="p-net" class="hidden">
+  <!-- 基本配置面板 -->
+  <div id="p-config" class="hidden">
+    <div class="card">
+      <h2>系统信息</h2>
+      <div class="row">
+        <div class="field"><label>设备名称</label><input id="s_devicename" maxlength="63"></div>
+        <div class="field"><label>制造商</label><input id="s_manufacturer" maxlength="63"></div>
+        <div class="field"><label>型号</label><input id="s_model" maxlength="63"></div>
+        <div class="field"><label>固件版本</label><output class="read-value" id="s_version">-</output></div>
+      </div>
+      <div class="nav">
+        <button class="btn btn-p" onclick="saveSystemInfo()">保存系统信息</button>
+      </div>
+    </div>
     <div class="card">
       <h2>网络参数</h2>
       <div class="row">
@@ -143,35 +152,36 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>子网掩码</label><input id="n_mask"></div>
         <div class="field"><label>默认网关</label><input id="n_gw"></div>
         <div class="field"><label>DNS</label><input id="n_dns"></div>
-        <div class="field"><label>MAC 地址</label><input id="n_mac" disabled></div>
-        <div class="field"><label>DHCP</label><input id="n_dhcp" disabled></div>
+        <div class="field"><label>MAC 地址</label><output class="read-value" id="n_mac">-</output></div>
+        <div class="field"><label>DHCP</label><output class="read-value" id="n_dhcp">-</output></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="saveNet()">保存网络配置</button>
+        <button class="btn btn-p" onclick="saveNetwork()">保存网络参数</button>
+        <button class="btn btn-w" id="network_reboot_btn" onclick="saveNetwork(true)">保存网络参数并重启</button>
       </div>
     </div>
     <div class="card">
-      <h2>设备标识</h2>
+      <h2>设备基本信息</h2>
       <div class="row">
         <div class="field"><label>SN 序列号</label><input id="n_sn" maxlength="32"></div>
         <div class="field"><label>位置/桩号</label><input id="n_loc" maxlength="16"></div>
         <div class="field"><label>蓝牙地址</label><input id="n_ble" maxlength="8"></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="saveNet()">保存设备标识</button>
+        <button class="btn btn-p" onclick="saveIdentity()">保存设备基本信息</button>
       </div>
     </div>
   </div>
 
   <!-- RS485 端口面板 -->
   <div id="p-port" class="hidden">
-    <div class="card" id="port_cards"></div>
+    <div class="card" id="port_cards"><h2>端口设置</h2></div>
   </div>
 
-  <!-- 用户设置面板 -->
-  <div id="p-user" class="hidden">
+  <!-- 系统维护面板 -->
+  <div id="p-maint" class="hidden">
     <div class="card">
-      <h2>修改密码</h2>
+      <h2>用户设置</h2>
       <div class="row">
         <div class="field"><label>旧密码</label><input id="pw_old" type="password"></div>
         <div class="field"><label>新密码</label><input id="pw_new" type="password"></div>
@@ -180,15 +190,11 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <button class="btn btn-w" onclick="changePwd()">修改密码</button>
       </div>
     </div>
-  </div>
-
-  <!-- 系统维护面板 -->
-  <div id="p-maint" class="hidden">
     <div class="card">
-      <h2>NFC 配置维护</h2>
+      <h2>系统维护 · NFC 配置</h2>
       <div class="row">
-        <div class="field"><label>NFC 服务</label><input id="nfc_started" disabled></div>
-        <div class="field"><label>NFC 状态</label><input id="nfc_state" disabled></div>
+        <div class="field"><label>NFC 服务</label><output class="read-value" id="nfc_started">-</output></div>
+        <div class="field"><label>NFC 状态</label><output class="read-value" id="nfc_state">-</output></div>
       </div>
       <div class="nav">
         <button class="btn btn-p" onclick="nfcBackup()">备份配置</button>
@@ -203,8 +209,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     </div>
     <div class="card">
       <h2>固件升级 (OTA)</h2>
-      <p style="font-size:13px;color:var(--dim);margin-bottom:12px">选择 .bin 固件文件后点击上传, 设备将自动重启.</p>
-      <input type="file" id="ota_file" accept=".bin" style="font-size:13px;margin-bottom:10px">
+      <div class="field"><label>固件文件 (.bin)</label><input type="file" id="ota_file" accept=".bin"></div>
       <div class="ota-bar hidden" id="ota_bar"><i id="ota_prog"></i></div>
       <div class="nav">
         <button class="btn btn-p" onclick="uploadOta()">上传固件</button>
@@ -223,17 +228,35 @@ const $$ = s => document.querySelectorAll(s);
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.remove('active'));
   t.classList.add('active');
-  ['sysinfo','net','port','io','user','maint'].forEach(k => {
+  ['monitor','config','port','maint'].forEach(k => {
     $('#p-' + k).classList.toggle('hidden', k !== t.dataset.t);
   });
 });
 
 // Toast
+let toastTimer;
 function toast(msg, ok) {
   const el = $('#toast');
+  clearTimeout(toastTimer);
   el.textContent = msg;
   el.className = 'toast show ' + (ok ? 'ok' : 'err');
-  setTimeout(() => el.classList.remove('show'), 3000);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+function apiError(code, fallback) {
+  const errors = {
+    '0x01000001': '缺少必要参数',
+    '0x01000003': '参数格式错误或保存失败',
+    '0x01000004': '参数超出允许范围',
+    '405': '请求方式错误',
+    '500': '设备内部错误'
+  };
+  return errors[code] || fallback + ': ' + code;
+}
+
+function saveError(area, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith(area + '保存失败') ? message : area + '保存失败: ' + message;
 }
 
 // Load system info
@@ -246,7 +269,7 @@ async function loadSysInfo() {
       $('#s_devicename').value = j.data.devicename || '';
       $('#s_manufacturer').value = j.data.manufacturer || '';
       $('#s_model').value = j.data.model || '';
-      $('#s_version').value = j.data.version || '';
+      $('#s_version').textContent = j.data.version || '-';
     }
   } catch(e) { console.error('sysinfo', e); }
 }
@@ -261,8 +284,8 @@ async function loadNet() {
       $('#n_mask').value = j.data.mask || '';
       $('#n_gw').value = j.data.gateway || '';
       $('#n_dns').value = j.data.dns || '';
-      $('#n_mac').value = j.data.mac || '';
-      $('#n_dhcp').value = j.data.dhcp ? '已启用' : '未启用';
+      $('#n_mac').textContent = j.data.mac || '-';
+      $('#n_dhcp').textContent = j.data.dhcp ? '已启用' : '未启用';
       $('#n_sn').value = j.data.sn || '';
       $('#n_ble').value = j.data.bloothaddress || '';
       if (j.data.addressinfo) $('#n_loc').value = j.data.addressinfo;
@@ -270,22 +293,41 @@ async function loadNet() {
   } catch(e) { console.error('net', e); }
 }
 
-// Save network config
-async function saveNet() {
+// 网络参数与设备基本信息独立保存，避免一个按钮隐式提交另一组未确认的修改。
+async function saveNetwork(restartAfter = false) {
+  if (restartAfter && !confirm('确认保存网络参数并重启设备? 当前连接将暂时中断.')) return;
   try {
     const fd = new URLSearchParams({
       ip: $('#n_ip').value,
       mask: $('#n_mask').value,
       gateway: $('#n_gw').value,
-      dns: $('#n_dns').value,
+      dns: $('#n_dns').value
+    });
+    const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (j.code !== '0') throw new Error(apiError(j.code, '网络参数保存失败'));
+    if (restartAfter) {
+      await rebootDevice('network_reboot_btn', true);
+    } else {
+      toast('网络参数已保存，重启设备后生效', true);
+      await loadNet();
+    }
+  } catch(e) { toast(saveError('网络参数', e), false); }
+}
+
+async function saveIdentity() {
+  try {
+    const fd = new URLSearchParams({
       addressinfo: $('#n_loc').value,
       sn: $('#n_sn').value,
       bloothaddress: $('#n_ble').value
     });
     const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
     const j = await r.json();
-    toast(j.code === '0' ? '网络配置已保存' : '保存失败: ' + j.code, j.code === '0');
-  } catch(e) { toast('保存失败: ' + e, false); }
+    if (j.code !== '0') throw new Error(apiError(j.code, '设备基本信息保存失败'));
+    toast('设备基本信息已保存', true);
+    await loadNet();
+  } catch(e) { toast(saveError('设备基本信息', e), false); }
 }
 
 // Save system info
@@ -298,8 +340,10 @@ async function saveSystemInfo() {
     });
     const r = await fetch('/updatesysteminfoconfig', { method: 'POST', body: fd });
     const j = await r.json();
-    toast(j.code === '0' ? '系统信息已保存' : '保存失败: ' + j.code, j.code === '0');
-  } catch(e) { toast('保存失败: ' + e, false); }
+    if (j.code !== '0') throw new Error(apiError(j.code, '系统信息保存失败'));
+    toast('系统信息已保存', true);
+    await loadSysInfo();
+  } catch(e) { toast(saveError('系统信息', e), false); }
 }
 
 // Load RS485 port config — 与原 C++ WebIndex 的 9 个参数完全对应
@@ -317,7 +361,7 @@ async function loadPorts() {
       [12, '230400'], [13, '256000'], [14, '460800'], [15, '921600']
     ];
     const modes = ['从站', '主站(客户端)', '从站(服务端)'];
-    let html = '<h2>RS485 端口配置</h2>';
+    let html = '<h2>端口设置</h2>';
     for (let i = 0; i < 3; i++) {
       const v = (key, fallback) => d[key + i] === undefined ? fallback : d[key + i];
       html += `<div class="port-card">
@@ -342,20 +386,22 @@ async function loadPorts() {
           <div class="field"><label>端口主从</label><select id="p_mode_${i}">
             ${modes.map((m,n) => `<option value="${n}" ${n===v('masterslaveport_',0)?'selected':''}>${m}</option>`).join('')}
           </select></div>
-          <div class="field"><label>从站地址</label><input id="p_addr_${i}" type="number" min="0" max="247" value="${v('slaveaddress_',1)}"></div>
+          <div class="field"><label>从站地址</label><input id="p_addr_${i}" type="number" min="1" max="247" value="${v('slaveaddress_',1)}"></div>
           <div class="field"><label>重试次数</label><input id="p_retry_${i}" type="number" min="0" max="65535" value="${v('retrycount_',3)}"></div>
           <div class="field"><label>发送响应间隔(ms)</label><input id="p_timeout_${i}" type="number" min="0" max="65535" value="${v('responeinteval_',1000)}"></div>
           <div class="field"><label>通信间隔(ms)</label><input id="p_tti_${i}" type="number" min="0" max="65535" value="${v('tti_',20)}"></div>
         </div>
       </div>`;
     }
-    html += '<div class="nav"><button class="btn btn-p" onclick="savePorts()">保存端口配置</button></div>';
+    html += '<div class="nav"><button class="btn btn-p" onclick="savePorts()">保存端口配置</button>' +
+      '<button class="btn btn-w" id="ports_reboot_btn" onclick="savePorts(true)">保存端口配置并重启</button></div>';
     $('#port_cards').innerHTML = html;
   } catch(e) { console.error('port', e); }
 }
 
 // Save RS485 port config — 9 个字段全部提交，不使用隐式默认值覆盖用户设置
-async function savePorts() {
+async function savePorts(restartAfter = false) {
+  if (restartAfter && !confirm('确认保存 3 个 RS485 端口配置并重启设备? 当前连接将暂时中断.')) return;
   try {
     for (let i = 0; i < 3; i++) {
       const fd = new URLSearchParams({
@@ -374,9 +420,13 @@ async function savePorts() {
       const result = await response.json();
       if (result.code !== '0') throw new Error(`端口${i+1}: ${result.code}`);
     }
-    toast('端口配置已保存', true);
-    await loadPorts();
-  } catch(e) { toast('保存失败: ' + e, false); }
+    if (restartAfter) {
+      await rebootDevice('ports_reboot_btn', true);
+    } else {
+      toast('3 个 RS485 端口配置已保存，重启设备后生效', true);
+      await loadPorts();
+    }
+  } catch(e) { toast('端口配置保存失败: ' + e.message, false); }
 }
 
 // Poll IO data
@@ -452,18 +502,18 @@ async function pollStatus() {
       return `${h}h ${m}m ${sec}s`;
     };
     const resetReason = ['POWERON','SW','RTC_WDT','WDT','DEEP_SLEEP','RESTART','EXT_CPU','BOD','USB_UART','JTAG','EFUSE','PWR_GLITCH','RTC_STORE','SPI_FLASH','SYSCPU','BROWNOUT'];
-    $('#st_uptime').value = fmtSec(d.uptime || 0);
-    $('#st_eth').value = d.ethernet_link ? 'PHY UP' : 'PHY DOWN';
-    $('#st_ble').value = d.ble_connected ? '已连接' : (d.ble_notify ? '通知已开' : '未连接');
-    $('#st_udp').value = d.udp_multicast ? `已收 ${d.udp_received_bytes || 0} 字节` : '未接收';
-    $('#st_rtu1_com').value = d.rs485_1_comerr || 0;
-    $('#st_rtu1_app').value = d.rs485_1_apperr || 0;
-    $('#st_rtu2_com').value = d.rs485_2_comerr || 0;
-    $('#st_rtu2_app').value = d.rs485_2_apperr || 0;
-    $('#st_recovery').value = `${d.recovery_mode} (R:${d.recoverable} D:${d.degradable} S:${d.severe})`;
-    $('#st_heap').value = `${d.free_heap || 0} 字节`;
-    $('#st_reset').value = d.reset_count || 0;
-    $('#st_reason').value = resetReason[d.reset_reason] || ('0x' + (d.reset_reason || 0).toString(16));
+    $('#st_uptime').textContent = fmtSec(d.uptime || 0);
+    $('#st_eth').textContent = d.ethernet_link ? 'PHY UP' : 'PHY DOWN';
+    $('#st_ble').textContent = d.ble_connected ? '已连接' : (d.ble_notify ? '通知已开' : '未连接');
+    $('#st_udp').textContent = d.udp_multicast ? `已收 ${d.udp_received_bytes || 0} 字节` : '未接收';
+    $('#st_rtu1_com').textContent = d.rs485_1_comerr || 0;
+    $('#st_rtu1_app').textContent = d.rs485_1_apperr || 0;
+    $('#st_rtu2_com').textContent = d.rs485_2_comerr || 0;
+    $('#st_rtu2_app').textContent = d.rs485_2_apperr || 0;
+    $('#st_recovery').textContent = `${d.recovery_mode} (R:${d.recoverable} D:${d.degradable} S:${d.severe})`;
+    $('#st_heap').textContent = `${d.free_heap || 0} 字节`;
+    $('#st_reset').textContent = d.reset_count || 0;
+    $('#st_reason').textContent = resetReason[d.reset_reason] || ('0x' + (d.reset_reason || 0).toString(16));
   } catch(e) { console.error('status', e); }
 }
 
@@ -487,7 +537,7 @@ async function changePwd() {
     const r = await fetch('/updatepwd', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code === '0') {
-      toast('密码已修改, 请重新登录', true);
+      toast('密码已修改，即将退出登录', true);
       setTimeout(() => location.href = '/logout', 1500);
     } else {
       toast('修改失败: ' + (j.code === '0x00010001' ? '旧密码错误' : j.code), false);
@@ -500,8 +550,8 @@ async function pollNfcStatus() {
     const r = await fetch('/getnfcstatus');
     const j = await r.json();
     if (!j.data) return;
-    $('#nfc_started').value = j.data.started ? '已启动' : '未启动';
-    $('#nfc_state').value = j.data.state || 'Unknown';
+    $('#nfc_started').textContent = j.data.started ? '已启动' : '未启动';
+    $('#nfc_state').textContent = j.data.state || 'Unknown';
   } catch(e) { console.error('nfc status', e); }
 }
 
@@ -525,14 +575,16 @@ async function nfcRestore() {
 }
 
 let rebooting = false;
-async function rebootDevice() {
-  if (rebooting || !confirm('确认重启设备? 当前连接将暂时中断.')) return;
+async function rebootDevice(buttonId = 'reboot_btn', afterConfigSave = false) {
+  if (rebooting || (!afterConfigSave && !confirm('确认重启设备? 当前连接将暂时中断.'))) return;
   rebooting = true;
-  const button = $('#reboot_btn');
+  const button = $('#' + buttonId);
+  const originalLabel = button.textContent;
   button.disabled = true;
   button.textContent = '正在提交';
   try {
-    const r = await fetch('/reboot', { method: 'POST' });
+    const body = afterConfigSave ? new URLSearchParams({ after_config_save: '1' }) : undefined;
+    const r = await fetch('/reboot', { method: 'POST', body });
     const j = await r.json();
     if (j.code !== '0') throw new Error(j.code);
     clearInterval(pollTimer);
@@ -540,7 +592,7 @@ async function rebootDevice() {
     clearInterval(nfcStatusTimer);
     let seconds = 8;
     button.textContent = `设备重启中 (${seconds}s)`;
-    toast('重启指令已发送', true);
+    toast(afterConfigSave ? '配置已提交，成功落盘后设备将重启' : '重启指令已发送', true);
     const countdown = setInterval(() => {
       seconds -= 1;
       button.textContent = `设备重启中 (${seconds}s)`;
@@ -552,7 +604,7 @@ async function rebootDevice() {
   } catch(e) {
     rebooting = false;
     button.disabled = false;
-    button.textContent = '重启设备';
+    button.textContent = originalLabel;
     toast('重启失败: ' + e, false);
   }
 }
