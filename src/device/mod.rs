@@ -68,6 +68,7 @@ pub struct DeviceActor {
     next_holding_persist: Instant,
     next_device_text_persist: Instant,
     next_config_persist: Instant,
+    next_web_system_info_persist: Instant,
 }
 
 impl DeviceActor {
@@ -76,6 +77,7 @@ impl DeviceActor {
             next_holding_persist: Instant::now(),
             next_device_text_persist: Instant::now(),
             next_config_persist: Instant::now(),
+            next_web_system_info_persist: Instant::now(),
         }
     }
 }
@@ -156,6 +158,13 @@ impl Actor for DeviceActor {
             if let Err(e) = apply_config() {
                 CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
                 log::error!("[device] config idle persist failed: {e}");
+            }
+        }
+        if Instant::now() >= self.next_web_system_info_persist {
+            self.next_web_system_info_persist = Instant::now() + Duration::from_secs(1);
+            match crate::web::persist_pending_system_info() {
+                Ok(_) => {}
+                Err(error) => log::error!("[device] web system info persist failed: {error}"),
             }
         }
         if Instant::now() >= self.next_device_text_persist

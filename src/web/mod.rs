@@ -150,7 +150,7 @@ fn decode_web_system_info(blob: &[u8]) -> Option<WebSystemInfo> {
     })
 }
 
-fn load_web_system_info() -> WebSystemInfo {
+fn load_web_system_info_from_nvs() -> WebSystemInfo {
     let fallback = WebSystemInfo {
         device_name: "工业测控执行器".to_string(),
         manufacturer: String::new(),
@@ -167,16 +167,52 @@ fn load_web_system_info() -> WebSystemInfo {
     .unwrap_or(fallback)
 }
 
+static WEB_SYSTEM_INFO_CACHE: std::sync::LazyLock<Mutex<WebSystemInfo>> =
+    std::sync::LazyLock::new(|| Mutex::new(load_web_system_info_from_nvs()));
+static WEB_SYSTEM_INFO_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn load_web_system_info() -> WebSystemInfo {
+    WEB_SYSTEM_INFO_CACHE
+        .lock()
+        .map(|info| info.clone())
+        .unwrap_or_else(|_| load_web_system_info_from_nvs())
+}
+
 fn save_web_system_info(info: &WebSystemInfo) -> bool {
     let Some(blob) = encode_web_system_info(info) else {
         return false;
     };
-    matches!(
-        crate::device::try_with_nvs_mut(|nvs| nvs
-            .set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
-            .map_err(|e| format!("{e:?}"))),
-        Some(Ok(()))
-    )
+    let Ok(mut cached) = WEB_SYSTEM_INFO_CACHE.lock() else {
+        return false;
+    };
+    *cached = info.clone();
+    let _ = blob;
+    WEB_SYSTEM_INFO_DIRTY.store(true, Ordering::Release);
+    true
+}
+
+/// DeviceActor 独占调用的 Web 系统信息落盘路径。
+pub fn persist_pending_system_info() -> Result<bool, String> {
+    if !WEB_SYSTEM_INFO_DIRTY.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let info = WEB_SYSTEM_INFO_CACHE
+        .lock()
+        .map_err(|_| "web system info cache poisoned".to_string())?
+        .clone();
+    let blob = encode_web_system_info(&info).ok_or_else(|| "invalid web system info".to_string())?;
+    let result = crate::device::try_with_nvs_mut(|nvs| {
+        nvs.set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
+            .map_err(|e| format!("{e:?}"))
+    });
+    match result {
+        Some(Ok(())) => {
+            WEB_SYSTEM_INFO_DIRTY.store(false, Ordering::Release);
+            Ok(true)
+        }
+        Some(Err(error)) => Err(error),
+        None => Err("NVS unavailable".to_string()),
+    }
 }
 
 // ============================================================================
@@ -301,6 +337,8 @@ pub fn start() -> AppResult<()> {
     if STARTED.load(Ordering::Acquire) {
         return Ok(());
     }
+    // 在服务线程创建前预热一次 NVS 缓存；请求路径只访问内存，不做 Flash 读取。
+    let _ = load_web_system_info();
     let spawn_result = std::thread::Builder::new()
         .name("http-srv".into())
         // LOOP18: http-srv 栈从 8KB 提到 12KB.
@@ -929,15 +967,7 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
             cfg.name.fill(0);
             cfg.name[..name_bytes.len()].copy_from_slice(name_bytes);
         });
-        if let Err(error) = crate::device::apply_config_sync() {
-            log::error!("[http] system info persist failed: {error}");
-            return send_json(
-                stream,
-                500,
-                &json_response("updatesysteminfoconfig", "0x01000003"),
-            );
-        }
-        let _ = crate::nfc::backup_now();
+        crate::device::request_persist_config();
     }
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
 }
@@ -1055,16 +1085,6 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         );
     }
 
-    let network_changed = config_read_with(|cs| {
-        let cfg = &cs.cfg;
-        cfg.ip != ip
-            || cfg.mask != mask
-            || cfg.gateway != gw
-            || dns.is_some_and(|value| cfg.dns != value)
-            || cfg.dhcp
-    })
-    .unwrap_or(true);
-
     crate::bus::backends::config_modify(|cfg| {
         cfg.ip = ip;
         cfg.mask = mask;
@@ -1106,26 +1126,13 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         gw[3],
     );
 
-    // Web 保存必须在确认 NVS 成功后再返回；网络重配延后到响应发出之后，
-    // 避免修改本机 IP 时当前 HTTP 连接先被拆除而让页面误报保存失败。
-    if let Err(error) = crate::device::apply_config_sync() {
-        log::error!("[http] network config persist failed: {error}");
-        return send_json(
-            stream,
-            500,
-            &json_response("updatenetworkconfig", "0x01000003"),
-        );
-    }
+    // Web 请求线程只更新 RCU 并投递合并持久化标志，禁止在 socket 线程同步写
+    // NVS/Flash；网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
+    crate::device::request_persist_config();
     if ble_name.is_some() {
         crate::ble_at::notify_ble_name_changed();
     }
-    let _ = crate::nfc::backup_now();
-    let response = send_json(stream, 200, &json_response("updatenetworkconfig", "0"));
-    if response.is_ok() && network_changed {
-        #[cfg(feature = "ethernet-w5500")]
-        crate::ethernet::w5500::request_reconfigure();
-    }
-    response
+    send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
 }
 
 /// C++ 固件波特率索引表（与 handleGetPortConfig 中 (PRegBuf[reg] >> 12) & 0x0F 完全一致，
@@ -1289,15 +1296,7 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
 
     // 三个端口由 Web 连续提交。端口保存只落盘，不得重配 W5500，否则第一个
     // 请求会中断后两个请求，造成页面提示成功但仅端口 1 实际保存。
-    if let Err(error) = crate::device::apply_config_sync() {
-        log::error!("[http] RS485 port config persist failed: {error}");
-        return send_json(
-            stream,
-            500,
-            &json_response("updateportconfig", "0x01000003"),
-        );
-    }
-    let _ = crate::nfc::backup_now();
+    crate::device::request_persist_config();
     send_json(stream, 200, &json_response("updateportconfig", "0"))
 }
 
@@ -1573,15 +1572,8 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
         cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
     });
     log::info!("[http] update BLE name: {:?}", name);
-    if let Err(error) = crate::device::apply_config_sync() {
-        log::error!("[http] BLE config persist failed: {error}");
-        return send_json(
-            stream,
-            500,
-            &json_response("updatebleconfig", "0x01000003"),
-        );
-    }
-    // 只有 NVS 已确认保存后才更新 GAP 名，避免持久化失败时运行值与重启值不一致。
+    crate::device::request_persist_config();
+    // GAP 名称立即更新；配置快照由 DeviceActor 合并落盘。
     crate::ble_at::notify_ble_name_changed();
     send_json(stream, 200, &json_response("updatebleconfig", "0"))
 }

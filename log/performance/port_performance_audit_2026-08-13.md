@@ -149,3 +149,15 @@
   不改变采样、告警阈值、协议或 IO 行为。
 - 默认、F3、F4 `cargo check` 与 `cargo test --bin gateway --no-run` 均通过，
   **0 error, 0 warning**。
+
+## LOOP35 Web 持久化阻塞复盘（2026-08-14）
+
+- 首版 Web 修复曾在 HTTP 请求线程同步调用 `SystemConfig::save_to_nvs`，并在网络
+  保存后热重配活动 netif；实机恢复原值后并发连接阶段出现 Web/TCP 暂时失联。
+- 根因是 Flash/NVS 写入与 W5500 netif 重配进入通信请求关键路径，不能以短时成功
+  掩盖工业系统的尾延迟风险。
+- 当前改为 Web 只写 RCU：SystemConfig 由 `CONFIG_DIRTY` 交给 DeviceActor 合并
+  持久化，Web 系统信息 blob 由独立 dirty 标志交给同一 Actor；NVS 失败自动保留
+  dirty 并重试。网络配置不在线修改活动 netif，重启时统一加载。
+- DI/DO 数值排序和 1 基页面标签保持不变；内部 DO 控制地址仍为 0 基，手机/PC/
+  Modbus 兼容接口未改变。
