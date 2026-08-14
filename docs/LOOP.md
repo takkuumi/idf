@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-13 (LOOP34: LwIP 内存余量与遥测调度)
+> 最后更新: 2026-08-14 (LOOP36: Web 持久化实机闭环与 DHCP 状态修复)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,22 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## LOOP36 Web 持久化实机闭环与 DHCP 状态修复（2026-08-14）
+
+- [x] 完整烧录 `e98902fdc136`，bootloader 校验全部 6 个 app segment 并从 factory
+  `0x20000` 启动；NVS 未擦除，应用大小 `1,684,432 / 2,359,296B`（71.40%）。
+- [x] Web 系统信息、SN、位置、BLE 名称及三路 RS485 参数完成修改、异步落盘、
+  重启恢复、原值回滚和再次启动核对，测试数据无残留。
+- [x] 修复静态 IP 的 `GOT_IP` 事件被误判为 DHCP 租约的问题；只有配置原本处于
+  DHCP 模式才回写租约地址。静态模式重启后 Web 保持 `dhcp=0`。
+- [x] 四个 Modbus TCP 端口以 8 条并发长连接完成 400 次 FC03 标准最大 125 words
+  读取，同时完成 20 次认证 Web 状态查询；全部成功，P95 `114.73ms`。
+- [x] 压力结束后持续观察至 300 秒：heap `2054KB`、internal SRAM `40KB`（历史最低
+  `35KB`）、7 个任务最低剩余栈 `4300B`，空载周期 deadline miss 回落到 1；无
+  panic、stack canary、pthread 创建失败、W5500/LwIP 异常或意外复位。
+- [ ] 现场 RTU1 未连接真实从站，周期性 short response 为预期环境告警；本轮仅确认
+  RTU master/slave UART 正常启动，未把该项记录为真实 RTU 从站闭环通过。
 
 ## LOOP35 Web 保存与 DI/DO 顺序修复（2026-08-14）
 
@@ -24,8 +40,8 @@
 - [x] DI/DO 键按数字索引排序，页面按 `DI1..N`、`DO1..N` 显示；DO 控制仍提交
   内部 0 基地址，Modbus 线圈和硬件位序保持不变。
 - [x] 设备标识卡片增加就近保存按钮，位置字段长度与后端 16 字节边界一致。
-- [x] 默认、F3、F4 `cargo check` 和测试编译通过，0 warning；实机持久化与重启
-  回归将在本提交完整烧录后记录。
+- [x] 默认、F3、F4 `cargo check` 和测试编译通过，0 warning；实机持久化、重启、
+  原值回滚及并发回归已完成，详见 LOOP36 和 `log/hardware/web_persist_2026-08-14.md`。
 
 ## LOOP34 LwIP 内部 SRAM 余量与遥测调度（2026-08-13）
 
