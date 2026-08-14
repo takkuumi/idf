@@ -89,18 +89,7 @@ impl ModbusBackend for BusBackend {
     }
 
     fn write_multiple_coils(&self, addr: u16, count: u16, packed_values: &[u8]) -> bool {
-        // 保留输入位图直到实际写入，避免 FC=0F 最大请求在栈上展开 2,000 个 bool。
-        let last = (addr as u32) + (count as u32);
-        if last > (u16::MAX as u32) + 1 {
-            return false;
-        }
-        for i in 0..count as usize {
-            let value = packed_values[i / 8] & (1 << (i % 8)) != 0;
-            if !crate::bus::backends::write_coil(addr.wrapping_add(i as u16), value) {
-                return false;
-            }
-        }
-        true
+        crate::bus::backends::write_coils(addr, count, packed_values)
     }
 
     fn write_multiple_registers(&self, addr: u16, values: &[u16]) -> bool {
@@ -368,7 +357,7 @@ where
     if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
         return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
     }
-    let byte_count = ((count as usize) + 7) / 8;
+    let byte_count = (count as usize).div_ceil(8);
     // out[0] = func (由 handle_pdu 填写), out[1] = byte_count, out[2..] = data
     // 注意: 调用方会在 out 开头写 func, 所以我们写 body 部分
     // 实际上 handle_pdu 期望我们写完整 PDU (含 func)
@@ -483,7 +472,7 @@ fn write_multi_coils_pdu<B: ModbusBackend>(
     if count == 0 || count as usize > MAX_BITS_PER_READ {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
-    if pdu.len() != 5 + byte_count || byte_count != (count as usize + 7) / 8 {
+    if pdu.len() != 5 + byte_count || byte_count != (count as usize).div_ceil(8) {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
     if !backend.write_multiple_coils(addr, count, &pdu[5..]) {

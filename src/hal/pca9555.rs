@@ -64,7 +64,9 @@ struct BusI2c {
 
 impl BusI2c {
     fn new(i2c: SwI2c) -> Self {
-        Self { i2c: Spin::new(i2c) }
+        Self {
+            i2c: Spin::new(i2c),
+        }
     }
 
     fn write_reg(&self, addr: u8, reg: u8, data: u8) -> AppResult<()> {
@@ -72,15 +74,21 @@ impl BusI2c {
         i2c.start();
         if !i2c.write_byte(addr) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr 0x{reg:02X}: NACK addr")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} wr 0x{reg:02X}: NACK addr"
+            )));
         }
         if !i2c.write_byte(reg) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr 0x{reg:02X}: NACK reg")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} wr 0x{reg:02X}: NACK reg"
+            )));
         }
         if !i2c.write_byte(data) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr 0x{reg:02X}: NACK data")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} wr 0x{reg:02X}: NACK data"
+            )));
         }
         i2c.stop();
         Ok(())
@@ -93,11 +101,15 @@ impl BusI2c {
         i2c.start();
         if !i2c.write_byte(addr) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK addr")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK addr"
+            )));
         }
         if !i2c.write_byte(reg) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK reg")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} wr2 0x{reg:02X}: NACK reg"
+            )));
         }
         for byte in data {
             if !i2c.write_byte(byte) {
@@ -116,16 +128,22 @@ impl BusI2c {
         i2c.start();
         if !i2c.write_byte(addr) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd 0x{reg:02X}: NACK addr")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd 0x{reg:02X}: NACK addr"
+            )));
         }
         if !i2c.write_byte(reg) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd 0x{reg:02X}: NACK reg")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd 0x{reg:02X}: NACK reg"
+            )));
         }
         i2c.start();
         if !i2c.write_byte(addr | 1) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd 0x{reg:02X}: NACK read")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd 0x{reg:02X}: NACK read"
+            )));
         }
         let val = i2c.read_byte(false);
         i2c.stop();
@@ -138,16 +156,22 @@ impl BusI2c {
         i2c.start();
         if !i2c.write_byte(addr) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK addr")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK addr"
+            )));
         }
         if !i2c.write_byte(reg) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK reg")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK reg"
+            )));
         }
         i2c.start();
         if !i2c.write_byte(addr | 1) {
             i2c.stop();
-            return Err(AppError::Io(format!("I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK read")));
+            return Err(AppError::Io(format!(
+                "I2C 0x{addr:02X} rd2 0x{reg:02X}: NACK read"
+            )));
         }
         let data = [i2c.read_byte(true), i2c.read_byte(false)];
         i2c.stop();
@@ -210,7 +234,7 @@ impl Pca9555Duo {
 
         // Status LEDs: PWR+RUN ON (matching reference: gucOtherLedState = 0xFF & PWRLED & RUNLED)
         // PWRLED=0xFE, RUNLED=0xDF → gucOtherLedState = 0xDE (bits for PWR+RUN cleared = ON)
-        let other_led: u8 = 0xFF & 0xFE & 0xDF; // = 0xDE
+        let other_led: u8 = 0xFE & 0xDF; // = 0xDE
         led_bus.write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, other_led)?;
         log::info!("[pca9555] status LEDs: PWR+RUN on (0x{other_led:02X})");
 
@@ -281,8 +305,12 @@ impl Pca9555Duo {
 }
 
 impl DigitalIo for Pca9555Duo {
-    fn di_count(&self) -> usize { 16 }
-    fn do_count(&self) -> usize { 16 }
+    fn di_count(&self) -> usize {
+        16
+    }
+    fn do_count(&self) -> usize {
+        16
+    }
 
     fn read_di_all(&self) -> AppResult<u64> {
         let [raw0, raw1] = self.io_bus.read_regs2(ADDR_DI_IO, REG_INPUT_0)?;
@@ -307,23 +335,13 @@ impl DigitalIo for Pca9555Duo {
 
     fn write_do_all(&self, value: u64) -> AppResult<()> {
         let bits = (value & 0xFFFF) as u16;
-        // 无锁 CAS: 仅当 cache 从旧值换成 bits 时才写入硬件
-        loop {
-            let cur = self.do_cache.load(Ordering::Acquire);
-            if cur == bits {
-                return Ok(());
-            }
-            match self.do_cache.compare_exchange_weak(
-                cur,
-                bits,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => std::hint::spin_loop(),
-            }
+        if self.do_cache.load(Ordering::Acquire) == bits {
+            return Ok(());
         }
-        self.apply_do(bits)
+        self.apply_do(bits)?;
+        // 缓存表示已确认的硬件状态，不能在 I2C 写入成功前发布。
+        self.do_cache.store(bits, Ordering::Release);
+        Ok(())
     }
 
     fn write_do(&self, idx: usize, on: bool) -> AppResult<()> {
@@ -331,24 +349,14 @@ impl DigitalIo for Pca9555Duo {
             return Err(AppError::Io(format!("do idx {idx} out of range")));
         }
         let mask = 1u16 << idx;
-        let mut bits: u16;
-        loop {
-            let cur = self.do_cache.load(Ordering::Acquire);
-            bits = if on { cur | mask } else { cur & !mask };
-            if cur == bits {
-                return Ok(());
-            }
-            match self.do_cache.compare_exchange_weak(
-                cur,
-                bits,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => std::hint::spin_loop(),
-            }
+        let current = self.do_cache.load(Ordering::Acquire);
+        let bits = if on { current | mask } else { current & !mask };
+        if current == bits {
+            return Ok(());
         }
-        self.apply_do(bits)
+        self.apply_do(bits)?;
+        self.do_cache.store(bits, Ordering::Release);
+        Ok(())
     }
 
     fn read_do_cached(&self) -> u64 {

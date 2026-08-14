@@ -66,20 +66,14 @@ impl GpioBank {
         // RS485 #0/#1 DE (输出, 默认低 = 接收模式)
         let rs485_de = [
             Spin::new(
-                PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[0]) }).map_err(|e| {
-                    AppError::Hal(format!(
-                        "rs485_de[0] gpio{}: {e:?}",
-                        rs485_de_pins[0]
-                    ))
-                })?,
+                PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[0]) }).map_err(
+                    |e| AppError::Hal(format!("rs485_de[0] gpio{}: {e:?}", rs485_de_pins[0])),
+                )?,
             ),
             Spin::new(
-                PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[1]) }).map_err(|e| {
-                    AppError::Hal(format!(
-                        "rs485_de[1] gpio{}: {e:?}",
-                        rs485_de_pins[1]
-                    ))
-                })?,
+                PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[1]) }).map_err(
+                    |e| AppError::Hal(format!("rs485_de[1] gpio{}: {e:?}", rs485_de_pins[1])),
+                )?,
             ),
         ];
         for pin in rs485_de.iter() {
@@ -97,8 +91,10 @@ impl GpioBank {
 
         Ok(Self {
             eth_int,
-            eth_rst: Spin::new(PinDriver::output(unsafe { AnyOutputPin::steal(eth_rst_pin) })
-                .map_err(|e| AppError::Hal(format!("eth_rst reinit: {e:?}")))?),
+            eth_rst: Spin::new(
+                PinDriver::output(unsafe { AnyOutputPin::steal(eth_rst_pin) })
+                    .map_err(|e| AppError::Hal(format!("eth_rst reinit: {e:?}")))?,
+            ),
             rs485_de,
             run_led,
         })

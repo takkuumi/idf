@@ -23,8 +23,8 @@
 //!   AT+CFGWRITE=<addr>,<value>        按 Modbus 地址写 U16
 
 use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16};
-use crate::device::{self, parse_ipv4, SystemConfig};
 use crate::config::regs;
+use crate::device::{self, SystemConfig, parse_ipv4};
 
 // ----------------------------------------------------------------------------
 // AT+CFGSN[=<sn>]
@@ -168,7 +168,10 @@ pub fn handle_cfgbtname(args: &str) -> String {
 pub fn handle_cfg485(args: &str) -> String {
     let parts: Vec<&str> = args.split(',').collect();
     if parts.is_empty() {
-        return err(10, "usage: AT+CFG485=<idx>[,<baud>,<data>,<stop>,<parity>,<slave>,<mode>]");
+        return err(
+            10,
+            "usage: AT+CFG485=<idx>[,<baud>,<data>,<stop>,<parity>,<slave>,<mode>]",
+        );
     }
     let idx = match parse_u16(parts[0]) {
         Some(i) if i < 2 => i as usize,
@@ -285,7 +288,14 @@ pub fn handle_cfgread(args: &str) -> String {
         None => return err(10, "invalid addr"),
     };
     if !(regs::CFG_BASE..regs::CFG_END).contains(&addr) {
-        return err(11, &format!("addr out of range [{:#06X}..{:#06X})", regs::CFG_BASE, regs::CFG_END));
+        return err(
+            11,
+            &format!(
+                "addr out of range [{:#06X}..{:#06X})",
+                regs::CFG_BASE,
+                regs::CFG_END
+            ),
+        );
     }
     let v = with_cfg(|c| c.read_reg(addr).unwrap_or(0));
     ok_data(&format!("{},0x{:04X}", v, v))

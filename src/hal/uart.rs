@@ -10,7 +10,7 @@
 //!   - UART0: 下载/日志 (TX=43, RX=44)
 //!   - UART1: RS485 #0 (Modbus 主站)
 //!   - UART2: RS485 #1 (Modbus 从站)
-//! 把 UART 实例化推迟到 RS485 模块可避免与 `EspSerial` 等高层封装冲突。
+// 把 UART 实例化推迟到 RS485 模块可避免与 `EspSerial` 等高层封装冲突。
 
 use crate::error::AppResult;
 
@@ -59,9 +59,14 @@ impl UartPort {
     ///
     /// 参数为 uart0/uart1/uart2 的 TX/RX 引脚号。
     /// 默认串口配置取自 `config::modbus::{rtu_slave, rtu_master}`。
-    pub fn init(uart0_tx: u8, uart0_rx: u8,
-                uart1_tx: u8, uart1_rx: u8,
-                uart2_tx: u8, uart2_rx: u8) -> AppResult<Self> {
+    pub fn init(
+        uart0_tx: u8,
+        uart0_rx: u8,
+        uart1_tx: u8,
+        uart1_rx: u8,
+        uart2_tx: u8,
+        uart2_rx: u8,
+    ) -> AppResult<Self> {
         use crate::config::modbus::{rtu_master, rtu_slave};
 
         Ok(Self {

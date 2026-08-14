@@ -432,9 +432,9 @@ impl St25dv {
             return Err(());
         }
         let n = buf.len();
-        for i in 0..n {
+        for (i, byte) in buf.iter_mut().enumerate() {
             let ack = i < n - 1; // ACK all but last byte
-            buf[i] = i2c.read_byte(ack);
+            *byte = i2c.read_byte(ack);
         }
         i2c.stop();
         Ok(())
@@ -514,7 +514,12 @@ struct PsramBuffer<T> {
 }
 
 impl<T> PsramBuffer<T> {
-    fn zeroed(len: usize) -> Option<Self> {
+    /// 分配 `len` 个全零元素。
+    ///
+    /// # Safety
+    ///
+    /// `T` 的全零位模式必须是有效值。
+    unsafe fn zeroed(len: usize) -> Option<Self> {
         if len == 0 || core::mem::size_of::<T>() == 0 {
             return None;
         }
@@ -579,7 +584,8 @@ pub fn start() -> AppResult<()> {
     if STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let data_buf = match PsramBuffer::<u8>::zeroed(NFC_BLOB_DATA_BYTES) {
+    // SAFETY: `u8` 的所有位模式均有效。
+    let data_buf = match unsafe { PsramBuffer::<u8>::zeroed(NFC_BLOB_DATA_BYTES) } {
         Some(buffer) => buffer,
         None => {
             STARTED.store(false, Ordering::Release);
@@ -588,7 +594,8 @@ pub fn start() -> AppResult<()> {
             ));
         }
     };
-    let nfc_words = match PsramBuffer::<u16>::zeroed(NFC_BLOB_DATA_WORDS) {
+    // SAFETY: `u16` 的所有位模式均有效。
+    let nfc_words = match unsafe { PsramBuffer::<u16>::zeroed(NFC_BLOB_DATA_WORDS) } {
         Some(buffer) => buffer,
         None => {
             STARTED.store(false, Ordering::Release);
@@ -715,10 +722,24 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
 
             // 原 C++ 的 0x0120..0x07FF 是无头原始 PRegBuf。自动流程绝不把 NFC
             // 覆盖到本机；只有显式 restore 才恢复，dirty/显式 backup 才写入。
+            let backup_requested =
+                command == NFC_CMD_BACKUP || (command == NFC_CMD_AUTO && local_dirty);
+            if backup_requested {
+                // 在取得快照前消费 dirty。备份期间的新写入会重新置位，成功后
+                // 不再清零，避免长 EEPROM 写周期吞掉并发配置更新。
+                crate::bus::storage_state::HOLDING_NFC_DIRTY
+                    .swap(false, std::sync::atomic::Ordering::AcqRel);
+            }
             let regbuf_arc = storage_read();
             let regbuf = regbuf_arc.as_ref().map(|s| s.holding_buf.as_ref());
             match (command, regbuf) {
-                (_, None) => *NFC_STATE.lock() = NfcState::Error,
+                (_, None) => {
+                    if backup_requested {
+                        crate::bus::storage_state::HOLDING_NFC_DIRTY
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    *NFC_STATE.lock() = NfcState::Error;
+                }
                 (NFC_CMD_BACKUP, Some(rb)) => {
                     log::info!("[nfc] manual backup executing");
                     finish_backup(backup_to_nfc(active_dev, rb, &mut data_buf));
@@ -840,7 +861,7 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16], scratch: &mut [u8]) -> Resul
     }
 
     // 2. 计算 CRC32
-    let crc = crc32(&data);
+    let crc = crc32(data);
 
     // NFC 磨损均衡：CRC 仅保存在 RAM 中，不写入 EEPROM，避免破坏旧格式。
     // 启动读到有效旧快照时也会初始化该值，因此未变化的显式备份不会重复擦写。
@@ -874,10 +895,10 @@ fn backup_to_nfc(dev: &St25dv, holding_buf: &[u16], scratch: &mut [u8]) -> Resul
 
 fn finish_backup(result: Result<(), ()>) {
     if result.is_ok() {
-        crate::bus::storage_state::HOLDING_NFC_DIRTY
-            .store(false, std::sync::atomic::Ordering::Release);
         *NFC_STATE.lock() = NfcState::BackedUp;
     } else {
+        crate::bus::storage_state::HOLDING_NFC_DIRTY
+            .store(true, std::sync::atomic::Ordering::Release);
         *NFC_STATE.lock() = NfcState::Error;
     }
 }

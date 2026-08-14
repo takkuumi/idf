@@ -1,19 +1,19 @@
 //! Actor 模型框架 (无锁邮箱, 取代共享可变状态)
 //!
 //! ## 设计目标
-//! - 完全 lock-free 消息传递 (基于 [`crate::sync::MpscRing`])
+//! - 有界、非阻塞生产者消息传递 (基于 [`crate::sync::MpscRing`])
 //! - Actor 之间通过消息通信, 不共享可变状态 (每个 Actor 状态由其线程独占)
 //! - 取代 `Mutex<RwLock` 风格的共享状态: 状态 = Actor 内部 `&mut self`, 由 mailbox 串行
 //!
 //! ## 核心组件
 //! - [`Actor`] trait: 行为 (`handle(&mut self, msg)`)
 //! - [`Mailbox`] / [`MpscRing`]: bounded MPSC, 多生产者单消费者
-//! - [`ActorRef`]: 类型安全的消息发送句柄 (fire-and-forget)
+//! - [`ActorRef`][]: 类型安全的消息发送句柄 (fire-and-forget)
 //! - [`spawn`]: 启动一个独立线程消费 mailbox, 独占调用 `handle`
 //!
 //! ## 与锁的区别
 //! - 锁: 共享可变状态 + 争用 park; 高频路径上调度器介入明显
-//! - Actor: 状态由单线程独占; 其他任务通过消息 (拷贝) 推动, 不争用同一变量
+//! - Actor: 状态由单线程独占; 其他任务通过有界消息推动, 不共享业务可变状态
 //! - mailbox 满时丢弃新消息并记日志 (工业实时系统丢一条请求优于 park 整个链路)
 //!
 //! ## 使用示例
@@ -34,6 +34,7 @@
 //! ```
 
 use crate::sync::MpscRing;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Actor trait.
@@ -58,12 +59,14 @@ pub trait Actor: 'static + Send {
 ///
 /// `send` 是 fire-and-forget; mailbox 满时仅记日志, 不阻塞调用方任务.
 pub struct ActorRef<A: Actor> {
-    mailbox: &'static MpscRing<A::Msg, 32>,
+    mailbox: Arc<MpscRing<A::Msg, 32>>,
 }
 
 impl<A: Actor> Clone for ActorRef<A> {
     fn clone(&self) -> Self {
-        Self { mailbox: self.mailbox }
+        Self {
+            mailbox: self.mailbox.clone(),
+        }
     }
 }
 
@@ -96,18 +99,22 @@ pub struct ActorHandle<A: Actor> {
 
 /// 启动一个 Actor: 在独立线程中消费 mailbox, 调用 `handle`.
 ///
-/// mailbox 通过 `Box::leak` 获取 `&'static` 生命周期 (生命周期 = 程序).
-/// Actor 内部状态本身由其线程独占, 无需任何同步原语.
-pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
-    let mailbox: &'static MpscRing<A::Msg, 32> = Box::leak(Box::new(MpscRing::new()));
-    let actor_ref = ActorRef { mailbox };
-    let actor_handle = ActorHandle { actor_ref: actor_ref.clone() };
+/// mailbox 由生产者句柄和消费线程共同持有；线程创建失败时会正常释放，避免
+/// 启动期 internal SRAM 紧张时泄漏邮箱并触发整机 panic/reboot。
+pub fn spawn<A: Actor>(mut actor: A) -> std::io::Result<(ActorRef<A>, ActorHandle<A>)> {
+    let mailbox = Arc::new(MpscRing::new());
+    let actor_ref = ActorRef {
+        mailbox: mailbox.clone(),
+    };
+    let actor_handle = ActorHandle {
+        actor_ref: actor_ref.clone(),
+    };
 
     let type_name = core::any::type_name::<A>();
     let short = type_name.split("::").last().unwrap_or(type_name);
     let name = format!("actor-{short}");
     // DeviceActor 的协议 blob 已移到固定堆缓冲，任务栈受集中预算约束。
-    match std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(name)
         .stack_size(crate::safety::stack_budget::DEVICE_ACTOR)
         .spawn(move || {
@@ -131,14 +138,8 @@ pub fn spawn<A: Actor>(mut actor: A) -> (ActorRef<A>, ActorHandle<A>) {
                 }
                 crate::health::feed_wdt();
             }
-        }) {
-        Ok(_) => (actor_ref, actor_handle),
-        Err(e) => {
-            // spawn 失败属致命错误 (无 DeviceActor 则 NVS 持久化全停).
-            // panic=abort 配置下触发整机 reset, 由分级 recovery 机制兜底.
-            panic!("actor spawn failed: {e}");
-        }
-    }
+        })?;
+    Ok((actor_ref, actor_handle))
 }
 
 // ============================================================================
@@ -164,8 +165,10 @@ mod tests {
 
     #[test]
     fn test_actor_basic() {
-        let counter = Counter { value: AtomicU32::new(0) };
-        let (actor_ref, _handle) = spawn(counter);
+        let counter = Counter {
+            value: AtomicU32::new(0),
+        };
+        let (actor_ref, _handle) = spawn(counter).expect("actor thread must start");
         for _ in 0..10 {
             actor_ref.send(Add(1));
         }

@@ -9,8 +9,8 @@
 //! 见 `docs/system/LEGACY_BUS_RETIRE.md` 阶段 B/C/D (退役完成).
 //!
 //! # 写者并发
-//! `STORAGE` / `CONFIG` 的 `Rcu::write` 假定串行执笔 (单 Modbus 任务串 / 单 DeviceActor).
-//! 多写者并发 push 同一 retire 槽可能丢一个未回收快照 (泄漏 1 帧, 极罕见) — 见 `rcu.rs`.
+//! `STORAGE` / `CONFIG` 使用 `Spin<Option<Arc<T>>>` 发布不可变快照，写端串行化 RMW，
+//! 防止 TCP、RTU、BLE、Web 和 DeviceActor 并发修改时出现 lost update。
 
 use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
@@ -28,7 +28,7 @@ use super::storage_state::{STORAGE, StorageSnapshot, proto_status, storage_read}
 // 多个并发写者: Modbus TCP 4 连接 + RTU + DeviceActor + RS485 master + DHCP。
 // 并发写者会导致:
 //   1. RMW 竞争丢写 (两个线程同时 clone 同一快照, 各自修改, 后写覆盖前写)
-//   2. retire_queue 溢出 (4 槽, 突发覆盖会保守泄漏一个 COW 快照)
+//   2. 并发 clone 同一旧快照后相互覆盖，造成业务字段丢写
 //
 // 修复: 用 Spin<()> 短锁保护 clone-mutate-write 序列。持锁时间 = clone + mutate +
 // Rcu::write；快照 clone 仅增加 Arc 引用，实际修改区按需 COW。远小于 Modbus
@@ -50,7 +50,7 @@ static RCU_WRITE_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
 /// 读线圈 (DO, FC=01): 地址语义同 `Bus::read_coil`.
 #[inline]
 pub fn read_coil(addr: u16) -> Option<bool> {
-    if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT {
+    if (regs::COIL_DO_BASE..regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT).contains(&addr) {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         return Some(ch < hw_version::DO_COUNT && IO.do_.get_bit(ch));
     }
@@ -80,7 +80,7 @@ pub fn read_disc(addr: u16) -> Option<bool> {
 
 /// 读输入寄存器 (AI + 系统状态 + 故障统计, FC=04). 地址语义同 `Bus::read_input_reg`.
 pub fn read_input_reg(addr: u16) -> Option<u16> {
-    if addr >= regs::INREG_AI_BASE && addr < regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT {
+    if (regs::INREG_AI_BASE..regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT).contains(&addr) {
         let idx = (addr - regs::INREG_AI_BASE) as usize;
         return Some(if idx < regs::INREG_AI_COUNT as usize {
             IO.ai.get_raw(idx)
@@ -88,8 +88,8 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             0
         });
     }
-    if addr >= regs::INREG_AI_STATUS_BASE
-        && addr < regs::INREG_AI_STATUS_BASE + regs::INREG_AI_COUNT
+    if (regs::INREG_AI_STATUS_BASE..regs::INREG_AI_STATUS_BASE + regs::INREG_AI_COUNT)
+        .contains(&addr)
     {
         let idx = (addr - regs::INREG_AI_STATUS_BASE) as usize;
         return Some(IO.ai.get_scaled(idx));
@@ -186,7 +186,10 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             DegradedMode::Minimal => 3,
         }),
         regs::INREG_RECOV_BLE_DROPS => {
+            #[cfg(feature = "ble-at")]
             let drops = crate::ble_at::binary_tx_drops();
+            #[cfg(not(feature = "ble-at"))]
+            let drops = 0u32;
             Some(drops.min(0xFFFF) as u16)
         }
         regs::INREG_RINGLOG_COUNT => {
@@ -202,7 +205,7 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         }
         // ---- LOOP10: Ringlog 数据条目 (FC=04, 0x0887..0x08A6, 8条×4字) ----
         // 从 FC=03 移至 FC=04: 避免与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 地址冲突
-        addr if addr >= regs::INREG_RINGLOG_BASE && addr < regs::INREG_RINGLOG_BASE + 32 => {
+        addr if (regs::INREG_RINGLOG_BASE..regs::INREG_RINGLOG_BASE + 32).contains(&addr) => {
             let entry_idx = ((addr - regs::INREG_RINGLOG_BASE) / 4) as usize;
             let field_idx = (addr - regs::INREG_RINGLOG_BASE) % 4;
             let ring = crate::error::ringlog::RING_LOG.lock();
@@ -224,12 +227,12 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         // 数据由 udp_multicast 模块接收并填充, 32 字节 (16 个 U16) 映射到 0x0090-0x009F.
         // 余下 0x00A0-0x00FF 保留为 0 (对齐参考固件 REG_STATU_SWITCH_END=0x0100).
         addr if (regs::INREG_SWITCH_STATUS_BASE..regs::INREG_SWITCH_STATUS_END).contains(&addr) => {
-            let word_idx = (addr - regs::INREG_SWITCH_STATUS_BASE) as u16;
+            let word_idx = addr - regs::INREG_SWITCH_STATUS_BASE;
             crate::udp_multicast::read_switch_status(word_idx)
         }
         // ---- MONITOR_PLC 别名区 (30001-30128, LOOP12) ----
         // 老 SCADA 系统通过 FC=04 轮询 3xxxx 区. 映射: 30001-30048→DI 状态, 30049-30056→AI scaled.
-        addr if addr >= regs::MONITOR_PLC_BASE && addr <= regs::MONITOR_PLC_END => {
+        addr if (regs::MONITOR_PLC_BASE..=regs::MONITOR_PLC_END).contains(&addr) => {
             let idx = (addr - regs::MONITOR_PLC_BASE) as usize;
             if idx < 48 {
                 // DI status (bit 0..47)
@@ -301,12 +304,12 @@ fn read_hold_reg_from_snapshots(
         _ => {}
     }
     // 1. device_text (5000..=6999): 来自 STORAGE (Rcu 主存)
-    if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
+    if (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr) {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         return storage.device_text.get(idx).copied();
     }
     // 2. CFG / PRegBuf (0x0880..=0x107F)
-    if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
+    if (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr) {
         // LOOP10 修复: ringlog 已移至 FC=04 (read_input_reg), 不再在 FC=03 中拦截
         // 旧代码 ringlog 0x0887-0x08A6 与 SN(0x0894)/PLACE(0x089D)/HW_VER(0x08A5) 重叠,
         // 导致 FC=03 读 SN/PLACE 返回 ringlog 条目而非实际配置值.
@@ -323,7 +326,7 @@ fn read_hold_reg_from_snapshots(
     }
     // ---- CONTROL_PLC 别名区 (40001-40300, LOOP12) ----
     // 老 SCADA 通过 FC=03 读 4xxxx 区. 映射: 40001-40048→DO 状态, 40049+→HOLD_USER_BASE 区.
-    if addr >= regs::CONTROL_PLC_BASE && addr <= regs::CONTROL_PLC_END {
+    if (regs::CONTROL_PLC_BASE..=regs::CONTROL_PLC_END).contains(&addr) {
         let idx = (addr - regs::CONTROL_PLC_BASE) as usize;
         return if idx < 48 {
             // DO status (bit 0..47)
@@ -340,7 +343,7 @@ fn read_hold_reg_from_snapshots(
         };
     }
     // 3. PROTO 区 (0x4000..<PROTO_END): 来自 STORAGE.proto
-    if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
+    if (regs::PROTO_BASE..regs::PROTO_END).contains(&addr) {
         let idx = (addr - regs::PROTO_BASE) as usize;
         return storage.proto.data.get(idx).copied();
     }
@@ -531,9 +534,7 @@ use crate::device::system_config::{SystemConfig, WriteResult};
 /// 克隆当前 STORAGE 快照 (无 Arc, 拿到独立可改 T).
 #[inline]
 fn storage_clone() -> StorageSnapshot {
-    storage_read()
-        .map(|a| (*a).clone())
-        .unwrap_or_else(StorageSnapshot::new)
+    storage_read().map(|a| (*a).clone()).unwrap_or_default()
 }
 
 /// 克隆当前 CONFIG 快照.
@@ -541,9 +542,7 @@ fn storage_clone() -> StorageSnapshot {
 /// ConfigSnapshot 仅含小型 SystemConfig，不携带逻辑配置大对象。
 #[inline]
 fn config_clone() -> ConfigSnapshot {
-    config_read()
-        .map(|a| (*a).clone())
-        .unwrap_or_else(ConfigSnapshot::new)
+    config_read().map(|a| (*a).clone()).unwrap_or_default()
 }
 
 /// 把 snapshot 的 proto.status 字段与 atomic 同步 (每次 RCU RMW 回写前调用).
@@ -567,6 +566,11 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
         return false;
     }
     let end_exclusive = addr as u32 + values.len() as u32;
+    // FC=10 必须先验证整段。旧实现逐字执行到非法地址才返回异常，会留下客户端
+    // 不知道的半笔配置。先验证可保证失败请求不产生任何业务副作用。
+    if !(0..values.len()).all(|offset| is_writable_hold_reg(addr + offset as u16)) {
+        return false;
+    }
 
     // PC 逻辑文本按 60 words/chunk 写入。整块只 clone/publish/save 一次，避免
     // 60 次 4KB 快照与同步 NVS 写导致 2s Modbus 超时和 Flash 过度磨损。
@@ -662,12 +666,24 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
         .all(|(offset, &value)| write_hold_reg_locked(addr.wrapping_add(offset as u16), value))
 }
 
+#[inline]
+fn is_writable_hold_reg(addr: u16) -> bool {
+    (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
+        || (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr)
+        || (regs::CONTROL_PLC_BASE..=regs::CONTROL_PLC_END).contains(&addr)
+        || (regs::PROTO_BASE..regs::PROTO_END).contains(&addr)
+        || matches!(
+            addr,
+            regs::PROTO_COMMIT | regs::PROTO_RELOAD | regs::PROTO_VERSION | regs::PROTO_LENGTH
+        )
+}
+
 /// write_hold_reg 的内部实现, 调用方必须持有 RCU_WRITE_LOCK
 fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
     //    Android 1.0.78 WRITE_DEVICE_TEXT_COUNT (0xB5) + WRITE_DEVICE_TEXT_DATA (0xB7)
     //    通过 Modbus FC=10 写入, 我们写后立即持久化以保证工业可靠性.
-    if addr >= regs::DEVICE_TEXT_BASE && addr <= regs::DEVICE_TEXT_END {
+    if (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr) {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         let mut snap = storage_clone();
         Arc::make_mut(&mut snap.device_text)[idx] = value;
@@ -685,7 +701,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // - Apply    : RCU + NVS + cfg_version++ (网络/BLE 等需要重新初始化外设)
     // - Reset    : 恢复出厂 + NVS + apply_config
     // - NotFound : 地址不在本配置区, 落 holding_buf 兜底
-    if addr >= regs::HOLD_CFG_BASE && addr <= regs::HOLD_CFG_END {
+    if (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr) {
         let mut cs = config_clone();
         match cs.cfg.write_reg(addr, value) {
             WriteResult::Ok => {
@@ -726,7 +742,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     }
     // ---- CONTROL_PLC 别名区 (40001-40300, LOOP12) ----
     // 老 SCADA FC=06/10 写入 4xxxx. 映射: 40001-40048→DO 状态, 40049+→HOLD_USER_BASE 区.
-    if addr >= regs::CONTROL_PLC_BASE && addr <= regs::CONTROL_PLC_END {
+    if (regs::CONTROL_PLC_BASE..=regs::CONTROL_PLC_END).contains(&addr) {
         let idx = (addr - regs::CONTROL_PLC_BASE) as usize;
         if idx < 48 {
             // DO bit write
@@ -746,28 +762,36 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
             });
             return true;
         }
-        return false;
-    } else if addr >= regs::PROTO_BASE && addr < regs::PROTO_END {
+        false
+    } else if (regs::PROTO_BASE..regs::PROTO_END).contains(&addr) {
         let mut snap = storage_clone();
         let idx = (addr - regs::PROTO_BASE) as usize;
         Arc::make_mut(&mut snap.proto.data)[idx] = value;
         snap.proto.dirty = true;
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
-        return true;
+        true
     } else {
         match addr {
             regs::PROTO_COMMIT => {
                 if value == 0xC5C5 {
                     super::storage_state::proto_status_set(1);
-                    crate::device::request_commit();
+                    if !crate::device::request_commit() {
+                        super::storage_state::proto_status_set(3);
+                        log::warn!("[device] commit rejected: actor unavailable or mailbox full");
+                        return false;
+                    }
                 }
                 true
             }
             regs::PROTO_RELOAD => {
                 if value == 0xA5A5 {
                     super::storage_state::proto_status_set(2);
-                    crate::device::request_reload();
+                    if !crate::device::request_reload() {
+                        super::storage_state::proto_status_set(3);
+                        log::warn!("[device] reload rejected: actor unavailable or mailbox full");
+                        return false;
+                    }
                 }
                 true
             }
@@ -798,7 +822,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
 /// 避免历史上 web `/iocontrol` 与 CONTROL_PLC 等路径忘记调用 notify 导致硬件不刷新的 bug
 /// (详见 docs/LOOP.md LOOP13 章节). notify 内部是 AtomicBool::store(true) 幂等.
 pub fn write_coil(addr: u16, value: bool) -> bool {
-    if addr >= regs::COIL_DO_BASE && addr < regs::COIL_DO_END {
+    if (regs::COIL_DO_BASE..regs::COIL_DO_END).contains(&addr) {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         super::io_global::IO.do_.set_bit(ch, value);
         #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
@@ -809,7 +833,9 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         // PC 明确下发的重启属于计划操作：先正常应答 FC=05，再由 main_loop 执行。
         regs::COIL_RESTART | regs::COIL_LOGIC_RESTART => {
             if value {
-                super::io_global::IO.sys.request_reset();
+                super::io_global::IO
+                    .sys
+                    .request_reset(super::io_state::ResetSource::MODBUS);
             }
             true
         }
@@ -817,6 +843,53 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         regs::COIL_INTERNAL_START | regs::COIL_INTERNAL_STOP => true,
         _ => false,
     }
+}
+
+/// 批量写线圈。先验证完整地址窗口；物理 DO 使用 AtomicBits64 的 mask_replace
+/// 一次发布，读者不会观察到半笔 FC=0F 状态。
+pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
+    if count == 0
+        || packed_values.len() != (count as usize).div_ceil(8)
+        || (addr as u32) + count as u32 > (u16::MAX as u32) + 1
+    {
+        return false;
+    }
+    let end_exclusive = addr as u32 + count as u32;
+    if addr >= regs::COIL_DO_BASE && end_exclusive <= regs::COIL_DO_END as u32 {
+        let start = (addr - regs::COIL_DO_BASE) as usize;
+        let mut mask = 0u64;
+        let mut value = 0u64;
+        for bit in 0..count as usize {
+            let target = start + bit;
+            mask |= 1u64 << target;
+            if packed_values[bit / 8] & (1 << (bit % 8)) != 0 {
+                value |= 1u64 << target;
+            }
+        }
+        super::io_global::IO.do_.mask_replace(mask, value);
+        #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+        crate::io::do_::notify();
+        return true;
+    }
+
+    // 内部控制线圈是唯一另一段可写窗口。全段验证完成后才执行重启等副作用。
+    let all_controls = (0..count).all(|offset| {
+        matches!(
+            addr + offset,
+            regs::COIL_INTERNAL_START
+                | regs::COIL_INTERNAL_STOP
+                | regs::COIL_RESTART
+                | regs::COIL_LOGIC_RESTART
+        )
+    });
+    all_controls
+        && (0..count).all(|offset| {
+            let bit = offset as usize;
+            write_coil(
+                addr + offset,
+                packed_values[bit / 8] & (1 << (bit % 8)) != 0,
+            )
+        })
 }
 
 /// 修改 SystemConfig 部分字段后回写 CONFIG RCU. 用于 w5500 DHCP 写回等单写者场景.

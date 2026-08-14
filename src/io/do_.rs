@@ -12,6 +12,8 @@ use crate::sync::MainLoopCell;
 
 /// 10s 兜底轮询: 即使 dirty 未触发, 也每 10s 检查一次硬件同步
 const FALLBACK_TICKS: u32 = 10_000 / crate::config::MAIN_LOOP_PERIOD_MS as u32;
+/// 硬件写失败后 100ms 重试，避免 5ms 忙重试占满 I2C，同时不等待 10s 兜底。
+const RETRY_TICKS: u32 = 100 / crate::config::MAIN_LOOP_PERIOD_MS as u32;
 
 /// Modbus/其他模块写入 DO 后置位, 通知 DO 任务立即刷新
 static DO_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -29,6 +31,7 @@ struct DoState {
     last: u64,
     /// 主循环 tick 计数器, 用于 10s 兜底定时
     tick_count: u32,
+    consecutive_failures: u32,
 }
 
 static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
@@ -39,6 +42,7 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
         .init(DoState {
             last: u64::MAX,
             tick_count: 0,
+            consecutive_failures: 0,
         })
         .map_err(|_| crate::error::AppError::Io("DO state busy during init".into()))?;
     let _ = _hal;
@@ -66,10 +70,26 @@ pub fn tick_do_output(hal: &Hal) {
 
         let bits = crate::bus::IO.do_.load_bits();
         if bits != state.last {
-            if let Err(e) = hal.dio().write_do_all(bits) {
-                log::error!("[do] write_do_all failed: {}", e);
+            match hal.dio().write_do_all(bits) {
+                Ok(()) => {
+                    state.last = bits;
+                    state.consecutive_failures = 0;
+                }
+                Err(e) => {
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                    if state.consecutive_failures == 1
+                        || state.consecutive_failures.is_multiple_of(100)
+                    {
+                        log::error!(
+                            "[do] write_do_all failed (attempt={}): {}",
+                            state.consecutive_failures,
+                            e
+                        );
+                    }
+                    // 保持 last 不变，确保下次仍识别为未同步；100ms 后重试。
+                    state.tick_count = FALLBACK_TICKS.saturating_sub(RETRY_TICKS);
+                }
             }
-            state.last = bits;
         }
     });
 }

@@ -1,18 +1,18 @@
-//! 大容量存储状态 - RCU (Read-Copy-Update) 无锁
+//! 大容量存储状态 - 不可变 Arc 快照
 //!
 //! ## 之前 (parking_lot::Mutex<StorageState>)
 //! - 11KB 大锁, Modbus 多寄存器写持锁 N 次
 //! - 高并发时锁竞争明显
 //!
 //! ## 现在 (Rcu<StorageState>)
-//! - 读: lock-free 原子加载
-//! - 写: 构造新值, 原子替换并按 epoch 回收旧值
+//! - 读: 极短自旋临界区内克隆 Arc
+//! - 写: 构造新值后替换 Arc，最后一个读者释放时回收
 //! - 写极少 (commit/reload), 读极多 (Modbus 请求)
 //!
 //! ## 关键优化
 //! - 写时构造完整新值, 一次原子 swap
 //! - 写期间读者看到的是旧值, 不会看到部分更新
-//! - 完全没有锁竞争
+//! - 大数组访问和业务闭包在临界区外执行
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,13 +74,13 @@ impl Default for StorageSnapshot {
     }
 }
 
-/// 全局存储 (RCU, lock-free 读)
+/// 全局存储快照
 pub static STORAGE: LazyLock<Rcu<StorageSnapshot>> =
     LazyLock::new(|| Rcu::new(StorageSnapshot::new()));
 
-/// 读 (lock-free, 永远不阻塞)
+/// 读（锁内只克隆 Arc）
 pub fn storage_read() -> Option<Arc<StorageSnapshot>> {
-    STORAGE.read().map(|s| Arc::new(s.clone()))
+    STORAGE.read()
 }
 
 /// 写 (原子替换)
@@ -88,7 +88,7 @@ pub fn storage_write(snapshot: StorageSnapshot) {
     STORAGE.write(snapshot);
 }
 
-/// 读并执行 (无 Arc 分配)
+/// 读并执行（业务闭包在锁外）
 pub fn storage_read_with<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&StorageSnapshot) -> R,
@@ -111,12 +111,6 @@ pub static HOLDING_NFC_DIRTY: AtomicBool = AtomicBool::new(false);
 /// 启动时是否从至少一个通过 magic/version/CRC 校验的 NVS holding blob 恢复成功。
 /// NFC 自动冲突决策只在此值为 false 时允许用标签覆盖本机；有效 NVS 永远优先。
 pub static HOLDING_NVS_VALID: AtomicBool = AtomicBool::new(false);
-
-/// DO NVS 持久化 dirty 标志 (LOOP13).
-///
-/// `tick_do_output` 写硬件后同步置 true; main_loop 每 1s 节流检查并写 NVS.
-/// 用于避免 DO 写频次 (~Hz 量级) 过高导致 NVS flash 过写.
-pub static DO_NVS_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {

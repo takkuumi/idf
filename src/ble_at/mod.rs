@@ -85,6 +85,7 @@ static HANDLE_TABLE: [AtomicU16; ATTR_TABLE_LEN] = [
 /// Bluedord 分配的 GATT 接口号. 用 AtomicU8:
 /// - 0xFF = 未注册 (sentinel, ESP_GATT_IF_NONE 在 ESP-IDF 头文件定义)
 /// - 0..=0xFE = 已注册接口号
+///
 /// 替代 Spin<Option<esp_gatt_if_t>>, 真无锁 (原 Spin 在每回调+每 tick 都竞争)
 // 注: ESP-IDF esp_gatt_if_t 实际为 u8 (绑定确认). 0xFF = 未注册.
 static GATTS_IF: AtomicU8 = AtomicU8::new(0xFF);
@@ -92,6 +93,7 @@ static GATTS_IF: AtomicU8 = AtomicU8::new(0xFF);
 /// 当前 GATT 连接 ID. 用 AtomicU16:
 /// - 0xFFFF = 无客户端连接 (sentinel, ESP-IDF conn_id 最大 0x7FFF 远小于此)
 /// - 其他 = 有效连接 ID
+///
 /// 替代 Spin<Option<u16>>, 真无锁
 static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
 /// 每次连接/断线递增，防止 Bluedroid 复用 conn_id 后发送旧连接的排队响应。
@@ -111,7 +113,7 @@ pub fn notify_ble_name_changed() {
 static TASK_HB: TaskHb = TaskHb::new("ble-at");
 
 /// 输入缓冲区 (累计 GATT 写入, 直到遇到 \n)
-/// 单条 AT 命令最长约 200 字节 (BULKW 50 个 U16), 256 字节够用
+/// 单条 AT 命令最长约 200 字节 (BULKW 50 个 U16)，512 字节覆盖分片和行结束符。
 static RX_BUFFER: LazyLock<Spin<heapless::String<512>>> =
     LazyLock::new(|| Spin::new(heapless::String::new()));
 
@@ -368,8 +370,7 @@ static ATTRIBUTE_TABLE: [SyncGattAttrDb; ATTR_TABLE_LEN] = [
 // ============================================================================
 // GATT 回调 (由 Bluedroid C 栈调用)
 // ============================================================================
-/// GATT 事件回调
-///
+// GATT 事件回调
 // ============================================================================
 
 fn start_advertising() {
@@ -503,7 +504,7 @@ unsafe extern "C" fn gatts_event_cb(
                 log::error!("[ble_at] GATT app registration failed: {}", reg.status);
                 return;
             }
-            GATTS_IF.store(gatts_if as u8, Ordering::Release);
+            GATTS_IF.store(gatts_if, Ordering::Release);
             log::info!(
                 "[ble_at] calling create_attr_tab(gatts_if={}, n_attr={})",
                 gatts_if,
@@ -691,7 +692,7 @@ unsafe extern "C" fn gatts_event_cb(
             // LOOP8: 原子写入替代 Spin<Option>
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             CONN_ID.store(p.conn_id, Ordering::Release);
-            GATTS_IF.store(gatts_if as u8, Ordering::Release);
+            GATTS_IF.store(gatts_if, Ordering::Release);
             NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
             GATT_CONGESTED.store(false, Ordering::Release);
             ADV_ACTIVE.store(false, Ordering::Release);
@@ -704,13 +705,10 @@ unsafe extern "C" fn gatts_event_cb(
             // 心跳业务数据必须与请求应答完全一致。Android parseHeartbeat 把
             // func 后的数据解析为 slave + runStatus + terminal(6-byte MAC)。
             let pdu = build_heartbeat_pdu(1);
-            let mut frame = TxBleFrame::new();
-            let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]); // tx_id=0, proto_id=0
-            let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
-            let _ = frame.extend_from_slice(&pdu);
-            let crc = modbus_crc16(&frame[..frame.len()]);
-            let _ = frame.push(crc as u8);
-            let _ = frame.push((crc >> 8) as u8);
+            let Some(frame) = build_ble_frame(0, 0, &pdu) else {
+                log::error!("[ble_at] connect heartbeat exceeds TX frame capacity");
+                return;
+            };
             // Android 首次 connect 后能立即收到心跳, 不用等 ~10s 周期心跳.
             let frame_len = frame.len();
             if enqueue_tx_frame(frame) {
@@ -1036,7 +1034,9 @@ pub fn process_tick() {
         // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data。
         const ADV_RETRY_TICKS: u32 = 5_000 / crate::config::BLE_PROCESS_PERIOD_MS as u32;
         // LOOP17: 统一使用 config_adv_data() 入口 (与 start/update_gap_device_name 一致)
-        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && tick % ADV_RETRY_TICKS == 0 {
+        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+            && tick.is_multiple_of(ADV_RETRY_TICKS)
+        {
             log::warn!("[ble_at] advertising not active, retrying config_adv_data");
             config_adv_data();
         }
@@ -1073,36 +1073,32 @@ pub fn process_tick() {
     // 0. 处理 RX_BUFFER 中的 AT 文本命令 (修复死路径: 之前 parser::process 从未调用)
     //    完整行 (以 \n 结尾) 调 parser::process 处理, 响应推送 BINARY_TX
     let mut at_response: Option<String> = None;
-    if let Some(mut rx) = RX_BUFFER.try_lock() {
-        if let Some(pos) = rx.find('\n') {
-            // 取行, 移除已处理部分 (heapless::String 无 replace_range, 用 pop_front)
-            let line_str: String = rx[..pos].trim_end_matches('\r').to_string();
-            // 删除前 pos+1 个字符 (= line + '\n')
-            for _ in 0..=pos {
-                if rx.is_empty() {
-                    break;
-                }
-                let _ = rx.remove(0);
+    if let Some(mut rx) = RX_BUFFER.try_lock()
+        && let Some(pos) = rx.find('\n')
+    {
+        // 取行, 移除已处理部分 (heapless::String 无 replace_range, 用 pop_front)
+        let line_str: String = rx[..pos].trim_end_matches('\r').to_string();
+        // 删除前 pos+1 个字符 (= line + '\n')
+        for _ in 0..=pos {
+            if rx.is_empty() {
+                break;
             }
-            drop(rx);
-            log::info!("[ble_at] AT cmd: {}", line_str);
-            at_response = Some(crate::ble_at::parser::process(&line_str));
+            let _ = rx.remove(0);
         }
+        drop(rx);
+        log::info!("[ble_at] AT cmd: {}", line_str);
+        at_response = Some(crate::ble_at::parser::process(&line_str));
     }
     if let Some(resp) = at_response {
-        // 把 AT 文本响应包装成 BLE 帧 (tx_id=0, proto_id=0)
-        let mut frame = TxBleFrame::new();
-        let _ = frame.extend_from_slice(&0u16.to_be_bytes());
-        let _ = frame.extend_from_slice(&0u16.to_be_bytes());
-        let bytes = resp.as_bytes();
-        let len = bytes.len() as u16;
-        let _ = frame.extend_from_slice(&len.to_be_bytes());
-        let _ = frame.extend_from_slice(bytes);
-        let crc = modbus_crc16(&frame[..frame.len()]);
-        let _ = frame.push(crc as u8);
-        let _ = frame.push((crc >> 8) as u8);
-        if !enqueue_tx_frame(frame) {
-            log::warn!("[ble_at] AT response too long, dropping");
+        // 把 AT 文本响应包装成 BLE 帧 (tx_id=0, proto_id=0)。超长响应不能
+        // 忽略 heapless 容量错误，否则长度字段与实际载荷不一致，客户端无法复位解析器。
+        let frame = build_ble_frame(0, 0, resp.as_bytes()).or_else(|| {
+            log::warn!("[ble_at] AT response too long: {} bytes", resp.len());
+            let error = crate::ble_at::parser::err(3, "response too long");
+            build_ble_frame(0, 0, error.as_bytes())
+        });
+        if frame.is_none_or(|frame| !enqueue_tx_frame(frame)) {
+            log::warn!("[ble_at] AT response queue full, dropping");
         }
     }
 
@@ -1112,16 +1108,9 @@ pub fn process_tick() {
     const HEARTBEAT_TICKS: u16 = (10_000 / crate::config::BLE_PROCESS_PERIOD_MS) as u16;
     static HB_DIV: AtomicU16 = AtomicU16::new(0);
     let n = HB_DIV.fetch_add(1, Ordering::Relaxed);
-    if n % HEARTBEAT_TICKS == 0 && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
+    if n.is_multiple_of(HEARTBEAT_TICKS) && TX_NOTIFY_ENABLED.load(Ordering::Acquire) {
         let pdu = build_heartbeat_pdu(1);
-        let mut frame = TxBleFrame::new();
-        let _ = frame.extend_from_slice(&[0u8, 0, 0, 0]);
-        let _ = frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
-        let _ = frame.extend_from_slice(&pdu);
-        let crc = crate::modbus::shared::modbus_crc16(&frame);
-        let _ = frame.push(crc as u8);
-        let _ = frame.push((crc >> 8) as u8);
-        if enqueue_tx_frame(frame) {
+        if build_ble_frame(0, 0, &pdu).is_some_and(enqueue_tx_frame) {
             log::debug!("[ble_at] periodic heartbeat queued");
         }
     }
@@ -1192,8 +1181,18 @@ fn send_next_notification(gatts_if_raw: u8, conn_id: u16, tx_handle: u16) {
 /// 接收来自 GATT write 的数据 (供 GATT 回调调用)
 pub fn feed_data(data: &[u8]) {
     let mut rx = RX_BUFFER.lock();
-    for &b in data {
-        let _ = rx.push(b as char);
+    // 文本通道只接受 ASCII AT 命令。逐字忽略容量错误会留下截断命令，并把下一
+    // 条写入拼到旧尾部；溢出或非 ASCII 时整行丢弃，让客户端可以从下一行恢复。
+    if !data.is_ascii() || data.len() > rx.capacity().saturating_sub(rx.len()) {
+        rx.clear();
+        log::warn!(
+            "[ble_at] invalid/oversized AT input dropped (chunk={} bytes)",
+            data.len()
+        );
+        return;
+    }
+    if let Ok(text) = core::str::from_utf8(data) {
+        let _ = rx.push_str(text);
     }
 }
 
@@ -1470,17 +1469,18 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     // ---- metuory-wireless-management-app-1.0.78 通过 Modbus FC=03/04 读取设备信息 ----
     // Android 期望自定义格式响应 ([length_byte][data]), 不是标准 Modbus RTU.
     // 命中 Android 已知名单后直接返回, 跳过 Modbus RTU 路径.
-    if (func == 0x03 || func == 0x04) && data.len() >= 12 {
-        if handle_ble_android_read_command(
+    if (func == 0x03 || func == 0x04)
+        && data.len() >= 12
+        && handle_ble_android_read_command(
             func,
             &data[8..crc_begin],
             tx_id,
             proto_id,
             conn_id,
             unit,
-        ) {
-            return true;
-        }
+        )
+    {
+        return true;
     }
     // ---- DEVICE_FUNCTION_COUNT (LOOP12: 0xB0/0xB1, 映射到 Modbus 0x08FC) ----
     // Android 1.0.78 通过自定义 opcodes 读写 FUNC_COUNT 寄存器, 走自定义子协议不走 Modbus FC.
@@ -1530,7 +1530,7 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
 
     // ---- 自定义 MCA 协议命令 (0xC0-0xCF) ----
     // Android 端可能通过这些命令获取 IP/子网/网关等设备信息
-    if func >= 0xC0 && func <= 0xCF {
+    if (0xC0..=0xCF).contains(&func) {
         return handle_mca_custom_command(
             func,
             &data[8..crc_begin],
@@ -1542,11 +1542,11 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     }
     // ---- MCA 逻辑配置协议 (0xD0-0xD3) ----
     // 0xD0 LOGIC_CONFIG / 0xD1 LOGIC_RETRIEVE / 0xD2 DELETE_CONFIG / 0xD3 COM_REQUEST
-    if func >= 0xD0 && func <= 0xD3 {
-        if let Some(rsp) = logic_handlers::dispatch_logic_cmd(func, &data[8..crc_begin]) {
-            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
-            return true;
-        }
+    if (0xD0..=0xD3).contains(&func)
+        && let Some(rsp) = logic_handlers::dispatch_logic_cmd(func, &data[8..crc_begin])
+    {
+        send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+        return true;
     }
     // 其它 PDU: unit_id 字节作为 Modbus slave 地址, func+data 作为 Modbus PDU
     let pdu = &data[6..crc_begin]; // [unit][func][data...]
@@ -1558,7 +1558,6 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
 /// 帧格式: tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | pdu_data(N) | crc(2 LE)
 /// 其中 length 字段 = pdu_data.len() (含 slave/func/data/CRC, 不含 BLE 帧头尾)
 /// CRC 计算范围 = 整个帧除最后 2 字节
-
 fn handle_handheld_config_text(
     func: u8,
     pdu: &[u8],
@@ -1588,11 +1587,7 @@ fn handle_handheld_config_text(
                 heapless::Vec::new();
             for i in 0..words {
                 let a = read_addr.saturating_add(i as u16);
-                let v = if func == 0xB2 {
-                    crate::bus::backends::read_hold_reg(a).unwrap_or(0)
-                } else {
-                    crate::bus::backends::read_hold_reg(a).unwrap_or(0)
-                };
+                let v = crate::bus::backends::read_hold_reg(a).unwrap_or(0);
                 let _ = bytes.extend_from_slice(&v.to_be_bytes());
             }
             let _ = rsp.push(bytes.len() as u8);
@@ -1656,13 +1651,7 @@ fn handle_mca_custom_command(
     conn_id: u16,
     _unit: u8,
 ) -> bool {
-    log::info!(
-        "[ble_at] MCA custom cmd: func=0x{func:02X}, data={}",
-        data.iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={data:02X?}",);
     match func {
         0xCE => {
             // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
@@ -1961,9 +1950,7 @@ fn handle_ble_android_read_command(
                     let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(take as u8);
-                    for i in 0..take {
-                        let _ = d.push(bytes[i]);
-                    }
+                    let _ = d.extend_from_slice(&bytes[..take]);
                     log::info!("[ble_at] READ_SN: {} bytes", take);
                     Some(d)
                 }
@@ -1974,9 +1961,7 @@ fn handle_ble_android_read_command(
                     let take = bytes.len().min(BLE_RESPONSE_DATA_MAX - 1);
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(take as u8);
-                    for i in 0..take {
-                        let _ = d.push(bytes[i]);
-                    }
+                    let _ = d.extend_from_slice(&bytes[..take]);
                     log::info!("[ble_at] READ_LOCATION: {} bytes", take);
                     Some(d)
                 }
@@ -2003,7 +1988,7 @@ fn handle_ble_android_read_command(
                     let _ = d.push(packed);
                     let _ = d.push(r.mode); // masterSlaveType
                     let _ = d.push((r.slave_addr as u16 >> 8) as u8);
-                    let _ = d.push(r.slave_addr & 0xFF);
+                    let _ = d.push(r.slave_addr);
                     let _ = d.push((r.retry_count >> 8) as u8);
                     let _ = d.push((r.retry_count & 0xFF) as u8);
                     let _ = d.push((r.timeout_ms >> 8) as u8);
@@ -2029,7 +2014,7 @@ fn handle_ble_android_read_command(
                 // parseResReadADC: length = buffer[0], 然后 for i=1; i<buffer.length; i+=2 → BE short
                 (0x0080, _) => {
                     // 读所有 AI 通道 (F16=4, F4=8)
-                    let ai_count = crate::config::hw_version::AI_COUNT as u16;
+                    let ai_count = crate::config::hw_version::AI_COUNT;
                     let n = reg_cnt.min(ai_count) as usize;
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push((n * 2) as u8); // length = 2*N bytes
@@ -2047,7 +2032,7 @@ fn handle_ble_android_read_command(
                 // READ_COM_OUTPUT_IO_STATUS (0x0200, count): 同上, 解析复用
                 (0x0000, _) | (0x0200, _) => {
                     let bit_count = (reg_cnt as usize).min(BLE_RESPONSE_DATA_MAX * 8);
-                    let n_bytes = (bit_count + 7) / 8;
+                    let n_bytes = bit_count.div_ceil(8);
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(n_bytes as u8); // length = N bytes of packed I/O
                     // 读 coil/disc 状态并打包
@@ -2941,7 +2926,7 @@ pub fn send_di_status_report(conn_id: u16) {
     let di_bits = crate::bus::IO.di.load_bits();
     // 2. 构造 pdu
     let di_count = hw_version::DI_COUNT;
-    let bitmap_bytes = (di_count + 7) / 8;
+    let bitmap_bytes = di_count.div_ceil(8);
     let mut pdu: heapless::Vec<u8, 16> = heapless::Vec::new();
     let _ = pdu.push(0x01); // unit (slave id)
     let _ = pdu.push(0x94); // func = REPORT_COM_INPUT_IO_STATUS
@@ -2964,15 +2949,15 @@ pub fn send_di_status_report(conn_id: u16) {
 }
 
 fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
-    let mut frame = TxBleFrame::new();
-    let _ = frame.extend_from_slice(&tx_id.to_be_bytes());
-    let _ = frame.extend_from_slice(&proto_id.to_be_bytes());
+    let Some(frame) = build_ble_frame(tx_id, proto_id, pdu_data) else {
+        log::error!(
+            "[ble_at] response exceeds TX frame capacity: {} bytes",
+            pdu_data.len()
+        );
+        BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     let length = pdu_data.len() as u16;
-    let _ = frame.extend_from_slice(&length.to_be_bytes());
-    let _ = frame.extend_from_slice(pdu_data);
-    let crc = modbus_crc16(&frame[..frame.len()]);
-    let _ = frame.push(crc as u8);
-    let _ = frame.push((crc >> 8) as u8);
     log::info!(
         "[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
         tx_id,
@@ -2998,6 +2983,24 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
             );
         }
     }
+}
+
+/// 构造完整 BLE 业务帧。容量检查先于任何写入，禁止产生部分帧。
+fn build_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8]) -> Option<TxBleFrame> {
+    const FRAME_OVERHEAD: usize = 2 + 2 + 2 + 2;
+    if pdu_data.len() > BLE_TX_FRAME_MAX - FRAME_OVERHEAD || pdu_data.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut frame = TxBleFrame::new();
+    frame.extend_from_slice(&tx_id.to_be_bytes()).ok()?;
+    frame.extend_from_slice(&proto_id.to_be_bytes()).ok()?;
+    frame
+        .extend_from_slice(&(pdu_data.len() as u16).to_be_bytes())
+        .ok()?;
+    frame.extend_from_slice(pdu_data).ok()?;
+    let crc = modbus_crc16(&frame);
+    frame.extend_from_slice(&crc.to_le_bytes()).ok()?;
+    Some(frame)
 }
 
 fn enqueue_tx_frame(frame: TxBleFrame) -> bool {
@@ -3189,6 +3192,24 @@ mod tests {
         assert_eq!(BLE_BINARY_FRAME_MAX, 512);
         assert_eq!(BLE_TX_SLOT_COUNT * BLE_TX_FRAME_MAX, 2176);
         assert_eq!(BLE_RX_SLOT_COUNT, 4);
+    }
+
+    #[test]
+    fn test_ble_frame_builder_is_atomic_at_capacity_boundary() {
+        let max_payload = [0xA5; BLE_TX_FRAME_MAX - 8];
+        let frame = build_ble_frame(0x1234, 0x5678, &max_payload).unwrap();
+        assert_eq!(frame.len(), BLE_TX_FRAME_MAX);
+        assert_eq!(
+            u16::from_be_bytes([frame[4], frame[5]]) as usize,
+            max_payload.len()
+        );
+        assert_eq!(
+            u16::from_le_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]),
+            modbus_crc16(&frame[..frame.len() - 2])
+        );
+
+        let oversized = [0x5A; BLE_TX_FRAME_MAX - 7];
+        assert!(build_ble_frame(0, 0, &oversized).is_none());
     }
 }
 

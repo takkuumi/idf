@@ -103,7 +103,15 @@ impl MainLoopPerf {
             let p = &self.phase_peaks_us;
             log::info!(
                 "[perf] phase_peak_us tcp={} ai_ao={} di={} do={} persist={} eth={} ble={} events={} housekeeping={}",
-                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                p[6],
+                p[7],
+                p[8]
             );
             self.phase_peaks_us.fill(0);
         }
@@ -189,7 +197,6 @@ fn main() -> AppResult<()> {
 
     // 6. 复位计数持久化 (NVS 已就绪, 直接读写, 不用 catch_unwind)
     let mut reset_count = device::load_reset_count();
-    log::warn!("[MAIN-P2] after load_reset_count = {}", reset_count);
     reset_count = reset_count.wrapping_add(1);
     match device::save_reset_count(reset_count) {
         Ok(()) => log::info!("[main] reset count={}", reset_count),
@@ -204,7 +211,9 @@ fn main() -> AppResult<()> {
     {
         log::info!("[main] starting ethernet (W5500)...");
 
-        ethernet::start(hal.clone(), sys_loop.clone())?;
+        if let Err(error) = ethernet::start(hal.clone(), sys_loop.clone()) {
+            log::error!("[main] Ethernet startup failed; supervisor will retry: {error}");
+        }
     }
 
     // 5.1 启动 Wi-Fi (ESP32-S3 内置, 作为以太网冗余链路, 默认不启用)
@@ -311,7 +320,7 @@ fn main() -> AppResult<()> {
     );
     // 打印任务-核心分配 (便于验证双核优化)
     health::print_core_assignment();
-    if let Err(e) = main_loop(timer_svc, hal.clone(), protocols) {
+    if let Err(e) = main_loop(timer_svc, hal.clone(), sys_loop, protocols) {
         log::error!("[main] main loop returned error: {e}");
         // 不再立即重启, 尝试降级运行
         crate::error::recovery::record_failure(
@@ -340,8 +349,11 @@ fn main() -> AppResult<()> {
 fn main_loop(
     _timer_svc: EspTaskTimerService,
     hal: Arc<Hal>,
+    sys_loop: EspSystemEventLoop,
     protocols: protocol::ProtocolRegistry,
 ) -> AppResult<()> {
+    // 在裁剪掉对应外设的合法 feature 组合中仍明确消费参数，保持零警告构建。
+    let _ = (&hal, &sys_loop);
     let mut tick: u32 = 0;
     let mut ota_validation_done = false;
     let period = Duration::from_millis(MAIN_LOOP_PERIOD_MS);
@@ -368,7 +380,7 @@ fn main_loop(
         perf.measure(0, crate::modbus::tcp_server::tick_tcp_server);
 
         // 5ms 网络基准调度；AI/AO 分频保持 100ms 周期。
-        if tick % (100 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(100 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(feature = "ai-ao")]
             perf.measure(1, || {
                 crate::channel::ai::tick_ai_sample(&hal);
@@ -377,7 +389,7 @@ fn main_loop(
         }
 
         // DI 仍按 20ms 去抖，避免网络提速后把 I2C 轮询负载放大 4 倍。
-        if tick % (20 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(20 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(feature = "io-di-do")]
             perf.measure(2, || crate::io::di::tick_di_scan(&hal));
         }
@@ -395,12 +407,12 @@ fn main_loop(
         });
 
         // ETH 心跳 5s，取消独立 pthread。
-        if tick % (5000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(5000 / MAIN_LOOP_PERIOD_MS as u32) {
             perf.measure(5, crate::ethernet::w5500::tick_eth_heartbeat);
         }
 
         // BLE 请求与通知按 10ms 调度，避免手持机配置命令额外等待 100ms。
-        if tick % (BLE_PROCESS_PERIOD_MS as u32 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(BLE_PROCESS_PERIOD_MS as u32 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(feature = "ble-at")]
             perf.measure(6, ble_at::process_tick);
         }
@@ -410,56 +422,76 @@ fn main_loop(
         perf.measure(7, || {
             while let Some(event) = crate::bus::event_bus::recv_event() {
                 match event {
-                crate::bus::IoEvent::DiChanged => {
-                    // DI 变化: 发 BLE 通知给 Android, 走 BINARY_TX 队列异步发送
-                    #[cfg(feature = "ble-at")]
-                    {
-                        // conn_id 取 0 (send_ble_frame 内会尝试锁定 GATTS_IF/CONN_ID 读)
-                        crate::ble_at::send_di_status_report(0);
+                    crate::bus::IoEvent::DiChanged => {
+                        // DI 变化: 发 BLE 通知给 Android, 走 BINARY_TX 队列异步发送
+                        #[cfg(feature = "ble-at")]
+                        {
+                            // conn_id 取 0 (send_ble_frame 内会尝试锁定 GATTS_IF/CONN_ID 读)
+                            crate::ble_at::send_di_status_report(0);
+                        }
                     }
-                }
-                crate::bus::IoEvent::DoChanged => {
-                    // DO 变化: 暂不主动上报 (Modbus TCP 客户端可轮询)
-                    log::debug!("[main] DO changed event received");
-                }
-                crate::bus::IoEvent::AiSampled => {
-                    // AI 采样完成: 暂不主动上报
-                }
-                crate::bus::IoEvent::AoUpdated => {
-                    // AO 输出更新: 暂不主动上报
-                }
-                crate::bus::IoEvent::ResetRequested => {
-                    // 已在 1s tick 中处理, 忽略
-                }
-                crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
-                    // GOT_IP 同时覆盖 DHCP 租约和静态 IP 生效。只有当前配置本来
-                    // 就是 DHCP 模式时才回写租约，避免静态地址启动后被误标成 DHCP。
-                    log::info!(
-                        "[eth] main loop: IP assigned {}.{}.{}.{}",
-                        ip_b[0],
-                        ip_b[1],
-                        ip_b[2],
-                        ip_b[3]
-                    );
-                    crate::bus::backends::config_modify(|c| {
-                        apply_assigned_ip_to_config(c, ip_b, mask_b, gw_b);
-                    });
-                }
+                    crate::bus::IoEvent::DoChanged => {
+                        // DO 变化: 暂不主动上报 (Modbus TCP 客户端可轮询)
+                        log::debug!("[main] DO changed event received");
+                    }
+                    crate::bus::IoEvent::AiSampled => {
+                        // AI 采样完成: 暂不主动上报
+                    }
+                    crate::bus::IoEvent::AoUpdated => {
+                        // AO 输出更新: 暂不主动上报
+                    }
+                    crate::bus::IoEvent::ResetRequested => {
+                        // 已在 1s tick 中处理, 忽略
+                    }
+                    crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
+                        // GOT_IP 同时覆盖 DHCP 租约和静态 IP 生效。只有当前配置本来
+                        // 就是 DHCP 模式时才回写租约，避免静态地址启动后被误标成 DHCP。
+                        log::info!(
+                            "[eth] main loop: IP assigned {}.{}.{}.{}",
+                            ip_b[0],
+                            ip_b[1],
+                            ip_b[2],
+                            ip_b[3]
+                        );
+                        let dhcp_enabled =
+                            crate::bus::config_state::config_read_with(|c| c.cfg.dhcp)
+                                .unwrap_or(false);
+                        if dhcp_enabled {
+                            crate::bus::backends::config_modify(|c| {
+                                apply_assigned_ip_to_config(c, ip_b, mask_b, gw_b);
+                            });
+                        }
+                    }
                 }
             }
         });
 
         // 每 1s 更新 uptime + 检查任务心跳
-        if tick % (1000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(1000 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(debug_assertions)]
             let housekeeping_started = std::time::Instant::now();
             let uptime = start.elapsed().as_secs() as u32;
             // 阶段 A: uptime 写 + reset-request 读 全过 bus::IO.sys (原子), 无锁
             crate::bus::IO.sys.set_uptime(uptime);
-            if crate::bus::IO.sys.is_reset_requested() {
-                log::warn!("[main] user-requested reset");
+            let reset_request = crate::bus::IO.sys.take_reset_request();
+            if reset_request == 0 {
+                // No reset requested.
+            } else if crate::bus::io_state::ResetSource::is_valid(reset_request) {
+                log::warn!(
+                    "[main] planned reset requested by {}",
+                    crate::bus::io_state::ResetSource::label(reset_request)
+                );
                 std::thread::sleep(Duration::from_millis(100));
                 unsafe { esp_idf_sys::esp_restart() };
+            } else {
+                log::error!(
+                    "[main] ignored invalid reset request marker 0x{reset_request:02X}; possible state corruption"
+                );
+                crate::error::recovery::record_failure(
+                    crate::error::recovery::Severity::Severe,
+                    "reset-request",
+                    "invalid reset request marker",
+                );
             }
 
             // 单个业务任务异常不能中断仍可工作的 IO、BLE 或其他协议。
@@ -478,26 +510,38 @@ fn main_loop(
 
             // 启动期 pthread/资源短缺不应永久丢失协议。只重试尚未标记运行的
             // 协议；成功任务不会重复创建。每 5 秒一次，避免资源压力下忙重试。
-            if uptime % 5 == 0 && !protocols.all_running() {
-                if let Err(e) = protocols.start_all() {
-                    log::warn!("[supervisor] protocol retry incomplete: {}", e);
-                }
+            if uptime.is_multiple_of(5)
+                && !protocols.all_running()
+                && let Err(e) = protocols.start_all()
+            {
+                log::warn!("[supervisor] protocol retry incomplete: {}", e);
             }
-            if uptime % 5 == 0 {
-                if !udp_multicast::is_started() {
-                    if let Err(e) = udp_multicast::start() {
-                        log::warn!("[supervisor] UDP task retry failed: {}", e);
-                    }
+            if uptime.is_multiple_of(5) {
+                if !device::actor_is_started()
+                    && let Err(error) = device::ensure_actor_started()
+                {
+                    log::warn!("[supervisor] DeviceActor retry failed: {error}");
                 }
-                if !nfc::is_started() {
-                    if let Err(e) = nfc::start() {
-                        log::warn!("[supervisor] NFC task retry failed: {}", e);
-                    }
+                #[cfg(feature = "ethernet-w5500")]
+                if !ethernet::w5500::is_started()
+                    && let Err(error) = ethernet::start(hal.clone(), sys_loop.clone())
+                {
+                    log::warn!("[supervisor] Ethernet retry failed: {error}");
                 }
-                if !web::is_started() {
-                    if let Err(e) = web::start() {
-                        log::warn!("[supervisor] HTTP task retry failed: {}", e);
-                    }
+                if !udp_multicast::is_started()
+                    && let Err(e) = udp_multicast::start()
+                {
+                    log::warn!("[supervisor] UDP task retry failed: {}", e);
+                }
+                if !nfc::is_started()
+                    && let Err(e) = nfc::start()
+                {
+                    log::warn!("[supervisor] NFC task retry failed: {}", e);
+                }
+                if !web::is_started()
+                    && let Err(e) = web::start()
+                {
+                    log::warn!("[supervisor] HTTP task retry failed: {}", e);
                 }
             }
 
@@ -507,7 +551,9 @@ fn main_loop(
             if !ota_validation_done
                 && uptime >= 30
                 && stalled.is_empty()
+                && device::actor_is_started()
                 && protocols.all_running()
+                && (!cfg!(feature = "ethernet-w5500") || ethernet::w5500::is_started())
                 && udp_multicast::is_started()
                 && nfc::is_started()
                 && web::is_started()
@@ -517,13 +563,11 @@ fn main_loop(
 
             // LOOP8: 每 60s 打印内存/运行时间。栈水位健康状态压缩为一行汇总，
             // 避免逐任务串口 INFO 阻塞 main-loop 并制造端口延迟尖峰。
-            if tick % (60000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            if tick.is_multiple_of(60000 / MAIN_LOOP_PERIOD_MS as u32) {
                 let free_heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
                 let min_heap = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() };
-                let internal_caps =
-                    esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
-                let internal_free =
-                    unsafe { esp_idf_sys::heap_caps_get_free_size(internal_caps) };
+                let internal_caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+                let internal_free = unsafe { esp_idf_sys::heap_caps_get_free_size(internal_caps) };
                 let internal_min =
                     unsafe { esp_idf_sys::heap_caps_get_minimum_free_size(internal_caps) };
                 log::info!(
@@ -547,7 +591,7 @@ fn main_loop(
             let stack_report_period_ms = 60_000;
             #[cfg(not(debug_assertions))]
             let stack_report_period_ms = 600_000;
-            if tick % (stack_report_period_ms / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+            if tick.is_multiple_of(stack_report_period_ms / MAIN_LOOP_PERIOD_MS as u32) {
                 health::print_stack_watermarks();
             }
             #[cfg(debug_assertions)]
@@ -559,7 +603,7 @@ fn main_loop(
         if work_us > MAIN_LOOP_PERIOD_MS * 1_000 {
             deadline_miss_count = deadline_miss_count.saturating_add(1);
         }
-        if tick % (60_000 / MAIN_LOOP_PERIOD_MS as u32) == 0 {
+        if tick.is_multiple_of(60_000 / MAIN_LOOP_PERIOD_MS as u32) {
             log::info!(
                 "[perf] main_loop period={}ms max_work={}us deadline_miss={}",
                 MAIN_LOOP_PERIOD_MS,

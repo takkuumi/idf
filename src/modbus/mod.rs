@@ -7,9 +7,11 @@
 //!
 //! 数据通过 `bus::backends` 无锁全局函数访问，Modbus 寄存器映射见 `config::regs`。
 
+#[cfg(feature = "modbus-rtu")]
 use std::sync::Arc;
 
 use crate::error::AppResult;
+#[cfg(feature = "modbus-rtu")]
 use crate::hal::Hal;
 
 #[cfg(feature = "modbus-rtu")]

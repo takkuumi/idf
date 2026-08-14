@@ -205,14 +205,14 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
         match sock.recv_from(&mut buf) {
             Ok((len, src)) => {
                 // 源 IP 过滤 (对齐参考固件: 仅接受来自 SWITCH_IP 的包)
-                if let Some(sip) = cfg.switch_ip {
-                    if !src_ip_matches(&src, sip) {
-                        log::debug!(
-                            "[udp-mcast] dropped packet from {} (filter mismatch)",
-                            src.ip()
-                        );
-                        continue;
-                    }
+                if let Some(sip) = cfg.switch_ip
+                    && !src_ip_matches(&src, sip)
+                {
+                    log::debug!(
+                        "[udp-mcast] dropped packet from {} (filter mismatch)",
+                        src.ip()
+                    );
+                    continue;
                 }
                 // 写入全局 RECV_BUF (供 Modbus FC=04 读取)
                 let n = len.min(regs::MULTICAST_BUF_SIZE);
@@ -366,9 +366,9 @@ pub fn received_len() -> usize {
 /// recvBuffer 按 U8 存储, Modbus 按 U16 读取 → 每 U16 = 2 字节 (LE).
 pub fn read_switch_status(word_idx: u16) -> Option<u16> {
     let idx = word_idx as usize;
-    let total_words = (regs::MULTICAST_BUF_SIZE + 1) / 2;
+    let total_words = regs::MULTICAST_BUF_SIZE.div_ceil(2);
     // LOOP9: 修复 && → || (AND 恒真 → 所有地址返回 Some; OR 正确拒绝越界)
-    if idx >= total_words as usize || word_idx >= regs::INREG_SWITCH_STATUS_COUNT {
+    if idx >= total_words || word_idx >= regs::INREG_SWITCH_STATUS_COUNT {
         return None;
     }
     let guard = RECV_BUF.lock();

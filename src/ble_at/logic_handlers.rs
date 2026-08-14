@@ -248,7 +248,11 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
         return None;
     }
     let sub = data[0];
-    log::info!("[logic_cfg] D1 LOGIC_RETRIEVE: sub=0x{:02X} ({})", sub, sub_name(sub));
+    log::info!(
+        "[logic_cfg] D1 LOGIC_RETRIEVE: sub=0x{:02X} ({})",
+        sub,
+        sub_name(sub)
+    );
 
     match load_config(sub) {
         Some(cfg_data) => {
@@ -265,7 +269,11 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
             Some(rsp)
         }
         None => {
-            log::info!("[logic_cfg] D1: sub=0x{:02X} ({}) not configured", sub, sub_name(sub));
+            log::info!(
+                "[logic_cfg] D1: sub=0x{:02X} ({}) not configured",
+                sub,
+                sub_name(sub)
+            );
             // 参考固件: 未配置时返回错误帧 (cmd 字段保持 0xD1 与请求匹配)
             Some(build_ack(0xD1, sub, 0x84))
         }
@@ -315,9 +323,9 @@ pub fn handle_com_request() -> Option<heapless::Vec<u8, 256>> {
 fn read_io_bitmap(is_di: bool) -> heapless::Vec<u8, 8> {
     let mut bitmap: heapless::Vec<u8, 8> = heapless::Vec::new();
     let count = if is_di {
-        crate::config::hw_version::DI_COUNT as usize
+        crate::config::hw_version::DI_COUNT
     } else {
-        crate::config::hw_version::DO_COUNT as usize
+        crate::config::hw_version::DO_COUNT
     };
     let io = &crate::bus::IO;
 

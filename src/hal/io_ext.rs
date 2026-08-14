@@ -62,11 +62,8 @@ impl IoExtender {
         let do_addrs = cfg::DO_ADDRS;
 
         // 探测 DI 芯片
-        let mut di_chips: [Mcp23017; MAX_DI_CHIPS] = [
-            Mcp23017::new(0),
-            Mcp23017::new(0),
-            Mcp23017::new(0),
-        ];
+        let mut di_chips: [Mcp23017; MAX_DI_CHIPS] =
+            [Mcp23017::new(0), Mcp23017::new(0), Mcp23017::new(0)];
         for (i, &addr) in di_addrs.iter().enumerate() {
             let chip = Mcp23017::new(addr);
             if !chip.probe(&mut bus_guard) {
@@ -81,11 +78,8 @@ impl IoExtender {
         }
 
         // 探测 + 初始化 DO 芯片 (F3: 1 片; F4: 3 片)
-        let mut do_chips: [Mcp23017; MAX_DO_CHIPS] = [
-            Mcp23017::new(0),
-            Mcp23017::new(0),
-            Mcp23017::new(0),
-        ];
+        let mut do_chips: [Mcp23017; MAX_DO_CHIPS] =
+            [Mcp23017::new(0), Mcp23017::new(0), Mcp23017::new(0)];
         for (i, &addr) in do_addrs.iter().enumerate() {
             let chip = Mcp23017::new(addr);
             if !chip.probe(&mut bus_guard) {
@@ -139,8 +133,6 @@ impl IoExtender {
     /// F4: 48 bit (3 片 MCP23017, 每片写 16 bit)
     #[inline]
     pub fn write_do(&self, value: u64) -> AppResult<()> {
-        // 缓存更新 (无锁位图)
-        self.do_cache.store_bits(value);
         // 限制为 DO_COUNT 位 (超出 bit 忽略)
         let mask = if hw_version::DO_COUNT >= 64 {
             u64::MAX
@@ -155,6 +147,8 @@ impl IoExtender {
             let do_bits = ((value >> shift) & 0xFFFF) as u16;
             self.do_chips[i].write_outputs(&mut *bus, do_bits)?;
         }
+        // 只有全部芯片写成功后，缓存才代表已确认的硬件状态。
+        self.do_cache.store_bits(value);
         Ok(())
     }
 

@@ -19,7 +19,6 @@
 //! 注意: 需在 sdkconfig.defaults 中启用 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
 use crate::sync::MainLoopCell;
-use core::cell::UnsafeCell;
 use core::fmt::Write as _;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -35,11 +34,77 @@ const HEARTBEAT_PERIOD_S: u64 = 5;
 /// 心跳失败上限 (>= 即触发复位)
 const HEARTBEAT_MAX_FAIL: u32 = 3; // 旧值, 实际由 recovery 模块分级处理
 
+struct EthStartupGuard {
+    spi_host: esp_idf_sys::spi_host_device_t,
+    bus_initialized: bool,
+    mac: *mut esp_idf_sys::esp_eth_mac_t,
+    phy: *mut esp_idf_sys::esp_eth_phy_t,
+    driver: esp_idf_sys::esp_eth_handle_t,
+    netif: *mut esp_idf_sys::esp_netif_t,
+    glue: esp_idf_sys::esp_eth_netif_glue_handle_t,
+    started: bool,
+    committed: bool,
+}
+
+impl EthStartupGuard {
+    fn new(spi_host: esp_idf_sys::spi_host_device_t) -> Self {
+        Self {
+            spi_host,
+            bus_initialized: false,
+            mac: std::ptr::null_mut(),
+            phy: std::ptr::null_mut(),
+            driver: std::ptr::null_mut(),
+            netif: std::ptr::null_mut(),
+            glue: std::ptr::null_mut(),
+            started: false,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for EthStartupGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        unsafe {
+            if self.started && !self.driver.is_null() {
+                let _ = esp_idf_sys::esp_eth_stop(self.driver);
+            }
+            if !self.glue.is_null() {
+                let _ = esp_idf_sys::esp_eth_del_netif_glue(self.glue);
+            }
+            if !self.netif.is_null() {
+                esp_idf_sys::esp_netif_destroy(self.netif);
+            }
+            if !self.driver.is_null() {
+                let _ = esp_idf_sys::esp_eth_driver_uninstall(self.driver);
+            }
+            if !self.phy.is_null()
+                && let Some(del) = (*self.phy).del
+            {
+                let _ = del(self.phy);
+            }
+            if !self.mac.is_null()
+                && let Some(del) = (*self.mac).del
+            {
+                let _ = del(self.mac);
+            }
+            if self.bus_initialized {
+                let _ = esp_idf_sys::spi_bus_free(self.spi_host);
+            }
+        }
+    }
+}
+
 /// 启动 W5500 以太网。
 ///
 /// SPI3_HOST 总线由本模块独占管理 (W5500 是 SPI 总线上唯一外设)。
 /// ETH_RST 引脚复用 `hal.gpio.eth_reset_pulse()`，避免与 GPIO 模块重复初始化。
 pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
+    if ETH_STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let _ = sys_loop;
 
     log::info!(
@@ -73,6 +138,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     // 2) 初始化 SPI 总线 (W5500 独占 SPI3_HOST)
     //    DMA: SPI_DMA_CH_AUTO (ESP-IDF 自动分配 DMA 通道)
     let spi_host = pins::ETH_SPI_HOST as esp_idf_sys::spi_host_device_t;
+    let mut resources = EthStartupGuard::new(spi_host);
     let bus_cfg =
         spi_bus_config_default(pins::ETH_SPI_MOSI, pins::ETH_SPI_MISO, pins::ETH_SPI_SCLK);
     let dma_chan = esp_idf_sys::spi_common_dma_t_SPI_DMA_CH_AUTO;
@@ -80,6 +146,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
         unsafe { esp_idf_sys::spi_bus_initialize(spi_host, &bus_cfg, dma_chan) },
         "spi_bus_initialize",
     )?;
+    resources.bus_initialized = true;
     log::info!("[eth] SPI bus initialized (host={}, DMA=auto)", spi_host);
 
     // 3) W5500 SPI 设备配置
@@ -98,6 +165,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
             "esp_eth_mac_new_w5500 returned null".into(),
         ));
     }
+    resources.mac = mac;
 
     // 5) 创建 PHY
     //    reset_gpio_num=-1: RST 由 hal.gpio.eth_reset_pulse() 手动管理, 不让 PHY 驱动重复控制
@@ -108,6 +176,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
             "esp_eth_phy_new_w5500 returned null".into(),
         ));
     }
+    resources.phy = phy;
 
     // 6) 安装驱动
     let eth_cfg = eth_config_default(mac, phy);
@@ -116,6 +185,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
         unsafe { esp_idf_sys::esp_eth_driver_install(&eth_cfg, &mut eth_handle as *mut _) },
         "esp_eth_driver_install",
     )?;
+    resources.driver = eth_handle;
 
     // 6.5) 设置 MAC 地址 (W5500 无预置 MAC, 需从 ESP32 eFuse 读取后写入)
     {
@@ -159,27 +229,31 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
     if netif.is_null() {
         return Err(AppError::Ethernet("esp_netif_new returned null".into()));
     }
+    resources.netif = netif;
     let glue = unsafe { esp_idf_sys::esp_eth_new_netif_glue(eth_handle) };
+    if glue.is_null() {
+        return Err(AppError::Ethernet(
+            "esp_eth_new_netif_glue returned null".into(),
+        ));
+    }
+    resources.glue = glue;
     check(
         unsafe { esp_idf_sys::esp_netif_attach(netif, glue as *mut c_void) },
         "esp_netif_attach",
     )?;
-    ETH_NETIF.store(netif, Ordering::Release);
-    ETH_HANDLE.store(eth_handle as *mut c_void, Ordering::Release);
-
     // 7.5) 配置网络: 读取 SystemConfig, 禁用 DHCP → 设置静态 IP
     apply_netif_config(netif)?;
 
     // 8) 先注册事件，再启动驱动。静态 IP 或链路已经接通时，esp_eth_start 后
     // GOT_IP/CONNECTED 可能立即投递；反向排序会永久漏掉首次状态事件。
-    spawn_ip_watch(eth_handle)?;
-    spawn_eth_link_watch(eth_handle)?;
+    register_event_handlers()?;
 
     // 9) 启动
     check(
         unsafe { esp_idf_sys::esp_eth_start(eth_handle) },
         "esp_eth_start",
     )?;
+    resources.started = true;
     log::info!(
         "[eth] W5500 driver installed and started, eth_handle={:p}",
         eth_handle
@@ -187,6 +261,11 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 
     // 11) 心跳任务
     spawn_heartbeat()?;
+
+    ETH_NETIF.store(netif, Ordering::Release);
+    ETH_HANDLE.store(eth_handle, Ordering::Release);
+    ETH_STARTED.store(true, Ordering::Release);
+    resources.committed = true;
 
     log::info!("[eth] W5500 startup complete");
     Ok(())
@@ -296,210 +375,27 @@ fn eth_mac_config_default() -> esp_idf_sys::eth_mac_config_t {
 //   satisfies GDMA alignment constraints. No runtime allocation needed.
 // ============================================================================
 
-/// W5500 staging buffers in .bss (internal SRAM, DMA range, 64-byte aligned).
-/// 1600 bytes covers max Ethernet frame (1536B) + SPI header (3B) + margin.
-#[repr(C, align(64))]
-struct W5500DmaStaging {
-    tx: [u8; 1600],
-    rx: [u8; 1600],
-}
-
-/// `static mut` 和“不可变 static 转可变裸指针”都会破坏 Rust 别名规则。
-/// UnsafeCell 明确声明内部可变性；实际串行化由每个 CustomSpiCtx 的 FreeRTOS mutex 保证。
-struct W5500DmaStagingCell(UnsafeCell<W5500DmaStaging>);
-
-// SAFETY: 所有 RX/TX 回调在访问缓冲前都持有同一个 ctx.lock。
-unsafe impl Sync for W5500DmaStagingCell {}
-
-static STAGING: W5500DmaStagingCell = W5500DmaStagingCell(UnsafeCell::new(W5500DmaStaging {
-    tx: [0u8; 1600],
-    rx: [0u8; 1600],
-}));
-
-/// Custom SPI driver config (passed via `custom_spi_driver.config`).
-#[derive(Clone)]
-struct CustomSpiInitCfg {
-    host_id: esp_idf_sys::spi_host_device_t,
-    dev_cfg: esp_idf_sys::spi_device_interface_config_t,
-}
-
-/// Per-driver context (allocated in init, freed in deinit).
-struct CustomSpiCtx {
-    handle: esp_idf_sys::spi_device_handle_t,
-    lock: esp_idf_sys::QueueHandle_t,
-}
-// SAFETY: handle is freed by SPI driver; lock is mutex.
-unsafe impl Send for CustomSpiCtx {}
-unsafe impl Sync for CustomSpiCtx {}
-
-/// W5500 calls init(config) where config is `custom_spi_driver.config` pointer.
-unsafe extern "C" fn w5500_custom_spi_init(
-    spi_config: *const std::ffi::c_void,
-) -> *mut std::ffi::c_void {
-    if spi_config.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: ESP-IDF invokes this callback with the long-lived configuration
-    // pointer installed by eth_w5500_config_default().
-    let cfg = unsafe { &*(spi_config as *const CustomSpiInitCfg) };
-    let mut handle: esp_idf_sys::spi_device_handle_t = std::ptr::null_mut();
-    let ret = unsafe { esp_idf_sys::spi_bus_add_device(cfg.host_id, &cfg.dev_cfg, &mut handle) };
-    if ret != 0 {
-        log::error!("[eth] custom_spi: spi_bus_add_device failed: 0x{:x}", ret);
-        return std::ptr::null_mut();
-    }
-
-    // Serialize SPI access. Note: W5500 rx_task and any tx caller all run
-    // through this lock. Non-recursive mutex (only one caller at a time).
-    let lock = unsafe { esp_idf_sys::xQueueCreateMutex(0) };
-    if lock.is_null() {
-        unsafe { esp_idf_sys::spi_bus_remove_device(handle) };
-        return std::ptr::null_mut();
-    }
-    log::info!("[eth] LOOP24: static 1600B TX+RX DMA staging bufs in .bss (internal SRAM)");
-
-    let ctx = Box::new(CustomSpiCtx { handle, lock });
-    Box::into_raw(ctx) as *mut std::ffi::c_void
-}
-
-unsafe extern "C" fn w5500_custom_spi_deinit(spi_ctx: *mut std::ffi::c_void) -> i32 {
-    if spi_ctx.is_null() {
-        return 0;
-    }
-    // SAFETY: init allocated this context and ESP-IDF calls deinit exactly once.
-    let ctx = unsafe { Box::from_raw(spi_ctx as *mut CustomSpiCtx) };
-    if !ctx.lock.is_null() {
-        unsafe { esp_idf_sys::vQueueDelete(ctx.lock) };
-    }
-    if !ctx.handle.is_null() {
-        unsafe { esp_idf_sys::spi_bus_remove_device(ctx.handle) };
-    }
-    0
-}
-
-unsafe extern "C" fn w5500_custom_spi_read(
-    spi_ctx: *mut std::ffi::c_void,
-    cmd: u32,
-    addr: u32,
-    data: *mut std::ffi::c_void,
-    data_len: u32,
-) -> i32 {
-    if spi_ctx.is_null() {
-        return 0x1201;
-    }
-    // SAFETY: ESP-IDF retains the context returned by init until deinit.
-    let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
-    let data_len_us = data_len as usize;
-    if data_len_us > 1600 {
-        return 0x1202;
-    }
-    if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
-        return 0x1203;
-    }
-    // SAFETY: STAGING.rx is a static array in .bss (internal SRAM DMA range),
-    // 64-byte aligned via #[repr(C, align(64))].
-    // SAFETY: ctx.lock serializes both callbacks; UnsafeCell is the sole mutable storage.
-    let rx_ptr = unsafe { (*STAGING.0.get()).rx.as_mut_ptr() };
-    let mut trans = esp_idf_sys::spi_transaction_t {
-        cmd: cmd as u16,
-        addr: addr as u64,
-        length: data_len_us * 8,
-        rxlength: data_len_us * 8,
-        flags: 0,
-        override_freq_hz: 0,
-        user: std::ptr::null_mut(),
-        __bindgen_anon_1: esp_idf_sys::spi_transaction_t__bindgen_ty_1 {
-            tx_buffer: std::ptr::null(),
-        },
-        __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
-            rx_buffer: rx_ptr as *mut std::ffi::c_void,
-        },
-    };
-    let ret = unsafe { esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _) };
-    if ret == 0 && !data.is_null() {
-        // SAFETY: `data` is the caller-provided RX buffer for data_len_us bytes.
-        unsafe { core::ptr::copy_nonoverlapping(rx_ptr, data as *mut u8, data_len_us) };
-    }
-    let _ = unsafe { esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0) };
-    ret
-}
-
-unsafe extern "C" fn w5500_custom_spi_write(
-    spi_ctx: *mut std::ffi::c_void,
-    cmd: u32,
-    addr: u32,
-    data: *const std::ffi::c_void,
-    data_len: u32,
-) -> i32 {
-    if spi_ctx.is_null() {
-        return 0x1201;
-    }
-    // SAFETY: ESP-IDF retains the context returned by init until deinit.
-    let ctx = unsafe { &*(spi_ctx as *const CustomSpiCtx) };
-    let data_len_us = data_len as usize;
-    if data_len_us > 1600 {
-        return 0x1202;
-    }
-    if unsafe { esp_idf_sys::xQueueSemaphoreTake(ctx.lock, 1000) } != 1 {
-        return 0x1203;
-    }
-    // SAFETY: STAGING.tx is static array in .bss (internal SRAM DMA range).
-    // Both reads (read function) and writes (write function) are guarded
-    // by the SPI mutex (ctx.lock). The as_mut_ptr() call only returns a
-    // raw pointer; actual mutation happens via copy_nonoverlapping.
-    // SAFETY: ctx.lock serializes both callbacks; UnsafeCell is the sole mutable storage.
-    let tx_ptr = unsafe { (*STAGING.0.get()).tx.as_mut_ptr() };
-    if !data.is_null() {
-        // SAFETY: `data` is the caller-provided TX buffer for data_len_us bytes.
-        unsafe { core::ptr::copy_nonoverlapping(data as *const u8, tx_ptr, data_len_us) };
-    }
-    let mut trans = esp_idf_sys::spi_transaction_t {
-        cmd: cmd as u16,
-        addr: addr as u64,
-        length: data_len_us * 8,
-        rxlength: 0,
-        flags: 0,
-        override_freq_hz: 0,
-        user: std::ptr::null_mut(),
-        __bindgen_anon_1: esp_idf_sys::spi_transaction_t__bindgen_ty_1 {
-            tx_buffer: tx_ptr as *const std::ffi::c_void,
-        },
-        __bindgen_anon_2: esp_idf_sys::spi_transaction_t__bindgen_ty_2 {
-            rx_buffer: std::ptr::null_mut(),
-        },
-    };
-    let ret = unsafe { esp_idf_sys::spi_device_polling_transmit(ctx.handle, &mut trans as *mut _) };
-    let _ = unsafe { esp_idf_sys::xQueueGenericSend(ctx.lock, std::ptr::null_mut(), 0, 0) };
-    ret
-}
-
 /// W5500 配置: SPI 主机 + 设备配置 + 中断引脚
 /// ESP-IDF v5.5.4: eth_w5500_config_t 不再接受 spi_device_handle_t,
 /// 而是接受 spi_host_id + spi_devcfg 指针, MAC 驱动内部调用 spi_bus_add_device
-///
-/// LOOP22: 使用 custom_spi_driver 注入预分配 PSRAM DMA buffer 包装.
 fn eth_w5500_config_default(
     spi_host: esp_idf_sys::spi_host_device_t,
     dev_cfg: &esp_idf_sys::spi_device_interface_config_t,
     int_gpio: u8,
 ) -> esp_idf_sys::eth_w5500_config_t {
-    let init_cfg = Box::new(CustomSpiInitCfg {
-        host_id: spi_host,
-        dev_cfg: *dev_cfg,
-    });
-    let init_cfg_ptr = Box::into_raw(init_cfg) as *const std::ffi::c_void;
+    let custom_spi_driver = esp_idf_sys::eth_spi_custom_driver_config_t {
+        config: std::ptr::null_mut(),
+        init: None,
+        deinit: None,
+        read: None,
+        write: None,
+    };
     esp_idf_sys::eth_w5500_config_t {
         int_gpio_num: int_gpio as i32,
         poll_period_ms: 0,
         spi_host_id: spi_host,
         spi_devcfg: dev_cfg as *const _ as *mut _,
-        custom_spi_driver: esp_idf_sys::eth_spi_custom_driver_config_t {
-            config: init_cfg_ptr as *mut std::ffi::c_void,
-            init: Some(w5500_custom_spi_init),
-            deinit: Some(w5500_custom_spi_deinit),
-            read: Some(w5500_custom_spi_read),
-            write: Some(w5500_custom_spi_write),
-        },
+        custom_spi_driver,
     }
 }
 
@@ -533,21 +429,65 @@ fn eth_config_default(
     }
 }
 
-// ---- IP 事件 watch ----
-fn spawn_ip_watch(eth_handle: esp_idf_sys::esp_eth_handle_t) -> AppResult<()> {
-    let base = unsafe { esp_idf_sys::IP_EVENT };
+// ---- IP / ETH 事件 watch ----
+static EVENT_HANDLERS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+fn register_event_handlers() -> AppResult<()> {
+    if EVENT_HANDLERS_REGISTERED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let ip_base = unsafe { esp_idf_sys::IP_EVENT };
+    let eth_base = unsafe { esp_idf_sys::ETH_EVENT };
+    let ip_id = esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32;
+    let connected_id = esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32;
+    let disconnected_id = esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32;
+
     check(
         unsafe {
             esp_idf_sys::esp_event_handler_register(
-                base,
-                esp_idf_sys::ip_event_t_IP_EVENT_ETH_GOT_IP as i32,
+                ip_base,
+                ip_id,
                 Some(ip_event_cb),
-                eth_handle as *mut c_void,
+                std::ptr::null_mut(),
             )
         },
         "esp_event_handler_register(IP_EVENT_ETH_GOT_IP)",
     )?;
-    log::info!("[eth] IP_EVENT_ETH_GOT_IP handler registered");
+    if let Err(error) = check(
+        unsafe {
+            esp_idf_sys::esp_event_handler_register(
+                eth_base,
+                connected_id,
+                Some(eth_event_cb),
+                std::ptr::null_mut(),
+            )
+        },
+        "esp_event_handler_register(ETHERNET_EVENT_CONNECTED)",
+    ) {
+        unsafe {
+            esp_idf_sys::esp_event_handler_unregister(ip_base, ip_id, Some(ip_event_cb));
+        }
+        return Err(error);
+    }
+    if let Err(error) = check(
+        unsafe {
+            esp_idf_sys::esp_event_handler_register(
+                eth_base,
+                disconnected_id,
+                Some(eth_event_cb),
+                std::ptr::null_mut(),
+            )
+        },
+        "esp_event_handler_register(ETHERNET_EVENT_DISCONNECTED)",
+    ) {
+        unsafe {
+            esp_idf_sys::esp_event_handler_unregister(eth_base, connected_id, Some(eth_event_cb));
+            esp_idf_sys::esp_event_handler_unregister(ip_base, ip_id, Some(ip_event_cb));
+        }
+        return Err(error);
+    }
+    EVENT_HANDLERS_REGISTERED.store(true, Ordering::Release);
+    log::info!("[eth] IP/ETH event handlers registered");
     Ok(())
 }
 
@@ -618,43 +558,20 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 /// 链路状态缓存 (true = 已连接). 由 eth_event_cb 维护, heartbeat_once 读取.
 /// 启动时假定为 true, 避免首次 IP 分配前误报 fail (后续事件会修正).
 static ETH_LINK_UP: AtomicBool = AtomicBool::new(true);
+static ETH_STARTED: AtomicBool = AtomicBool::new(false);
 static ETH_NETIF: AtomicPtr<esp_idf_sys::esp_netif_obj> = AtomicPtr::new(std::ptr::null_mut());
 static ETH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static NET_RECONFIG_REQUEST_MS: AtomicU32 = AtomicU32::new(0);
+
+pub fn is_started() -> bool {
+    ETH_STARTED.load(Ordering::Acquire)
+}
 
 /// 请求在 main_loop 中重新应用网络参数。500ms 去抖保证 FC=16/BLE 分片批量写完后
 /// 才应用，避免把半组 IP/掩码短暂写进 netif。
 pub fn request_reconfigure() {
     let now = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u32;
     NET_RECONFIG_REQUEST_MS.store(now.max(1), Ordering::Release);
-}
-
-fn spawn_eth_link_watch(_eth_handle: esp_idf_sys::esp_eth_handle_t) -> AppResult<()> {
-    let base = unsafe { esp_idf_sys::ETH_EVENT };
-    check(
-        unsafe {
-            esp_idf_sys::esp_event_handler_register(
-                base,
-                esp_idf_sys::eth_event_t_ETHERNET_EVENT_CONNECTED as i32,
-                Some(eth_event_cb),
-                std::ptr::null_mut(),
-            )
-        },
-        "esp_event_handler_register(ETHERNET_EVENT_CONNECTED)",
-    )?;
-    check(
-        unsafe {
-            esp_idf_sys::esp_event_handler_register(
-                base,
-                esp_idf_sys::eth_event_t_ETHERNET_EVENT_DISCONNECTED as i32,
-                Some(eth_event_cb),
-                std::ptr::null_mut(),
-            )
-        },
-        "esp_event_handler_register(ETHERNET_EVENT_DISCONNECTED)",
-    )?;
-    log::info!("[eth] ETH_EVENT CONNECTED/DISCONNECTED handlers registered");
-    Ok(())
 }
 
 extern "C" fn eth_event_cb(
@@ -800,7 +717,7 @@ fn heartbeat_once() -> bool {
         return false;
     }
 
-    let netif = unsafe { esp_idf_sys::esp_netif_get_handle_from_ifkey(b"ETH_DEF\x00".as_ptr()) };
+    let netif = unsafe { esp_idf_sys::esp_netif_get_handle_from_ifkey(c"ETH_DEF".as_ptr()) };
     if netif.is_null() {
         log::debug!("[eth-heartbeat] netif not found");
         return false;

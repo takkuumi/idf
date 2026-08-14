@@ -62,7 +62,7 @@ static LAST_DEGRADABLE_MS: AtomicU32 = AtomicU32::new(0);
 static LAST_SEVERE_MS: AtomicU32 = AtomicU32::new(0);
 
 // === 当前降级模式 (原子无锁) ===
-static DEGRADED_MODE: AtomicU32 = AtomicU32::new(0);  // 0=Normal
+static DEGRADED_MODE: AtomicU32 = AtomicU32::new(0); // 0=Normal
 /// 记录一次故障
 pub fn record_failure(severity: Severity, module: &str, msg: &str) {
     let now = elapsed_ms();
@@ -109,7 +109,11 @@ pub fn enter_mode(new_mode: DegradedMode) {
     };
     let old = DEGRADED_MODE.swap(v, Ordering::AcqRel);
     if old != v {
-        log::warn!("[recovery] mode: {:?} -> {:?}", current_mode_label(old), new_mode);
+        log::warn!(
+            "[recovery] mode: {:?} -> {:?}",
+            current_mode_label(old),
+            new_mode
+        );
     }
 }
 
@@ -144,15 +148,15 @@ pub enum Feature {
 
 /// 检查是否允许执行某项功能 (根据当前降级模式)
 pub fn is_feature_allowed(feature: Feature) -> bool {
-    match (mode(), feature) {
-        (DegradedMode::Normal, _) => true,
-        (DegradedMode::BleOnly, Feature::Ble) => true,
-        (DegradedMode::BleOnly, Feature::LocalIo) => true,
-        (DegradedMode::LocalOnly, Feature::Ble) => true,
-        (DegradedMode::LocalOnly, Feature::LocalIo) => true,
-        (DegradedMode::Minimal, Feature::LocalIo) => true,
-        _ => false,
-    }
+    matches!(
+        (mode(), feature),
+        (DegradedMode::Normal, _)
+            | (DegradedMode::BleOnly, Feature::Ble)
+            | (DegradedMode::BleOnly, Feature::LocalIo)
+            | (DegradedMode::LocalOnly, Feature::Ble)
+            | (DegradedMode::LocalOnly, Feature::LocalIo)
+            | (DegradedMode::Minimal, Feature::LocalIo)
+    )
 }
 
 /// 故障统计快照 (用于 Modbus 寄存器暴露给 Modbus Poll)
@@ -188,10 +192,7 @@ pub enum RecoveryAction {
 ///
 /// 根据故障类型、发生频率、当前模式决定下一步行动。
 /// 设计目标: 故障不触发软件重启，保留仍可工作的业务并等待运维处理。
-pub fn decide_action(
-    severity: Severity,
-    consecutive_failures: u32,
-) -> RecoveryAction {
+pub fn decide_action(severity: Severity, consecutive_failures: u32) -> RecoveryAction {
     match severity {
         Severity::Recoverable => {
             // 可恢复故障: 短暂重试即可, 永不重启
@@ -209,12 +210,8 @@ pub fn decide_action(
                 RecoveryAction::Retry(std::time::Duration::from_secs(1))
             }
         }
-        Severity::Severe => {
-            RecoveryAction::Degrade(DegradedMode::LocalOnly)
-        }
-        Severity::Fatal => {
-            RecoveryAction::Degrade(DegradedMode::Minimal)
-        }
+        Severity::Severe => RecoveryAction::Degrade(DegradedMode::LocalOnly),
+        Severity::Fatal => RecoveryAction::Degrade(DegradedMode::Minimal),
     }
 }
 
@@ -270,29 +267,47 @@ mod tests {
 
         // 2-4 次: 降级到 BleOnly
         let action = decide_action(Severity::Degradable, 2);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::BleOnly)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::BleOnly)
+        ));
         let action = decide_action(Severity::Degradable, 4);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::BleOnly)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::BleOnly)
+        ));
 
         // 5-9 次: 降级到 LocalOnly
         let action = decide_action(Severity::Degradable, 5);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::LocalOnly)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::LocalOnly)
+        ));
 
         // 10+ 次: 降级到 Minimal
         let action = decide_action(Severity::Degradable, 10);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::Minimal)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::Minimal)
+        ));
     }
 
     #[test]
     fn test_severe_degrades_without_restart() {
         let action = decide_action(Severity::Severe, 1);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::LocalOnly)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::LocalOnly)
+        ));
     }
 
     #[test]
     fn test_fatal_degrades_without_restart() {
         let action = decide_action(Severity::Fatal, 0);
-        assert!(matches!(action, RecoveryAction::Degrade(DegradedMode::Minimal)));
+        assert!(matches!(
+            action,
+            RecoveryAction::Degrade(DegradedMode::Minimal)
+        ));
     }
 
     #[test]

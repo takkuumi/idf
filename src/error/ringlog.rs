@@ -54,7 +54,7 @@ pub static RING_LOG: LazyLock<Spin<RingLog>> = LazyLock::new(|| Spin::new(RingLo
 pub struct RingLog {
     entries: heapless::Vec<LogEntry, 100>,
     /// 启动时间 (用于 timestamp)
-    boot_time: std::time::Instant,
+    boot_time: Option<std::time::Instant>,
     /// 写入计数 (mod 2^32)
     write_count: u32,
 }
@@ -63,24 +63,22 @@ impl RingLog {
     pub const fn new() -> Self {
         Self {
             entries: heapless::Vec::new(),
-            boot_time: unsafe { std::mem::zeroed() }, // 占位, 在 lock 中初始化
+            boot_time: None,
             write_count: 0,
         }
     }
 
     /// 初始化 boot_time (在第一次锁定时调用)
-    fn ensure_boot(&mut self) {
-        if self.write_count == 0 && self.boot_time == unsafe { std::mem::zeroed() } {
-            self.boot_time = std::time::Instant::now();
-        }
+    fn boot_time(&mut self) -> std::time::Instant {
+        *self.boot_time.get_or_insert_with(std::time::Instant::now)
     }
 
     /// 记录一条日志
     /// LOOP8: 使用 esp_timer_get_time() 获取秒级时间戳, 避免 49.7 天 wrap
     pub fn record(&mut self, level: u8, module_id: u8, code: u16, context: u32) {
-        self.ensure_boot();
+        let boot_time = self.boot_time();
         // 使用秒级时间戳: u32 可运行 ~136 年不 wrap (vs ms 仅 49.7 天)
-        let timestamp_s = self.boot_time.elapsed().as_secs() as u32;
+        let timestamp_s = boot_time.elapsed().as_secs() as u32;
         let entry = LogEntry {
             timestamp_s,
             level,
@@ -125,7 +123,7 @@ pub static LOG_WRITE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub fn log_error(module_id: u8, code: u16, context: u32) {
     {
         let mut guard = RING_LOG.lock();
-        guard.record(2, module_id, code, context);  // level 2 = Error
+        guard.record(2, module_id, code, context); // level 2 = Error
         let cnt = guard.write_count();
         LOG_WRITE_COUNT.store(cnt, Ordering::Release);
     }
@@ -135,7 +133,7 @@ pub fn log_error(module_id: u8, code: u16, context: u32) {
 pub fn log_warn(module_id: u8, code: u16, context: u32) {
     {
         let mut guard = RING_LOG.lock();
-        guard.record(1, module_id, code, context);  // level 1 = Warn
+        guard.record(1, module_id, code, context); // level 1 = Warn
         let cnt = guard.write_count();
         LOG_WRITE_COUNT.store(cnt, Ordering::Release);
     }
@@ -145,7 +143,7 @@ pub fn log_warn(module_id: u8, code: u16, context: u32) {
 pub fn log_critical(module_id: u8, code: u16, context: u32) {
     {
         let mut guard = RING_LOG.lock();
-        guard.record(3, module_id, code, context);  // level 3 = Critical
+        guard.record(3, module_id, code, context); // level 3 = Critical
         let cnt = guard.write_count();
         LOG_WRITE_COUNT.store(cnt, Ordering::Release);
     }
@@ -189,7 +187,7 @@ mod tests {
         // 满了覆盖最旧, 只保留最后 100 条
         assert_eq!(ring.len(), 100);
         assert_eq!(ring.entries()[99].code, 149); // 最后一条
-        assert_eq!(ring.entries()[0].code, 50);   // 第 51 条 (最早剩下的)
+        assert_eq!(ring.entries()[0].code, 50); // 第 51 条 (最早剩下的)
     }
 
     #[test]

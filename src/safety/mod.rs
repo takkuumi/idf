@@ -10,5 +10,5 @@
 //! - 可被高频循环读取 (每次只数原子操作, 无锁)
 //! - 不引入新依赖, 不修改现有任务签名
 
-pub mod stack_guard;
 pub mod stack_budget;
+pub mod stack_guard;

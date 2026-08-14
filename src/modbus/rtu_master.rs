@@ -114,6 +114,9 @@ fn poll_with_retry(
 ) -> AppResult<()> {
     let mut last_err: Option<crate::error::AppError> = None;
     for attempt in 0..=max_retry {
+        // 单次超时最多 5s，最多 6 次尝试。每次尝试前喂狗，断线重试不能累积成
+        // 30s 无喂狗窗口并造成非计划重启。
+        crate::health::feed_wdt();
         match poll_once(port, item, timeout_ms) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -158,17 +161,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         )));
     }
 
-    // 异常响应 (Modbus spec: func | 0x80, code: Illegal F/R/V/Slave Failure)
-    if resp[1] & 0x80 != 0 {
-        // LOOP14: 异常响应 → 累加 APPERR
-        crate::modbus::shared::RS485_STATS.inc_master_apperr();
-        return Err(crate::error::AppError::Modbus(format!(
-            "exception: {:02x}",
-            resp[2]
-        )));
-    }
-
-    // CRC 校验
+    // 在解释功能码和 payload 前先校验整帧 CRC。
     let n = resp.len();
     let crc = modbus_crc16(&resp[..n - 2]);
     let recv_crc = u16::from_le_bytes([resp[n - 2], resp[n - 1]]);
@@ -181,28 +174,40 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         )));
     }
 
+    // 异常响应必须对应本次请求，且标准长度固定为 5 字节。
+    if resp[1] == (item.func | 0x80) {
+        if n != 5 {
+            crate::modbus::shared::RS485_STATS.inc_master_comerr();
+            return Err(crate::error::AppError::Modbus(format!(
+                "invalid exception length: {n}"
+            )));
+        }
+        crate::modbus::shared::RS485_STATS.inc_master_apperr();
+        return Err(crate::error::AppError::Modbus(format!(
+            "exception: {:02x}",
+            resp[2]
+        )));
+    }
+    if resp[1] != item.func {
+        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        return Err(crate::error::AppError::Modbus(format!(
+            "function mismatch: {:02x}!={:02x}",
+            resp[1], item.func
+        )));
+    }
+
     // 解析寄存器数据 (FC=03/04) 并写回 bus
     if item.func == 0x03 || item.func == 0x04 {
-        let byte_count = resp[2] as usize;
-        if byte_count + 5 != n {
-            log::warn!(
-                "[mb-rtu-master] byte_count {} != payload {}",
-                byte_count,
-                n - 5
-            );
-        }
+        let data = register_data(&resp, item).inspect_err(|_| {
+            crate::modbus::shared::RS485_STATS.inc_master_apperr();
+        })?;
         // Modbus RTU FC=03/04 单帧最多 125 reg, 用 heapless::Vec 避免 heap 分配
         let mut regs: heapless::Vec<u16, 128> = heapless::Vec::new();
-        for i in 0..byte_count / 2 {
-            let v = u16::from_be_bytes([resp[3 + 2 * i], resp[4 + 2 * i]]);
-            if regs.push(v).is_err() {
-                log::warn!(
-                    "[mb-rtu-master] regs overflow at {}, byte_count={}",
-                    i,
-                    byte_count
-                );
-                break;
-            }
+        for word in data.chunks_exact(2) {
+            regs.push(u16::from_be_bytes([word[0], word[1]]))
+                .map_err(|_| {
+                    crate::error::AppError::Modbus("register response too large".into())
+                })?;
         }
         log::debug!("[mb-rtu-master] slave={} fc=03 regs={:?}", item.slave, regs);
 
@@ -241,6 +246,23 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     Ok(())
 }
 
+fn register_data(resp: &[u8], item: PollItem) -> AppResult<&[u8]> {
+    let Some(&declared) = resp.get(2) else {
+        return Err(crate::error::AppError::Modbus(
+            "register response missing byte count".into(),
+        ));
+    };
+    let byte_count = declared as usize;
+    let expected = item.count as usize * 2;
+    if byte_count != expected || !byte_count.is_multiple_of(2) || resp.len() != byte_count + 5 {
+        return Err(crate::error::AppError::Modbus(format!(
+            "invalid register payload: declared={byte_count}, expected={expected}, frame={}",
+            resp.len()
+        )));
+    }
+    Ok(&resp[3..3 + byte_count])
+}
+
 /// 构造 RTU 请求帧: [slave, func, start_hi, start_lo, count_hi, count_lo, crc_lo, crc_hi]
 fn build_request(item: PollItem) -> heapless::Vec<u8, 16> {
     let mut req = heapless::Vec::new();
@@ -251,4 +273,34 @@ fn build_request(item: PollItem) -> heapless::Vec<u8, 16> {
     let crc = modbus_crc16(&req);
     let _ = req.extend_from_slice(&crc.to_le_bytes());
     req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ITEM: PollItem = PollItem {
+        slave: 1,
+        func: 0x03,
+        start: 0,
+        count: 2,
+        dest_reg: None,
+    };
+
+    #[test]
+    fn test_register_data_rejects_declared_length_larger_than_frame() {
+        let response = [1, 3, 250, 0, 0];
+        assert!(register_data(&response, ITEM).is_err());
+    }
+
+    #[test]
+    fn test_register_data_requires_requested_word_count() {
+        let response = [1, 3, 2, 0x12, 0x34, 0, 0];
+        assert!(register_data(&response, ITEM).is_err());
+        let response = [1, 3, 4, 0x12, 0x34, 0x56, 0x78, 0, 0];
+        assert_eq!(
+            register_data(&response, ITEM).unwrap(),
+            &[0x12, 0x34, 0x56, 0x78]
+        );
+    }
 }

@@ -32,10 +32,9 @@ pub mod system_config;
 
 use std::time::{Duration, Instant};
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use crate::actor::{Actor, ActorRef, spawn};
-use crate::sync::Spin;
 
 // ----------------------------------------------------------------------------
 // DeviceActor: 异步请求队列 (取代 AtomicBool 标志位 + watch_loop 轮询)
@@ -141,7 +140,9 @@ impl Actor for DeviceActor {
             DeviceCmd::PersistConfigAndReset => match apply_config() {
                 Ok(()) => {
                     log::info!("[device] config persisted; reset requested by Web UI");
-                    crate::bus::IO.sys.request_reset();
+                    crate::bus::IO
+                        .sys
+                        .request_reset(crate::bus::io_state::ResetSource::WEB_CONFIG_SAVED);
                 }
                 Err(e) => {
                     CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
@@ -197,9 +198,9 @@ impl Actor for DeviceActor {
     }
 }
 
-/// 全局 DeviceActor 引用 (Lazy 初始化, 由 `init()` 唤起)
-static DEVICE_ACTOR: LazyLock<ActorRef<DeviceActor>> =
-    LazyLock::new(|| spawn(DeviceActor::new()).0);
+/// 全局 DeviceActor 引用。线程创建失败时保持 `None`，由 main supervisor 重试；
+/// 业务读写仍使用 RAM 快照，不因临时 internal SRAM 不足触发 panic/reboot。
+static DEVICE_ACTOR: Mutex<Option<ActorRef<DeviceActor>>> = Mutex::new(None);
 
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvsPartition, NvsDefault};
 
@@ -208,7 +209,9 @@ use crate::config::regs;
 use crate::error::{AppError, AppResult};
 use crate::health::{self, TaskHb};
 
-pub use system_config::{SystemConfig, parse_ipv4};
+pub use system_config::SystemConfig;
+#[cfg(feature = "ble-at")]
+pub use system_config::parse_ipv4;
 
 /// device-store 监听任务心跳 (静态分配)
 static WATCH_HB: TaskHb = TaskHb::new("device-store");
@@ -288,6 +291,7 @@ const DO_NVS_MAGIC: u16 = 0xD05D;
 
 /// 协议数据字数 (U16)
 const PROTO_WORDS: usize = 1500;
+type LoadedProto = (Box<[u16]>, u16, u16);
 /// 协议数据字节数
 const PROTO_DATA_BYTES: usize = PROTO_WORDS * 2; // 3000
 /// blob 头部大小: magic(2) + version(2) + length(2) + crc(4) = 10 字节
@@ -298,13 +302,13 @@ const BLOB_TOTAL_BYTES: usize = BLOB_HEADER_BYTES + PROTO_DATA_BYTES; // 3010
 const BLOB_ALLOC_BYTES: usize = 4097;
 
 /// commit/reload 共用的协议序列化缓冲。避免 3010 字节数组进入 DeviceActor 调用栈。
-static PROTO_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
-    LazyLock::new(|| Spin::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
+static PROTO_BLOB_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
+    LazyLock::new(|| Mutex::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
 
 const DEVICE_TEXT_BLOB_BYTES: usize = regs::DEVICE_TEXT_COUNT as usize * 2;
 /// 4000B 有效数据使用 4097B 一次性工作区，确保优先分配到 PSRAM并长期复用。
-static DEVICE_TEXT_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
-    LazyLock::new(|| Spin::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
+static DEVICE_TEXT_BLOB_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
+    LazyLock::new(|| Mutex::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
 
 // ----------------------------------------------------------------------------
 // 全局状态
@@ -324,10 +328,10 @@ pub static NVS_PARTITION: LazyLock<Option<EspDefaultNvsPartition>> =
 /// NVS 句柄 (gateway namespace)
 /// 注意 esp_idf_svc 0.50: EspDefaultNvs::new 第三参数 read_write: bool
 /// 使用 Option 内部存储, 初始化失败时设为 None, 后续操作 graceful fail
-pub static NVS: LazyLock<Spin<Option<EspDefaultNvs>>> = LazyLock::new(|| {
+pub static NVS: LazyLock<Mutex<Option<EspDefaultNvs>>> = LazyLock::new(|| {
     let partition = match NVS_PARTITION.as_ref() {
         Some(partition) => partition.clone(),
-        None => return Spin::new(None),
+        None => return Mutex::new(None),
     };
     let inner = match EspDefaultNvs::new(partition, NVS_NAMESPACE, true) {
         Ok(nvs) => {
@@ -340,7 +344,7 @@ pub static NVS: LazyLock<Spin<Option<EspDefaultNvs>>> = LazyLock::new(|| {
             None
         }
     };
-    Spin::new(inner)
+    Mutex::new(inner)
 });
 
 // ----------------------------------------------------------------------------
@@ -357,7 +361,7 @@ pub fn init() -> AppResult<()> {
     LazyLock::force(&NVS);
 
     // 2. 加载协议数据 (NVS 不可用时使用空数据)
-    let (data, version, length) = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+    let (data, version, length) = if let Some(nvs) = nvs_lock().as_ref() {
         load_proto_from_nvs(nvs)?
     } else {
         log::warn!("[device] NVS unavailable, using empty protocol data");
@@ -365,7 +369,7 @@ pub fn init() -> AppResult<()> {
     };
 
     // 3. 加载设备文本区 (Android 1.0.78 0x1388-0x1B77)
-    let device_text = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+    let device_text = if let Some(nvs) = nvs_lock().as_ref() {
         load_device_text_from_nvs(nvs)?
     } else {
         log::warn!("[device] NVS unavailable, using empty device_text");
@@ -373,7 +377,7 @@ pub fn init() -> AppResult<()> {
     };
 
     // 4. 加载系统配置 (NVS 不可用时使用默认值)
-    let mut cfg = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+    let mut cfg = if let Some(nvs) = nvs_lock().as_ref() {
         SystemConfig::load_from_nvs(nvs)?
     } else {
         log::warn!("[device] NVS unavailable, using default SystemConfig");
@@ -396,7 +400,7 @@ pub fn init() -> AppResult<()> {
 
         // LOOP13: 从 NVS 加载 holding_buf (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
         //         永久丢失的 bug 修复. NVS 不可用时回退全 0.
-        let mut holding_buf = if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+        let mut holding_buf = if let Some(nvs) = nvs_lock().as_ref() {
             holding_store::load_from_nvs(nvs)?
         } else {
             log::warn!("[device] NVS unavailable, using empty holding_buf");
@@ -422,7 +426,7 @@ pub fn init() -> AppResult<()> {
 
         // LOOP13: 加载 DO 位图到 IO.do_. 安全优先: init 默认 0 (DO 全断),
         //         加载后才覆盖为持久值, 上电期间硬件上电保护先于 DO 加载生效.
-        if let Some(nvs) = LazyLock::force(&NVS).lock().as_ref() {
+        if let Some(nvs) = nvs_lock().as_ref() {
             let do_bits = load_do_bits_from_nvs(nvs);
             IO.do_.store_bits(do_bits);
             // 触发 main_loop 立即同步到硬件 (notify 已在 write_coil 内化)
@@ -451,16 +455,46 @@ pub fn init() -> AppResult<()> {
         cfg.fw_version,
     );
 
-    // 4. 启动 DeviceActor (替代 watch_loop)
-    // 关键: 必须在此处 force(), 否则后续 DEVICE_ACTOR.send() 会触发 lazy init
-    // 在其他线程/上下文访问 spinlock 时产生重入, 触发 FreeRTOS assert
-    health::register_with_stack(&WATCH_HB, crate::safety::stack_budget::DEVICE_ACTOR);
-    health::set_next_thread_core(health::CORE_NET);
-    LazyLock::force(&DEVICE_ACTOR);
-    log::info!("[device] DeviceActor started (mailbox consumer thread)");
-    health::reset_thread_core();
+    // 4. 启动 DeviceActor (替代 watch_loop)。失败向上传递但不 panic，main
+    // supervisor 会在资源恢复后重试，已发布的 RAM 配置仍可正常提供业务。
+    ensure_actor_started()?;
 
     Ok(())
+}
+
+fn device_actor_lock() -> MutexGuard<'static, Option<ActorRef<DeviceActor>>> {
+    DEVICE_ACTOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 确保 DeviceActor 已运行。返回 `true` 表示本次新建，`false` 表示此前已运行。
+pub fn ensure_actor_started() -> AppResult<bool> {
+    let mut slot = device_actor_lock();
+    if slot.is_some() {
+        return Ok(false);
+    }
+
+    health::set_next_thread_core(health::CORE_NET);
+    let spawned = spawn(DeviceActor::new());
+    health::reset_thread_core();
+    let (actor_ref, _handle) =
+        spawned.map_err(|e| AppError::Config(format!("DeviceActor spawn failed: {e}")))?;
+
+    *slot = Some(actor_ref);
+    health::register_with_stack(&WATCH_HB, crate::safety::stack_budget::DEVICE_ACTOR);
+    log::info!("[device] DeviceActor started (mailbox consumer thread)");
+    Ok(true)
+}
+
+pub fn actor_is_started() -> bool {
+    device_actor_lock().is_some()
+}
+
+fn try_send_device_cmd(cmd: DeviceCmd) -> bool {
+    device_actor_lock()
+        .as_ref()
+        .is_some_and(|actor| actor.try_send(cmd))
 }
 
 /// 借用 NVS 分区句柄 (供其它模块如 blemesh 复用, 避免重复 take)
@@ -470,13 +504,15 @@ pub fn nvs_partition() -> Option<EspDefaultNvsPartition> {
 
 /// 安全获取 NVS 句柄 (NVS 可能为 None 因为初始化失败)
 /// 返回的 Guard 内部是 Option<EspDefaultNvs>, 调用方需 .as_ref() 检查
-pub fn nvs_lock() -> crate::sync::SpinGuard<'static, Option<EspDefaultNvs>> {
-    LazyLock::force(&NVS).lock()
+pub fn nvs_lock() -> MutexGuard<'static, Option<EspDefaultNvs>> {
+    LazyLock::force(&NVS)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// NVS 是否可用 (用于快速检查, 避免不必要的锁)
 pub fn nvs_available() -> bool {
-    LazyLock::force(&NVS).lock().is_some()
+    nvs_lock().is_some()
 }
 
 /// 在 NVS 可用时调用闭包 (传入 &EspDefaultNvs), 否则返回 None
@@ -532,8 +568,9 @@ pub fn load_reset_count() -> u16 {
 /// 实际 NVS 写入由 device-store 监听线程在后台完成, 主线程立即返回 Ok(())。
 /// 失败时通过 log 记录, 不影响业务逻辑。
 pub fn save_reset_count(cnt: u16) -> AppResult<()> {
-    DEVICE_ACTOR.send(DeviceCmd::PersistResetCount(cnt));
-    Ok(())
+    try_send_device_cmd(DeviceCmd::PersistResetCount(cnt))
+        .then_some(())
+        .ok_or_else(|| AppError::Config("device actor unavailable or mailbox full".into()))
 }
 
 // ----------------------------------------------------------------------------
@@ -560,8 +597,9 @@ pub fn load_mesh_keys() -> (u16, u16) {
 
 /// 保存 BLE Mesh net_idx / app_idx 到 NVS (异步: 递交 DeviceActor, 不阻塞调用方)
 pub fn save_mesh_keys(net_idx: u16, app_idx: u16) -> AppResult<()> {
-    DEVICE_ACTOR.send(DeviceCmd::PersistMeshKeys { net_idx, app_idx });
-    Ok(())
+    try_send_device_cmd(DeviceCmd::PersistMeshKeys { net_idx, app_idx })
+        .then_some(())
+        .ok_or_else(|| AppError::Config("device actor unavailable or mailbox full".into()))
 }
 
 // ----------------------------------------------------------------------------
@@ -570,13 +608,13 @@ pub fn save_mesh_keys(net_idx: u16, app_idx: u16) -> AppResult<()> {
 
 /// 请求持久化 (由 Modbus 写 COMMIT 寄存器或 AT+COMMIT 调用)
 /// 实际写入由监听线程异步执行, 避免阻塞 Modbus/AT 主线程
-pub fn request_commit() {
-    DEVICE_ACTOR.send(DeviceCmd::Commit);
+pub fn request_commit() -> bool {
+    try_send_device_cmd(DeviceCmd::Commit)
 }
 
 /// 请求重载 (由 Modbus 写 RELOAD 寄存器或 AT+RELOAD 调用)
-pub fn request_reload() {
-    DEVICE_ACTOR.send(DeviceCmd::Reload);
+pub fn request_reload() -> bool {
+    try_send_device_cmd(DeviceCmd::Reload)
 }
 
 /// 请求应用配置 (由 Modbus 写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 调用)
@@ -585,8 +623,9 @@ pub fn request_persist_config() {
 }
 
 /// 异步落盘当前系统配置，且仅在落盘成功后复位。
-pub fn request_persist_config_and_reset() {
-    DEVICE_ACTOR.send(DeviceCmd::PersistConfigAndReset);
+/// 返回 `false` 表示邮箱暂时已满，调用方必须向用户报告未接受。
+pub fn request_persist_config_and_reset() -> bool {
+    try_send_device_cmd(DeviceCmd::PersistConfigAndReset)
 }
 
 /// 持久化并通知需要运行时重配的外设。普通 SN/位置/RS485 数据落盘不得扰动网络。
@@ -633,7 +672,9 @@ fn commit() -> AppResult<()> {
         };
         let new_active = if active == 0 { 1u8 } else { 0u8 };
 
-        let mut blob = PROTO_BLOB_BUFFER.lock();
+        let mut blob = PROTO_BLOB_BUFFER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         blob.fill(0);
         blob[0..2].copy_from_slice(&PROTO_MAGIC.to_le_bytes());
         blob[2..4].copy_from_slice(&version.to_le_bytes());
@@ -659,32 +700,36 @@ fn commit() -> AppResult<()> {
     });
 
     let new_active = match write_result {
-        Some(Ok(active)) => Some(active),
+        Some(Ok(active)) => active,
         Some(Err(e)) => {
             bus::storage_state::proto_status_set(3);
             return Err(e);
         }
         None => {
-            log::warn!("[device] NVS unavailable, proto commit skipped");
-            None
+            bus::storage_state::proto_status_set(3);
+            return Err(AppError::Config(
+                "NVS unavailable, proto commit deferred".into(),
+            ));
         }
     };
 
-    // 7. 更新状态: atomic 复位 + RCU RMW 把 dirty 清零 (快照镜像也会被同步)
+    // 7. 仅当当前快照仍是本次落盘的数据时清 dirty。Flash 写入期间如果收到
+    // 新的协议写入，Arc 数据指针会变化，必须保留 dirty 供下一次提交。
     bus::storage_state::proto_status_set(0);
     bus::backends::storage_modify(|snap| {
-        snap.proto.dirty = false;
+        if Arc::ptr_eq(&snap.proto.data, &data)
+            && snap.proto.version == version
+            && snap.proto.length == length
+        {
+            snap.proto.dirty = false;
+        }
     });
 
     log::info!(
         "[device] proto committed: {} words, ver={:#06x}, blob={}",
         length,
         version,
-        match new_active {
-            Some(0) => "A",
-            Some(_) => "B",
-            None => "skipped",
-        }
+        if new_active == 0 { "A" } else { "B" }
     );
     Ok(())
 }
@@ -694,11 +739,8 @@ fn reload() -> AppResult<()> {
     bus::storage_state::proto_status_set(2);
 
     // 2. 从 NVS 读取 (若 NVS 不可用则使用空数据)
-    let (data, version, length) =
-        try_with_nvs(|nvs| load_proto_from_nvs(nvs)).unwrap_or_else(|| {
-            log::warn!("[device] NVS unavailable on reload, using empty data");
-            Ok((vec![0u16; PROTO_WORDS].into_boxed_slice(), 0, 0))
-        })?;
+    let (data, version, length) = try_with_nvs(load_proto_from_nvs)
+        .ok_or_else(|| AppError::Config("NVS unavailable, proto reload cancelled".into()))??;
 
     // 3. 写回快照: RCU RMW 仅替换 proto; device_text / holding_buf 保持不动.
     bus::storage_state::proto_status_set(0);
@@ -758,13 +800,11 @@ fn apply_config() -> AppResult<()> {
     Ok(())
 }
 
-/// 从 NVS 加载协议数据 (双 blob A/B + legacy 兼容)
-///
-/// 读取顺序:
-/// 1. 读 active 标志 → 读对应 blob → 校验 magic + CRC
-/// 2. 失败则读另一个 blob → 校验
-/// 3. 都失败则尝试 legacy 单 blob 格式 (兼容旧固件)
-/// 4. 都失败则返回空默认值
+// 从 NVS 加载协议数据 (双 blob A/B + legacy 兼容):
+// 1. 读 active 标志 → 读对应 blob → 校验 magic + CRC
+// 2. 失败则读另一个 blob → 校验
+// 3. 都失败则尝试 legacy 单 blob 格式 (兼容旧固件)
+// 4. 都失败则返回空默认值
 /// 加载设备文本区 (2000 字 = 4000 字节, NVS blob "dev_text")
 ///
 /// 成功加载条件:
@@ -788,7 +828,9 @@ fn load_device_text_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
         return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
     }
     // 2. 读 blob
-    let mut buf = DEVICE_TEXT_BLOB_BUFFER.lock();
+    let mut buf = DEVICE_TEXT_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     buf.fill(0);
     let blob = match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut buf[..expected_bytes]) {
         Ok(Some(b)) if b.len() == expected_bytes => b,
@@ -827,7 +869,9 @@ pub fn save_device_text_to_nvs(text: &[u16]) -> AppResult<()> {
             regs::DEVICE_TEXT_COUNT as usize
         )));
     }
-    let mut blob = DEVICE_TEXT_BLOB_BUFFER.lock();
+    let mut blob = DEVICE_TEXT_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (i, &v) in text.iter().enumerate() {
         blob[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
     }
@@ -837,7 +881,9 @@ pub fn save_device_text_to_nvs(text: &[u16]) -> AppResult<()> {
 /// 从当前 RCU 快照复制到复用缓冲后再写 NVS。RCU reader 只覆盖 4KB memcpy，
 /// 不跨越慢速 Flash 操作，避免连续 Modbus 写导致 retire queue 积压。
 fn save_current_device_text_to_nvs() -> AppResult<()> {
-    let mut blob = DEVICE_TEXT_BLOB_BUFFER.lock();
+    let mut blob = DEVICE_TEXT_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let encoded = crate::bus::storage_state::storage_read_with(|snap| {
         if snap.device_text.len() != regs::DEVICE_TEXT_COUNT as usize {
             return false;
@@ -883,7 +929,9 @@ pub fn request_save_device_text() {
 
 /// LOOP13: 异步持久化 holding_buf (走 Actor mailbox)
 pub fn request_persist_holding() {
-    DEVICE_ACTOR.send(DeviceCmd::PersistHolding);
+    if !try_send_device_cmd(DeviceCmd::PersistHolding) {
+        log::warn!("[device] actor unavailable or mailbox full; holding dirty flag retained");
+    }
 }
 
 /// LOOP13: 同步加载 DO 位图 (init 调用). NVS 不存在或 magic 错误返回 0.
@@ -921,8 +969,9 @@ pub fn save_do_bits_to_nvs(bits: u64) -> AppResult<()> {
         Ok(())
     })
     .unwrap_or_else(|| {
-        log::warn!("[device] NVS unavailable, do_bits persist skipped");
-        Ok(())
+        Err(AppError::Config(
+            "NVS unavailable, do_bits not persisted".into(),
+        ))
     })
 }
 
@@ -950,14 +999,21 @@ pub fn persist_do_bits_throttled(now_ms: u32) {
         return;
     }
 
-    if save_do_bits_to_nvs(bits).is_ok() {
-        DO_PERSIST_LAST.store_bits(bits);
-        DO_PERSIST_LAST_MS.store(now_ms, Ordering::Release);
-        log::debug!("[device] do_bits {:#018x} persisted (throttled)", bits);
+    match save_do_bits_to_nvs(bits) {
+        Ok(()) => {
+            DO_PERSIST_LAST.store_bits(bits);
+            DO_PERSIST_LAST_MS.store(now_ms, Ordering::Release);
+            log::debug!("[device] do_bits {:#018x} persisted (throttled)", bits);
+        }
+        Err(error) => {
+            // 失败仍记录尝试时间，保持每秒重试而不是退化成每 5ms 忙重试。
+            DO_PERSIST_LAST_MS.store(now_ms, Ordering::Release);
+            log::warn!("[device] do_bits persist failed; will retry: {error}");
+        }
     }
 }
 
-fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<(Box<[u16]>, u16, u16)> {
+fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<LoadedProto> {
     let data = vec![0u16; PROTO_WORDS].into_boxed_slice();
 
     // 尝试读取双 blob
@@ -1008,8 +1064,10 @@ fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<(Box<[u16]>, u16, u16)>
 ///
 /// blob 布局: [magic:2][version:2][length:2][crc:4][data:3000] = 3010 字节
 /// CRC 覆盖 header[0..6] + data, 用 wrapping_add 合并两部分 CRC
-fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<(Box<[u16]>, u16, u16)>> {
-    let mut buf = PROTO_BLOB_BUFFER.lock();
+fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<LoadedProto>> {
+    let mut buf = PROTO_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let blob = nvs
         .get_blob(key, &mut buf)
         .map_err(|e| AppError::Config(format!("nvs get_blob {key}: {e:?}")))?;
@@ -1056,7 +1114,7 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<(Box<[u1
 }
 
 /// 读取 legacy 单 blob 格式 (兼容旧固件, 仅用于迁移)
-fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<(Box<[u16]>, u16, u16)>> {
+fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<LoadedProto>> {
     // 1. 检查 legacy magic
     let magic = nvs
         .get_u16(NVS_KEY_MAGIC_LEGACY)
@@ -1068,7 +1126,9 @@ fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<(Box<[u16]>, u16, u
     }
 
     // 2. 读 legacy blob
-    let mut buf = PROTO_BLOB_BUFFER.lock();
+    let mut buf = PROTO_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let blob = nvs
         .get_blob(NVS_KEY_DATA_LEGACY, &mut buf[..PROTO_DATA_BYTES])
         .map_err(|e| AppError::Config(format!("nvs get legacy blob: {e:?}")))?;

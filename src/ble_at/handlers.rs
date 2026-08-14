@@ -152,14 +152,39 @@ pub fn handle_status(_args: &str) -> String {
         io.sys.get_reset_count(),
         io.di.load_bits(),
         io.do_.load_bits(),
-        [io.ai.get_raw(0), io.ai.get_raw(1), io.ai.get_raw(2), io.ai.get_raw(3), io.ai.get_raw(4), io.ai.get_raw(5)],
-        [io.ao.get_scaled(0), io.ao.get_scaled(1), io.ao.get_scaled(2), io.ao.get_scaled(3)],
+        [
+            io.ai.get_raw(0),
+            io.ai.get_raw(1),
+            io.ai.get_raw(2),
+            io.ai.get_raw(3),
+            io.ai.get_raw(4),
+            io.ai.get_raw(5),
+        ],
+        [
+            io.ao.get_scaled(0),
+            io.ao.get_scaled(1),
+            io.ao.get_scaled(2),
+            io.ao.get_scaled(3),
+        ],
     );
     ok_data(&format!(
         "uptime={}s,fw=0x{:04X},rst={},ver={},di=0x{:X},do=0x{:X},ai=0x{:04X},0x{:04X},0x{:04X},0x{:04X},0x{:04X},0x{:04X},ao=0x{:04X},0x{:04X},0x{:04X},0x{:04X}",
-        uptime, fw, rst, crate::config::hw_version::NAME, di, do_,
-        ai[0], ai[1], ai[2], ai[3], ai[4], ai[5],
-        ao[0], ao[1], ao[2], ao[3]
+        uptime,
+        fw,
+        rst,
+        crate::config::hw_version::NAME,
+        di,
+        do_,
+        ai[0],
+        ai[1],
+        ai[2],
+        ai[3],
+        ai[4],
+        ai[5],
+        ao[0],
+        ao[1],
+        ao[2],
+        ao[3]
     ))
 }
 
@@ -169,7 +194,9 @@ pub fn handle_status(_args: &str) -> String {
 // ----------------------------------------------------------------------------
 pub fn handle_reset(_args: &str) -> String {
     // 直接置位 IO.sys 请求复位 (无锁)
-    crate::bus::IO.sys.request_reset();
+    crate::bus::IO
+        .sys
+        .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
     // main_loop 在响应入队后执行复位，不创建一次性 pthread。
     ok_data("resetting in 200ms")
 }

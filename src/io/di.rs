@@ -12,7 +12,7 @@ use crate::sync::MainLoopCell;
 /// 去抖需要的连续相同采样次数
 const DEBOUNCE_COUNT: u8 = 3;
 
-/// 启动 DI 扫描任务
+// 启动 DI 扫描任务
 // 架构改造 Phase 2: DI 扫描合并到 main_loop
 // 原始: 独立 pthread 5ms 高频扫描
 // 改造后: main_loop 20ms tick 调用

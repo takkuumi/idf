@@ -32,11 +32,14 @@ pub fn handle_ota_write(args: &str) -> String {
     if hex.is_empty() {
         return err(10, "empty data");
     }
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return err(11, "odd hex length");
     }
     if hex.len() / 2 > OTA_AT_CHUNK_MAX {
-        return err(12, &format!("chunk too large (max {} bytes)", OTA_AT_CHUNK_MAX));
+        return err(
+            12,
+            &format!("chunk too large (max {} bytes)", OTA_AT_CHUNK_MAX),
+        );
     }
 
     // hex → bytes (用 heapless::Vec 避免 heap 分配)
@@ -88,7 +91,9 @@ pub fn handle_ota_status(_args: &str) -> String {
     let total = ota::total_bytes();
     ok_data(&format!(
         "status={},written={},total={}",
-        st.as_u16(), written, total
+        st.as_u16(),
+        written,
+        total
     ))
 }
 
@@ -99,6 +104,8 @@ pub fn handle_ota_reboot(_args: &str) -> String {
         return err(30, &format!("cannot reboot: status={}", st.as_u16()));
     }
     // 交给 main_loop 的 1s 调度点执行，避免为一次性延时申请 12KB pthread 栈。
-    crate::bus::IO.sys.request_reset();
+    crate::bus::IO
+        .sys
+        .request_reset(crate::bus::io_state::ResetSource::BLE_OTA);
     ok_none()
 }

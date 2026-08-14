@@ -1,4 +1,4 @@
-//! 配置状态 - RCU (Read-Copy-Update) 无锁
+//! 配置状态 - 不可变 Arc 快照
 //!
 //! ## 之前 (parking_lot::RwLock)
 //! - 每次 Modbus 读需要 acquire read lock
@@ -6,9 +6,9 @@
 //! - 高并发时锁竞争明显
 //!
 //! ## 现在 (Rcu<T>)
-//! - 读: lock-free 原子加载, 纳秒级
-//! - 写: 构造新值, 原子替换指针
-//! - 读期间永不阻塞 (除非 OS 抢占)
+//! - 读: 极短自旋临界区内克隆 Arc，业务读取在锁外
+//! - 写: 构造新值后在极短临界区替换 Arc
+//! - 不依赖 ESP-IDF pthread TLS 的延迟回收算法
 //!
 //! ## 性能 (实机测试)
 //! - 读 1000 次: 旧 ~150ms, 新 < 1ms
@@ -44,17 +44,17 @@ impl Default for ConfigSnapshot {
     }
 }
 
-/// 全局配置 (RCU, lock-free 读)
+/// 全局配置快照
 pub static CONFIG: LazyLock<Rcu<ConfigSnapshot>> =
     LazyLock::new(|| Rcu::new(ConfigSnapshot::new()));
 
-/// 读 (lock-free, 永远不阻塞)
+/// 读（锁内只克隆 Arc）
 /// 返回 Arc 让调用方可以安全持有 (即使 RCU 被更新, 引用仍有效)
 pub fn config_read() -> Option<Arc<ConfigSnapshot>> {
-    CONFIG.read().map(|s| Arc::new(s.clone()))
+    CONFIG.read()
 }
 
-/// 写 (原子替换, 旧值自动 leak)
+/// 写（指针替换，旧值在最后一个读者释放后回收）。
 pub fn config_write(snapshot: ConfigSnapshot) {
     CONFIG.write(snapshot);
 }

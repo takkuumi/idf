@@ -22,13 +22,12 @@
 //! proto blob 数据 3000 字节, holding_buf 4096 字节. 同样 8B header,
 //! 总 blob 4104 字节. CRC32 覆盖 data 区不含 header.
 
-use std::sync::{LazyLock, atomic::Ordering};
+use std::sync::{LazyLock, Mutex, atomic::Ordering};
 
 use esp_idf_svc::nvs::EspDefaultNvs;
 
 use crate::bus::storage_state::{HOLDING_DIRTY, HOLDING_NVS_VALID, storage_read_with};
 use crate::error::{AppError, AppResult};
-use crate::sync::Spin;
 
 // ---- NVS keys ----
 /// blob A (header + 4096B data)
@@ -54,8 +53,8 @@ pub const HOLDING_BLOB_TOTAL: usize = HOLDING_HEADER_BYTES + HOLDING_DATA_BYTES;
 
 /// 保存/加载共用工作区。4104B 超过 ALWAYSINTERNAL 阈值，优先进入 PSRAM；
 /// 首次分配后永久复用，NVS 周期内不再反复申请大块内部堆。
-static HOLDING_BLOB_BUFFER: LazyLock<Spin<Box<[u8]>>> =
-    LazyLock::new(|| Spin::new(vec![0u8; HOLDING_BLOB_TOTAL].into_boxed_slice()));
+static HOLDING_BLOB_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
+    LazyLock::new(|| Mutex::new(vec![0u8; HOLDING_BLOB_TOTAL].into_boxed_slice()));
 
 /// 把当前 holding_buf (RCU 快照) 写入 NVS A/B 双 blob.
 ///
@@ -70,7 +69,9 @@ pub fn save_to_nvs() -> AppResult<()> {
     }
 
     // 1. 直接序列化，避免先深拷贝 4KB holding 再创建 4KB blob。
-    let mut blob = HOLDING_BLOB_BUFFER.lock();
+    let mut blob = HOLDING_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     blob.fill(0);
     blob[0..2].copy_from_slice(&HOLDING_MAGIC.to_le_bytes());
     blob[2..4].copy_from_slice(&HOLDING_BLOB_VERSION.to_le_bytes());
@@ -160,7 +161,9 @@ pub fn load_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
 
 /// 从指定 NVS blob key 读取并校验, 成功则返回 Some(Vec<u16>), 失败返回 None.
 fn try_load_one(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<Vec<u16>>> {
-    let mut buf = HOLDING_BLOB_BUFFER.lock();
+    let mut buf = HOLDING_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     buf.fill(0);
     let blob = nvs
         .get_blob(key, buf.as_mut())

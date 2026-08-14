@@ -193,26 +193,36 @@ fn save_web_system_info(info: &WebSystemInfo) -> bool {
 
 /// DeviceActor 独占调用的 Web 系统信息落盘路径。
 pub fn persist_pending_system_info() -> Result<bool, String> {
-    if !WEB_SYSTEM_INFO_DIRTY.load(Ordering::Acquire) {
+    // 写入前消费 dirty。若 NVS 写入期间又有保存请求，写者会重新置 true，
+    // 成功路径不得再无条件清零，否则最新值可能永久只留在 RAM。
+    if !WEB_SYSTEM_INFO_DIRTY.swap(false, Ordering::AcqRel) {
         return Ok(false);
     }
-    let info = WEB_SYSTEM_INFO_CACHE
-        .lock()
-        .map_err(|_| "web system info cache poisoned".to_string())?
-        .clone();
-    let blob =
-        encode_web_system_info(&info).ok_or_else(|| "invalid web system info".to_string())?;
+    let info = match WEB_SYSTEM_INFO_CACHE.lock() {
+        Ok(info) => info.clone(),
+        Err(_) => {
+            WEB_SYSTEM_INFO_DIRTY.store(true, Ordering::Release);
+            return Err("web system info cache poisoned".to_string());
+        }
+    };
+    let Some(blob) = encode_web_system_info(&info) else {
+        WEB_SYSTEM_INFO_DIRTY.store(true, Ordering::Release);
+        return Err("invalid web system info".to_string());
+    };
     let result = crate::device::try_with_nvs_mut(|nvs| {
         nvs.set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
             .map_err(|e| format!("{e:?}"))
     });
     match result {
-        Some(Ok(())) => {
-            WEB_SYSTEM_INFO_DIRTY.store(false, Ordering::Release);
-            Ok(true)
+        Some(Ok(())) => Ok(true),
+        Some(Err(error)) => {
+            WEB_SYSTEM_INFO_DIRTY.store(true, Ordering::Release);
+            Err(error)
         }
-        Some(Err(error)) => Err(error),
-        None => Err("NVS unavailable".to_string()),
+        None => {
+            WEB_SYSTEM_INFO_DIRTY.store(true, Ordering::Release);
+            Err("NVS unavailable".to_string())
+        }
     }
 }
 
@@ -454,10 +464,10 @@ impl HttpRequest {
         };
         for pair in cookie.split(';') {
             let kv = pair.trim();
-            if let Some((k, v)) = kv.split_once('=') {
-                if k.trim() == "ESPSESSIONID" {
-                    return validate_session_cookie(v.trim().as_bytes());
-                }
+            if let Some((k, v)) = kv.split_once('=')
+                && k.trim() == "ESPSESSIONID"
+            {
+                return validate_session_cookie(v.trim().as_bytes());
             }
         }
         false
@@ -641,8 +651,8 @@ fn read_bounded_header_line(
 ///
 /// LOOP9 安全加固:
 /// - header 行长度上限 MAX_HEADER_LINE (防恶意超长 header → OOM)
-/// 返回 (HttpRequest 框架, content_length, reader) — body 由调用方按需读取,
-/// OTA 走流式 (handle_ota_upload_stream), 其余路由走 read_exact 上限 MAX_BODY_SIZE.
+// 返回 (HttpRequest 框架, content_length, reader) — body 由调用方按需读取,
+// OTA 走流式 (handle_ota_upload_stream), 其余路由走 read_exact 上限 MAX_BODY_SIZE.
 fn parse_request_headers(
     stream: TcpStream,
 ) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
@@ -929,10 +939,7 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
             &json_response("updatesysteminfoconfig", "0x01000001"),
         );
     }
-    if addressinfo
-        .as_ref()
-        .is_some_and(|value| value.as_bytes().len() > 16)
-    {
+    if addressinfo.as_ref().is_some_and(|value| value.len() > 16) {
         return send_json(
             stream,
             200,
@@ -1130,13 +1137,9 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
             &json_response("updatenetworkconfig", "0x01000001"),
         );
     }
-    if addressinfo
-        .as_ref()
-        .is_some_and(|value| value.as_bytes().len() > 16)
-        || sn.as_ref().is_some_and(|value| value.as_bytes().len() > 32)
-        || ble_name
-            .as_ref()
-            .is_some_and(|value| value.as_bytes().len() > 8)
+    if addressinfo.as_ref().is_some_and(|value| value.len() > 16)
+        || sn.as_ref().is_some_and(|value| value.len() > 32)
+        || ble_name.as_ref().is_some_and(|value| value.len() > 8)
     {
         return send_json(
             stream,
@@ -1196,6 +1199,7 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     // NVS/Flash；网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
     crate::device::request_persist_config();
     if ble_name.is_some() {
+        #[cfg(feature = "ble-at")]
         crate::ble_at::notify_ble_name_changed();
     }
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
@@ -1531,7 +1535,7 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     }
 
     // AI 值
-    let ai_count = crate::config::hw_version::AI_COUNT as u16;
+    let ai_count = crate::config::hw_version::AI_COUNT;
     let mut ai_data = String::new();
     let mut ai_max = String::new();
     let mut ai_min = String::new();
@@ -1640,6 +1644,7 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
     log::info!("[http] update BLE name: {:?}", name);
     crate::device::request_persist_config();
     // GAP 名称立即更新；配置快照由 DeviceActor 合并落盘。
+    #[cfg(feature = "ble-at")]
     crate::ble_at::notify_ble_name_changed();
     send_json(stream, 200, &json_response("updatebleconfig", "0"))
 }
@@ -1730,13 +1735,16 @@ fn handle_reboot(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<(
     if req.method != "POST" {
         return send_json(stream, 405, &json_response("reboot", "405"));
     }
-    send_json(stream, 200, &json_response("reboot", "0"))?;
     if req.form_field("after_config_save").as_deref() == Some("1") {
-        crate::device::request_persist_config_and_reset();
+        if !crate::device::request_persist_config_and_reset() {
+            return send_json(stream, 200, &json_response("reboot", "0x01000005"));
+        }
     } else {
-        crate::bus::IO.sys.request_reset();
+        crate::bus::IO
+            .sys
+            .request_reset(crate::bus::io_state::ResetSource::WEB);
     }
-    Ok(())
+    send_json(stream, 200, &json_response("reboot", "0"))
 }
 
 /// POST /updatepwd

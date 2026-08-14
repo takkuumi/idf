@@ -123,16 +123,16 @@ pub struct SystemConfig {
 /// `Ok` / `Persist` / `Apply` / `Reset` 都表示地址命中并已写入 cfg 字段.
 /// 区别仅在调用方 (`bus::backends::write_hold_reg`) 应触发的副作用:
 ///
-/// - `Ok`       : 仅写入 CONFIG RCU, **不** 触发 NVS 持久化. 用于只读/诊断类寄存器
-///                (FW_VER / CFG_VER / UNKNOWN 等).
-/// - `Persist`  : 写入 CONFIG RCU **且** 触发 NVS 持久化 (cfg_version 不变). 用于
-///                用户可编辑但不需要重启的配置 (SN / PLACE / BLE_NAME / BLE_MESH_EN /
-///                RS485 配置等). Android 1.0.78 直接 Modbus FC=10 写入, 不调 APPLY,
-///                所以这里必须主动 persist 否则配置不落盘.
-/// - `Apply`    : 写入 + 持久化 + cfg_version++ (网络 / BLE MAC 等需要重新初始化外设
-///                时使用; 网络配置不重启生效由各模块自行监听 cfg 变化).
-/// - `Reset`    : 恢复出厂默认 + 持久化 + apply_config (CFG_RESET_DEFAULT=0xD5D5 触发).
-/// - `NotFound` : 地址不在本配置区, 调用方应尝试 holding_buf 兜底或返回 false.
+/// - `Ok`: 仅写入 CONFIG RCU, **不** 触发 NVS 持久化. 用于只读/诊断类寄存器
+///   (FW_VER / CFG_VER / UNKNOWN 等).
+/// - `Persist`: 写入 CONFIG RCU **且** 触发 NVS 持久化 (cfg_version 不变). 用于
+///   用户可编辑但不需要重启的配置 (SN / PLACE / BLE_NAME / BLE_MESH_EN /
+///   RS485 配置等). Android 1.0.78 直接 Modbus FC=10 写入, 不调 APPLY,
+///   所以这里必须主动 persist 否则配置不落盘.
+/// - `Apply`: 写入 + 持久化 + cfg_version++ (网络 / BLE MAC 等需要重新初始化外设
+///   时使用; 网络配置不重启生效由各模块自行监听 cfg 变化).
+/// - `Reset`: 恢复出厂默认 + 持久化 + apply_config (CFG_RESET_DEFAULT=0xD5D5 触发).
+/// - `NotFound`: 地址不在本配置区, 调用方应尝试 holding_buf 兜底或返回 false.
 #[derive(Debug, PartialEq)]
 pub enum WriteResult {
     /// 普通字段写入成功 (不持久化, 用于诊断/只读字段)
@@ -238,10 +238,14 @@ impl SystemConfig {
     pub fn fw_version_from_cargo() -> u16 {
         let v = env!("CARGO_PKG_VERSION");
         let mut parts = v.split('.');
-        let major: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let minor: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let patch: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major * 100 + minor * 10 + patch).min(0xFFFF)
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        major
+            .saturating_mul(100)
+            .saturating_add(minor.saturating_mul(10))
+            .saturating_add(patch)
+            .min(u16::MAX as u32) as u16
     }
 
     /// 从 Cargo.toml 解析固件日期码 → u16 (默认 MM.DD 编码: MMDD)
@@ -609,6 +613,7 @@ impl SystemConfig {
                 hi,
                 lo
             );
+            #[cfg(feature = "ble-at")]
             crate::ble_at::notify_ble_name_changed();
             return WriteResult::Persist;
         }

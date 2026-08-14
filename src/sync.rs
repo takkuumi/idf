@@ -2,7 +2,7 @@
 //!
 //! ## 设计取向
 //! - 高频实时位图 (DI/DO 64 位) → [`AtomicBits64`] (wait-free 读 + CAS 单位写)
-//! - 短临界区 (外设句柄 / NVS / legacy Bus / 环日志 / 缓冲池 / BLE 回调表) → [`Spin`]
+//! - 短临界区 (外设句柄 / legacy Bus / 环日志 / BLE 回调表) → [`Spin`]
 //!   - 非阻塞自旋, 无中毒, 不阻塞内核/调度器
 //! - 多生产者-单消费者消息 (Actor mailbox / 事件总线) → [`MpscRing`]
 //!   - bounded MPSC, 不阻塞, 满即丢
@@ -21,10 +21,10 @@
 //! | OTA session / pending | Mutex\<Opt\>/Mutex\<u32\> | 单原子 + Spin\<Opt\> | 准无锁 |
 //! | event_bus | std Mutex\<Queue\> | MpscRing | 非阻塞 (满丢新) |
 //! | ble_at 6 锁 | parking_lot::Mutex | Spin | 短临界区自旋 |
-//! | device NVS | parking_lot::Mutex | Spin | 短临界区自旋 |
+//! | device NVS | parking_lot::Mutex | std Mutex | Flash 擦写期间让出 CPU |
 //! | legacy Bus | parking_lot::Mutex | Spin + try_lock | 短临界区自旋 |
 //! | HAL 外设句柄 | parking_lot::Mutex | Spin | 短临界区自旋 |
-//! | ringlog / buffer_pool | std::sync::Mutex | Spin | 短临界区自旋 |
+//! | ringlog | std::sync::Mutex | Spin | 短临界区自旋 |
 
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;

@@ -81,6 +81,7 @@ struct OtaSession {
     handle_active: bool,
     /// BEGIN 时选中的 OTA 分区地址，END 时复用同一槽位.
     partition_addr: usize,
+    partition_size: u32,
     total_size: u32,
     written: u32,
     /// 上次错误状态 (写入失败时设置, 用于 STATUS 读取)
@@ -178,6 +179,7 @@ pub fn begin(total_size: u32) -> AppResult<()> {
         handle,
         handle_active: true,
         partition_addr: partition as usize,
+        partition_size: part_size,
         total_size,
         written: 0,
         last_status: OtaStatus::Receiving,
@@ -217,28 +219,35 @@ pub fn write_chunk(data: &[u8]) -> AppResult<usize> {
         )));
     }
 
-    // 累计写入量防溢: 超过 total_size 直接拒绝，防止越界写 OTA 分区
-    if sess.total_size > 0 {
-        let remaining = sess.total_size.saturating_sub(sess.written);
-        if (data.len() as u32) > remaining {
-            return Err(AppError::Ota(format!(
-                "write would overflow: written={}, chunk={}, total={}",
-                sess.written,
-                data.len(),
-                sess.total_size
-            )));
-        }
+    let next_written = sess
+        .written
+        .checked_add(data.len() as u32)
+        .ok_or_else(|| AppError::Ota("written byte counter overflow".into()))?;
+    // 即使 BEGIN 使用未知大小，也不能依赖底层写失败来发现越过分区边界。
+    let limit = if sess.total_size > 0 {
+        sess.total_size.min(sess.partition_size)
+    } else {
+        sess.partition_size
+    };
+    if next_written > limit {
+        return Err(AppError::Ota(format!(
+            "write would overflow: written={}, chunk={}, limit={limit}",
+            sess.written,
+            data.len()
+        )));
     }
 
     let r =
         unsafe { esp_idf_sys::esp_ota_write(sess.handle, data.as_ptr() as *const _, data.len()) };
     if r != 0 {
-        sess.last_status = OtaStatus::VerifyFailed;
+        let handle = sess.handle;
+        let _ = unsafe { esp_idf_sys::esp_ota_abort(handle) };
+        *s = None;
         LAST_STATUS.store(OtaStatus::VerifyFailed as u8, Ordering::Release);
         return Err(AppError::Ota(format!("esp_ota_write failed: 0x{:08X}", r)));
     }
 
-    sess.written = sess.written.saturating_add(data.len() as u32);
+    sess.written = next_written;
     Ok(data.len())
 }
 
@@ -265,7 +274,7 @@ pub fn end() -> AppResult<()> {
     // ESP-IDF 明确规定：esp_ota_end 无论返回值如何，handle 都已释放。
     sess.handle_active = false;
     if r != 0 {
-        sess.last_status = OtaStatus::VerifyFailed;
+        *s = None;
         LAST_STATUS.store(OtaStatus::VerifyFailed as u8, Ordering::Release);
         return Err(AppError::Ota(format!("esp_ota_end failed: 0x{:08X}", r)));
     }
@@ -319,8 +328,8 @@ pub fn abort() -> AppResult<()> {
             sess.written,
             sess.total_size
         );
+        LAST_STATUS.store(OtaStatus::Aborted as u8, Ordering::Release);
     }
-    LAST_STATUS.store(OtaStatus::Aborted as u8, Ordering::Release);
     Ok(())
 }
 

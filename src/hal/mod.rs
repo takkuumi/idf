@@ -41,6 +41,7 @@ pub mod sw_i2c;
 pub mod uart;
 
 pub use adc::AdcHandle;
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub use digital_io::DigitalIo;
 pub use gpio::GpioBank;
 #[cfg(any(feature = "f3", feature = "f4"))]

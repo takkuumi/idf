@@ -3,7 +3,7 @@
 //! 统一所有模块的错误返回，便于 `?` 传播。
 //!
 //! 子模块:
-//! - [`recovery`]: 分级故障恢复 (替代直接 esp_restart)
+//! - [`recovery`][]: 分级故障恢复 (替代直接 esp_restart)
 
 pub mod recovery;
 pub mod ringlog;

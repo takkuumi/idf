@@ -940,3 +940,53 @@ just test-compile    # 仅编译测试 binary
 - 真机分别验证标识部分提交、网络部分提交和旧客户端完整提交，均返回成功且未交叉覆盖配置。
 - Web、Modbus TCP 502/503/504/5002 正常，recovery mode 为 Normal，严重故障计数为 0。
 - 详细记录: `log/hardware/web_ui_reorganization_2026-08-14.md`。
+
+## LOOP32 Rust 安全与故障恢复审计 (2026-08-14)
+
+### 核心修复
+
+- 自定义裸指针 RCU 替换为 `Spin<Option<Arc<T>>>` 快照，不再存在读者与快照释放竞争造成的 UAF。
+- 移除 `Instant::zeroed()` 未定义行为；Flash/NVS 长临界区由自旋锁改为可调度 Mutex。
+- DeviceActor 邮箱使用 Arc 生命周期管理，线程创建失败返回错误并由 supervisor 每 5 秒重试，不再 `panic=abort` 触发非计划重启。
+- Modbus FC=0F/10 在任何业务副作用前验证完整地址区间；DO 批量写一次原子发布，失败请求不留下半笔写入。
+- TCP 四端口切换改为事务式重绑，新端口全部成功前保留旧 listener；标准最大 ADU 保持 260 bytes。
+- RTU 主站清理迟到输入、先验 CRC/功能码/长度并限制 payload 边界；每次长超时重试前喂 WDT。
+- OTA 所有失败路径释放会话，累计长度使用 checked add，并始终限制在目标 OTA 分区容量内。
+- W5500 启动使用 RAII 回滚 MAC/PHY/driver/netif/glue/SPI 资源；启动失败由 supervisor 重试，不终止 main。
+- ADC Continuous 按 ESP32-S3 Type2 4-byte DMA 格式解析，OneShot fallback 对齐 ESP-IDF 5.5 `adc_oneshot_*` API。
+- 默认、F3、F4、最小 RTU、最小 TCP 和 OneShot AI/AO 特性组合均纳入零警告编译检查。
+
+### 资源边界
+
+- 默认用户任务栈预算 90 KiB；全部可选用户任务上限 104 KiB；ESP-IDF 已知系统任务预算 36 KiB。
+- TCP server 在 main-loop 内以非阻塞状态机复用四个 listener 和最多 8 个 client，不按端口或连接创建 pthread。
+- 大型协议、holding、设备文本和 NFC 工作区固定复用并优先落入 PSRAM，pthread 栈只保留有界帧缓冲。
+
+### 验证边界
+
+- 已通过格式、零警告 Clippy、测试目标编译和特性矩阵；详见 `log/hardware/rust_safety_audit_2026-08-14.md`。
+- 短时真机回归不能证明全年无休；交付前仍需 72 小时以上浸泡、断网/拔线、Flash 故障和电源扰动测试。
+
+## LOOP33 首轮 AI 崩溃根因与真机回归 (2026-08-14)
+
+### 根因与修复
+
+- 崩溃固定发生在主循环 `tick=20`，即首次 100 ms AI 采样；不是 BLE、
+  ADC DMA、W5500 DMA 或 `log::MAX_LOG_LEVEL_FILTER` 被覆盖。
+- `map_range` 需要支持参考固件的反向输出区间 `4095 -> 0`，旧实现却调用
+  `v.clamp(4095, 0)`；Rust 明确禁止下界大于上界，优化构建直接触发
+  `BREAK`。现用两个输出端点的有序最小/最大值夹紧，并补齐反向输入、
+  反向输出和越界测试。
+- 删除全部硬编码地址和硬件 watchpoint 诊断；W5500 固定使用 ESP-IDF
+  官方 SPI 驱动，删除不可达的自定义 DMA 分支和 3200 B staging SRAM。
+
+### 真机结果
+
+- 默认完整固件稳定运行到 180 秒，无 panic、Stack canary、ENOMEM、
+  pthread 创建失败和非计划重启。
+- 内部 SRAM 最低 41 KiB；7 个任务无低栈，最低栈余量 4308 B；HTTP
+  请求后最大任务栈使用率 56%。
+- TCP 502/503/504/5002、FC03 单寄存器、125 寄存器 259 B 响应和 260 B
+  最大请求通过；Web 登录及 7 个只读业务接口通过。
+- 本轮短时回归证明启动和请求路径恢复，不替代 72 小时浸泡、真实手持机
+  BLE 写配置、USB-RS485 闭环和 OTA 升级/回滚验收。

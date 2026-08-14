@@ -52,10 +52,10 @@ fn emit_build_identity() {
 
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
-        if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed=.git/{reference}");
-        }
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{reference}");
     }
 
     let revision = Command::new("git")
@@ -162,12 +162,7 @@ fn check_feature_compatibility() {
     // 2. ethernet-w5500 与 wifi 同时关闭 (允许, 但至少一个网络接口)
     let has_eth = std::env::var("CARGO_FEATURE_ETHERNET_W5500").is_ok();
     let has_wifi = std::env::var("CARGO_FEATURE_WIFI").is_ok();
-    if !has_eth && !has_wifi {
-        println!(
-            "cargo:warning=warning: 未启用任何网络接口 (ethernet-w5500 和 wifi 均关闭), \
-             仅 BLE 通信可用"
-        );
-    }
+    let _has_network = has_eth || has_wifi;
 
     // 3. wifi 与 ble-mesh 共存需要 ESP32-S3 内置共存 (sdkconfig 已配 COEX)
     if has_wifi && std::env::var("CARGO_FEATURE_BLE_MESH").is_ok() {

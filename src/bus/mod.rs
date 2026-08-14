@@ -5,7 +5,7 @@
 //! | 子模块 | 内容 | 大小 | 实现 | 访问频率 |
 //! |-------|------|------|------|---------|
 //! | [`io_state`] | di/do_/ai/ao/sys | ~80B | 无锁 (AtomicBits64 / Atomic*) | 5-100ms 高频 |
-//! | [`storage_state`] | proto/device_text/holding_buf | ~11KB | RCU 无锁 | 偶尔 |
+//! | [`storage_state`] | proto/device_text/holding_buf | ~11KB | Arc 快照 | 偶尔 |
 //! | [`config_state`] | SystemConfig | ~160B | RCU 无锁 | 偶尔 |
 //!
 //! `proto.status` 状态机 (commit=1 / reload=2 / failed=3) 由
@@ -19,7 +19,6 @@
 //! - Modbus 多寄存器写只持 RCU (原子 swap), 不再持大锁 N 次
 //! - 配置读写零锁 (RCU), Modbus 高频读不阻塞
 pub mod backends;
-pub mod buffer_pool;
 pub mod config_state;
 pub mod event_bus;
 pub mod io_global;
@@ -32,4 +31,5 @@ pub mod storage_state;
 pub use config_state::config_read;
 pub use event_bus::{IoEvent, send_event};
 pub use io_global::IO;
+#[cfg(feature = "modbus-rtu")]
 pub use storage_state::proto_status;

@@ -134,12 +134,9 @@ impl Client {
     }
 
     fn is_timed_out(&self) -> bool {
-        if self
-            .partial_frame_started
-            .is_some_and(|started| {
-                started.elapsed() >= Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS)
-            })
-        {
+        if self.partial_frame_started.is_some_and(|started| {
+            started.elapsed() >= Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS)
+        }) {
             return true;
         }
         if self
@@ -332,8 +329,11 @@ pub fn tick_tcp_server() {
                         desired
                     );
                 } else {
-                    let previous = state.active_ports;
-                    match bind_ports(&desired, &mut state.listeners) {
+                    match rebind_ports_transactional(
+                        &state.active_ports,
+                        &desired,
+                        &mut state.listeners,
+                    ) {
                         Ok(()) => {
                             state.active_ports = desired;
                             state.listener_cursor = 0;
@@ -342,21 +342,10 @@ pub fn tick_tcp_server() {
                         }
                         Err((port, e)) => {
                             log::error!(
-                                "[mb-tcp] rebind :{} failed: {}; restoring {:?}",
+                                "[mb-tcp] rebind :{} failed: {}; old listeners retained",
                                 port,
-                                e,
-                                previous
+                                e
                             );
-                            if let Err((rollback_port, rollback_error)) =
-                                bind_ports(&previous, &mut state.listeners)
-                            {
-                                log::error!(
-                                    "[mb-tcp] listener rollback :{} failed: {} (will retry)",
-                                    rollback_port,
-                                    rollback_error
-                                );
-                                schedule_listener_recovery(state, now);
-                            }
                         }
                     }
                 }
@@ -415,7 +404,7 @@ fn schedule_listener_recovery(state: &mut TcpServerState, now: Instant) {
 }
 
 fn recover_listeners_if_due(state: &mut TcpServerState, now: Instant) {
-    if !state.listener_rebind_due.is_some_and(|due| now >= due) {
+    if state.listener_rebind_due.is_none_or(|due| now < due) {
         return;
     }
     match bind_ports(&state.active_ports, &mut state.listeners) {
@@ -444,19 +433,81 @@ fn ports_are_valid(ports: &[u16; 4]) -> bool {
             .all(|(i, port)| !ports[..i].contains(port))
 }
 
-/// 复用启动期预留的 Vec 容量。运行中的 TCP 状态机不扩容；发生失败时调用方
-/// 可用旧端口集回滚，已建立的客户端 socket 不受 listener 重绑影响。
+/// 启动和故障恢复使用的完整绑定。调用时会关闭现有 listener；运行期正常配置
+/// 切换必须使用 `rebind_ports_transactional` 保留旧服务直到新端口全部成功。
 fn bind_ports(
     ports: &[u16; 4],
     listeners: &mut Vec<TcpListener>,
 ) -> Result<(), (u16, std::io::Error)> {
     listeners.clear();
     for &port in ports {
-        let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| (port, e))?;
-        listener.set_nonblocking(true).map_err(|e| (port, e))?;
+        let listener = bind_listener(port)?;
         listeners.push(listener);
         log::info!("[mb-tcp] bound :{port}");
     }
+    Ok(())
+}
+
+fn bind_listener(port: u16) -> Result<TcpListener, (u16, std::io::Error)> {
+    let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| (port, e))?;
+    listener.set_nonblocking(true).map_err(|e| (port, e))?;
+    Ok(listener)
+}
+
+/// 先绑定全部新增端口，只有都成功后才移动保留端口并关闭废弃 listener。
+/// 这样错误端口或暂时的 LwIP 资源不足不会中断仍在工作的旧 TCP 服务。
+fn rebind_ports_transactional(
+    old_ports: &[u16; 4],
+    desired: &[u16; 4],
+    listeners: &mut Vec<TcpListener>,
+) -> Result<(), (u16, std::io::Error)> {
+    if listeners.len() != old_ports.len() {
+        return Err((
+            desired[0],
+            std::io::Error::other("listener state does not match active ports"),
+        ));
+    }
+
+    let mut replacements: Vec<(u16, TcpListener)> = Vec::new();
+    replacements
+        .try_reserve_exact(desired.len())
+        .map_err(|error| {
+            (
+                desired[0],
+                std::io::Error::other(format!("listener allocation: {error}")),
+            )
+        })?;
+    for &port in desired {
+        if !old_ports.contains(&port) {
+            replacements.push((port, bind_listener(port)?));
+        }
+    }
+
+    let mut next = Vec::new();
+    next.try_reserve_exact(desired.len()).map_err(|error| {
+        (
+            desired[0],
+            std::io::Error::other(format!("listener allocation: {error}")),
+        )
+    })?;
+    for &port in desired {
+        if let Some(old_index) = old_ports.iter().position(|&old_port| old_port == port) {
+            let listener = listeners[old_index]
+                .try_clone()
+                .map_err(|error| (port, error))?;
+            next.push(listener);
+        } else {
+            let Some(replacement_index) = replacements
+                .iter()
+                .position(|(new_port, _)| *new_port == port)
+            else {
+                return Err((port, std::io::Error::other("new listener missing")));
+            };
+            next.push(replacements.swap_remove(replacement_index).1);
+        }
+        log::info!("[mb-tcp] bound :{port}");
+    }
+    *listeners = next;
     Ok(())
 }
 
@@ -488,15 +539,15 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
             }
             Ok((stream, peer)) => {
                 accepted += 1;
-                    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-                    match Client::new(id, peer, stream) {
-                        Ok(client) => {
-                            state.clients.push(client);
-                            CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
-                            log::debug!("[mb-tcp] conn_id={id} from {peer} accepted");
-                        }
-                        Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
+                let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                match Client::new(id, peer, stream) {
+                    Ok(client) => {
+                        state.clients.push(client);
+                        CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
+                        log::debug!("[mb-tcp] conn_id={id} from {peer} accepted");
                     }
+                    Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == ErrorKind::Interrupted => {}

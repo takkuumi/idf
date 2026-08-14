@@ -28,28 +28,55 @@ pub fn read_dip_address() -> DipAddress {
     // 配置 5 个 GPIO 为输入模式 (gpio_set_direction 是幂等的, 多次调用安全)
     for &pin in &pins::RS485_ADDR_PINS {
         unsafe {
-            esp_idf_sys::gpio_set_direction(pin as esp_idf_sys::gpio_num_t, esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT);
-            esp_idf_sys::gpio_set_pull_mode(pin as esp_idf_sys::gpio_num_t, esp_idf_sys::gpio_pull_mode_t_GPIO_FLOATING);
+            esp_idf_sys::gpio_set_direction(
+                pin as esp_idf_sys::gpio_num_t,
+                esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT,
+            );
+            esp_idf_sys::gpio_set_pull_mode(
+                pin as esp_idf_sys::gpio_num_t,
+                esp_idf_sys::gpio_pull_mode_t_GPIO_FLOATING,
+            );
         }
     }
     unsafe {
-        esp_idf_sys::gpio_set_direction(pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t, esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT);
-        esp_idf_sys::gpio_set_pull_mode(pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t, esp_idf_sys::gpio_pull_mode_t_GPIO_FLOATING);
+        esp_idf_sys::gpio_set_direction(
+            pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t,
+            esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT,
+        );
+        esp_idf_sys::gpio_set_pull_mode(
+            pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t,
+            esp_idf_sys::gpio_pull_mode_t_GPIO_FLOATING,
+        );
     }
 
     // 读取电平
-    let ad0 = unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[0] as esp_idf_sys::gpio_num_t) } as u8;
-    let ad1 = unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[1] as esp_idf_sys::gpio_num_t) } as u8;
-    let ad2 = unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[2] as esp_idf_sys::gpio_num_t) } as u8;
-    let ad3 = unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[3] as esp_idf_sys::gpio_num_t) } as u8;
-    let esp_stop = unsafe { esp_idf_sys::gpio_get_level(pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t) } != 0;
+    let ad0 =
+        unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[0] as esp_idf_sys::gpio_num_t) }
+            as u8;
+    let ad1 =
+        unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[1] as esp_idf_sys::gpio_num_t) }
+            as u8;
+    let ad2 =
+        unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[2] as esp_idf_sys::gpio_num_t) }
+            as u8;
+    let ad3 =
+        unsafe { esp_idf_sys::gpio_get_level(pins::RS485_ADDR_PINS[3] as esp_idf_sys::gpio_num_t) }
+            as u8;
+    let esp_stop =
+        unsafe { esp_idf_sys::gpio_get_level(pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t) } != 0;
 
     let address = (ad3 << 3) | (ad2 << 2) | (ad1 << 1) | ad0;
     log::info!(
         "[dip] AD0={} AD1={} AD2={} AD3={} → address={} (gpio {}/{}/{}/{})",
-        ad0, ad1, ad2, ad3, address,
-        pins::RS485_ADDR_PINS[0], pins::RS485_ADDR_PINS[1],
-        pins::RS485_ADDR_PINS[2], pins::RS485_ADDR_PINS[3]
+        ad0,
+        ad1,
+        ad2,
+        ad3,
+        address,
+        pins::RS485_ADDR_PINS[0],
+        pins::RS485_ADDR_PINS[1],
+        pins::RS485_ADDR_PINS[2],
+        pins::RS485_ADDR_PINS[3]
     );
     DipAddress { address, esp_stop }
 }

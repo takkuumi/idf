@@ -19,8 +19,8 @@ use crate::sync::Spin;
 
 use esp_idf_hal::gpio::AnyOutputPin;
 use esp_idf_hal::ledc::{
-    config::TimerConfig, LedcDriver, LedcTimerDriver, Resolution, LowSpeed,
-    TIMER0, TIMER1, TIMER2, TIMER3, CHANNEL0, CHANNEL1, CHANNEL2, CHANNEL3,
+    CHANNEL0, CHANNEL1, CHANNEL2, CHANNEL3, LedcDriver, LedcTimerDriver, LowSpeed, Resolution,
+    TIMER0, TIMER1, TIMER2, TIMER3, config::TimerConfig,
 };
 use esp_idf_hal::units::Hertz;
 
@@ -55,7 +55,11 @@ fn resolution_from_bits(bits: u8) -> AppResult<Resolution> {
         12 => Resolution::Bits12,
         13 => Resolution::Bits13,
         14 => Resolution::Bits14,
-        _ => return Err(AppError::Hal(format!("invalid ledc resolution bits: {bits}"))),
+        _ => {
+            return Err(AppError::Hal(format!(
+                "invalid ledc resolution bits: {bits}"
+            )));
+        }
     })
 }
 
@@ -65,7 +69,10 @@ impl LedcHandle {
     /// 参数:
     /// - `timer_cfg`: 定时器编号/频率/分辨率
     /// - `channels`: `[(ledc_channel, gpio_num); 4]`
-    pub fn init(timer_cfg: LedcTimerCfg, channels: [(u8, u8); AO_CHANNEL_COUNT]) -> AppResult<Self> {
+    pub fn init(
+        timer_cfg: LedcTimerCfg,
+        channels: [(u8, u8); AO_CHANNEL_COUNT],
+    ) -> AppResult<Self> {
         let resolution = resolution_from_bits(timer_cfg.resolution_bits)?;
         // LOOP14: LEDC 时钟源选择
         // esp-idf-hal TimerConfig::default() 隐式选 LEDC_USE_XTAL_CLK (40MHz 晶振),
@@ -99,7 +106,7 @@ impl LedcHandle {
                 return Err(AppError::Hal(format!(
                     "invalid ledc timer: {}",
                     timer_cfg.timer
-                )))
+                )));
             }
         };
 
@@ -114,23 +121,15 @@ impl LedcHandle {
                 1 => LedcDriver::new(unsafe { CHANNEL1::steal() }, &*timer_driver, pin),
                 2 => LedcDriver::new(unsafe { CHANNEL2::steal() }, &*timer_driver, pin),
                 3 => LedcDriver::new(unsafe { CHANNEL3::steal() }, &*timer_driver, pin),
-                _ => {
-                    return Err(AppError::Hal(format!(
-                        "invalid ledc channel: {ch_num}"
-                    )))
-                }
+                _ => return Err(AppError::Hal(format!("invalid ledc channel: {ch_num}"))),
             }
             .map_err(|e| AppError::Hal(format!("ledc chan {i}: {e:?}")))?;
             chs.push(Spin::new(driver));
         }
 
         // Vec -> array (长度已知为 4)
-        let channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT] = [
-            chs.remove(0),
-            chs.remove(0),
-            chs.remove(0),
-            chs.remove(0),
-        ];
+        let channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT] =
+            [chs.remove(0), chs.remove(0), chs.remove(0), chs.remove(0)];
 
         Ok(Self { channels })
     }
@@ -138,15 +137,13 @@ impl LedcHandle {
     /// 设置 AO 通道 idx (0..4) 的占空比。
     ///
     /// `duty` 范围 0..=2^resolution_bits-1 (12-bit 即 0..=4095)。
-    /// 越界或硬件错误时记日志并忽略 (不向上传播)。
-    pub fn set_duty(&self, idx: usize, duty: u32) {
+    /// 越界或硬件错误向上传播，调用方只有在成功后才能更新已应用缓存。
+    pub fn set_duty(&self, idx: usize, duty: u32) -> AppResult<()> {
         if idx >= AO_CHANNEL_COUNT {
-            log::warn!("[ledc] set_duty idx out of range: {idx}");
-            return;
+            return Err(AppError::Hal(format!("ledc channel {idx} out of range")));
         }
         let mut ch = self.channels[idx].lock();
-        if let Err(e) = ch.set_duty(duty) {
-            log::warn!("[ledc] set_duty ch{idx} failed: {e:?}");
-        }
+        ch.set_duty(duty)
+            .map_err(|e| AppError::Hal(format!("ledc set_duty ch{idx}: {e:?}")))
     }
 }

@@ -5,12 +5,17 @@
 //!
 //! 启动入口：[`start`]
 
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 use std::sync::Arc;
 
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 use crate::error::AppResult;
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 use crate::hal::Hal;
 
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub mod di;
+#[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub mod do_;
 
 /// 启动 IO 扫描任务

@@ -128,6 +128,12 @@ impl Rs485Port {
         request: &[u8],
         timeout_ms: u64,
     ) -> AppResult<heapless::Vec<u8, 256>> {
+        // 上一轮超时后可能有迟到的响应残留在 RX ring。Modbus 主站在发出新请求前
+        // 没有合法的未消费数据，清空可避免旧帧被误配给本轮事务。
+        check(
+            unsafe { uart_flush_input(self.cfg.uart_port as uart_port_t) },
+            "uart_flush_input",
+        )?;
         self.write(request)?;
         let mut buf = [0u8; 256];
         let n = self.read(&mut buf, timeout_ms)?;

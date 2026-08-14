@@ -10,12 +10,12 @@
 
 use crate::error::AppResult;
 
-pub use port::Rs485Port;
 pub use config::Rs485Config;
+pub use port::Rs485Port;
 
-pub mod port;
 pub mod config;
 pub mod dip;
+pub mod port;
 
 /// 创建一路 RS485 端口
 pub fn open(_cfg: &Rs485Config) -> AppResult<Rs485Port> {

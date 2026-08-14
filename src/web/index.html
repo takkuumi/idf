@@ -248,6 +248,7 @@ function apiError(code, fallback) {
     '0x01000001': '缺少必要参数',
     '0x01000003': '参数格式错误或保存失败',
     '0x01000004': '参数超出允许范围',
+    '0x01000005': '设备存储任务繁忙，请稍后重试',
     '405': '请求方式错误',
     '500': '设备内部错误'
   };
@@ -586,7 +587,7 @@ async function rebootDevice(buttonId = 'reboot_btn', afterConfigSave = false) {
     const body = afterConfigSave ? new URLSearchParams({ after_config_save: '1' }) : undefined;
     const r = await fetch('/reboot', { method: 'POST', body });
     const j = await r.json();
-    if (j.code !== '0') throw new Error(j.code);
+    if (j.code !== '0') throw new Error(apiError(j.code, '重启请求失败'));
     clearInterval(pollTimer);
     clearInterval(statusTimer);
     clearInterval(nfcStatusTimer);
@@ -605,7 +606,7 @@ async function rebootDevice(buttonId = 'reboot_btn', afterConfigSave = false) {
     rebooting = false;
     button.disabled = false;
     button.textContent = originalLabel;
-    toast('重启失败: ' + e, false);
+    toast('重启失败: ' + (e instanceof Error ? e.message : String(e)), false);
   }
 }
 

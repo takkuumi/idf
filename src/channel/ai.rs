@@ -27,12 +27,7 @@ pub const CHANNEL_COUNT: usize = 8;
 #[cfg(not(feature = "f4"))]
 pub const CHANNEL_COUNT: usize = 6;
 
-/// 启动 AI 采样任务
-///
-/// TODO: 假设 `hal.adc.sample(idx: usize) -> u16`，由 hal/adc 模块实现后接入。
-/// TODO: `_timer_svc` 可用于更精确的定时采样，当前用 std::thread::sleep。
-// 架构改造 Phase 2: AI 合并到 main_loop
-// 状态用 MainLoopCell 保护 (单线程访问, 无 atomic CAS 开销)
+// AI 已合并到 main_loop，状态用 MainLoopCell 保护。
 
 struct AiState {
     buf: [[u16; AVG_WINDOW]; CHANNEL_COUNT],
@@ -63,17 +58,6 @@ pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppR
 pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     let _ = AI_STATE.with_mut(|state| {
         let raws: [u16; 6] = hal.adc.sample_all();
-
-        // LOOP14: eFuse 工厂校准 — 在 raw 上叠加 esp_adc_cal_raw_to_voltage (mV),
-        // 然后用 mV 走 4-20mA 映射. 旧逻辑直接用 raw → 单位噪声 ±20 LSB (~40mV) 已消除.
-        // holding_buf SENSOR_MIN/MAX 仍存的是 raw LSB, 所以应用层 map_range 仍按原逻辑.
-        let _mv_per_ch: [u32; 6] = {
-            let mut arr = [0u32; 6];
-            for ch in 0..6 {
-                arr[ch] = hal.adc.raw_to_mv(raws[ch]);
-            }
-            arr
-        };
 
         // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
         // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
@@ -129,10 +113,10 @@ fn read_sensor_calib(is_min: bool) -> [u16; CHANNEL_COUNT] {
     let mut out = [0u16; CHANNEL_COUNT];
     let idx_base = (base as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
     crate::bus::storage_state::storage_read_with(|snap| {
-        for ch in 0..CHANNEL_COUNT {
+        for (ch, value) in out.iter_mut().enumerate() {
             let i = idx_base + ch;
             if i < snap.holding_buf.len() {
-                out[ch] = snap.holding_buf[i];
+                *value = snap.holding_buf[i];
             }
         }
     });
@@ -154,7 +138,9 @@ fn map_range(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u1
     let num = (x - in_min) as i64 * (out_max - out_min) as i64;
     let den = (in_max - in_min) as i64;
     let v = out_min as i64 + num / den;
-    v.clamp(out_min as i64, out_max as i64) as u16
+    let lower = i64::from(out_min.min(out_max));
+    let upper = i64::from(out_min.max(out_max));
+    v.clamp(lower, upper) as u16
 }
 
 #[cfg(test)]
@@ -166,12 +152,12 @@ mod tests {
     #[test]
     fn test_map_range_basic() {
         // x=in_max → out=4095 (满量程)
-        assert_eq!(map_range(3016, 605, 3016, 4095, 0), 4095);
+        assert_eq!(map_range(3016, 3016, 605, 4095, 0), 4095);
         // x=in_min → out=0 (零点)
-        assert_eq!(map_range(605, 605, 3016, 4095, 0), 0);
+        assert_eq!(map_range(605, 3016, 605, 4095, 0), 0);
         // x 中点 → out 中点
         let mid_in = (605 + 3016) / 2;
-        let mid_out = map_range(mid_in, 605, 3016, 4095, 0);
+        let mid_out = map_range(mid_in, 3016, 605, 4095, 0);
         assert!(
             mid_out > 1900 && mid_out < 2100,
             "mid_out={mid_out} 应接近 2047"
@@ -181,9 +167,9 @@ mod tests {
     #[test]
     fn test_map_range_clamp() {
         // x 超出 in_max → clamp 到 out_max
-        assert_eq!(map_range(4000, 605, 3016, 4095, 0), 4095);
+        assert_eq!(map_range(4000, 3016, 605, 4095, 0), 4095);
         // x 低于 in_min → clamp 到 out_min
-        assert_eq!(map_range(0, 605, 3016, 4095, 0), 0);
+        assert_eq!(map_range(0, 3016, 605, 4095, 0), 0);
     }
 
     #[test]
@@ -197,7 +183,7 @@ mod tests {
     fn test_map_range_inverted_output() {
         // 反向映射 (out_min > out_max): 参考固件 cal_max→4095, cal_min→0
         // 当 x=cal_max(3016) 输出 4095, x=cal_min(605) 输出 0
-        assert_eq!(map_range(3016, 605, 3016, 4095, 0), 4095);
-        assert_eq!(map_range(605, 605, 3016, 4095, 0), 0);
+        assert_eq!(map_range(3016, 3016, 605, 4095, 0), 4095);
+        assert_eq!(map_range(605, 3016, 605, 4095, 0), 0);
     }
 }

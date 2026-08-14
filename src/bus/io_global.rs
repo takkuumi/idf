@@ -2,8 +2,8 @@
 //!
 //! 包含: di, do_, ai, ao, sys 全部使用原子操作, 零锁开销。
 
-use std::sync::atomic::AtomicU32;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicU32;
 
 use super::io_state::*;
 
