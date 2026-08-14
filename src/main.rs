@@ -432,7 +432,8 @@ fn main_loop(
                     // 已在 1s tick 中处理, 忽略
                 }
                 crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
-                    // DHCP 完成, 把 IP/mask/gw 写入 CONFIG RCU
+                    // GOT_IP 同时覆盖 DHCP 租约和静态 IP 生效。只有当前配置本来
+                    // 就是 DHCP 模式时才回写租约，避免静态地址启动后被误标成 DHCP。
                     log::info!(
                         "[eth] main loop: IP assigned {}.{}.{}.{}",
                         ip_b[0],
@@ -441,10 +442,7 @@ fn main_loop(
                         ip_b[3]
                     );
                     crate::bus::backends::config_modify(|c| {
-                        c.ip = ip_b;
-                        c.mask = mask_b;
-                        c.gateway = gw_b;
-                        c.dhcp = true;
+                        apply_assigned_ip_to_config(c, ip_b, mask_b, gw_b);
                     });
                 }
                 }
@@ -590,6 +588,20 @@ fn main_loop(
     }
 }
 
+#[inline]
+fn apply_assigned_ip_to_config(
+    cfg: &mut crate::device::SystemConfig,
+    ip: [u8; 4],
+    mask: [u8; 4],
+    gateway: [u8; 4],
+) {
+    if cfg.dhcp {
+        cfg.ip = ip;
+        cfg.mask = mask;
+        cfg.gateway = gateway;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // 日志初始化
 // ----------------------------------------------------------------------------
@@ -692,7 +704,36 @@ fn is_ota_app_subtype(subtype: esp_idf_sys::esp_partition_subtype_t) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ota_app_subtype, ota_state_needs_confirmation};
+    use super::{apply_assigned_ip_to_config, is_ota_app_subtype, ota_state_needs_confirmation};
+
+    #[test]
+    fn test_got_ip_preserves_static_network_mode() {
+        let mut cfg = crate::device::SystemConfig::defaults();
+        cfg.dhcp = false;
+        cfg.ip = [192, 168, 51, 221];
+        cfg.mask = [255, 255, 255, 0];
+        cfg.gateway = [192, 168, 51, 1];
+
+        apply_assigned_ip_to_config(&mut cfg, [10, 0, 0, 20], [255, 0, 0, 0], [10, 0, 0, 1]);
+
+        assert!(!cfg.dhcp);
+        assert_eq!(cfg.ip, [192, 168, 51, 221]);
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
+    }
+
+    #[test]
+    fn test_got_ip_updates_dhcp_lease() {
+        let mut cfg = crate::device::SystemConfig::defaults();
+        cfg.dhcp = true;
+
+        apply_assigned_ip_to_config(&mut cfg, [10, 0, 0, 20], [255, 255, 255, 0], [10, 0, 0, 1]);
+
+        assert!(cfg.dhcp);
+        assert_eq!(cfg.ip, [10, 0, 0, 20]);
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [10, 0, 0, 1]);
+    }
 
     #[test]
     fn test_ota_pending_verify_uses_esp_idf_enum() {
