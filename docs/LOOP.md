@@ -990,3 +990,11 @@ just test-compile    # 仅编译测试 binary
   最大请求通过；Web 登录及 7 个只读业务接口通过。
 - 本轮短时回归证明启动和请求路径恢复，不替代 72 小时浸泡、真实手持机
   BLE 写配置、USB-RS485 闭环和 OTA 升级/回滚验收。
+
+## LOOP34 OTA 最终实机闭环 (2026-08-14)
+
+- 默认全功能提交 `c04381f` 生成 1,689,664 B OTA 应用镜像，Web 上传返回
+  `code=0`；设备自动切换 OTA 槽并重启，无回滚。
+- 重启后 Web 配置接口和四个 Modbus TCP 端口全部恢复，`recovery_mode=Normal`；
+  四路均通过 FC03 标准最大 125 寄存器（259 B 响应）及 260 B 最大 ADU 接收测试。
+- 详细结果见 `log/hardware/ota_final_validation_2026-08-14.md`。
