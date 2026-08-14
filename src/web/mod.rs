@@ -1953,6 +1953,13 @@ mod tests {
     }
 
     #[test]
+    fn test_reboot_control_is_present() {
+        assert!(pages::INDEX_HTML.contains("重启设备"));
+        assert!(pages::INDEX_HTML.contains("/reboot"));
+        assert!(pages::INDEX_HTML.contains("rebootDevice()"));
+    }
+
+    #[test]
     fn test_io_page_uses_numeric_order_and_one_based_labels() {
         assert!(pages::INDEX_HTML.contains("Number(a.slice('di_addr_'.length))"));
         assert!(pages::INDEX_HTML.contains("Number(a.slice('do_addr_'.length))"));

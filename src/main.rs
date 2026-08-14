@@ -457,12 +457,7 @@ fn main_loop(
             // 阶段 A: uptime 写 + reset-request 读 全过 bus::IO.sys (原子), 无锁
             crate::bus::IO.sys.set_uptime(uptime);
             if crate::bus::IO.sys.is_reset_requested() {
-                log::warn!("[main] reset requested via modbus (user-initiated)");
-                crate::error::recovery::record_failure(
-                    crate::error::recovery::Severity::Fatal,
-                    "main",
-                    "user-requested reset via modbus",
-                );
+                log::warn!("[main] user-requested reset");
                 std::thread::sleep(Duration::from_millis(100));
                 unsafe { esp_idf_sys::esp_restart() };
             }

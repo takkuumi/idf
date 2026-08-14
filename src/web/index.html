@@ -31,6 +31,7 @@ border-radius:5px;color:var(--text);font-size:13px;outline:none}
 .btn-p{background:var(--accent);color:#fff}.btn-p:hover{opacity:.85}
 .btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
 .btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
+.btn:disabled{cursor:not-allowed;opacity:.55}
 .di-list,.do-list,.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
 .io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
 .led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
@@ -192,6 +193,12 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <div class="nav">
         <button class="btn btn-p" onclick="nfcBackup()">备份配置</button>
         <button class="btn btn-w" onclick="nfcRestore()">恢复配置</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>设备重启</h2>
+      <div class="nav">
+        <button class="btn btn-w" id="reboot_btn" onclick="rebootDevice()">重启设备</button>
       </div>
     </div>
     <div class="card">
@@ -515,6 +522,39 @@ async function nfcRestore() {
     toast(j.code === '0' ? 'NFC 恢复请求已提交' : 'NFC 恢复失败: ' + j.code, j.code === '0');
     setTimeout(pollNfcStatus, 5500);
   } catch(e) { toast('NFC 恢复失败: ' + e, false); }
+}
+
+let rebooting = false;
+async function rebootDevice() {
+  if (rebooting || !confirm('确认重启设备? 当前连接将暂时中断.')) return;
+  rebooting = true;
+  const button = $('#reboot_btn');
+  button.disabled = true;
+  button.textContent = '正在提交';
+  try {
+    const r = await fetch('/reboot', { method: 'POST' });
+    const j = await r.json();
+    if (j.code !== '0') throw new Error(j.code);
+    clearInterval(pollTimer);
+    clearInterval(statusTimer);
+    clearInterval(nfcStatusTimer);
+    let seconds = 8;
+    button.textContent = `设备重启中 (${seconds}s)`;
+    toast('重启指令已发送', true);
+    const countdown = setInterval(() => {
+      seconds -= 1;
+      button.textContent = `设备重启中 (${seconds}s)`;
+      if (seconds <= 0) {
+        clearInterval(countdown);
+        location.href = '/login';
+      }
+    }, 1000);
+  } catch(e) {
+    rebooting = false;
+    button.disabled = false;
+    button.textContent = '重启设备';
+    toast('重启失败: ' + e, false);
+  }
 }
 
 // OTA upload
