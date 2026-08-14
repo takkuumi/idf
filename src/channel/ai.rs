@@ -3,7 +3,9 @@
 //! - 周期 100ms 采样 6 路 ADC1 (12-bit)
 //! - 滑动平均 (窗口 8)
 //! - 4-20mA 转换：假设 ADC 0-3.3V 对应 4-20mA，可标定
-//! - 写入 `BUS.ai.raw` (滑动平均后的原始值) 和 `BUS.ai.scaled` (mA*1000)
+//! - 写入 `BUS.ai.raw` (滑动平均后的 ADC 值)
+//! - 写入 `BUS.ai.scaled` (与原 MCA `Get_Analog()` 一致的 0..4095 校准值)
+//! - 写入 `BUS.ai.status` (与原 MCA `Analog_Status[]` 一致的状态位)
 
 use std::sync::Arc;
 
@@ -59,9 +61,8 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     let _ = AI_STATE.with_mut(|state| {
         let raws: [u16; 6] = hal.adc.sample_all();
 
-        // LOOP9: 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)
-        // 对齐参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0) → 0..4095
-        // 缺失校准 (min==max==0) 时回退到 4-20mA 线性映射 (旧逻辑)
+        // 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)。
+        // 原 MCA 只有在 min/max 都非零时才启用现场校准，否则使用 605/3016 默认值。
         let sensor_min = read_sensor_calib(true);
         let sensor_max = read_sensor_calib(false);
 
@@ -78,24 +79,34 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
             } else {
                 (sum / state.filled.max(1) as u32) as u16
             };
-            let cal_min = sensor_min[ch];
-            let cal_max = sensor_max[ch];
-            let scaled: u16 = if cal_min != cal_max {
-                // 校准生效: 参考固件 map(avg, cal_max, cal_min, 4095, 0)
-                map_range(avg, cal_max, cal_min, 4095, 0)
+            let (cal_min, cal_max) = effective_calibration(sensor_min[ch], sensor_max[ch]);
+            // 原 MCA: sensorValue = map(raw, max, min, 4095, 0),
+            // gucAnalogData = 4095 - sensorValue。因此 raw 越接近 max，输出越接近 0。
+            // 代数等价形式是直接把 [min,max] 映射到 [4095,0]。
+            let scaled = map_range(avg, cal_min, cal_max, 4095, 0);
+            let status = if (cal_max as i32 - avg as i32) > 240 {
+                0
             } else {
-                // 无校准: 回退 4-20mA 线性映射 (ADC 0..4095 → 4000..20000 mA*1000)
-                (ai_calib::MA_MIN
-                    + (avg as u32) * (ai_calib::MA_MAX - ai_calib::MA_MIN) / ai_calib::ADC_MAX)
-                    as u16
+                1
             };
             crate::bus::IO.ai.set_raw(ch, avg);
             crate::bus::IO.ai.set_scaled(ch, scaled);
+            crate::bus::IO.ai.set_status(ch, status);
         }
         state.pos = (state.pos + 1) % AVG_WINDOW;
         state.filled = (state.filled + 1).min(AVG_WINDOW);
         crate::bus::send_event(crate::bus::IoEvent::AiSampled);
     });
+}
+
+/// 选择与原 MCA `Get_Analog()` 一致的校准区间。
+/// min/max 任一为 0 都表示尚未完成有效校准，必须回退到默认 605/3016。
+fn effective_calibration(min: u16, max: u16) -> (u16, u16) {
+    if min != 0 && max != 0 && min != max {
+        (min, max)
+    } else {
+        (ai_calib::SENSOR_MIN, ai_calib::SENSOR_MAX)
+    }
 }
 
 /// 读取 SENSOR_MIN/MAX 校准值数组 (LOOP12: 返回 [u16; CHANNEL_COUNT] 同步 cfg 切换).
@@ -147,13 +158,18 @@ fn map_range(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u1
 mod tests {
     use super::*;
 
-    /// LOOP9 回归测试: map_range 对齐参考固件 map(x, in_max, in_min, 4095, 0)
-    /// 参考固件: scaled = map(avg_raw, cal_max, cal_min, 4095, 0)
+    #[test]
+    fn test_effective_calibration_requires_both_values() {
+        assert_eq!(effective_calibration(0, 3064), (605, 3016));
+        assert_eq!(effective_calibration(605, 0), (605, 3016));
+        assert_eq!(effective_calibration(605, 3016), (605, 3016));
+    }
+
+    /// 回归测试: 对齐原固件 `gucAnalogData = 4095 - map(raw, max, min, 4095, 0)`。
     #[test]
     fn test_map_range_basic() {
-        // x=in_max → out=4095 (满量程)
+        // 中间 map(raw, max, min, 4095, 0)：raw=max → 4095，raw=min → 0。
         assert_eq!(map_range(3016, 3016, 605, 4095, 0), 4095);
-        // x=in_min → out=0 (零点)
         assert_eq!(map_range(605, 3016, 605, 4095, 0), 0);
         // x 中点 → out 中点
         let mid_in = (605 + 3016) / 2;
@@ -166,9 +182,7 @@ mod tests {
 
     #[test]
     fn test_map_range_clamp() {
-        // x 超出 in_max → clamp 到 out_max
         assert_eq!(map_range(4000, 3016, 605, 4095, 0), 4095);
-        // x 低于 in_min → clamp 到 out_min
         assert_eq!(map_range(0, 3016, 605, 4095, 0), 0);
     }
 
@@ -181,9 +195,8 @@ mod tests {
 
     #[test]
     fn test_map_range_inverted_output() {
-        // 反向映射 (out_min > out_max): 参考固件 cal_max→4095, cal_min→0
-        // 当 x=cal_max(3016) 输出 4095, x=cal_min(605) 输出 0
-        assert_eq!(map_range(3016, 3016, 605, 4095, 0), 4095);
-        assert_eq!(map_range(605, 3016, 605, 4095, 0), 0);
+        // 最终输出使用 [min,max] -> [4095,0]，与原固件取反后的结果一致。
+        assert_eq!(map_range(3016, 605, 3016, 4095, 0), 0);
+        assert_eq!(map_range(605, 605, 3016, 4095, 0), 4095);
     }
 }

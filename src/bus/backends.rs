@@ -83,7 +83,8 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
     if (regs::INREG_AI_BASE..regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT).contains(&addr) {
         let idx = (addr - regs::INREG_AI_BASE) as usize;
         return Some(if idx < regs::INREG_AI_COUNT as usize {
-            IO.ai.get_raw(idx)
+            // 原 MCA REG_A01..REG_AMAX 输出 Get_Analog() 校准值，而非 ADC 原始采样值。
+            IO.ai.get_scaled(idx)
         } else {
             0
         });
@@ -92,7 +93,8 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         .contains(&addr)
     {
         let idx = (addr - regs::INREG_AI_STATUS_BASE) as usize;
-        return Some(IO.ai.get_scaled(idx));
+        // 原 MCA REG_STATU_A01.. 输出 Analog_Status[] (0/1)，不能返回 AI 数值。
+        return Some(IO.ai.get_status(idx));
     }
     match addr {
         // tauri-app Meta::read 固定读取 0x0800..0x0805。

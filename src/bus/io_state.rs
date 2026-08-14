@@ -28,6 +28,8 @@ pub struct DoState {
 pub struct AiState {
     pub raw: [AtomicU16; 8],
     pub scaled: [AtomicU16; 8],
+    /// AI 状态位，与原 MCA `Analog_Status[]` 对齐：0=正常，1=接近/超过满量程。
+    pub status: [AtomicU8; 8],
 }
 
 /// AO 状态 (4 通道: 工程量 + LEDC duty)
@@ -111,6 +113,7 @@ impl Default for AiState {
         Self {
             raw: [const { AtomicU16::new(0) }; 8],
             scaled: [const { AtomicU16::new(0) }; 8],
+            status: [const { AtomicU8::new(0) }; 8],
         }
     }
 }
@@ -211,6 +214,20 @@ impl AiState {
     pub fn get_scaled(&self, ch: usize) -> u16 {
         if ch < self.scaled.len() {
             self.scaled[ch].load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+
+    pub fn set_status(&self, ch: usize, value: u8) {
+        if ch < self.status.len() {
+            self.status[ch].store(value, Ordering::Release);
+        }
+    }
+
+    pub fn get_status(&self, ch: usize) -> u16 {
+        if ch < self.status.len() {
+            self.status[ch].load(Ordering::Acquire) as u16
         } else {
             0
         }

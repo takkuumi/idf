@@ -153,12 +153,12 @@ pub fn handle_status(_args: &str) -> String {
         io.di.load_bits(),
         io.do_.load_bits(),
         [
-            io.ai.get_raw(0),
-            io.ai.get_raw(1),
-            io.ai.get_raw(2),
-            io.ai.get_raw(3),
-            io.ai.get_raw(4),
-            io.ai.get_raw(5),
+            io.ai.get_scaled(0),
+            io.ai.get_scaled(1),
+            io.ai.get_scaled(2),
+            io.ai.get_scaled(3),
+            io.ai.get_scaled(4),
+            io.ai.get_scaled(5),
         ],
         [
             io.ao.get_scaled(0),

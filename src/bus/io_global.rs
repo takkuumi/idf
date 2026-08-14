@@ -57,6 +57,16 @@ impl IoBundle {
                     std::sync::atomic::AtomicU16::new(0),
                     std::sync::atomic::AtomicU16::new(0),
                 ],
+                status: [
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                    std::sync::atomic::AtomicU8::new(0),
+                ],
             },
             ao: AoState {
                 scaled: [
