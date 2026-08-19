@@ -462,19 +462,7 @@ impl SystemConfig {
         if let Some(v) = read_mac(&self.eth_mac, regs::HOLD_MAC_BASE, addr) {
             return Some(v);
         }
-        // BLE 名称 (0x08E2, 4 regs = 8 bytes) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51)
-        // 必须放在 BLE MAC 之前检查, 虽然两者不重叠, 但 0x08E2 是 metuory 蓝牙 ID 显示字段,
-        // 误写会污染 BLE MAC → BLE 重启时显示异常
-        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT)
-            .contains(&addr)
-        {
-            let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
-            return Some(u16::from_be_bytes([
-                self.ble_name[idx],
-                self.ble_name[idx + 1],
-            ]));
-        }
-        // 4000+ 属于原 C++/PC 连续逻辑区，不再放置会截断场景数据的 BLE MAC 别名。
+        // 2274..2277 是旧 MCA 的蓝牙地址，必须由通用 PRegBuf 原样保存。
         // 前 3 个物理 RS485 端口。BT/NET 两个兼容块由通用 PRegBuf 保存，
         // 不能别名到 rs485[0]，否则 PC 写 NET 会覆盖 RS485-1。
         for i in 0..self.rs485.len() {
@@ -596,28 +584,7 @@ impl SystemConfig {
         if let Some(()) = write_mac(&mut self.eth_mac, regs::HOLD_MAC_BASE, addr, value) {
             return WriteResult::Apply;
         }
-        // BLE 名称 (0x08E2, 4 regs) — metuory 1.0.78 WRITE_BLUETOOTH_ID (0x51) 必须 Persist
-        // 顺序必须在 BLE MAC 之前: metuory 写入 0x08E2 期待更新 ble_name (蓝牙 ID 显示)
-        // 若先匹配 BLE_MAC (旧地址), ble_name 永远不会被写入, 重启后丢失
-        if (regs::HOLD_BLE_NAME_BASE..regs::HOLD_BLE_NAME_BASE + regs::HOLD_BLE_NAME_COUNT)
-            .contains(&addr)
-        {
-            let idx = (addr - regs::HOLD_BLE_NAME_BASE) as usize * 2;
-            let [hi, lo] = value.to_be_bytes();
-            self.ble_name[idx] = hi;
-            self.ble_name[idx + 1] = lo;
-            log::warn!(
-                "[write_reg] BLE_NAME write addr=0x{:04X} idx={} hi={:02X} lo={:02X}",
-                addr,
-                idx,
-                hi,
-                lo
-            );
-            #[cfg(feature = "ble-at")]
-            crate::ble_at::notify_ble_name_changed();
-            return WriteResult::Persist;
-        }
-        // 4000+ 始终由调用方写入连续 PRegBuf。
+        // 2274..2277 由调用方写入连续 PRegBuf，不得改写运行时 BLE 名称。
         // 前 3 个物理 RS485；后两个 BT/NET 兼容块走 PRegBuf。
         for i in 0..self.rs485.len() {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
@@ -967,12 +934,13 @@ mod tests {
         assert_eq!(result, WriteResult::Persist);
     }
 
-    /// 写入 BLE_NAME (HOLD_BLE_NAME_BASE..+4) 必须返回 Persist.
+    /// 2274..2277 是旧 MCA 蓝牙地址，必须回退到通用 PRegBuf。
     #[test]
-    fn test_write_reg_ble_name_persist() {
+    fn test_write_reg_ble_address_falls_back_to_preg() {
         let mut cfg = SystemConfig::defaults();
-        let result = cfg.write_reg(regs::HOLD_BLE_NAME_BASE, 0x4747); // "GG"
-        assert_eq!(result, WriteResult::Persist);
+        let result = cfg.write_reg(regs::HOLD_BLE_ADDR_BASE, 0x4747);
+        assert_eq!(result, WriteResult::NotFound);
+        assert_eq!(cfg.read_reg(regs::HOLD_BLE_ADDR_BASE), None);
     }
 
     /// 写入 RS485 配置 (HOLD_RS485_BASE) 必须返回 Persist.
@@ -1282,14 +1250,13 @@ mod tests {
         );
     }
 
-    /// PC 与 metuory 1.0.78 共用 0x08E2 作为 BLE 节点/名称。
-    /// 0x0FA4 必须保留给 PC 连续逻辑配置，不能定义第二套别名。
+    /// 旧 MCA 以 2274..2277 保存 BLE 地址；0x0FA4 保留给逻辑配置。
     #[test]
     fn test_layout_bt_addr_matches_design() {
         assert_eq!(
-            regs::HOLD_BLE_NAME_BASE,
-            0x08E2,
-            "BLE_NAME 必须在 0x08E2 (metuory WRITE_BLUETOOTH_ID 0x51)"
+            regs::HOLD_BLE_ADDR_BASE,
+            2274,
+            "BLE address must match MCA register 2274"
         );
         assert!((regs::HOLD_USER_BASE..=regs::HOLD_CFG_END).contains(&0x0FA4));
     }

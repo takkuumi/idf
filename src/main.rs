@@ -28,6 +28,7 @@ mod ble_at;
 mod bus;
 mod channel;
 mod config;
+mod control_logic;
 mod device;
 mod error;
 mod ethernet;
@@ -312,6 +313,8 @@ fn main() -> AppResult<()> {
         );
     }
 
+    control_logic::init();
+
     // 10. 主循环
     health::register_with_stack(&MAIN_HB, safety::stack_budget::MAIN);
     log::info!(
@@ -398,6 +401,10 @@ fn main_loop(
         // 这使 TCP/RTU/BLE/Web 点位控制到物理输出的额外调度延迟不超过 5ms。
         #[cfg(feature = "io-di-do")]
         perf.measure(3, || crate::io::do_::tick_do_output(&hal));
+
+        // MCA control words are scheduled here so delay/pulse never block
+        // Modbus, TCP, BLE, or the watchdog.
+        control_logic::tick();
 
         // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
         #[cfg(feature = "io-di-do")]
@@ -579,9 +586,21 @@ fn main_loop(
                     internal_min / 1024,
                     tick
                 );
-                if internal_free < 32 * 1024 || internal_min < 32 * 1024 {
+                // `internal_min` is a historical watermark and can dip during a
+                // large Modbus response even after the allocation is released.
+                // Only current exhaustion is an ERROR; retain the watermark as a
+                // lower-severity diagnostic so transient request peaks do not look
+                // like a persistent leak.
+                const INTERNAL_FREE_ERROR: usize = 24 * 1024;
+                if internal_free < INTERNAL_FREE_ERROR {
                     log::error!(
-                        "[mem] LOW INTERNAL SRAM: free={}B min={}B",
+                        "[mem] LOW INTERNAL SRAM NOW: free={}B watermark={}B",
+                        internal_free,
+                        internal_min
+                    );
+                } else if internal_min < INTERNAL_FREE_ERROR {
+                    log::warn!(
+                        "[mem] INTERNAL SRAM watermark low after transient peak: free={}B watermark={}B",
                         internal_free,
                         internal_min
                     );

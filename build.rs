@@ -100,6 +100,7 @@ fn validate_production_envelope() {
     let partitions = std::fs::read_to_string(PARTITIONS)
         .unwrap_or_else(|e| panic!("cannot read {PARTITIONS}: {e}"));
     require_partition(&partitions, "nvs", 0x9000, 0x6000);
+    require_partition(&partitions, "holding", 0x18000, 0x8000);
     require_partition(&partitions, "factory", 0x20000, 0x240000);
     require_partition(&partitions, "ota_0", 0x260000, 0x240000);
     require_partition(&partitions, "ota_1", 0x4A0000, 0x240000);

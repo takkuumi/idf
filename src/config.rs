@@ -382,6 +382,10 @@ pub mod regs {
     pub const COIL_INTERNAL_STOP: u16 = 0x0401;
     pub const COIL_RESTART: u16 = 0x0402;
     pub const COIL_LOGIC_RESTART: u16 = 0x0403;
+    /// 旧 MCA 扩展线圈窗口: DRegBuf 覆盖 REG_D01..REG_DXX (512..2047).
+    pub const LEGACY_COIL_BASE: u16 = 0x0200;
+    pub const LEGACY_COIL_END: u16 = 0x07FF;
+    pub const LEGACY_COIL_COUNT: u16 = LEGACY_COIL_END - LEGACY_COIL_BASE + 1;
 
     // ---- 离散输入 (Discrete Input, FC=02) - DI 输入 ----
     // 参考固件: REG_T01 = 0x0000, 编号 1-16 (F16)
@@ -398,6 +402,7 @@ pub mod regs {
     pub const INREG_ADC485: u16 = 0x087D; // 模拟量+485通道数
     pub const INREG_FW_VER: u16 = 0x087E; // 固件版本号
     pub const INREG_FW_DATE: u16 = 0x087F; // 固件版本日期
+    pub const INREG_LEGACY_END: u16 = 0x087F;
 
     // ---- 故障恢复状态 (RO, FC=04) ----
     // 暴露给 Modbus Master 用于远程监控设备健康
@@ -476,10 +481,13 @@ pub mod regs {
     // 主站 COM 数量 + IP (2269-2273)
     pub const HOLD_MASTER_COM: u16 = 2269;
     pub const HOLD_MASTER_IP_BASE: u16 = 2270;
-    // BLE 节点/名称 — PC DeviceMMP 与 metuory 1.0.78 均读写 0x08E2..0x08E5。
-    // 0x0FA4 位于 PC 逻辑配置连续区，严禁再放置 BLE MAC 别名。
-    pub const HOLD_BLE_NAME_BASE: u16 = 0x08E2;
-    pub const HOLD_BLE_NAME_COUNT: u16 = 4;
+    // 旧 MCA 的 2274..2277 是 8 字节蓝牙地址 (SLAVE_REG_BT_ARRD1..4)，
+    // 属于通用 PRegBuf；蓝牙名称不占用 Modbus holding 地址。
+    pub const HOLD_BLE_ADDR_BASE: u16 = 2274;
+    pub const HOLD_BLE_ADDR_COUNT: u16 = 4;
+    /// Deprecated name retained for source/API compatibility; value is the MCA BLE address.
+    pub const HOLD_BLE_NAME_BASE: u16 = HOLD_BLE_ADDR_BASE;
+    pub const HOLD_BLE_NAME_COUNT: u16 = HOLD_BLE_ADDR_COUNT;
     // 传感器标定 (2280-2295, 8 sensors × 2 values)
     pub const HOLD_SENSOR_MIN_BASE: u16 = 2280;
     pub const HOLD_SENSOR_MAX_BASE: u16 = 2288;
@@ -488,6 +496,7 @@ pub mod regs {
     // 用户自定义区 (4000-4223 = 224 words)
     pub const HOLD_USER_BASE: u16 = 4000;
     pub const HOLD_USER_COUNT: u16 = 224;
+    pub const HOLD_PROTECT_WORD: u16 = 4222;
     // P区结束地址
     pub const HOLD_CFG_END: u16 = 4223;
     // 通用 P区缓冲 (0x0880..0x107F = 2048 字) — 用于未映射字段的通用读写
@@ -538,7 +547,7 @@ pub mod regs {
     pub const CFG_BLE_MAC_BASE: u16 = 0;
     pub const CFG_END: u16 = HOLD_CFG_END + 1;
     // Backward compat aliases
-    pub const CFG_BLE_NAME_BASE: u16 = HOLD_BLE_NAME_BASE;
+    pub const CFG_BLE_NAME_BASE: u16 = HOLD_BLE_ADDR_BASE;
     pub const CFG_NAME_BASE: u16 = HOLD_PLACE_BASE;
     pub const CFG_NAME_COUNT: u16 = HOLD_PLACE_COUNT;
     pub const CFG_RS485_BASE: u16 = HOLD_RS485_BASE;
@@ -559,6 +568,8 @@ pub mod regs {
     pub const CONTROL_PLC_BASE: u16 = 0x9C41; // 40001
     pub const CONTROL_PLC_END: u16 = 0x9D6C; // 40300
     pub const CONTROL_PLC_COUNT: u16 = 300;
+    pub const MONITOR_WORD_COUNT: u16 = 128;
+    pub const CONTROL_WORD_COUNT: u16 = 300;
 }
 
 // ============================================================================
@@ -603,8 +614,8 @@ mod tests {
         assert_eq!(regs::HOLD_MAC_BASE, 2263);
         // SLAVE_REG_MASTER_COM = 2269
         assert_eq!(regs::HOLD_MASTER_COM, 2269);
-        // PC/手机共用的 BLE 节点/名称起点
-        assert_eq!(regs::HOLD_BLE_NAME_BASE, 0x08E2);
+        // 旧 MCA 蓝牙地址起点
+        assert_eq!(regs::HOLD_BLE_ADDR_BASE, 2274);
         // SLAVE_SERSOR_MIN = 2280
         assert_eq!(regs::HOLD_SENSOR_MIN_BASE, 2280);
         // SLAVE_SERSOR_MAX = 2288
@@ -625,7 +636,7 @@ mod tests {
         assert!(regs::HOLD_GW_BASE < regs::HOLD_DNS_BASE);
         assert!(regs::HOLD_DNS_BASE < regs::HOLD_MAC_BASE);
         assert!(regs::HOLD_MAC_BASE < regs::HOLD_MASTER_COM);
-        assert!(regs::HOLD_MASTER_COM < regs::HOLD_BLE_NAME_BASE);
+        assert!(regs::HOLD_MASTER_COM < regs::HOLD_BLE_ADDR_BASE);
         assert_eq!(regs::HOLD_PC_DEVICE_BASE, 2196);
         assert_eq!(regs::HOLD_PC_DEVICE_END, 2278);
     }

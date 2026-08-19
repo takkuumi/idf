@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use super::config_state::{CONFIG, ConfigSnapshot, config_read, config_read_with};
 use super::io_global::IO;
-use super::storage_state::{STORAGE, StorageSnapshot, proto_status, storage_read};
+use super::storage_state::{
+    STORAGE, StorageSnapshot, proto_status, storage_read, storage_read_with,
+};
 
 // ----------------------------------------------------------------------------
 // LOOP8: RCU 写者串行化锁
@@ -50,13 +52,28 @@ static RCU_WRITE_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
 /// 读线圈 (DO, FC=01): 地址语义同 `Bus::read_coil`.
 #[inline]
 pub fn read_coil(addr: u16) -> Option<bool> {
-    if (regs::COIL_DO_BASE..regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT).contains(&addr) {
+    // 旧 MCA FC01 的地址窗口是 0..0x7FF，而不仅是物理 D 点：
+    // 0..47 为输入镜像，48..511 为保留内部位，512..559 为物理输出，
+    // 560..2047 为持久化 DRegBuf 扩展位。
+    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
+        return Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize));
+    }
+    if (regs::COIL_DO_BASE..regs::COIL_DO_END).contains(&addr) {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         return Some(ch < hw_version::DO_COUNT && IO.do_.get_bit(ch));
     }
-    // 原 PC 工具用 FC=01 读取 X 点，并固定请求 48 点；未安装点按 0 填充。
-    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
-        return Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize));
+    if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
+        return storage_read_with(|storage| {
+            storage
+                .legacy_coils
+                .get((addr - regs::LEGACY_COIL_BASE) as usize)
+                .copied()
+                .map(|value| value != 0)
+        })
+        .flatten();
+    }
+    if (regs::LEGACY_POINT_WINDOW_COUNT..regs::COIL_DO_BASE).contains(&addr) {
+        return Some(false);
     }
     if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
         return Some(false);
@@ -67,11 +84,7 @@ pub fn read_coil(addr: u16) -> Option<bool> {
 /// 读离散输入 (DI, FC=02).
 #[inline]
 pub fn read_disc(addr: u16) -> Option<bool> {
-    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
-        Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize))
-    } else {
-        None
-    }
+    read_coil(addr)
 }
 
 // ----------------------------------------------------------------------------
@@ -80,6 +93,18 @@ pub fn read_disc(addr: u16) -> Option<bool> {
 
 /// 读输入寄存器 (AI + 系统状态 + 故障统计, FC=04). 地址语义同 `Bus::read_input_reg`.
 pub fn read_input_reg(addr: u16) -> Option<u16> {
+    // RS485 主站结果由组态中的 master_addr 指定。上位机历史业务固定用
+    // FC04 读取 4000+ 镜像；值由独立原子区发布，不能误读 0x4000 协议存储。
+    #[cfg(feature = "modbus-rtu")]
+    if let Some(value) = crate::modbus::rtu_master::read_result_reg(addr) {
+        return Some(value);
+    }
+    // 4000..4223 is a continuous RS485 result window. Only configured ranges
+    // are marked valid by the poller; gaps must read as zero so one FC04 batch
+    // cannot fail merely because adjacent result addresses are unused.
+    if (regs::HOLD_USER_BASE..=regs::HOLD_CFG_END).contains(&addr) {
+        return Some(0);
+    }
     if (regs::INREG_AI_BASE..regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT).contains(&addr) {
         let idx = (addr - regs::INREG_AI_BASE) as usize;
         return Some(if idx < regs::INREG_AI_COUNT as usize {
@@ -230,7 +255,7 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
         // 余下 0x00A0-0x00FF 保留为 0 (对齐参考固件 REG_STATU_SWITCH_END=0x0100).
         addr if (regs::INREG_SWITCH_STATUS_BASE..regs::INREG_SWITCH_STATUS_END).contains(&addr) => {
             let word_idx = addr - regs::INREG_SWITCH_STATUS_BASE;
-            crate::udp_multicast::read_switch_status(word_idx)
+            crate::udp_multicast::read_switch_status(word_idx).or(Some(0))
         }
         // ---- MONITOR_PLC 别名区 (30001-30128, LOOP12) ----
         // 老 SCADA 系统通过 FC=04 轮询 3xxxx 区. 映射: 30001-30048→DI 状态, 30049-30056→AI scaled.
@@ -246,6 +271,18 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
                 Some(0)
             }
         }
+        // 原 C++ PMntrBuf (FC04 地址 0..127)。主站结果镜像优先，未配置时
+        // 返回持久化监控字而不是非法地址。
+        addr if addr < regs::MONITOR_WORD_COUNT => {
+            if let Some(feedback) = crate::control_logic::feedback_word(addr) {
+                Some(feedback)
+            } else {
+                storage_read_with(|storage| storage.monitor_words.get(addr as usize).copied())
+                    .flatten()
+            }
+        }
+        // 原 C++ MODS_04H 接受整个 0..REG_AXX(0x087F) 窗口，未赋值项清零返回。
+        addr if addr <= regs::INREG_LEGACY_END => Some(0),
         _ => None,
     }
 }
@@ -279,16 +316,62 @@ pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
     let Some(storage) = STORAGE.read() else {
         return false;
     };
-    for offset in 0..count {
-        let Some(value) =
-            read_hold_reg_from_snapshots(addr.wrapping_add(offset), &config, &storage)
-        else {
-            return false;
-        };
-        let byte_offset = offset as usize * 2;
-        out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
+    for _ in 0..4 {
+        #[cfg(feature = "modbus-rtu")]
+        let before = crate::modbus::rtu_master::result_version();
+        #[cfg(feature = "modbus-rtu")]
+        if before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        for offset in 0..count {
+            let Some(value) =
+                read_hold_reg_from_snapshots(addr.wrapping_add(offset), &config, &storage)
+            else {
+                return false;
+            };
+            let byte_offset = offset as usize * 2;
+            out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        #[cfg(feature = "modbus-rtu")]
+        if crate::modbus::rtu_master::result_version() != before {
+            continue;
+        }
+        return true;
     }
-    true
+    false
+}
+
+/// 批量读输入寄存器。RS485 多字镜像通过版本校验保证同一响应来自同一轮询结果。
+pub fn encode_input_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
+    if count == 0 || out.len() != count as usize * 2 {
+        return false;
+    }
+    if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
+        return false;
+    }
+    for _ in 0..4 {
+        #[cfg(feature = "modbus-rtu")]
+        let before = crate::modbus::rtu_master::result_version();
+        #[cfg(feature = "modbus-rtu")]
+        if before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        for offset in 0..count {
+            let Some(value) = read_input_reg(addr + offset) else {
+                return false;
+            };
+            let byte_offset = offset as usize * 2;
+            out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        #[cfg(feature = "modbus-rtu")]
+        if crate::modbus::rtu_master::result_version() != before {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn read_hold_reg_from_snapshots(
@@ -296,6 +379,24 @@ fn read_hold_reg_from_snapshots(
     config: &ConfigSnapshot,
     storage: &StorageSnapshot,
 ) -> Option<u16> {
+    // 原 C++ FC03 先匹配 PCtrlBuf，0..127 即使也属于 PMntrBuf，仍返回控制字；
+    // PMntrBuf 的权威读取功能码是 FC04。
+    // 运行时联动会直接更新该快照，未更新时返回持久化值。
+    if addr < regs::CONTROL_WORD_COUNT {
+        let mut value = storage.control_words.get(addr as usize).copied()?;
+        if matches!(addr, 10..=13) {
+            value = match addr {
+                10 => (IO.do_.load_bits() & 0xFF) as u16,
+                11 => (IO.di.load_bits() & 0xFF) as u16,
+                12 => ((IO.do_.load_bits() >> 8) & 0xFF) as u16,
+                _ => ((IO.di.load_bits() >> 8) & 0xFF) as u16,
+            };
+        }
+        if let Some(feedback) = crate::control_logic::feedback_word(addr) {
+            value = feedback;
+        }
+        return Some(value);
+    }
     // LOOP14: RS485 错误计数器 (0x0880-0x0883) 前置拦截 — 必须早于 SystemConfig 兜底,
     // 否则 read_hold_reg 落入 holding_buf 返回陈旧 NVS 值. metuory 仪表盘读取此值做诊断.
     match addr {
@@ -309,6 +410,12 @@ fn read_hold_reg_from_snapshots(
     if (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr) {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         return storage.device_text.get(idx).copied();
+    }
+    // 原 C++ 把主站响应写入同一个 PRegBuf，因此 FC03 也能读到结果。
+    // IDF 用原子镜像隔离高频运行时值与 NVS 配置，但保持完全相同的外部行为。
+    #[cfg(feature = "modbus-rtu")]
+    if let Some(value) = crate::modbus::rtu_master::read_result_reg(addr) {
+        return Some(value);
     }
     // 2. CFG / PRegBuf (0x0880..=0x107F)
     if (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr) {
@@ -344,6 +451,15 @@ fn read_hold_reg_from_snapshots(
             }
         };
     }
+    // 原 C++ FC03 首先读取 PCtrlBuf (地址 0..299)。这些地址与 FC04 的
+    // PMntrBuf 共用数值范围，但功能码语义不同，不能混为一谈。
+    if addr < regs::CONTROL_WORD_COUNT {
+        let mut value = storage.control_words.get(addr as usize).copied()?;
+        if let Some(feedback) = crate::control_logic::feedback_word(addr) {
+            value = feedback;
+        }
+        return Some(value);
+    }
     // 3. PROTO 区 (0x4000..<PROTO_END): 来自 STORAGE.proto
     if (regs::PROTO_BASE..regs::PROTO_END).contains(&addr) {
         let idx = (addr - regs::PROTO_BASE) as usize;
@@ -371,8 +487,13 @@ mod tests {
     }
 
     #[test]
-    fn read_input_reg_unknown() {
-        assert!(read_input_reg(0x0001).is_none());
+    fn legacy_input_register_gaps_return_zero() {
+        assert_eq!(read_input_reg(0x0001), Some(0));
+        assert_eq!(read_input_reg(0x00c8), Some(0));
+        assert!(read_input_reg(regs::INREG_LEGACY_END).is_some());
+        assert!(read_input_reg(regs::INREG_LEGACY_END + 1).is_some());
+        assert_eq!(read_input_reg(regs::HOLD_USER_BASE), Some(0));
+        assert_eq!(read_input_reg(regs::HOLD_CFG_END), Some(0));
     }
 
     /// LOOP10 回归测试: ringlog 数据条目必须通过 FC=04 (read_input_reg) 读出
@@ -483,11 +604,9 @@ mod tests {
 
     #[test]
     fn test_pc_fixed_io_and_meta_windows_are_readable() {
-        for addr in 0..regs::LEGACY_POINT_WINDOW_COUNT {
-            assert!(read_coil(addr).is_some(), "PC X address {addr}");
-        }
-        for addr in regs::COIL_DO_BASE..regs::COIL_DO_BASE + regs::LEGACY_POINT_WINDOW_COUNT {
-            assert!(read_coil(addr).is_some(), "PC Y address {addr}");
+        for addr in 0..=regs::LEGACY_COIL_END {
+            assert!(read_coil(addr).is_some(), "legacy FC01 address {addr}");
+            assert!(read_disc(addr).is_some(), "legacy FC02 address {addr}");
         }
         for addr in regs::INREG_AI_BASE..regs::INREG_AI_BASE + regs::LEGACY_AI_WINDOW_COUNT {
             assert!(read_input_reg(addr).is_some(), "PC AI address {addr}");
@@ -495,6 +614,33 @@ mod tests {
         for addr in regs::INREG_PC_META_BASE..regs::INREG_PC_META_BASE + 6 {
             assert!(read_input_reg(addr).is_some(), "PC Meta address {addr}");
         }
+    }
+
+    #[test]
+    fn test_legacy_control_monitor_and_coil_boundaries() {
+        assert!(read_hold_reg(0).is_some());
+        assert!(read_hold_reg(regs::CONTROL_WORD_COUNT - 1).is_some());
+        assert!(read_input_reg(0).is_some());
+        assert!(read_input_reg(regs::MONITOR_WORD_COUNT - 1).is_some());
+        assert!(write_hold_reg(regs::CONTROL_WORD_COUNT - 1, 0x1234));
+        assert_eq!(read_hold_reg(regs::CONTROL_WORD_COUNT - 1), Some(0x1234));
+
+        let last = regs::LEGACY_COIL_END;
+        assert!(write_coil(last, true));
+        assert_eq!(read_coil(last), Some(true));
+        assert!(!write_coil(last + 1, true));
+        assert!(write_hold_reg(regs::HOLD_PROTECT_WORD, 0x55AA));
+        assert_eq!(read_hold_reg(regs::HOLD_PROTECT_WORD), Some(0x55AA));
+    }
+
+    #[test]
+    fn test_legacy_multi_coil_crosses_physical_and_internal_boundary() {
+        let start = regs::COIL_DO_END - 2;
+        assert!(write_coils(start, 4, &[0b0000_1101]));
+        assert_eq!(read_coil(start), Some(true));
+        assert_eq!(read_coil(start + 1), Some(false));
+        assert_eq!(read_coil(start + 2), Some(true));
+        assert_eq!(read_coil(start + 3), Some(true));
     }
 
     #[test]
@@ -650,6 +796,9 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                     .store(true, std::sync::atomic::Ordering::Release);
                 super::storage_state::HOLDING_NFC_DIRTY
                     .store(true, std::sync::atomic::Ordering::Release);
+                if addr >= regs::HOLD_DEVICE_CONFIG {
+                    crate::control_logic::mark_config_changed();
+                }
             }
         }
         if request_runtime_apply {
@@ -670,7 +819,8 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
 
 #[inline]
 fn is_writable_hold_reg(addr: u16) -> bool {
-    (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
+    (0..regs::CONTROL_WORD_COUNT).contains(&addr)
+        || (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
         || (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr)
         || (regs::CONTROL_PLC_BASE..=regs::CONTROL_PLC_END).contains(&addr)
         || (regs::PROTO_BASE..regs::PROTO_END).contains(&addr)
@@ -682,6 +832,17 @@ fn is_writable_hold_reg(addr: u16) -> bool {
 
 /// write_hold_reg 的内部实现, 调用方必须持有 RCU_WRITE_LOCK
 fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
+    // 原 C++ PCtrlBuf (FC06/FC16 地址 0..299)。写入后保留在独立快照，
+    // 使旧客户端的控制字和重启恢复行为一致；具体 Q/I 联动由组态解析器消费。
+    if addr < regs::CONTROL_WORD_COUNT {
+        let mut snap = storage_clone();
+        Arc::make_mut(&mut snap.control_words)[addr as usize] = value;
+        sync_proto_status(&mut snap);
+        STORAGE.write(snap);
+        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        crate::control_logic::on_control_word_written(addr, value);
+        return true;
+    }
     // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
     //    Android 1.0.78 WRITE_DEVICE_TEXT_COUNT (0xB5) + WRITE_DEVICE_TEXT_DATA (0xB7)
     //    通过 Modbus FC=10 写入, 我们写后立即持久化以保证工业可靠性.
@@ -736,6 +897,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                     storage_modify_holding_locked(|buf| {
                         buf[idx] = value;
                     });
+                    if addr >= regs::HOLD_DEVICE_CONFIG {
+                        crate::control_logic::mark_config_changed();
+                    }
                     return true;
                 }
                 return false;
@@ -832,15 +996,28 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         return true;
     }
     match addr {
-        // PC 明确下发的重启属于计划操作：先正常应答 FC=05，再由 main_loop 执行。
+        // 旧 FC05 对 M2(0x0402) 的单点写会在应答后重启；FC0F 仍只写 DRegBuf。
         regs::COIL_RESTART | regs::COIL_LOGIC_RESTART => {
             if value {
                 super::io_global::IO
                     .sys
                     .request_reset(super::io_state::ResetSource::MODBUS);
             }
-            true
+            return true;
         }
+        _ => {}
+    }
+    if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
+        let _guard = RCU_WRITE_LOCK.lock();
+        let mut snap = storage_clone();
+        Arc::make_mut(&mut snap.legacy_coils)[(addr - regs::LEGACY_COIL_BASE) as usize] =
+            u8::from(value);
+        sync_proto_status(&mut snap);
+        STORAGE.write(snap);
+        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        return true;
+    }
+    match addr {
         // 原 C++ M0/M1 内部位暂不驱动业务，但需保持地址兼容并正常应答。
         regs::COIL_INTERNAL_START | regs::COIL_INTERNAL_STOP => true,
         _ => false,
@@ -871,6 +1048,35 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
         super::io_global::IO.do_.mask_replace(mask, value);
         #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
         crate::io::do_::notify();
+        return true;
+    }
+
+    if addr >= regs::LEGACY_COIL_BASE && end_exclusive <= regs::LEGACY_COIL_END as u32 + 1 {
+        let _guard = RCU_WRITE_LOCK.lock();
+        let mut snap = storage_clone();
+        let target = Arc::make_mut(&mut snap.legacy_coils);
+        let mut do_mask = 0u64;
+        let mut do_value = 0u64;
+        for offset in 0..count as usize {
+            let target_addr = addr + offset as u16;
+            let on = packed_values[offset / 8] & (1 << (offset % 8)) != 0;
+            target[(target_addr - regs::LEGACY_COIL_BASE) as usize] = u8::from(on);
+            if target_addr < regs::COIL_DO_END {
+                let channel = (target_addr - regs::COIL_DO_BASE) as usize;
+                do_mask |= 1u64 << channel;
+                if on {
+                    do_value |= 1u64 << channel;
+                }
+            }
+        }
+        sync_proto_status(&mut snap);
+        STORAGE.write(snap);
+        if do_mask != 0 {
+            super::io_global::IO.do_.mask_replace(do_mask, do_value);
+            #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
+            crate::io::do_::notify();
+        }
+        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
         return true;
     }
 
@@ -922,6 +1128,23 @@ where
 pub fn storage_set_snapshot(snap: StorageSnapshot) {
     let _guard = RCU_WRITE_LOCK.lock();
     super::storage_state::proto_status_set(snap.proto.status);
+    STORAGE.write(snap);
+}
+
+/// 启动时由 holding_store 恢复旧 MCA 的独立状态区。
+pub fn storage_restore_legacy_state(monitor: &[u16], control: &[u16], coils: &[u8]) {
+    let _guard = RCU_WRITE_LOCK.lock();
+    let mut snap = storage_clone();
+    if monitor.len() == regs::MONITOR_WORD_COUNT as usize {
+        Arc::make_mut(&mut snap.monitor_words).copy_from_slice(monitor);
+    }
+    if control.len() == regs::CONTROL_WORD_COUNT as usize {
+        Arc::make_mut(&mut snap.control_words).copy_from_slice(control);
+    }
+    if coils.len() == regs::LEGACY_COIL_COUNT as usize {
+        Arc::make_mut(&mut snap.legacy_coils).copy_from_slice(coils);
+    }
+    sync_proto_status(&mut snap);
     STORAGE.write(snap);
 }
 

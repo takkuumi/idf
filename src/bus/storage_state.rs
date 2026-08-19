@@ -48,7 +48,7 @@ impl Default for ProtoStore {
 
 /// 存储快照 (不可变)
 ///
-/// 三个大数组字段均为 `Arc<[u16]>`；快照 clone 是固定开销，写时 COW。
+/// 大数组字段均为 `Arc`；快照 clone 是固定开销，写时 COW。
 #[derive(Clone)]
 pub struct StorageSnapshot {
     pub proto: ProtoStore,
@@ -56,6 +56,12 @@ pub struct StorageSnapshot {
     pub device_text: Arc<[u16]>,
     /// 通用 P区保持寄存器缓冲 (0x0880..0x107F = 2048 字)
     pub holding_buf: Arc<[u16]>,
+    /// 旧 MCA 固件的 3xxxx 监控字 (FC03/FC04 地址 0..127)。
+    pub monitor_words: Arc<[u16]>,
+    /// 旧 MCA 固件的 4xxxx 控制字 (FC03/FC06/FC16 地址 0..299)。
+    pub control_words: Arc<[u16]>,
+    /// 旧 MCA 固件的扩展线圈/内部状态 (地址 512..2047)。
+    pub legacy_coils: Arc<[u8]>,
 }
 
 impl StorageSnapshot {
@@ -64,6 +70,9 @@ impl StorageSnapshot {
             proto: ProtoStore::default(),
             device_text: Arc::from(vec![0u16; 2000].into_boxed_slice()),
             holding_buf: Arc::from(vec![0u16; 2048].into_boxed_slice()),
+            monitor_words: Arc::from(vec![0u16; 128].into_boxed_slice()),
+            control_words: Arc::from(vec![0u16; 300].into_boxed_slice()),
+            legacy_coils: Arc::from(vec![0u8; 1536].into_boxed_slice()),
         }
     }
 }
@@ -104,11 +113,14 @@ where
 /// - NFC 仅读不写此标志, RCU 读者 (Modbus FC=03/04) 不需要它, 仅 DeviceActor 使用
 pub static HOLDING_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// 监控字、控制字和扩展线圈的独立持久化 dirty 标志。
+pub static LEGACY_IO_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// holding_buf 相对 NFC 备份是否有本地新改动。不得与 `HOLDING_DIRTY` 共用：
 /// NVS 成功和 NFC 成功是两个独立提交点，任一方清除另一方的 dirty 都会造成数据回滚。
 pub static HOLDING_NFC_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// 启动时是否从至少一个通过 magic/version/CRC 校验的 NVS holding blob 恢复成功。
+/// 启动时是否从至少一个通过 magic/version/CRC 校验的持久化 holding 快照恢复成功。
 /// NFC 自动冲突决策只在此值为 false 时允许用标签覆盖本机；有效 NVS 永远优先。
 pub static HOLDING_NVS_VALID: AtomicBool = AtomicBool::new(false);
 
@@ -132,12 +144,21 @@ mod tests {
         assert!(Arc::ptr_eq(&original.proto.data, &cloned.proto.data));
         assert!(Arc::ptr_eq(&original.device_text, &cloned.device_text));
         assert!(Arc::ptr_eq(&original.holding_buf, &cloned.holding_buf));
+        assert!(Arc::ptr_eq(&original.monitor_words, &cloned.monitor_words));
+        assert!(Arc::ptr_eq(&original.control_words, &cloned.control_words));
+        assert!(Arc::ptr_eq(&original.legacy_coils, &cloned.legacy_coils));
 
         Arc::make_mut(&mut cloned.holding_buf)[0] = 0x55AA;
         assert!(!Arc::ptr_eq(&original.holding_buf, &cloned.holding_buf));
         assert!(Arc::ptr_eq(&original.proto.data, &cloned.proto.data));
         assert!(Arc::ptr_eq(&original.device_text, &cloned.device_text));
         assert_eq!(original.holding_buf[0], 0);
+        Arc::make_mut(&mut cloned.monitor_words)[0] = 1;
+        Arc::make_mut(&mut cloned.control_words)[0] = 2;
+        Arc::make_mut(&mut cloned.legacy_coils)[0] = 1;
+        assert_eq!(original.monitor_words[0], 0);
+        assert_eq!(original.control_words[0], 0);
+        assert_eq!(original.legacy_coils[0], 0);
     }
 
     #[test]

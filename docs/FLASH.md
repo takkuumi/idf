@@ -28,6 +28,7 @@ QIO/80MHz 会使当前硬件在二级 Bootloader 加载阶段触发
 | phy_init | `0xF000` | `0x1000` | RF 校准 |
 | otadata | `0x10000` | `0x2000` | OTA 选择与回滚状态 |
 | nvs_keys | `0x17000` | `0x1000` | NVS 密钥预留 |
+| holding | `0x18000` | `0x8000` | PRegBuf A/B 原始快照（generation + CRC） |
 | factory | `0x20000` | `0x240000` | 串口烧录应用 |
 | ota_0 | `0x260000` | `0x240000` | OTA 槽 0 |
 | ota_1 | `0x4A0000` | `0x240000` | OTA 槽 1 |
@@ -35,7 +36,7 @@ QIO/80MHz 会使当前硬件在二级 Bootloader 加载阶段触发
 | ble_mesh | `0x6F0000` | `0x10000` | BLE Mesh NVS |
 | storage | `0x700000` | `0x100000` | 文件存储 |
 
-分区源文件为项目根目录的 `partitions.csv`。禁止只依赖设备上遗留的分区表；旧设备可能仍是单 factory 布局，在该布局下 OTA 必然失败。迁移时保留 `nvs@0x9000`，不得全擦，否则会丢失业务配置。
+分区源文件为项目根目录的 `partitions.csv`。禁止只依赖设备上遗留的分区表；旧设备可能仍是单 factory 布局，在该布局下 OTA 必然失败。迁移时保留 `nvs@0x9000`，不得全擦，否则会丢失业务配置。`holding` 使用应用前原空闲区，不移动 factory/OTA 地址；升级时必须同时烧录新分区表，随后同步一次工程组态，固件会把完整 PRegBuf 写入独立双槽。
 
 ## 3. 标准完整烧录
 

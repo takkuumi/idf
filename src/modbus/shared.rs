@@ -60,21 +60,7 @@ impl ModbusBackend for BusBackend {
     }
 
     fn encode_input_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
-        if out.len() != count as usize * 2 {
-            return false;
-        }
-        let last = (addr as u32) + (count as u32) - 1;
-        if last > u16::MAX as u32 {
-            return false;
-        }
-        for i in 0..count {
-            let Some(value) = crate::bus::backends::read_input_reg(addr.wrapping_add(i)) else {
-                return false;
-            };
-            let offset = i as usize * 2;
-            out[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-        }
-        true
+        crate::bus::backends::encode_input_regs_be(addr, count, out)
     }
 
     fn write_single_coil(&self, addr: u16, value: bool) -> bool {

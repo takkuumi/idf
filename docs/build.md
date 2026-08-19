@@ -167,6 +167,7 @@ embuild = { version = "0.33", features = ["espidf"] }  # build-dependencies
 | phy_init | data phy | 0xF000 | 4 KB | PHY 校准数据 |
 | otadata | data ota | 0x10000 | 8 KB | OTA 选择分区 |
 | nvs_keys | data nvs_keys | 0x17000 | 4 KB | NVS 加密密钥 |
+| holding | data undefined | 0x18000 | 32 KB | PRegBuf A/B 掉电安全快照 |
 | factory | app factory | 0x20000 | 2.25 MB | 出厂固件 |
 | ota_0 | app ota_0 | 0x260000 | 2.25 MB | OTA 升级槽 0 |
 | ota_1 | app ota_1 | 0x4A0000 | 2.25 MB | OTA 升级槽 1 |

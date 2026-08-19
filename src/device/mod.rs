@@ -159,7 +159,8 @@ impl Actor for DeviceActor {
         WATCH_HB.tick();
         // 合并 PC/RTU/TCP 的连续 PRegBuf 写，在 Actor 上统一异步落盘。
         if Instant::now() >= self.next_holding_persist
-            && bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+            && (bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+                || bus::storage_state::LEGACY_IO_DIRTY.load(std::sync::atomic::Ordering::Acquire))
         {
             self.next_holding_persist = Instant::now() + Duration::from_secs(1);
             if let Err(e) = holding_store::save_to_nvs() {
@@ -400,13 +401,13 @@ pub fn init() -> AppResult<()> {
 
         // LOOP13: 从 NVS 加载 holding_buf (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
         //         永久丢失的 bug 修复. NVS 不可用时回退全 0.
-        let mut holding_buf = if let Some(nvs) = nvs_lock().as_ref() {
+        let mut holding_state = if let Some(nvs) = nvs_lock().as_ref() {
             holding_store::load_from_nvs(nvs)?
         } else {
             log::warn!("[device] NVS unavailable, using empty holding_buf");
-            vec![0u16; holding_store::HOLDING_WORDS]
+            holding_store::LoadedHoldingState::empty()
         };
-        initialize_legacy_preg_defaults(&mut holding_buf);
+        initialize_legacy_preg_defaults(&mut holding_state.words);
 
         let snap = StorageSnapshot {
             proto: ProtoStore {
@@ -417,7 +418,10 @@ pub fn init() -> AppResult<()> {
                 status: 0,
             },
             device_text: Arc::from(device_text.into_boxed_slice()),
-            holding_buf: Arc::from(holding_buf.into_boxed_slice()),
+            holding_buf: Arc::from(holding_state.words.into_boxed_slice()),
+            monitor_words: Arc::from(holding_state.monitor_words.into_boxed_slice()),
+            control_words: Arc::from(holding_state.control_words.into_boxed_slice()),
+            legacy_coils: Arc::from(holding_state.legacy_coils.into_boxed_slice()),
         };
         storage_write(snap);
 
@@ -986,7 +990,7 @@ pub fn persist_do_bits_throttled(now_ms: u32) {
 
     const THROTTLE_MS: u32 = 1000;
 
-    let bits = crate::bus::io_global::IO.do_.load_bits();
+    let bits = crate::bus::io_global::IO.do_.load_bits() & !crate::control_logic::transient_mask();
     let last_bits = DO_PERSIST_LAST.load_bits();
     let last_ms = DO_PERSIST_LAST_MS.load(Ordering::Acquire);
 

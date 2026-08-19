@@ -12,6 +12,7 @@
 # 兼容性约束：量产设备的旧分区表已将 NVS 固定在 0x9000。保留该地址，
 # 升级为多 OTA 槽位时不会丢失网络、端口、蓝牙和业务配置。
 # 总计: 0x6000 (nvs) + 0x1000 (phy) + 0x1000 (nvs_keys) + 0x2000 (otadata)
+#     + 0x8000 (holding A/B raw store)
 #     + 0x240000 (factory) + 0x240000 (ota_0) + 0x240000 (ota_1)
 #     + 0x10000 (coredump) + 0x10000 (ble_mesh) + 0x100000 (storage)
 #     = 0x800000 (8MB), 含 0x1A000-0x20000 对齐间隙
@@ -20,6 +21,7 @@ nvs,        data, nvs,      0x9000,   0x6000,
 phy_init,   data, phy,      0xF000,   0x1000,
 otadata,    data, ota,      0x10000,  0x2000,
 nvs_keys,   data, nvs_keys, 0x17000,  0x1000, encrypted
+holding,    data, undefined,0x18000,  0x8000,
 factory,    app,  factory,  0x20000,  0x240000,
 ota_0,      app,  ota_0,    0x260000, 0x240000,
 ota_1,      app,  ota_1,    0x4A0000, 0x240000,

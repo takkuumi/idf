@@ -31,5 +31,3 @@ pub mod storage_state;
 pub use config_state::config_read;
 pub use event_bus::{IoEvent, send_event};
 pub use io_global::IO;
-#[cfg(feature = "modbus-rtu")]
-pub use storage_state::proto_status;
