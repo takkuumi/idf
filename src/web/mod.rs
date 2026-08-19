@@ -352,13 +352,9 @@ pub fn start() -> AppResult<()> {
     let _ = load_web_system_info();
     let spawn_result = std::thread::Builder::new()
         .name("http-srv".into())
-        // LOOP18: http-srv 栈从 8KB 提到 12KB.
-        //  - OTA 上传期间单帧 buf 已缩到 2048B (见 handle_ota_upload_stream)
-        //  - 但 handle_get_io_data + handle_get_system_status 等长路径
-        //    单次请求会构造 ~30+ format! 临时字符串, 加上 BufReader 内部状态
-        //    + LwIP socket 状态, 实测峰值接近 7KB. 8KB 边界易触发 Stack canary.
-        //  - 与 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=12288 对齐, 移除
-        //    BLE/ETH/Modbus 同时启动时的栈压力来源.
+        // http-srv 栈经真机长路径和 OTA 请求验证后收敛到 10KB.
+        //  - OTA 上传采用流式缓冲，不在栈上保留整包数据。
+        //  - 长状态响应、路由分发和 LwIP socket 状态仍保留约 3KB 实测余量。
         .stack_size(crate::safety::stack_budget::HTTP)
         .spawn(server_loop);
     if let Err(e) = spawn_result {

@@ -55,7 +55,7 @@ const BACKOFF_MS: u64 = 5000;
 
 /// 从 CONFIG RCU 读取组播配置 (端口 + 组地址 + 源 IP 过滤)
 ///
-/// LOOP11: 零拷贝, 闭包内构造 MulticastConfig 返回 (避免 udp-mcast 6KB 栈上 clone ~2.5KB).
+/// LOOP11: 零拷贝, 闭包内构造 MulticastConfig 返回 (避免在 4KB 栈上 clone 大对象).
 fn read_multicast_config() -> MulticastConfig {
     config_read_with(|cs| {
         // 2190-2194 是 HOLD_CFG_BASE (0x0880) 偏移的子寄存器, 通过 SystemConfig::read_reg 读取

@@ -35,17 +35,17 @@
 //! | 任务            | 栈     | 监控项                                    |
 //! |----------------|--------|--------------------------------------------|
 //! | sys_evt        | 4KB   | 该任务无用户回调, 仅监控 ETH/BLE 事件栈  |
-//! | udp-mcast      | 6KB   | 心跳+配置读取栈深度                       |
-//! | nfc-st25       | 8KB   | loop 缓冲区栈                              |
-//! | mb-rtu-*       | 8KB   | UART 读 + handler 栈                      |
-//! | http-srv       | 12KB  | 路由分发栈 (LOOP18)                       |
-//! | actor          | 16KB  | NVS 串行持久化                            |
-//! | main           | 32KB  | 全局状态轮询栈                            |
+//! | udp-mcast      | 4KB   | 心跳+配置读取栈深度                       |
+//! | nfc-st25       | 6KB   | loop 缓冲区驻留 PSRAM                     |
+//! | mb-rtu-*       | 8/6KB | UART 读 + handler 栈                      |
+//! | http-srv       | 10KB  | 路由分发栈                                 |
+//! | actor          | 12KB  | NVS 串行持久化                            |
+//! | main           | 24KB  | 全局状态轮询栈                            |
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// 栈使用阈值 (剩余字节百分比) — 低于此阈值时 main_loop 主动告警
-/// 8% 是实测安全余量 (1KB 在 12KB 任务栈 = 8%)
+/// 8% 是实测安全余量 (约 1KB 在最小任务栈中)
 pub const STACK_USAGE_WARN_PCT: u32 = 90;
 /// 临界阈值 (剩余字节 < 4%)
 pub const STACK_USAGE_CRIT_PCT: u32 = 96;

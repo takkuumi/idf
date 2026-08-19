@@ -86,7 +86,7 @@ fn validate_production_envelope() {
 
     let sdk = std::fs::read_to_string(SDKCONFIG)
         .unwrap_or_else(|e| panic!("cannot read {SDKCONFIG}: {e}"));
-    require_config(&sdk, "CONFIG_ESP_MAIN_TASK_STACK_SIZE", "32768");
+    require_config(&sdk, "CONFIG_ESP_MAIN_TASK_STACK_SIZE", "24576");
     require_config(&sdk, "CONFIG_SPIRAM_SIZE", "2097152");
     require_config(&sdk, "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP", "y");
     require_config(&sdk, "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL", "65536");

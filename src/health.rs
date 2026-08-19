@@ -351,6 +351,14 @@ pub fn print_stack_watermarks() {
             esp_idf_sys::uxTaskGetStackHighWaterMark2(handle as esp_idf_sys::TaskHandle_t) as u32
         };
         let used_pct = size.saturating_sub(free).saturating_mul(100) / size;
+        #[cfg(debug_assertions)]
+        log::info!(
+            "[stack-detail] task={} size={}B min_free={}B used={}%",
+            task.name,
+            size,
+            free,
+            used_pct
+        );
         sampled += 1;
         if free < min_free {
             min_free = free;
