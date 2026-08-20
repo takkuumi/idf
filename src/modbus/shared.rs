@@ -128,72 +128,96 @@ const RS485_ACTIVITY_WINDOW_MS: u32 = 1_000;
 
 /// RS485 通信/应用错误计数器 (无锁原子, 全局静态)
 pub struct Rs485Stats {
-    pub master_comerr: AtomicU32, // 0x0880
-    pub master_apperr: AtomicU32, // 0x0881
-    pub slave_comerr: AtomicU32,  // 0x0882
-    pub slave_apperr: AtomicU32,  // 0x0883
-    master_last_ok_ms: AtomicU32,
-    slave_last_ok_ms: AtomicU32,
+    port_comerr: [AtomicU32; 3],
+    port_apperr: [AtomicU32; 3],
+    port_last_ok_ms: [AtomicU32; 3],
 }
 
 impl Rs485Stats {
     pub const fn new() -> Self {
         Self {
-            master_comerr: AtomicU32::new(0),
-            master_apperr: AtomicU32::new(0),
-            slave_comerr: AtomicU32::new(0),
-            slave_apperr: AtomicU32::new(0),
-            master_last_ok_ms: AtomicU32::new(0),
-            slave_last_ok_ms: AtomicU32::new(0),
+            port_comerr: [const { AtomicU32::new(0) }; 3],
+            port_apperr: [const { AtomicU32::new(0) }; 3],
+            port_last_ok_ms: [const { AtomicU32::new(0) }; 3],
+        }
+    }
+
+    #[inline]
+    pub fn port_comerr(&self, port: usize) -> u16 {
+        self.port_comerr
+            .get(port)
+            .map(|value| value.load(Ordering::Relaxed) as u16)
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn port_apperr(&self, port: usize) -> u16 {
+        self.port_apperr
+            .get(port)
+            .map(|value| value.load(Ordering::Relaxed) as u16)
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn inc_port_comerr(&self, port: usize) {
+        if let Some(value) = self.port_comerr.get(port) {
+            value.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn inc_port_apperr(&self, port: usize) {
+        if let Some(value) = self.port_apperr.get(port) {
+            value.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// 读 RS485 主站通信错误 (0x0880)
     #[inline]
     pub fn master_comerr(&self) -> u16 {
-        self.master_comerr.load(Ordering::Relaxed) as u16
+        self.port_comerr(0)
     }
 
     /// 读 RS485 主站应用错误 (0x0881)
     #[inline]
     pub fn master_apperr(&self) -> u16 {
-        self.master_apperr.load(Ordering::Relaxed) as u16
+        self.port_apperr(0)
     }
 
     /// 读 RS485 从站通信错误 (0x0882)
     #[inline]
     pub fn slave_comerr(&self) -> u16 {
-        self.slave_comerr.load(Ordering::Relaxed) as u16
+        self.port_comerr(1)
     }
 
     /// 读 RS485 从站应用错误 (0x0883)
     #[inline]
     pub fn slave_apperr(&self) -> u16 {
-        self.slave_apperr.load(Ordering::Relaxed) as u16
+        self.port_apperr(1)
     }
 
     /// 累加主站通信错误 (timeout/CRC/slave mismatch)
     #[inline]
     pub fn inc_master_comerr(&self) {
-        self.master_comerr.fetch_add(1, Ordering::Relaxed);
+        self.inc_port_comerr(0);
     }
 
     /// 累加主站应用错误 (Illegal F/R/V/Slave Failure)
     #[inline]
     pub fn inc_master_apperr(&self) {
-        self.master_apperr.fetch_add(1, Ordering::Relaxed);
+        self.inc_port_apperr(0);
     }
 
     /// 累加从站通信错误 (CRC 错/帧截断)
     #[inline]
     pub fn inc_slave_comerr(&self) {
-        self.slave_comerr.fetch_add(1, Ordering::Relaxed);
+        self.inc_port_comerr(1);
     }
 
     /// 累加从站应用错误 (非法功能码/非法寄存器)
     #[inline]
     pub fn inc_slave_apperr(&self) {
-        self.slave_apperr.fetch_add(1, Ordering::Relaxed);
+        self.inc_port_apperr(1);
     }
 
     #[inline]
@@ -203,31 +227,37 @@ impl Rs485Stats {
     }
 
     #[inline]
+    pub fn mark_port_ok(&self, port: usize) {
+        if let Some(value) = self.port_last_ok_ms.get(port) {
+            value.store(Self::uptime_ms().max(1), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
     pub fn mark_master_ok(&self) {
-        self.master_last_ok_ms
-            .store(Self::uptime_ms().max(1), Ordering::Relaxed);
+        self.mark_port_ok(0);
     }
 
     #[inline]
     pub fn mark_slave_ok(&self) {
-        self.slave_last_ok_ms
-            .store(Self::uptime_ms().max(1), Ordering::Relaxed);
+        self.mark_port_ok(1);
+    }
+
+    #[inline]
+    pub fn port_active(&self, port: usize) -> bool {
+        self.port_last_ok_ms.get(port).is_some_and(|value| {
+            activity_is_recent(value.load(Ordering::Relaxed), Self::uptime_ms())
+        })
     }
 
     #[inline]
     pub fn master_active(&self) -> bool {
-        activity_is_recent(
-            self.master_last_ok_ms.load(Ordering::Relaxed),
-            Self::uptime_ms(),
-        )
+        self.port_active(0)
     }
 
     #[inline]
     pub fn slave_active(&self) -> bool {
-        activity_is_recent(
-            self.slave_last_ok_ms.load(Ordering::Relaxed),
-            Self::uptime_ms(),
-        )
+        self.port_active(1)
     }
 }
 
@@ -317,9 +347,6 @@ pub fn handle_pdu<B: ModbusBackend>(
             1 + body_len
         }
         PduResult::Err(code) => {
-            // LOOP14: 从站发送异常响应 → 累加从站应用错误
-            // (RTU slave 接收方在收到非法 F/R/V 请求时累加, 表示上层语义错误)
-            RS485_STATS.inc_slave_apperr();
             out[0] = func | 0x80;
             out[1] = code;
             2
@@ -745,6 +772,22 @@ mod tests {
         assert!(activity_is_recent(500, 1_500));
         assert!(!activity_is_recent(500, 1_501));
         assert!(activity_is_recent(u32::MAX - 200, 300));
+    }
+
+    #[test]
+    fn test_rs485_error_counters_are_isolated_by_physical_port() {
+        let stats = Rs485Stats::new();
+        stats.inc_port_comerr(0);
+        stats.inc_port_apperr(1);
+        stats.inc_port_comerr(2);
+        stats.inc_port_comerr(2);
+        assert_eq!(stats.port_comerr(0), 1);
+        assert_eq!(stats.port_apperr(0), 0);
+        assert_eq!(stats.port_comerr(1), 0);
+        assert_eq!(stats.port_apperr(1), 1);
+        assert_eq!(stats.port_comerr(2), 2);
+        assert_eq!(stats.port_apperr(2), 0);
+        assert_eq!(stats.port_comerr(3), 0);
     }
 
     #[test]

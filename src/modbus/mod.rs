@@ -19,6 +19,8 @@ pub mod rtu_master;
 #[cfg(feature = "modbus-rtu")]
 pub mod rtu_port2;
 #[cfg(feature = "modbus-rtu")]
+pub mod rtu_runtime;
+#[cfg(feature = "modbus-rtu")]
 pub mod rtu_slave;
 pub mod shared;
 #[cfg(feature = "modbus-tcp")]
@@ -27,15 +29,7 @@ pub mod tcp_server;
 /// 启动 RTU Master + Slave 任务
 #[cfg(feature = "modbus-rtu")]
 pub fn start_rtu(_hal: Arc<Hal>) -> AppResult<()> {
-    rtu_master::start(_hal.clone())?;
-    rtu_slave::start(_hal.clone())?;
-
-    // 可选启动 RS485 第 3 端口 (UART0, 对齐参考固件 RS485-3)
-    // 注: UART0 与 USB CDC/JTAG 复用, 默认禁用以保留调试串口
-    if crate::config::modbus::rtu_port2::ENABLED {
-        rtu_port2::start(_hal.clone())?;
-    }
-    Ok(())
+    rtu_runtime::start(_hal)
 }
 
 /// 初始化 TCP Server 主循环状态机

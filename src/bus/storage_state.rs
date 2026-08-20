@@ -5,7 +5,7 @@
 //! - 高并发时锁竞争明显
 //!
 //! ## 现在 (Rcu<StorageState>)
-//! - 读: 极短自旋临界区内克隆 Arc
+//! - 读: 极短调度器互斥区内克隆 Arc
 //! - 写: 构造新值后替换 Arc，最后一个读者释放时回收
 //! - 写极少 (commit/reload), 读极多 (Modbus 请求)
 //!
@@ -15,7 +15,7 @@
 //! - 大数组访问和业务闭包在临界区外执行
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use std::sync::LazyLock;
 
@@ -119,6 +119,36 @@ pub static LEGACY_IO_DIRTY: AtomicBool = AtomicBool::new(false);
 /// holding_buf 相对 NFC 备份是否有本地新改动。不得与 `HOLDING_DIRTY` 共用：
 /// NVS 成功和 NFC 成功是两个独立提交点，任一方清除另一方的 dirty 都会造成数据回滚。
 pub static HOLDING_NFC_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次 holding/legacy 状态变更时间。自动 Flash/NFC 持久化只在配置流
+/// 静默后执行，把 PC 分块同步和连续联动控制合并为一次介质写入。
+static LAST_STORAGE_MUTATION_MS: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn mutation_now_ms() -> u32 {
+    (unsafe { esp_idf_sys::esp_timer_get_time() } as u64 / 1_000) as u32
+}
+
+#[inline]
+fn mark_storage_mutated() {
+    LAST_STORAGE_MUTATION_MS.store(mutation_now_ms(), Ordering::Release);
+}
+
+pub fn mark_holding_dirty() {
+    HOLDING_DIRTY.store(true, Ordering::Release);
+    HOLDING_NFC_DIRTY.store(true, Ordering::Release);
+    mark_storage_mutated();
+}
+
+pub fn mark_legacy_io_dirty() {
+    LEGACY_IO_DIRTY.store(true, Ordering::Release);
+    mark_storage_mutated();
+}
+
+/// `quiet_ms` 内没有新写入才允许自动持久化。u32 wrapping 差值可跨越 49 天回卷。
+pub fn storage_mutation_quiet_for(quiet_ms: u32) -> bool {
+    mutation_now_ms().wrapping_sub(LAST_STORAGE_MUTATION_MS.load(Ordering::Acquire)) >= quiet_ms
+}
 
 /// 启动时是否从至少一个通过 magic/version/CRC 校验的持久化 holding 快照恢复成功。
 /// NFC 自动冲突决策只在此值为 false 时允许用标签覆盖本机；有效 NVS 永远优先。

@@ -161,6 +161,7 @@ impl Actor for DeviceActor {
         if Instant::now() >= self.next_holding_persist
             && (bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
                 || bus::storage_state::LEGACY_IO_DIRTY.load(std::sync::atomic::Ordering::Acquire))
+            && bus::storage_state::storage_mutation_quiet_for(2_000)
         {
             self.next_holding_persist = Instant::now() + Duration::from_secs(1);
             if let Err(e) = holding_store::save_to_nvs() {

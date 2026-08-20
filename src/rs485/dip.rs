@@ -11,6 +11,9 @@
 //! 不依赖 esp-idf-hal PinDriver 所有权, 可在 Hal::init 之后随时调用.
 
 use crate::config::pins;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static BOOT_ADDRESS: AtomicU8 = AtomicU8::new(0);
 
 /// 拨码开关读取结果
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,6 +69,7 @@ pub fn read_dip_address() -> DipAddress {
         unsafe { esp_idf_sys::gpio_get_level(pins::ESP_STOP_PIN as esp_idf_sys::gpio_num_t) } != 0;
 
     let address = (ad3 << 3) | (ad2 << 2) | (ad1 << 1) | ad0;
+    BOOT_ADDRESS.store(address, Ordering::Release);
     log::info!(
         "[dip] AD0={} AD1={} AD2={} AD3={} → address={} (gpio {}/{}/{}/{})",
         ad0,
@@ -79,6 +83,12 @@ pub fn read_dip_address() -> DipAddress {
         pins::RS485_ADDR_PINS[3]
     );
     DipAddress { address, esp_stop }
+}
+
+/// 启动时锁存的拨码地址。拨码是物理安全约束，运行期 Web/BLE 写配置
+/// 不能绕过；变更拨码后需重启，与原 MCA 行为一致。
+pub fn boot_address() -> u8 {
+    BOOT_ADDRESS.load(Ordering::Acquire)
 }
 
 /// 应用 DIP 拨码结果到 SystemConfig.rs485[0]

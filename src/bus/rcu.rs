@@ -2,37 +2,43 @@
 //!
 //! 读写锁内只克隆或替换一个 `Arc`，实际读取、业务闭包和旧快照析构均在锁外。
 //! 这里不使用 `arc-swap`：其 debt/TLS 回收路径在 ESP-IDF pthread 环境中会破坏
-//! 相邻 BSS 状态。这个实现牺牲“理论 lock-free”，换取可验证的内存安全和确定性。
+//! 相邻 BSS 状态。快照指针只在调度器互斥量内克隆/替换，避免高优先级 main
+//! 抢占低优先级持有者后永久自旋。
 
-use std::sync::Arc;
-
-use crate::sync::Spin;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// 多读多写安全的不可变快照容器。
 pub struct Rcu<T> {
-    value: Spin<Option<Arc<T>>>,
+    value: Mutex<Option<Arc<T>>>,
 }
 
 impl<T> Rcu<T> {
     /// 构造空容器，第一次读取返回 `None`。
     pub const fn empty() -> Self {
         Self {
-            value: Spin::new(None),
+            value: Mutex::new(None),
         }
     }
 
     /// 创建已初始化容器。
     pub fn new(initial: T) -> Self {
         Self {
-            value: Spin::new(Some(Arc::new(initial))),
+            value: Mutex::new(Some(Arc::new(initial))),
         }
+    }
+
+    #[inline]
+    fn lock_value(&self) -> MutexGuard<'_, Option<Arc<T>>> {
+        self.value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 发布新快照。分配在锁前完成，旧快照在锁外释放。
     pub fn write(&self, new_value: T) {
         let new_value = Arc::new(new_value);
         let old_value = {
-            let mut current = self.value.lock();
+            let mut current = self.lock_value();
             current.replace(new_value)
         };
         drop(old_value);
@@ -40,7 +46,7 @@ impl<T> Rcu<T> {
 
     /// 读取当前快照并转移一个安全的所有权句柄。
     pub fn read(&self) -> Option<Arc<T>> {
-        self.value.lock().clone()
+        self.lock_value().clone()
     }
 
     /// 克隆当前快照值。

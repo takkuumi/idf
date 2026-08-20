@@ -174,8 +174,8 @@ pub fn handle_cfg485(args: &str) -> String {
         );
     }
     let idx = match parse_u16(parts[0]) {
-        Some(i) if i < 2 => i as usize,
-        _ => return err(11, "invalid idx (0..1)"),
+        Some(i) if i < 3 => i as usize,
+        _ => return err(11, "invalid idx (0..2)"),
     };
 
     if parts.len() == 1 {
@@ -257,7 +257,7 @@ pub fn handle_cfgreset(_args: &str) -> String {
 pub fn handle_cfginfo(_args: &str) -> String {
     let s = with_cfg(|c| {
         format!(
-            "sn={},name={},hw=0x{:04X},fw=0x{:04X},cfg_ver={},ip={},mask={},gw={},dhcp={},eth_mac={},ble_mac={},ble_name={},rs485_0=baud{}/slave{},rs485_1=baud{}/slave{}",
+            "sn={},name={},hw=0x{:04X},fw=0x{:04X},cfg_ver={},ip={},mask={},gw={},dhcp={},eth_mac={},ble_mac={},ble_name={},rs485_0=baud{}/slave{},rs485_1=baud{}/slave{},rs485_2=baud{}/slave{}",
             c.sn_str(),
             c.name_str(),
             c.hw_version,
@@ -273,7 +273,9 @@ pub fn handle_cfginfo(_args: &str) -> String {
             c.rs485[0].baudrate,
             c.rs485[0].slave_addr,
             c.rs485[1].baudrate,
-            c.rs485[1].slave_addr
+            c.rs485[1].slave_addr,
+            c.rs485[2].baudrate,
+            c.rs485[2].slave_addr
         )
     });
     ok_data(&s)
@@ -371,4 +373,23 @@ fn with_cfg<R>(f: impl FnOnce(&SystemConfig) -> R) -> R {
 /// 旧 `with_cfg_mut` 不触发 apply, 此处保持一致 (apply 由调用方/Modbus 写 CFG_APPLY 触发).
 fn with_cfg_mut<R>(f: impl FnOnce(&mut SystemConfig) -> R) -> R {
     crate::bus::backends::config_modify_with_result(|cfg| f(cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cfg485_exposes_all_three_legacy_ports() {
+        for index in 0..3 {
+            let response = handle_cfg485(&index.to_string());
+            assert!(response.contains(&format!("idx={index}")), "{response}");
+        }
+        assert!(handle_cfg485("3").contains("invalid idx (0..2)"));
+    }
+
+    #[test]
+    fn cfginfo_includes_third_legacy_port() {
+        assert!(handle_cfginfo("").contains("rs485_2="));
+    }
 }

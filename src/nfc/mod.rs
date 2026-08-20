@@ -708,7 +708,9 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
 
             let command = NFC_COMMAND.swap(NFC_CMD_AUTO, Ordering::AcqRel);
             let local_dirty = crate::bus::storage_state::HOLDING_NFC_DIRTY
-                .load(std::sync::atomic::Ordering::Acquire);
+                .load(std::sync::atomic::Ordering::Acquire)
+                && (command != NFC_CMD_AUTO
+                    || crate::bus::storage_state::storage_mutation_quiet_for(2_000));
             let update_ndef = !ndef_initialized || command == NFC_CMD_BACKUP || local_dirty;
             let mut ndef_failed = false;
             if update_ndef {

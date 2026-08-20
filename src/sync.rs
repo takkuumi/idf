@@ -3,14 +3,14 @@
 //! ## 设计取向
 //! - 高频实时位图 (DI/DO 64 位) → [`AtomicBits64`] (wait-free 读 + CAS 单位写)
 //! - 短临界区 (外设句柄 / legacy Bus / 环日志 / BLE 回调表) → [`Spin`]
-//!   - 非阻塞自旋, 无中毒, 不阻塞内核/调度器
+//!   - 无争用 CAS 快路径；持续争用时协作让出调度器，避免优先级反转
 //! - 多生产者-单消费者消息 (Actor mailbox / 事件总线) → [`MpscRing`]
 //!   - bounded MPSC, 不阻塞, 满即丢
 //!
 //! ## 为什么不用 parking_lot
 //! - parking_lot::Mutex 会把争用线程 park 到 OS (调度器介入, 微秒→毫秒级)
 //! - std::sync::Mutex 可中毒 (持锁线程 panic 时永久不可用)
-//! - 本模块: 所有锁都是短临界区 (≤ 微秒级), 用自旋 + CompareExchange 即可
+//! - 本模块: 所有锁都是短临界区 (≤ 微秒级), 以 CAS 为快路径
 //! - 工业实时路径 (I/O/Modbus) 永不睡眠
 //!
 //! ## 完全去除 parking_lot::Mutex 之后的状态分类
@@ -20,11 +20,11 @@
 //! | health registry | Mutex\<Registry\> | 原子指针表 + AtomicUsize | 真无锁 |
 //! | OTA session / pending | Mutex\<Opt\>/Mutex\<u32\> | 单原子 + Spin\<Opt\> | 准无锁 |
 //! | event_bus | std Mutex\<Queue\> | MpscRing | 非阻塞 (满丢新) |
-//! | ble_at 6 锁 | parking_lot::Mutex | Spin | 短临界区自旋 |
+//! | ble_at 6 锁 | parking_lot::Mutex | Spin | 回调 try_lock / 主循环协作自旋 |
 //! | device NVS | parking_lot::Mutex | std Mutex | Flash 擦写期间让出 CPU |
-//! | legacy Bus | parking_lot::Mutex | Spin + try_lock | 短临界区自旋 |
-//! | HAL 外设句柄 | parking_lot::Mutex | Spin | 短临界区自旋 |
-//! | ringlog | std::sync::Mutex | Spin | 短临界区自旋 |
+//! | legacy Bus | parking_lot::Mutex | Spin + try_lock | 短临界区协作自旋 |
+//! | HAL 外设句柄 | parking_lot::Mutex | Spin | 短临界区协作自旋 |
+//! | ringlog | std::sync::Mutex | Spin | 短临界区协作自旋 |
 
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -33,13 +33,14 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use heapless::spsc::Queue;
 
 // ============================================================================
-// Spin<T> — 非阻塞自旋锁 (短临界区, 无中毒)
+// Spin<T> — 协作式自旋锁 (短临界区, 无中毒)
 // ============================================================================
 //
 // 适用: 单原子级操作无法表达的临界区 (外设句柄 deresf mut, NVS, 大对象借片段).
-// 持锁应在微秒级; 永不 park, 不依赖 OS 调度器.
+// 持锁应在微秒级。争用超过短自旋窗口时让出一个 RTOS tick，避免高优先级
+// 任务抢占低优先级持有者后形成永久优先级反转。
 
-/// 非阻塞自旋锁 (非中毒).
+/// 短临界区协作式自旋锁 (非中毒).
 pub struct Spin<T: ?Sized> {
     flag: AtomicBool,
     inner: UnsafeCell<T>,
@@ -60,17 +61,26 @@ impl<T> Spin<T> {
 }
 
 impl<T: ?Sized> Spin<T> {
-    /// 阻塞自旋直到取得锁 (但不 park 线程).
+    /// 等待直到取得锁。无争用走 CAS 快路径；持续争用时协作让出调度器。
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // 先尝试 CAS 快路径
+        let mut contention = 0u8;
         while self
             .flag
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // CAS 失败: 等持有者释放, 再试 (减少 cache-line contention)
             while self.flag.load(Ordering::Relaxed) {
-                spin_loop();
+                contention = contention.wrapping_add(1);
+                if contention == 0 {
+                    #[cfg(target_os = "espidf")]
+                    unsafe {
+                        esp_idf_sys::vTaskDelay(1);
+                    }
+                    #[cfg(not(target_os = "espidf"))]
+                    std::thread::yield_now();
+                } else {
+                    spin_loop();
+                }
             }
         }
         SpinGuard { lock: self }
@@ -314,20 +324,19 @@ impl<T, const N: usize> MpscRing<T, N> {
         }
     }
 
-    /// 出队 (单消费者); 空返回 None. 阻塞短 Spin, 不 park.
+    /// 出队 (单消费者); 空或瞬时生产者争用均返回 None，下一 tick 重试。
     pub fn dequeue(&self) -> Option<T> {
-        let mut q = self.inner.lock();
-        q.dequeue()
+        self.inner.try_lock().and_then(|mut q| q.dequeue())
     }
 
-    /// 当前长度 (持锁瞬间快照).
+    /// 当前长度；瞬时争用时返回 0，调用者只把它用于诊断。
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.try_lock().map_or(0, |q| q.len())
     }
 
-    /// 是否空 (持锁瞬间快照).
+    /// 是否空；瞬时争用时按非空处理，避免错误宣告队列已排空。
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_empty()
+        self.inner.try_lock().is_some_and(|q| q.is_empty())
     }
 }
 

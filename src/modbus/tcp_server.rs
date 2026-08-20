@@ -638,6 +638,88 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_fc16_writes_contiguous_logic_words() {
+        let address = crate::config::regs::HOLD_DEVICE_CONFIG + 127;
+        let request = [
+            0x22,
+            0x14,
+            0,
+            0,
+            0,
+            13,
+            1,
+            0x10,
+            (address >> 8) as u8,
+            address as u8,
+            0,
+            3,
+            6,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+        ];
+        let mut response = [0u8; MAX_ADU_SIZE];
+        let len = build_response(&request, &BusBackend, &mut response).expect("response");
+        assert_eq!(
+            &response[..len],
+            &[
+                0x22, 0x14, 0, 0, 0, 6, 1, 0x10, request[8], request[9], 0, 3
+            ]
+        );
+        for (offset, expected) in [0x1122, 0x3344, 0x5566].into_iter().enumerate() {
+            assert_eq!(
+                crate::bus::backends::read_hold_reg(address + offset as u16),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_tcp_fc16_invalid_tail_is_rejected_without_partial_write() {
+        let address = crate::config::regs::HOLD_CFG_END;
+        let before = crate::bus::backends::read_hold_reg(address);
+        let request = [
+            0x22,
+            0x15,
+            0,
+            0,
+            0,
+            11,
+            1,
+            0x10,
+            (address >> 8) as u8,
+            address as u8,
+            0,
+            2,
+            4,
+            0xAA,
+            0xAA,
+            0xBB,
+            0xBB,
+        ];
+        let mut response = [0u8; MAX_ADU_SIZE];
+        let len = build_response(&request, &BusBackend, &mut response).expect("response");
+        assert_eq!(
+            &response[..len],
+            &[
+                0x22,
+                0x15,
+                0,
+                0,
+                0,
+                3,
+                1,
+                0x90,
+                crate::modbus::shared::exc::ILLEGAL_DATA_ADDRESS
+            ]
+        );
+        assert_eq!(crate::bus::backends::read_hold_reg(address), before);
+    }
+
+    #[test]
     fn test_tcp_port_set_validation() {
         assert!(ports_are_valid(&[502, 503, 504, 5002]));
         assert!(!ports_are_valid(&[502, 502, 504, 5002]));

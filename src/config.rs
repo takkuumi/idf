@@ -450,6 +450,8 @@ pub mod regs {
     pub const HOLD_485_1_APPERR: u16 = 0x0881;
     pub const HOLD_485_2_COMERR: u16 = 0x0882;
     pub const HOLD_485_2_APPERR: u16 = 0x0883;
+    pub const HOLD_485_3_COMERR: u16 = 0x0884;
+    pub const HOLD_485_3_APPERR: u16 = 0x0885;
     // SN 序列号 (2196-2204 = 9 words = 18 ASCII chars)
     pub const HOLD_SN_BASE: u16 = 2196;
     pub const HOLD_SN_COUNT: u16 = 9;

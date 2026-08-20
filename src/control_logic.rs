@@ -6,7 +6,7 @@
 //! feedback words are derived from configured I/Q points.
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::bus::IO;
@@ -16,7 +16,14 @@ use crate::sync::{MainLoopCell, MpscRing};
 const CONFIG_BASE: u16 = 2300;
 const HOLDING_BASE: u16 = crate::config::regs::HOLD_PXX_BASE;
 const MAX_LOGICS: usize = 32;
+const MAX_ANALOG_CHANNELS: usize = 64;
 const MAX_SCHEDULED: usize = 64;
+const MONITOR_RESULT_COUNT: usize = crate::config::regs::MONITOR_WORD_COUNT as usize;
+const USER_RESULT_BASE: u16 = crate::config::regs::HOLD_USER_BASE;
+const USER_RESULT_COUNT: usize = crate::config::regs::HOLD_USER_COUNT as usize;
+const ANALOG_RESULT_COUNT: usize = MONITOR_RESULT_COUNT + USER_RESULT_COUNT;
+const RESULT_MASK_BITS: usize = 32;
+const ANALOG_MASK_WORDS: usize = ANALOG_RESULT_COUNT.div_ceil(RESULT_MASK_BITS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ControlSpec {
@@ -39,9 +46,21 @@ struct IoLogic {
     controls: Vec<ControlSpec>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnalogChannel {
+    source: u8,
+    destination: u16,
+    minimum: u16,
+    maximum: u16,
+    unit_minimum: u16,
+    unit_maximum: u16,
+    reference: u16,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicTable {
     entries: Vec<IoLogic>,
+    analog_channels: Vec<AnalogChannel>,
 }
 
 impl Default for LogicTable {
@@ -51,6 +70,7 @@ impl Default for LogicTable {
         // allocations consuming scarce internal SRAM.
         Self {
             entries: Vec::with_capacity(MAX_LOGICS),
+            analog_channels: Vec::with_capacity(MAX_ANALOG_CHANNELS),
         }
     }
 }
@@ -81,6 +101,12 @@ static CONFIG_GENERATION: AtomicU32 = AtomicU32::new(1);
 static TABLE_GENERATION: AtomicU32 = AtomicU32::new(0);
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static TRANSIENT_MASK: crate::sync::AtomicBits64 = crate::sync::AtomicBits64::new(0);
+static ANALOG_VALUES: [AtomicU16; ANALOG_RESULT_COUNT] =
+    [const { AtomicU16::new(0) }; ANALOG_RESULT_COUNT];
+static ANALOG_VALID: [AtomicU32; ANALOG_MASK_WORDS] =
+    [const { AtomicU32::new(0) }; ANALOG_MASK_WORDS];
+static ANALOG_VERSION: AtomicU32 = AtomicU32::new(0);
+static LAST_ANALOG_UPDATE_MS: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 fn now_ms() -> u64 {
@@ -90,10 +116,13 @@ fn now_ms() -> u64 {
 pub fn init() {
     let _ = SCHEDULED.init(Vec::with_capacity(MAX_SCHEDULED));
     refresh_table();
-    let count = TABLE.read_with(|table| table.entries.len()).unwrap_or(0);
+    let (count, analog_count) = TABLE
+        .read_with(|table| (table.entries.len(), table.analog_channels.len()))
+        .unwrap_or((0, 0));
     log::info!(
-        "[control] MCA IO control table loaded: {} logic records",
-        count
+        "[control] MCA table loaded: {} IO records, {} analog channels",
+        count,
+        analog_count
     );
 }
 pub fn mark_config_changed() {
@@ -118,6 +147,126 @@ fn bit_words(words: &[u16], start: usize, count: usize) -> u64 {
         result |= (word as u64) << (logical_word * 16);
     }
     result
+}
+
+fn result_index(address: u16) -> Option<usize> {
+    if (address as usize) < MONITOR_RESULT_COUNT {
+        return Some(address as usize);
+    }
+    let index = address.checked_sub(USER_RESULT_BASE)? as usize;
+    (index < USER_RESULT_COUNT).then_some(MONITOR_RESULT_COUNT + index)
+}
+
+fn analog_destination_is_valid(channel: AnalogChannel) -> bool {
+    let words = if channel.has_engineering_range() {
+        2
+    } else {
+        1
+    };
+    let Some(last) = channel.destination.checked_add(words - 1) else {
+        return false;
+    };
+    matches!(
+        (result_index(channel.destination), result_index(last)),
+        (Some(first), Some(last)) if last - first + 1 == words as usize
+    )
+}
+
+impl AnalogChannel {
+    fn has_engineering_range(self) -> bool {
+        self.maximum > self.minimum && self.unit_maximum > self.unit_minimum
+    }
+
+    fn encode(self, raw: u16) -> ([u16; 2], usize) {
+        if !self.has_engineering_range() {
+            return ([raw, 0], 1);
+        }
+
+        // Arduino `map()` in MCA works with signed integers. It maps min/max
+        // multiplied by 100 and only then converts to float, preserving the
+        // legacy two-decimal quantisation exactly.
+        let input_min = 4096i64 * i64::from(self.unit_minimum) / i64::from(self.reference);
+        let input_max = 4096i64 * i64::from(self.unit_maximum) / i64::from(self.reference) - 1;
+        if input_max <= input_min {
+            return ([raw, 0], 1);
+        }
+        let input = i64::from(raw).clamp(input_min, input_max);
+        let output_min = i64::from(self.minimum) * 100;
+        let output_max = i64::from(self.maximum) * 100;
+        let scaled =
+            (input - input_min) * (output_max - output_min) / (input_max - input_min) + output_min;
+        let bits = ((scaled as f32) / 100.0).to_bits();
+        ([(bits >> 16) as u16, bits as u16], 2)
+    }
+}
+
+fn parse_channels(record_words: &[u16], header: usize, target: &mut Vec<AnalogChannel>) {
+    let Some(channel_header) = record_words.get(header).copied() else {
+        return;
+    };
+    let [channel_bytes, channel_count] = channel_header.to_be_bytes();
+    let channel_words = usize::from(channel_bytes) / 2;
+    if channel_words < 6 || channel_count == 0 {
+        return;
+    }
+    let channels_start = header + 1;
+    for channel_index in 0..usize::from(channel_count) {
+        if target.len() >= MAX_ANALOG_CHANNELS {
+            break;
+        }
+        let start = channels_start + channel_index * channel_words;
+        let Some(channel) = record_words.get(start).copied() else {
+            break;
+        };
+        if channel == 0 || channel > 16 {
+            continue;
+        }
+        let Some(&minimum) = record_words.get(start + 2) else {
+            continue;
+        };
+        let Some(&maximum) = record_words.get(start + 3) else {
+            continue;
+        };
+        let Some(&destination) = record_words.get(start + 4) else {
+            continue;
+        };
+        let unit_minimum = record_words.get(start + 6).copied().unwrap_or(0);
+        let unit_maximum = record_words.get(start + 7).copied().unwrap_or(20);
+        let parsed = AnalogChannel {
+            source: ((channel - 1) / 2) as u8,
+            destination,
+            minimum,
+            maximum,
+            unit_minimum,
+            unit_maximum,
+            reference: if channel.is_multiple_of(2) { 10 } else { 20 },
+        };
+        if analog_destination_is_valid(parsed) {
+            target.push(parsed);
+        }
+    }
+}
+
+fn rs485_channel_header(record_words: &[u16], start: usize) -> Option<usize> {
+    let function_header = *record_words.get(start + 5)?;
+    let [function_bytes, function_count] = function_header.to_be_bytes();
+    if function_bytes != 6 {
+        return None;
+    }
+    let mut cursor = start + 6;
+    for _ in 0..function_count {
+        let register_header = *record_words.get(cursor + 3)?;
+        let [register_bytes, register_count] = register_header.to_be_bytes();
+        if register_bytes == 0 || !register_bytes.is_multiple_of(2) {
+            return None;
+        }
+        cursor = cursor
+            .checked_add(4 + usize::from(register_bytes / 2) * usize::from(register_count))?;
+        if cursor > record_words.len() {
+            return None;
+        }
+    }
+    Some(cursor)
 }
 
 fn parse_table(words: &[u16]) -> LogicTable {
@@ -153,10 +302,21 @@ fn parse_table(words: &[u16]) -> LogicTable {
             continue;
         };
         let record_words = &words[..end_index];
+        let base_index = usize::from(start_addr - HOLDING_BASE);
         let Some(attribute) = holding_word(record_words, start_addr) else {
             continue;
         };
         let attribute = attribute.to_be_bytes()[1];
+        if attribute == 3 {
+            parse_channels(record_words, base_index + 4, &mut table.analog_channels);
+            continue;
+        }
+        if attribute == 4 {
+            if let Some(header) = rs485_channel_header(record_words, base_index) {
+                parse_channels(record_words, header, &mut table.analog_channels);
+            }
+            continue;
+        }
         if attribute != 1 && attribute != 5 {
             continue;
         }
@@ -167,7 +327,6 @@ fn parse_table(words: &[u16]) -> LogicTable {
         };
         let [q_bytes, q_count] = q_header.to_be_bytes();
         let q_words = (usize::from(q_bytes).saturating_add(1)) / 2;
-        let base_index = usize::from(start_addr - HOLDING_BASE);
         let q_start = base_index + 5;
         let mut q_points = heapless::Vec::<u8, 64>::new();
         for point in 0..usize::from(q_count) {
@@ -273,8 +432,62 @@ fn refresh_table() {
     let table = storage_read()
         .map(|s| parse_table(&s.holding_buf))
         .unwrap_or_default();
+    publish_analog_ranges(&table.analog_channels);
     TABLE.write(table);
     TABLE_GENERATION.store(generation, Ordering::Release);
+}
+
+fn publish_analog_ranges(channels: &[AnalogChannel]) {
+    ANALOG_VERSION.fetch_add(1, Ordering::AcqRel);
+    for value in &ANALOG_VALUES {
+        value.store(0, Ordering::Release);
+    }
+    let mut masks = [0u32; ANALOG_MASK_WORDS];
+    for channel in channels {
+        let start = result_index(channel.destination).expect("validated analog destination");
+        let count = if channel.has_engineering_range() {
+            2
+        } else {
+            1
+        };
+        for index in start..start + count {
+            masks[index / RESULT_MASK_BITS] |= 1u32 << (index % RESULT_MASK_BITS);
+        }
+    }
+    for (target, mask) in ANALOG_VALID.iter().zip(masks) {
+        target.store(mask, Ordering::Release);
+    }
+    ANALOG_VERSION.fetch_add(1, Ordering::Release);
+}
+
+fn update_analog_results(table: &LogicTable) {
+    if table.analog_channels.is_empty() {
+        return;
+    }
+    ANALOG_VERSION.fetch_add(1, Ordering::AcqRel);
+    for channel in &table.analog_channels {
+        let raw = IO.ai.get_scaled(channel.source as usize);
+        let (words, count) = channel.encode(raw);
+        let start = result_index(channel.destination).expect("validated analog destination");
+        for (offset, value) in words[..count].iter().copied().enumerate() {
+            ANALOG_VALUES[start + offset].store(value, Ordering::Release);
+        }
+    }
+    ANALOG_VERSION.fetch_add(1, Ordering::Release);
+}
+
+pub fn analog_result_word(address: u16) -> Option<u16> {
+    let index = result_index(address)?;
+    let mask = ANALOG_VALID[index / RESULT_MASK_BITS].load(Ordering::Acquire);
+    if mask & (1u32 << (index % RESULT_MASK_BITS)) == 0 {
+        return None;
+    }
+    Some(ANALOG_VALUES[index].load(Ordering::Acquire))
+}
+
+#[inline]
+pub fn analog_result_version() -> u32 {
+    ANALOG_VERSION.load(Ordering::Acquire)
 }
 
 fn point_scope(points: &[u8]) -> u64 {
@@ -310,15 +523,15 @@ pub fn on_control_word_written(address: u16, value: u16) {
     refresh_table();
     let _ = TABLE.read_with(|table| {
         for logic in &table.entries {
-            if let Some(command) = command_for_logic(logic, address, value) {
-                if !COMMANDS.try_enqueue(command) {
-                    log::warn!(
-                        "[control] command queue full; dropped logic={} address={} value={}",
-                        logic.logic_id,
-                        address,
-                        value
-                    );
-                }
+            if let Some(command) = command_for_logic(logic, address, value)
+                && !COMMANDS.try_enqueue(command)
+            {
+                log::warn!(
+                    "[control] command queue full; dropped logic={} address={} value={}",
+                    logic.logic_id,
+                    address,
+                    value
+                );
             }
         }
     });
@@ -372,6 +585,13 @@ fn apply_output(mask: u64, value: u64, transient: bool) {
 }
 
 pub fn tick() {
+    refresh_table();
+    let now = now_ms();
+    let last = LAST_ANALOG_UPDATE_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(u64::from(last)) >= 100 {
+        let _ = TABLE.read_with(update_analog_results);
+        LAST_ANALOG_UPDATE_MS.store(now as u32, Ordering::Relaxed);
+    }
     while let Some(command) = COMMANDS.dequeue() {
         let due = now_ms().saturating_add(u64::from(command.delay_ms));
         let _ = SCHEDULED.with_mut(|scheduled| {
@@ -455,6 +675,7 @@ mod tests {
         let second = logic(1, 17, 18, 1u64 << 5);
         let table = LogicTable {
             entries: vec![first, second],
+            analog_channels: Vec::new(),
         };
         assert_eq!(
             table
@@ -518,5 +739,84 @@ mod tests {
         words[start] = 1;
         words[start + 4] = 0x0401;
         assert!(parse_table(&words).entries.is_empty());
+    }
+
+    fn analog_words(attribute: u8, channel: u16, destination: u16) -> Vec<u16> {
+        let mut words = vec![0u16; 256];
+        let base = (CONFIG_BASE - HOLDING_BASE) as usize;
+        words[base] = 1;
+        words[base + 1] = 3;
+        words[base + 2] = 16;
+        let start = base + 3;
+        words[start] = u16::from(attribute);
+        words[start + 4] = 0x1001;
+        words[start + 5] = channel;
+        words[start + 6] = 0;
+        words[start + 7] = 0;
+        words[start + 8] = 100;
+        words[start + 9] = destination;
+        words[start + 10] = 0;
+        words[start + 11] = 4;
+        words[start + 12] = 20;
+        words
+    }
+
+    #[test]
+    fn parses_legacy_analog_channel_and_odd_channel_uses_20ma_reference() {
+        let table = parse_table(&analog_words(3, 1, 4001));
+        assert_eq!(table.analog_channels.len(), 1);
+        let channel = table.analog_channels[0];
+        assert_eq!(channel.source, 0);
+        assert_eq!(channel.reference, 20);
+        assert_eq!(channel.destination, 4001);
+    }
+
+    #[test]
+    fn even_channel_uses_10v_reference_and_maps_to_big_endian_f32_words() {
+        let channel = AnalogChannel {
+            source: 0,
+            destination: 2,
+            minimum: 0,
+            maximum: 100,
+            unit_minimum: 0,
+            unit_maximum: 10,
+            reference: 10,
+        };
+        let (encoded, count) = channel.encode(2048);
+        assert_eq!(count, 2);
+        let value = f32::from_bits((u32::from(encoded[0]) << 16) | u32::from(encoded[1]));
+        assert!(
+            (value - 50.01).abs() < 0.02,
+            "legacy integer map value={value}"
+        );
+    }
+
+    #[test]
+    fn invalid_or_absent_range_publishes_raw_value_in_one_word() {
+        let channel = AnalogChannel {
+            source: 0,
+            destination: 127,
+            minimum: 0,
+            maximum: 0,
+            unit_minimum: 0,
+            unit_maximum: 20,
+            reference: 20,
+        };
+        assert_eq!(channel.encode(3065), ([3065, 0], 1));
+        assert!(analog_destination_is_valid(channel));
+    }
+
+    #[test]
+    fn two_word_float_cannot_cross_monitor_and_user_result_areas() {
+        let channel = AnalogChannel {
+            source: 0,
+            destination: 127,
+            minimum: 0,
+            maximum: 100,
+            unit_minimum: 4,
+            unit_maximum: 20,
+            reference: 20,
+        };
+        assert!(!analog_destination_is_valid(channel));
     }
 }

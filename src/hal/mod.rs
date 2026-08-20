@@ -215,4 +215,18 @@ impl Hal {
             &self.io_ext
         }
     }
+
+    /// Update the physical Bluetooth status LED where this board variant has
+    /// the MCA-compatible status expander.
+    pub fn set_bt_led(&self, connected: bool) -> AppResult<()> {
+        #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
+        {
+            self.pca9555.set_bt_led(connected)
+        }
+        #[cfg(not(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4")))))]
+        {
+            let _ = connected;
+            Ok(())
+        }
+    }
 }

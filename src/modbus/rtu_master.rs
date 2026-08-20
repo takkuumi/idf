@@ -43,18 +43,19 @@ static RESULT_VALUES: [AtomicU16; RESULT_COUNT] = [const { AtomicU16::new(0) }; 
 static RESULT_VALID: [AtomicU32; RESULT_MASK_WORDS] =
     [const { AtomicU32::new(0) }; RESULT_MASK_WORDS];
 static RESULT_VERSION: AtomicU32 = AtomicU32::new(0);
+static RESULT_WRITERS: AtomicU32 = AtomicU32::new(0);
 
 /// 单条轮询任务
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PollItem {
+pub(crate) struct PollItem {
     /// 组态中的端口号，1 = RS485-1。
-    port: u8,
-    slave: u8,
-    func: u8,
-    start: u16,
-    count: u16,
+    pub(crate) port: u8,
+    pub(crate) slave: u8,
+    pub(crate) func: u8,
+    pub(crate) start: u16,
+    pub(crate) count: u16,
     /// 收到数据后写回的主机镜像起始地址。
-    dest_reg: u16,
+    pub(crate) dest_reg: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +77,17 @@ pub fn read_result_reg(addr: u16) -> Option<u16> {
 
 #[inline]
 pub fn result_version() -> u32 {
-    RESULT_VERSION.load(Ordering::Acquire)
+    let writers = RESULT_WRITERS.load(Ordering::Acquire);
+    RESULT_VERSION.load(Ordering::Acquire) | u32::from(writers != 0)
+}
+
+fn begin_result_write() {
+    RESULT_WRITERS.fetch_add(1, Ordering::AcqRel);
+}
+
+fn end_result_write() {
+    RESULT_VERSION.fetch_add(2, Ordering::Release);
+    RESULT_WRITERS.fetch_sub(1, Ordering::Release);
 }
 
 /// 批量编码主站镜像。`None` 表示起始地址不属于镜像区，`Some(false)` 表示
@@ -87,7 +98,7 @@ pub fn encode_result_regs_be(addr: u16, count: u16, out: &mut [u8]) -> Option<bo
         return Some(false);
     }
     for attempt in 0..4 {
-        let before = RESULT_VERSION.load(Ordering::Acquire);
+        let before = result_version();
         if before & 1 != 0 {
             if attempt < 3 {
                 std::hint::spin_loop();
@@ -104,7 +115,7 @@ pub fn encode_result_regs_be(addr: u16, count: u16, out: &mut [u8]) -> Option<bo
             out[offset * 2..offset * 2 + 2]
                 .copy_from_slice(&RESULT_VALUES[index].load(Ordering::Acquire).to_be_bytes());
         }
-        if RESULT_VERSION.load(Ordering::Acquire) == before {
+        if result_version() == before {
             return Some(true);
         }
     }
@@ -132,13 +143,13 @@ fn result_range_is_valid(start: u16, count: u16) -> bool {
     }
 }
 
-fn publish_result_ranges(items: &[PollItem]) {
-    RESULT_VERSION.fetch_add(1, Ordering::AcqRel);
+pub(crate) fn publish_result_ranges(items: &[PollItem]) {
+    begin_result_write();
     for value in &RESULT_VALUES {
         value.store(0, Ordering::Release);
     }
     let mut masks = [0u32; RESULT_MASK_WORDS];
-    for item in items.iter().filter(|item| item.port == 1) {
+    for item in items {
         let start = result_index(item.dest_reg).expect("validated poll result address");
         for index in start..start + item.count as usize {
             masks[index / RESULT_MASK_BITS] |= 1u32 << (index % RESULT_MASK_BITS);
@@ -147,11 +158,11 @@ fn publish_result_ranges(items: &[PollItem]) {
     for (target, mask) in RESULT_VALID.iter().zip(masks) {
         target.store(mask, Ordering::Release);
     }
-    RESULT_VERSION.fetch_add(1, Ordering::Release);
+    end_result_write();
 }
 
 fn write_result(item: PollItem, values: &[u16]) {
-    RESULT_VERSION.fetch_add(1, Ordering::AcqRel);
+    begin_result_write();
     let start = result_index(item.dest_reg).expect("validated poll result address");
     for (offset, value) in values.iter().copied().enumerate() {
         if offset >= item.count as usize {
@@ -159,16 +170,16 @@ fn write_result(item: PollItem, values: &[u16]) {
         }
         RESULT_VALUES[start + offset].store(value, Ordering::Release);
     }
-    RESULT_VERSION.fetch_add(1, Ordering::Release);
+    end_result_write();
 }
 
-fn clear_result(item: PollItem) {
-    RESULT_VERSION.fetch_add(1, Ordering::AcqRel);
+pub(crate) fn clear_result(item: PollItem) {
+    begin_result_write();
     let start = result_index(item.dest_reg).expect("validated poll result address");
     for value in &RESULT_VALUES[start..start + item.count as usize] {
         value.store(0, Ordering::Release);
     }
-    RESULT_VERSION.fetch_add(1, Ordering::Release);
+    end_result_write();
 }
 
 fn holding_word(words: &[u16], addr: u16) -> Option<u16> {
@@ -303,7 +314,7 @@ pub(crate) fn validate_poll_config(words: &[u16]) -> Result<PollConfigSummary, &
     })
 }
 
-fn load_poll_table() -> Result<heapless::Vec<PollItem, MAX_POLL_ITEMS>, &'static str> {
+pub(crate) fn load_poll_table() -> Result<heapless::Vec<PollItem, MAX_POLL_ITEMS>, &'static str> {
     let storage = crate::bus::storage_state::storage_read().ok_or("storage unavailable")?;
     parse_poll_table(&storage.holding_buf)
 }
@@ -414,7 +425,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
 }
 
 /// 带重试的轮询: 失败重试 MAX_RETRY 次, 间隔 100ms
-fn poll_with_retry(
+pub(crate) fn poll_with_retry(
     port: &mut Rs485Port,
     item: PollItem,
     max_retry: u32,
@@ -440,12 +451,13 @@ fn poll_with_retry(
 }
 
 fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult<()> {
+    let stats_port = usize::from(item.port.saturating_sub(1));
     let req = build_request(item);
     let resp = match port.send_recv(&req, timeout_ms) {
         Ok(r) => r,
         Err(_) => {
             // LOOP14: 主站通信错误 (超时) → 累加 RS485_1_COMERR
-            crate::modbus::shared::RS485_STATS.inc_master_comerr();
+            crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
             return Err(crate::error::AppError::Modbus("timeout".into()));
         }
     };
@@ -453,14 +465,14 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     if resp.is_empty() {
         // send_recv 返回空帧表示在 deadline 内没有收到首字节，语义是超时而非
         // 从站返回了一个格式错误的短帧；两者分别计入 COMERR/APPERR。
-        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(
             "timeout: empty response".into(),
         ));
     }
     if resp.len() < 5 {
         // LOOP14: 帧太短 (通信错误) → 累加 COMERR
-        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "short resp: {} bytes",
             resp.len()
@@ -470,7 +482,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     // 校验从站地址
     if resp[0] != item.slave {
         // LOOP14: 从站地址不匹配 (通信错误) → 累加 COMERR
-        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "slave mismatch: {}!={}",
             resp[0], item.slave
@@ -483,7 +495,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     let recv_crc = u16::from_le_bytes([resp[n - 2], resp[n - 1]]);
     if crc != recv_crc {
         // LOOP14: CRC 校验失败 (通信错误) → 累加 COMERR
-        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "crc mismatch: {:#06x}!={:#06x}",
             crc, recv_crc
@@ -493,19 +505,19 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     // 异常响应必须对应本次请求，且标准长度固定为 5 字节。
     if resp[1] == (item.func | 0x80) {
         if n != 5 {
-            crate::modbus::shared::RS485_STATS.inc_master_comerr();
+            crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
             return Err(crate::error::AppError::Modbus(format!(
                 "invalid exception length: {n}"
             )));
         }
-        crate::modbus::shared::RS485_STATS.inc_master_apperr();
+        crate::modbus::shared::RS485_STATS.inc_port_apperr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "exception: {:02x}",
             resp[2]
         )));
     }
     if resp[1] != item.func {
-        crate::modbus::shared::RS485_STATS.inc_master_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "function mismatch: {:02x}!={:02x}",
             resp[1], item.func
@@ -515,7 +527,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     // 解析寄存器数据 (FC=03/04) 并写回 bus
     if item.func == 0x03 || item.func == 0x04 {
         let data = register_data(&resp, item).inspect_err(|_| {
-            crate::modbus::shared::RS485_STATS.inc_master_apperr();
+            crate::modbus::shared::RS485_STATS.inc_port_apperr(stats_port);
         })?;
         // Modbus RTU FC=03/04 单帧最多 125 reg, 用 heapless::Vec 避免 heap 分配
         let mut regs: heapless::Vec<u16, 128> = heapless::Vec::new();
@@ -534,7 +546,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         write_result(item, &regs);
     } else if item.func == 0x01 || item.func == 0x02 {
         let data = response_data(&resp, item).inspect_err(|_| {
-            crate::modbus::shared::RS485_STATS.inc_master_apperr();
+            crate::modbus::shared::RS485_STATS.inc_port_apperr(stats_port);
         })?;
         // 对齐 C++ BEBufToUint16：位响应按相邻两个数据字节组成一个结果字，
         // 奇数字节在低位补 0。未覆盖的目标字保留，失败路径才整体清零。
@@ -548,7 +560,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         write_result(item, &words);
     }
 
-    crate::modbus::shared::RS485_STATS.mark_master_ok();
+    crate::modbus::shared::RS485_STATS.mark_port_ok(stats_port);
 
     Ok(())
 }

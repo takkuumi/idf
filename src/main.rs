@@ -421,7 +421,7 @@ fn main_loop(
         // BLE 请求与通知按 10ms 调度，避免手持机配置命令额外等待 100ms。
         if tick.is_multiple_of(BLE_PROCESS_PERIOD_MS as u32 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(feature = "ble-at")]
-            perf.measure(6, ble_at::process_tick);
+            perf.measure(6, || ble_at::process_tick(&hal));
         }
 
         // 消费 IO 事件 (避免事件队列满, 触发重置丢失关键状态变化)

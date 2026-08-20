@@ -1209,6 +1209,18 @@ const C_BAUD_TABLE: [u32; 16] = [
     256000, 460800, 921600,
 ];
 
+/// 旧 Web API 使用 1=Master、0/2=Slave；内部配置使用 0=Master、非 0=Slave。
+/// 转换只能发生在 HTTP 边界，否则直接保存旧值会让主从角色完全相反。
+#[inline]
+fn internal_to_legacy_port_mode(mode: u8) -> u8 {
+    if mode == 0 { 1 } else { 2 }
+}
+
+#[inline]
+fn legacy_to_internal_port_mode(mode: u8) -> u8 {
+    if mode == 1 { 0 } else { 1 }
+}
+
 /// GET /getportconfig — 对齐 C++ handleGetPortConfig 字段格式
 /// C++ 字段: datalen/checkmode/stopbit/baud/masterslaveport/slaveaddress/retrycount/responeinteval/tti
 /// C++ baud 是 4 位索引 (0..15)，datalen 是 0=8bit/1=7bit, stopbit 是 0=1bit/1=2bit
@@ -1237,7 +1249,7 @@ fn handle_get_port_config(stream: &mut TcpStream, _req: &HttpRequest) -> std::io
                     i,
                     baud_idx,
                     i,
-                    r.mode,
+                    internal_to_legacy_port_mode(r.mode),
                     i,
                     r.slave_addr,
                     i,
@@ -1340,7 +1352,7 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
     }
     crate::bus::backends::config_modify(|cfg| {
         cfg.rs485[index].baudrate = baud;
-        cfg.rs485[index].mode = mode;
+        cfg.rs485[index].mode = legacy_to_internal_port_mode(mode);
         cfg.rs485[index].slave_addr = slave_addr as u8;
         cfg.rs485[index].data_bits = databits;
         cfg.rs485[index].stop_bits = stopbits;
@@ -1396,7 +1408,7 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
     };
     let udp = crate::udp_multicast::is_receiving();
     let json = format!(
-        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{}}}}}"#,
+        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"rs485_3_comerr":{},"rs485_3_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{}}}}}"#,
         IO.sys.get_uptime(),
         eth,
         ble,
@@ -1412,10 +1424,12 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
         },
         udp,
         crate::udp_multicast::received_len(),
-        crate::modbus::shared::RS485_STATS.master_comerr(),
-        crate::modbus::shared::RS485_STATS.master_apperr(),
-        crate::modbus::shared::RS485_STATS.slave_comerr(),
-        crate::modbus::shared::RS485_STATS.slave_apperr(),
+        crate::modbus::shared::RS485_STATS.port_comerr(0),
+        crate::modbus::shared::RS485_STATS.port_apperr(0),
+        crate::modbus::shared::RS485_STATS.port_comerr(1),
+        crate::modbus::shared::RS485_STATS.port_apperr(1),
+        crate::modbus::shared::RS485_STATS.port_comerr(2),
+        crate::modbus::shared::RS485_STATS.port_apperr(2),
         mode,
         stats.recoverable,
         stats.degradable,
@@ -2075,6 +2089,16 @@ mod tests {
             pages::INDEX_HTML.contains("onchange=\"toggleDO(${n},this.checked)\""),
             "display must be one-based without changing the zero-based control address"
         );
+    }
+
+    #[test]
+    fn test_legacy_web_port_mode_round_trip() {
+        assert_eq!(legacy_to_internal_port_mode(1), 0, "legacy 1 is master");
+        assert_eq!(legacy_to_internal_port_mode(0), 1, "legacy 0 is slave");
+        assert_eq!(legacy_to_internal_port_mode(2), 1, "legacy 2 is slave");
+        assert_eq!(internal_to_legacy_port_mode(0), 1);
+        assert_eq!(internal_to_legacy_port_mode(1), 2);
+        assert_eq!(internal_to_legacy_port_mode(2), 2);
     }
 
     // ---- LOOP11: 会话管理回归测试 ----

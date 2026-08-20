@@ -81,7 +81,7 @@ fn read_multicast_config() -> MulticastConfig {
             mcast_port
         };
         let switch_ip = if switch_ip12 == 0 && switch_ip34 == 0 {
-            None // 不过滤源 IP
+            None // 旧固件会与 0.0.0.0 精确比较，因此普通来源全部拒绝
         } else {
             Some([
                 (switch_ip12 >> 8) as u8,
@@ -194,7 +194,7 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
             sip[3]
         );
     } else {
-        log::info!("[udp-mcast] source IP filter: DISABLED (accept all)");
+        log::warn!("[udp-mcast] source IP filter is unconfigured; dropping all packets");
     }
 
     let mut buf = [0u8; regs::MULTICAST_BUF_SIZE];
@@ -205,11 +205,9 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
         match sock.recv_from(&mut buf) {
             Ok((len, src)) => {
                 // 源 IP 过滤 (对齐参考固件: 仅接受来自 SWITCH_IP 的包)
-                if let Some(sip) = cfg.switch_ip
-                    && !src_ip_matches(&src, sip)
-                {
+                if !source_is_allowed(&src, cfg.switch_ip) {
                     log::debug!(
-                        "[udp-mcast] dropped packet from {} (filter mismatch)",
+                        "[udp-mcast] dropped packet from {} (source IP unconfigured or mismatch)",
                         src.ip()
                     );
                     continue;
@@ -255,6 +253,10 @@ fn src_ip_matches(src: &SocketAddr, filter: [u8; 4]) -> bool {
         IpAddr::V4(v4) => v4.octets() == filter,
         _ => false,
     }
+}
+
+fn source_is_allowed(src: &SocketAddr, filter: Option<[u8; 4]>) -> bool {
+    filter.is_some_and(|expected| src_ip_matches(src, expected))
 }
 
 /// 通过 setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP) 加入 IPv4 组播组
@@ -395,5 +397,19 @@ mod tests {
             ipv4_s_addr([192, 168, 51, 221]).to_ne_bytes(),
             [192, 168, 51, 221]
         );
+    }
+
+    #[test]
+    fn multicast_source_requires_an_exact_configured_ipv4_address() {
+        let source: SocketAddr = "192.168.51.221:5002".parse().unwrap();
+        assert!(!source_is_allowed(&source, None));
+        assert!(source_is_allowed(&source, Some([192, 168, 51, 221])));
+        assert!(!source_is_allowed(&source, Some([192, 168, 51, 222])));
+    }
+
+    #[test]
+    fn multicast_source_does_not_treat_ipv6_as_ipv4() {
+        let source: SocketAddr = "[::ffff:192.168.51.221]:5002".parse().unwrap();
+        assert!(!source_is_allowed(&source, Some([192, 168, 51, 221])));
     }
 }

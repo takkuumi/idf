@@ -1,12 +1,12 @@
-//! 应用层数据总线 - 细粒度无锁分片架构 (Phase 2, legacy `Spin<Bus>` 已退役)
+//! 应用层数据总线 - 细粒度快照分片架构 (legacy `Spin<Bus>` 已退役)
 //!
-//! 三段独立无锁状态:
+//! 三段独立状态:
 //!
 //! | 子模块 | 内容 | 大小 | 实现 | 访问频率 |
 //! |-------|------|------|------|---------|
 //! | [`io_state`] | di/do_/ai/ao/sys | ~80B | 无锁 (AtomicBits64 / Atomic*) | 5-100ms 高频 |
-//! | [`storage_state`] | proto/device_text/holding_buf | ~11KB | Arc 快照 | 偶尔 |
-//! | [`config_state`] | SystemConfig | ~160B | RCU 无锁 | 偶尔 |
+//! | [`storage_state`] | proto/device_text/holding_buf | ~11KB | Arc 快照 + 短互斥发布 | 偶尔 |
+//! | [`config_state`] | SystemConfig | ~160B | Arc 快照 + 短互斥发布 | 偶尔 |
 //!
 //! `proto.status` 状态机 (commit=1 / reload=2 / failed=3) 由
 //! [`storage_state::PROTO_STATUS_ATOMIC`] 独立承担 — 不进 RCU 快照, 高频写无需克隆 11KB.

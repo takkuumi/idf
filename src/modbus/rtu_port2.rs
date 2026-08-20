@@ -15,7 +15,7 @@ use crate::config::modbus::rtu_port2 as cfg;
 use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::health::{self, TaskHb};
-use crate::modbus::shared::{BusBackend, modbus_crc16};
+use crate::modbus::shared::BusBackend;
 use crate::rs485::{Rs485Config, Rs485Port};
 
 /// 任务心跳记录 (静态分配, main_loop 监控)
@@ -51,7 +51,13 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,
                     Ok(n) => {
-                        if let Err(e) = handle_request(&mut port, &backend, &buf[..n], slave_addr) {
+                        if let Err(e) = crate::modbus::rtu_slave::handle_request(
+                            &mut port,
+                            &backend,
+                            &buf[..n],
+                            slave_addr,
+                            2,
+                        ) {
                             log::warn!("[mb-rtu-port2] handle: {}", e);
                         }
                     }
@@ -73,56 +79,4 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         slave_addr
     );
     Ok(())
-}
-
-fn handle_request(
-    port: &mut Rs485Port,
-    backend: &BusBackend,
-    req: &[u8],
-    addr: u8,
-) -> AppResult<()> {
-    if req.len() < 4 {
-        return Ok(());
-    }
-
-    let slave = req[0];
-    if slave != 0 && slave != addr {
-        return Ok(());
-    }
-
-    let n = req.len();
-    let crc = modbus_crc16(&req[..n - 2]);
-    let recv_crc = u16::from_le_bytes([req[n - 2], req[n - 1]]);
-    if crc != recv_crc {
-        log::debug!(
-            "[mb-rtu-port2] crc mismatch: {:#06x}!={:#06x}",
-            crc,
-            recv_crc
-        );
-        return Ok(());
-    }
-
-    let func = req[1];
-    let resp = build_response(backend, slave, func, &req[2..n - 2]);
-
-    if slave == 0 {
-        return Ok(());
-    }
-
-    port.write(&resp)?;
-    Ok(())
-}
-
-fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> heapless::Vec<u8, 256> {
-    let mut out: heapless::Vec<u8, 256> = heapless::Vec::new();
-    let _ = out.push(slave);
-    let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
-    let pdu_len = crate::modbus::shared::handle_pdu(backend, func, pdu, &mut pdu_buf);
-    if pdu_len >= 2 {
-        let _ = out.extend_from_slice(&pdu_buf[..pdu_len]);
-    }
-    let crc = modbus_crc16(&out);
-    let _ = out.push(crc as u8);
-    let _ = out.push((crc >> 8) as u8);
-    out
 }

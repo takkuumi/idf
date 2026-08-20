@@ -123,6 +123,8 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>RS485-1 应用错误</label><output class="read-value" id="st_rtu1_app">-</output></div>
         <div class="field"><label>RS485-2 通信错误</label><output class="read-value" id="st_rtu2_com">-</output></div>
         <div class="field"><label>RS485-2 应用错误</label><output class="read-value" id="st_rtu2_app">-</output></div>
+        <div class="field"><label>RS485-3 通信错误</label><output class="read-value" id="st_rtu3_com">-</output></div>
+        <div class="field"><label>RS485-3 应用错误</label><output class="read-value" id="st_rtu3_app">-</output></div>
         <div class="field"><label>恢复模式</label><output class="read-value" id="st_recovery">-</output></div>
         <div class="field"><label>剩余堆内存</label><output class="read-value" id="st_heap">-</output></div>
         <div class="field"><label>复位次数</label><output class="read-value" id="st_reset">-</output></div>
@@ -511,6 +513,8 @@ async function pollStatus() {
     $('#st_rtu1_app').textContent = d.rs485_1_apperr || 0;
     $('#st_rtu2_com').textContent = d.rs485_2_comerr || 0;
     $('#st_rtu2_app').textContent = d.rs485_2_apperr || 0;
+    $('#st_rtu3_com').textContent = d.rs485_3_comerr || 0;
+    $('#st_rtu3_app').textContent = d.rs485_3_apperr || 0;
     $('#st_recovery').textContent = `${d.recovery_mode} (R:${d.recoverable} D:${d.degradable} S:${d.severe})`;
     $('#st_heap').textContent = `${d.free_heap || 0} 字节`;
     $('#st_reset').textContent = d.reset_count || 0;

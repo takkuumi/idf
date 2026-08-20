@@ -1,4 +1,4 @@
-//! Modbus 后端自由函数 — 完全无锁 (legacy `Spin<Bus>` 已退役)
+//! Modbus 后端自由函数 — 读热路径无锁，写路径按快照串行化
 //!
 //! FC=01/02/03/04 读端 + FC=05/06/0F/10 写端全部经此模块, 不再过 `Spin<Bus>`:
 //! - DI / DO / AI / AO / sys → `bus::IO` (原子 / `AtomicBits64`), 真无锁
@@ -9,12 +9,12 @@
 //! 见 `docs/system/LEGACY_BUS_RETIRE.md` 阶段 B/C/D (退役完成).
 //!
 //! # 写者并发
-//! `STORAGE` / `CONFIG` 使用 `Spin<Option<Arc<T>>>` 发布不可变快照，写端串行化 RMW，
+//! `STORAGE` / `CONFIG` 发布不可变快照，写端串行化 RMW，
 //! 防止 TCP、RTU、BLE、Web 和 DeviceActor 并发修改时出现 lost update。
 
 use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::config_state::{CONFIG, ConfigSnapshot, config_read, config_read_with};
 use super::io_global::IO;
@@ -32,18 +32,24 @@ use super::storage_state::{
 //   1. RMW 竞争丢写 (两个线程同时 clone 同一快照, 各自修改, 后写覆盖前写)
 //   2. 并发 clone 同一旧快照后相互覆盖，造成业务字段丢写
 //
-// 修复: 用 Spin<()> 短锁保护 clone-mutate-write 序列。持锁时间 = clone + mutate +
-// Rcu::write；快照 clone 仅增加 Arc 引用，实际修改区按需 COW。远小于 Modbus
-// 响应超时 (2s), 不会阻塞 Modbus TCP 线程。
+// 用调度器互斥量保护 clone-mutate-write 序列。它只在写竞争时让出 CPU，避免
+// main 抢占低优先级写者后永久自旋；快照读热路径不经过这把锁。
 //
-// 注意: 这把锁是"写者串行化"锁, 与读者无关 (读者仍走 RCU 无锁读路径)。
+// 注意: 这把锁是"写者串行化"锁, 与读者的快照发布互斥量相互独立。
 // 它保护的是 RMW 序列的原子性, 而非单个字段的并发安全 (字段并发由 RCU 保证)。
 
 /// 串行化 STORAGE + CONFIG RCU 写者 (单锁覆盖两域)
 ///
 /// 同时保护 STORAGE 和 CONFIG 的 clone-mutate-write 序列. 单一锁简化分析:
 /// 即使写者在 STORAGE 与 CONFIG 之间切换, 整段都是单线程执行, 避免跨域 race.
-static RCU_WRITE_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
+static RCU_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+#[inline]
+fn rcu_write_guard() -> MutexGuard<'static, ()> {
+    RCU_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ----------------------------------------------------------------------------
 // DI / DO (AtomicBits64 via IO)
@@ -93,6 +99,9 @@ pub fn read_disc(addr: u16) -> Option<bool> {
 
 /// 读输入寄存器 (AI + 系统状态 + 故障统计, FC=04). 地址语义同 `Bus::read_input_reg`.
 pub fn read_input_reg(addr: u16) -> Option<u16> {
+    if let Some(value) = crate::control_logic::analog_result_word(addr) {
+        return Some(value);
+    }
     // RS485 主站结果由组态中的 master_addr 指定。上位机历史业务固定用
     // FC04 读取 4000+ 镜像；值由独立原子区发布，不能误读 0x4000 协议存储。
     #[cfg(feature = "modbus-rtu")]
@@ -317,6 +326,11 @@ pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
         return false;
     };
     for _ in 0..4 {
+        let analog_before = crate::control_logic::analog_result_version();
+        if analog_before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
         #[cfg(feature = "modbus-rtu")]
         let before = crate::modbus::rtu_master::result_version();
         #[cfg(feature = "modbus-rtu")]
@@ -332,6 +346,9 @@ pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
             };
             let byte_offset = offset as usize * 2;
             out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        if crate::control_logic::analog_result_version() != analog_before {
+            continue;
         }
         #[cfg(feature = "modbus-rtu")]
         if crate::modbus::rtu_master::result_version() != before {
@@ -351,6 +368,11 @@ pub fn encode_input_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
         return false;
     }
     for _ in 0..4 {
+        let analog_before = crate::control_logic::analog_result_version();
+        if analog_before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
         #[cfg(feature = "modbus-rtu")]
         let before = crate::modbus::rtu_master::result_version();
         #[cfg(feature = "modbus-rtu")]
@@ -364,6 +386,9 @@ pub fn encode_input_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
             };
             let byte_offset = offset as usize * 2;
             out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        if crate::control_logic::analog_result_version() != analog_before {
+            continue;
         }
         #[cfg(feature = "modbus-rtu")]
         if crate::modbus::rtu_master::result_version() != before {
@@ -379,6 +404,11 @@ fn read_hold_reg_from_snapshots(
     config: &ConfigSnapshot,
     storage: &StorageSnapshot,
 ) -> Option<u16> {
+    if addr >= crate::config::regs::HOLD_USER_BASE
+        && let Some(value) = crate::control_logic::analog_result_word(addr)
+    {
+        return Some(value);
+    }
     // 原 C++ FC03 先匹配 PCtrlBuf，0..127 即使也属于 PMntrBuf，仍返回控制字；
     // PMntrBuf 的权威读取功能码是 FC04。
     // 运行时联动会直接更新该快照，未更新时返回持久化值。
@@ -404,6 +434,8 @@ fn read_hold_reg_from_snapshots(
         regs::HOLD_485_1_APPERR => return Some(crate::modbus::shared::RS485_STATS.master_apperr()),
         regs::HOLD_485_2_COMERR => return Some(crate::modbus::shared::RS485_STATS.slave_comerr()),
         regs::HOLD_485_2_APPERR => return Some(crate::modbus::shared::RS485_STATS.slave_apperr()),
+        regs::HOLD_485_3_COMERR => return Some(crate::modbus::shared::RS485_STATS.port_comerr(2)),
+        regs::HOLD_485_3_APPERR => return Some(crate::modbus::shared::RS485_STATS.port_apperr(2)),
         _ => {}
     }
     // 1. device_text (5000..=6999): 来自 STORAGE (Rcu 主存)
@@ -671,6 +703,17 @@ mod tests {
             "PC logic write must schedule NVS persistence"
         );
     }
+
+    #[test]
+    fn test_pc_logic_single_write_is_readable_and_persistent() {
+        let address = regs::HOLD_DEVICE_CONFIG + 119;
+        assert!(write_hold_reg(address, 0xA55A));
+        assert_eq!(read_hold_reg(address), Some(0xA55A));
+        assert!(
+            crate::bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire),
+            "FC06 logic write must schedule NVS persistence"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -704,8 +747,14 @@ fn sync_proto_status(snap: &mut StorageSnapshot) {
 /// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化整个 RMW 序列
 /// (clone → modify → atomic swap), 防止 lost update. 读路径不受影响.
 pub fn write_hold_reg(addr: u16, value: u16) -> bool {
-    let _guard = RCU_WRITE_LOCK.lock();
-    write_hold_reg_locked(addr, value)
+    let written = {
+        let _guard = rcu_write_guard();
+        write_hold_reg_locked(addr, value)
+    };
+    if written && addr < regs::CONTROL_WORD_COUNT {
+        crate::control_logic::on_control_word_written(addr, value);
+    }
+    written
 }
 
 /// 连续保持寄存器批量写。整批持有一次写者锁，保证 TCP/RTU/手机并发时不会交叉。
@@ -724,7 +773,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
     // 60 次 4KB 快照与同步 NVS 写导致 2s Modbus 超时和 Flash 过度磨损。
     if addr >= regs::DEVICE_TEXT_BASE && end_exclusive <= regs::DEVICE_TEXT_END as u32 + 1 {
         {
-            let _guard = RCU_WRITE_LOCK.lock();
+            let _guard = rcu_write_guard();
             let mut snap = storage_clone();
             let start = (addr - regs::DEVICE_TEXT_BASE) as usize;
             Arc::make_mut(&mut snap.device_text)[start..start + values.len()]
@@ -742,7 +791,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
         let mut request_config_persist = false;
         let mut request_runtime_apply = false;
         {
-            let _guard = RCU_WRITE_LOCK.lock();
+            let _guard = rcu_write_guard();
             let mut cs = config_clone();
             let mut config_changed = false;
             let mut config_needs_version_bump = false;
@@ -792,10 +841,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             if holding_changed {
                 sync_proto_status(&mut holding);
                 STORAGE.write(holding);
-                super::storage_state::HOLDING_DIRTY
-                    .store(true, std::sync::atomic::Ordering::Release);
-                super::storage_state::HOLDING_NFC_DIRTY
-                    .store(true, std::sync::atomic::Ordering::Release);
+                super::storage_state::mark_holding_dirty();
                 if addr >= regs::HOLD_DEVICE_CONFIG {
                     crate::control_logic::mark_config_changed();
                 }
@@ -810,11 +856,23 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
     }
 
     // 协议控制区等非 PReg 地址保留逐字语义，但整批仍禁止其它写者穿插。
-    let _guard = RCU_WRITE_LOCK.lock();
-    values
-        .iter()
-        .enumerate()
-        .all(|(offset, &value)| write_hold_reg_locked(addr.wrapping_add(offset as u16), value))
+    let written = {
+        let _guard = rcu_write_guard();
+        values
+            .iter()
+            .enumerate()
+            .all(|(offset, &value)| write_hold_reg_locked(addr.wrapping_add(offset as u16), value))
+    };
+    if written && addr < regs::CONTROL_WORD_COUNT {
+        for (offset, &value) in values.iter().enumerate() {
+            let target = addr + offset as u16;
+            if target >= regs::CONTROL_WORD_COUNT {
+                break;
+            }
+            crate::control_logic::on_control_word_written(target, value);
+        }
+    }
+    written
 }
 
 #[inline]
@@ -839,8 +897,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         Arc::make_mut(&mut snap.control_words)[addr as usize] = value;
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
-        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
-        crate::control_logic::on_control_word_written(addr, value);
+        super::storage_state::mark_legacy_io_dirty();
         return true;
     }
     // 1. device_text (5000..=6999): STORAGE RMW + NVS persist
@@ -1008,13 +1065,13 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         _ => {}
     }
     if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
-        let _guard = RCU_WRITE_LOCK.lock();
+        let _guard = rcu_write_guard();
         let mut snap = storage_clone();
         Arc::make_mut(&mut snap.legacy_coils)[(addr - regs::LEGACY_COIL_BASE) as usize] =
             u8::from(value);
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
-        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        super::storage_state::mark_legacy_io_dirty();
         return true;
     }
     match addr {
@@ -1052,7 +1109,7 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
     }
 
     if addr >= regs::LEGACY_COIL_BASE && end_exclusive <= regs::LEGACY_COIL_END as u32 + 1 {
-        let _guard = RCU_WRITE_LOCK.lock();
+        let _guard = rcu_write_guard();
         let mut snap = storage_clone();
         let target = Arc::make_mut(&mut snap.legacy_coils);
         let mut do_mask = 0u64;
@@ -1076,7 +1133,7 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
             #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
             crate::io::do_::notify();
         }
-        super::storage_state::LEGACY_IO_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        super::storage_state::mark_legacy_io_dirty();
         return true;
     }
 
@@ -1115,7 +1172,7 @@ pub fn config_modify_with_result<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SystemConfig) -> R,
 {
-    let _guard = RCU_WRITE_LOCK.lock();
+    let _guard = rcu_write_guard();
     let mut cs = config_clone();
     let r = f(&mut cs.cfg);
     super::config_state::CONFIG.write(cs);
@@ -1126,14 +1183,14 @@ where
 ///
 /// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化.
 pub fn storage_set_snapshot(snap: StorageSnapshot) {
-    let _guard = RCU_WRITE_LOCK.lock();
+    let _guard = rcu_write_guard();
     super::storage_state::proto_status_set(snap.proto.status);
     STORAGE.write(snap);
 }
 
 /// 启动时由 holding_store 恢复旧 MCA 的独立状态区。
 pub fn storage_restore_legacy_state(monitor: &[u16], control: &[u16], coils: &[u8]) {
-    let _guard = RCU_WRITE_LOCK.lock();
+    let _guard = rcu_write_guard();
     let mut snap = storage_clone();
     if monitor.len() == regs::MONITOR_WORD_COUNT as usize {
         Arc::make_mut(&mut snap.monitor_words).copy_from_slice(monitor);
@@ -1152,7 +1209,7 @@ pub fn storage_restore_legacy_state(monitor: &[u16], control: &[u16], coils: &[u
 ///
 /// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化 RMW, 防止 lost update.
 pub fn storage_modify<F: FnOnce(&mut StorageSnapshot)>(f: F) {
-    let _guard = RCU_WRITE_LOCK.lock();
+    let _guard = rcu_write_guard();
     let mut snap = storage_clone();
     f(&mut snap);
     sync_proto_status(&mut snap);
@@ -1166,7 +1223,7 @@ pub fn storage_modify<F: FnOnce(&mut StorageSnapshot)>(f: F) {
 /// 的两个分支 (CFG NotFound + CONTROL_PLC user area) 以及 NFC restore 中使用,
 /// 避免 NVS 写路径与业务写入分散.
 pub fn storage_modify_holding<F: FnOnce(&mut [u16])>(f: F) {
-    let _guard = RCU_WRITE_LOCK.lock();
+    let _guard = rcu_write_guard();
     storage_modify_holding_locked(f);
 }
 
@@ -1176,6 +1233,5 @@ fn storage_modify_holding_locked<F: FnOnce(&mut [u16])>(f: F) {
     f(Arc::make_mut(&mut snap.holding_buf));
     sync_proto_status(&mut snap);
     STORAGE.write(snap);
-    super::storage_state::HOLDING_DIRTY.store(true, std::sync::atomic::Ordering::Release);
-    super::storage_state::HOLDING_NFC_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    super::storage_state::mark_holding_dirty();
 }

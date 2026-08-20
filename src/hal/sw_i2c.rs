@@ -85,12 +85,26 @@ impl SwI2c {
             return; // repeated START belongs to the same transaction
         }
         let lock = self.physical_bus_lock();
+        let mut contention = 0u8;
         while lock
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             while lock.load(Ordering::Relaxed) {
-                spin_loop();
+                contention = contention.wrapping_add(1);
+                if contention == 0 {
+                    // NFC and the PCA9555 use distinct driver instances on the
+                    // same pins. Let a preempted lower-priority owner finish
+                    // its bounded transaction instead of spinning forever.
+                    #[cfg(target_os = "espidf")]
+                    unsafe {
+                        esp_idf_sys::vTaskDelay(1);
+                    }
+                    #[cfg(not(target_os = "espidf"))]
+                    std::thread::yield_now();
+                } else {
+                    spin_loop();
+                }
             }
         }
     }

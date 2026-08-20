@@ -8,9 +8,11 @@ pub const KIB: usize = 1024;
 
 pub const MAIN: usize = 24 * KIB;
 pub const DEVICE_ACTOR: usize = 12 * KIB;
-pub const MODBUS_RTU_MASTER: usize = 8 * KIB;
-pub const MODBUS_RTU_SLAVE: usize = 6 * KIB;
+pub const MODBUS_RTU_PORT0: usize = 8 * KIB;
+pub const MODBUS_RTU_PORT1: usize = 8 * KIB;
 pub const MODBUS_RTU_PORT2: usize = 8 * KIB;
+pub const MODBUS_RTU_MASTER: usize = MODBUS_RTU_PORT0;
+pub const MODBUS_RTU_SLAVE: usize = MODBUS_RTU_PORT1;
 pub const UDP_MULTICAST: usize = 4 * KIB;
 pub const NFC: usize = 6 * KIB;
 pub const HTTP: usize = 10 * KIB;
@@ -25,7 +27,7 @@ pub const W5500_RX: usize = 4 * KIB;
 
 /// 默认功能集常驻用户任务栈。
 pub const DEFAULT_USER_STACK_TOTAL: usize =
-    MAIN + DEVICE_ACTOR + MODBUS_RTU_MASTER + MODBUS_RTU_SLAVE + UDP_MULTICAST + NFC + HTTP;
+    MAIN + DEVICE_ACTOR + MODBUS_RTU_PORT0 + MODBUS_RTU_PORT1 + UDP_MULTICAST + NFC + HTTP;
 
 /// 可选任务全部启用时的用户任务栈上限（不含 ESP-IDF 系统任务）。
 pub const ALL_USER_STACK_TOTAL: usize =
@@ -46,8 +48,8 @@ mod tests {
 
     #[test]
     fn test_all_user_stacks_stay_within_internal_sram_budget() {
-        assert_eq!(DEFAULT_USER_STACK_TOTAL, 70 * KIB);
-        assert_eq!(ALL_USER_STACK_TOTAL, 84 * KIB);
+        assert_eq!(DEFAULT_USER_STACK_TOTAL, 72 * KIB);
+        assert_eq!(ALL_USER_STACK_TOTAL, 86 * KIB);
         assert_eq!(KNOWN_SYSTEM_STACK_TOTAL, 36 * KIB);
         assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
     }

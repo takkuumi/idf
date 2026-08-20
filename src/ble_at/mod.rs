@@ -96,6 +96,9 @@ static GATTS_IF: AtomicU8 = AtomicU8::new(0xFF);
 ///
 /// 替代 Spin<Option<u16>>, 真无锁
 static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
+/// Last GATT connection state successfully applied to the physical BT LED.
+/// 0=disconnected, 1=connected, 2=unknown/not yet applied.
+static BT_LED_APPLIED: AtomicU8 = AtomicU8::new(2);
 /// 每次连接/断线递增，防止 Bluedroid 复用 conn_id 后发送旧连接的排队响应。
 static CONNECTION_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1020,9 +1023,27 @@ pub fn update_gap_device_name() {
 
 /// 每 10ms 检查 RX_BUFFER 是否有完整命令行 (以 \n 结尾),
 /// 有则调用 parser::process 处理，响应排入统一 notification 字节流。
-pub fn process_tick() {
+pub fn process_tick(hal: &crate::hal::Hal) {
     // LOOP8: 心跳 — 之前从未 tick, 导致 ble-at 总被误判停滞
     TASK_HB.tick();
+    // The GATT callback only publishes atomics. PCA9555 I2C runs here in the
+    // main task so a lower-priority bus owner can never block Bluedroid.
+    let bt_connected = u8::from(CONN_ID.load(Ordering::Acquire) != 0xFFFF);
+    if BT_LED_APPLIED.load(Ordering::Acquire) != bt_connected {
+        match hal.set_bt_led(bt_connected != 0) {
+            Ok(()) => {
+                BT_LED_APPLIED.store(bt_connected, Ordering::Release);
+                log::info!(
+                    "[ble_at] physical BT LED {}",
+                    if bt_connected != 0 { "on" } else { "off" }
+                );
+            }
+            Err(error) => {
+                // Leave APPLIED unchanged: the next 10ms tick retries.
+                log::warn!("[ble_at] physical BT LED update failed: {error}");
+            }
+        }
+    }
     // 广播只在启动/回调失败时被动恢复。正常广播不做周期 stop/start，避免扫描
     // 窗口丢失和 controller churn。仅在未连接时执行恢复。
     if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire)
@@ -1046,10 +1067,21 @@ pub fn process_tick() {
         update_gap_device_name();
     }
     if CONNECTION_BUFFERS_DIRTY.swap(false, Ordering::AcqRel) {
-        BINARY_TX.lock().clear();
-        clear_binary_rx_slots();
-        RX_BUFFER.lock().clear();
-        log::debug!("[ble_at] stale connection buffers cleared");
+        let tx_cleared = BINARY_TX.try_lock().is_some_and(|mut tx| {
+            tx.clear();
+            true
+        });
+        let slots_cleared = clear_binary_rx_slots();
+        let text_cleared = RX_BUFFER.try_lock().is_some_and(|mut rx| {
+            rx.clear();
+            true
+        });
+        if tx_cleared && slots_cleared && text_cleared {
+            log::debug!("[ble_at] stale connection buffers cleared");
+        } else {
+            // 清理由 main-loop 延期重试，绝不等待 BLE 回调释放短临界区。
+            CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+        }
     }
     // LOOP8: 原子读取替代 Spin lock — 真无锁
     let conn_id_raw = CONN_ID.load(Ordering::Acquire);
@@ -1180,7 +1212,10 @@ fn send_next_notification(gatts_if_raw: u8, conn_id: u16, tx_handle: u16) {
 
 /// 接收来自 GATT write 的数据 (供 GATT 回调调用)
 pub fn feed_data(data: &[u8]) {
-    let mut rx = RX_BUFFER.lock();
+    let Some(mut rx) = RX_BUFFER.try_lock() else {
+        BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     // 文本通道只接受 ASCII AT 命令。逐字忽略容量错误会留下截断命令，并把下一
     // 条写入拼到旧尾部；溢出或非 ASCII 时整行丢弃，让客户端可以从下一行恢复。
     if !data.is_ascii() || data.len() > rx.capacity().saturating_sub(rx.len()) {
@@ -1205,27 +1240,29 @@ pub fn feed_data(data: &[u8]) {
 ///   tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | unit(1) | func(1) | data(N) | crc(2)
 /// 其中 pdu_data = Modbus RTU 响应 (slave + func + body + crc)
 fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> bool {
-    if frame.len() < 2 {
+    let Some(rtu_rsp) = build_embedded_modbus_response(frame) else {
         return false;
-    }
-    let slave = frame[0];
-    let func = frame[1];
-    let backend = crate::modbus::shared::BusBackend;
-    // pdu = slave/func 之后的所有数据, handle_pdu 会自行判断长度
-    let pdu = if frame.len() > 2 { &frame[2..] } else { &[] };
-    // 无堆分配: handle_pdu 写入栈缓冲区
-    let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
-    let pdu_len = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
-    // 构造 Modbus RTU 响应: slave + func + body + crc
-    let mut rtu_rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
-    let _ = rtu_rsp.push(slave);
-    let _ = rtu_rsp.extend_from_slice(&pdu_buf[..pdu_len]);
-    let crc = modbus_crc16(&rtu_rsp[..rtu_rsp.len()]);
-    let _ = rtu_rsp.push(crc as u8);
-    let _ = rtu_rsp.push((crc >> 8) as u8);
+    };
     // 用 BLE 帧格式包装 (Android 期望)
     send_ble_frame(tx_id, proto_id, &rtu_rsp, conn_id);
     true
+}
+
+/// Execute the Modbus PDU carried by a BLE binary frame. BLE supplies the
+/// outer CRC, so `frame` is `[unit, function, pdu...]`; the returned payload is
+/// a complete RTU-shaped response consumed by the existing Android codec.
+fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>> {
+    let (&slave, rest) = frame.split_first()?;
+    let (&func, pdu) = rest.split_first()?;
+    let backend = crate::modbus::shared::BusBackend;
+    let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
+    let pdu_len = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+    let mut response = heapless::Vec::<u8, 256>::new();
+    response.push(slave).ok()?;
+    response.extend_from_slice(&pdu_buf[..pdu_len]).ok()?;
+    let crc = modbus_crc16(&response);
+    response.extend_from_slice(&crc.to_le_bytes()).ok()?;
+    Some(response)
 }
 
 // ============================================================================
@@ -1273,7 +1310,12 @@ fn claim_binary_rx_slot(conn_id: u16) -> Option<u8> {
             .compare_exchange(RX_FREE, RX_ASSEMBLING, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            slot.frame.lock().clear();
+            let Some(mut frame) = slot.frame.try_lock() else {
+                slot.state.store(RX_FREE, Ordering::Release);
+                continue;
+            };
+            frame.clear();
+            drop(frame);
             slot.conn_id.store(conn_id, Ordering::Release);
             slot.epoch
                 .store(CONNECTION_EPOCH.load(Ordering::Acquire), Ordering::Release);
@@ -1283,21 +1325,28 @@ fn claim_binary_rx_slot(conn_id: u16) -> Option<u8> {
     None
 }
 
-fn release_binary_rx_slot(index: u8) {
+fn release_binary_rx_slot(index: u8) -> bool {
     let Some(slot) = BINARY_RX_SLOTS.get(index as usize) else {
-        return;
+        return false;
     };
-    slot.frame.lock().clear();
+    let Some(mut frame) = slot.frame.try_lock() else {
+        return false;
+    };
+    frame.clear();
+    drop(frame);
     slot.conn_id.store(0xFFFF, Ordering::Release);
     slot.state.store(RX_FREE, Ordering::Release);
+    true
 }
 
-fn clear_binary_rx_slots() {
+fn clear_binary_rx_slots() -> bool {
     ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
     while BINARY_REQUESTS.dequeue().is_some() {}
+    let mut cleared = true;
     for index in 0..BLE_RX_SLOT_COUNT {
-        release_binary_rx_slot(index as u8);
+        cleared &= release_binary_rx_slot(index as u8);
     }
+    cleared
 }
 
 fn process_binary_request_slot(index: u8, current_conn_id: u16) {
@@ -1314,13 +1363,21 @@ fn process_binary_request_slot(index: u8, current_conn_id: u16) {
     let conn_id = slot.conn_id.load(Ordering::Acquire);
     let epoch = slot.epoch.load(Ordering::Acquire);
     if conn_id == current_conn_id && epoch == CONNECTION_EPOCH.load(Ordering::Acquire) {
-        let frame = slot.frame.lock();
+        let Some(frame) = slot.frame.try_lock() else {
+            slot.state.store(RX_READY, Ordering::Release);
+            if !BINARY_REQUESTS.try_enqueue(index) {
+                CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+            }
+            return;
+        };
         let _ = try_handle_binary_protocol(&frame, conn_id, 0);
         drop(frame);
     } else {
         log::debug!("[ble_at] dropping stale request for conn_id={}", conn_id);
     }
-    release_binary_rx_slot(index);
+    if !release_binary_rx_slot(index) {
+        CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+    }
 }
 
 /// 将一或多次 GATT Write 重组为完整的 Android 协议帧。
@@ -1634,12 +1691,18 @@ fn handle_handheld_config_text(
 /// 发送原 MCA 自定义命令时，通过 func 值识别并分发。
 ///
 /// 命令对照 (原 MCA 固件 vBleMessageDistribution):
+///   0xC0 = CTRL_SWITCH
+///   0xC1 = INPUT_STATE
 ///   0xC2 = GET_SN_CODE
 ///   0xC3 = SET_SN_CODE
 ///   0xC4 = GET_LOCATION_INFO
+///   0xC5 = SET_LOCATION_INFO
 ///   0xC6 = GET_ETH_MAC
+///   0xC7 = SET_ETH_MAC
 ///   0xCA = GET_BLUETOOTH_NO
+///   0xCB = SET_BLUETOOTH_NO
 ///   0xCC = GET_DEVICE_TYPE
+///   0xCA = GET_BLUETOOTH_NO
 ///   0xCD = SET_NET_INFO
 ///   0xCE = GET_NET_INFO (IP/子网/网关)
 ///   0xCF = GET_FIRMWARE_VER
@@ -1652,88 +1715,153 @@ fn handle_mca_custom_command(
     _unit: u8,
 ) -> bool {
     log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={data:02X?}",);
-    match func {
-        0xCE => {
-            // GET_NET_INFO: 返回 IP/子网/网关 (各 4 字节)
-            let (ip, mask, gw) = crate::bus::config_state::config_read_with(|cs| {
-                (cs.cfg.ip, cs.cfg.mask, cs.cfg.gateway)
-            })
-            .unwrap_or(([0u8; 4], [0u8; 4], [0u8; 4]));
-            let mut rsp: heapless::Vec<u8, 16> = heapless::Vec::new();
-            let _ = rsp.push(0xCE); // cmd
-            let _ = rsp.push(0); // status = 成功
-            let _ = rsp.extend_from_slice(&ip); // IP 4 字节
-            let _ = rsp.extend_from_slice(&mask); // 掩码 4 字节
-            let _ = rsp.extend_from_slice(&gw); // 网关 4 字节
-            log::info!(
-                "[ble_at] GET_NET_INFO: ip={}.{}.{}.{} mask={}.{}.{}.{} gw={}.{}.{}.{}",
-                ip[0],
-                ip[1],
-                ip[2],
-                ip[3],
-                mask[0],
-                mask[1],
-                mask[2],
-                mask[3],
-                gw[0],
-                gw[1],
-                gw[2],
-                gw[3]
-            );
-            // 用 BLE 协议帧格式包装响应
-            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
-            true
-        }
-        0xC2 => {
-            // GET_SN_CODE
-            let sn =
-                crate::bus::config_state::config_read_with(|cs| cs.cfg.sn).unwrap_or([0u8; 32]);
-            let mut rsp: heapless::Vec<u8, 20> = heapless::Vec::new();
-            let _ = rsp.push(0xC2);
-            let _ = rsp.push(0);
-            // SN 9 个 U16 (大端) → 18 字节 ASCII
-            // LOOP9: push 顺序应为 BE [hi, lo], 而非 LE [lo, hi]
-            for i in 0..9usize {
-                let w = u16::from_be_bytes([sn[i * 2], sn[i * 2 + 1]]);
-                let _ = rsp.push((w >> 8) as u8); // hi byte first (BE)
-                let _ = rsp.push(w as u8); // lo byte second
-            }
-            log::info!("[ble_at] GET_SN_CODE: {} bytes", rsp.len());
-            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
-            true
-        }
-        0xCF => {
-            // GET_FIRMWARE_VER
-            let _fw = crate::config::APP_VERSION;
-            let mut rsp: heapless::Vec<u8, 8> = heapless::Vec::new();
-            let _ = rsp.push(0xCF);
-            let _ = rsp.push(0);
-            // 格式: major, minor, patch, date_hi, date_lo
-            let _ = rsp.push(2); // major
-            let _ = rsp.push(2); // minor
-            let _ = rsp.push(1); // patch
-            let _ = rsp.push(0x06); // date hi (June)
-            let _ = rsp.push(0x15); // date lo (15)
-            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
-            true
-        }
-        0xC6 => {
-            // GET_ETH_MAC
-            let mac =
-                crate::bus::config_state::config_read_with(|cs| cs.cfg.eth_mac).unwrap_or([0u8; 6]);
-            let mut rsp: heapless::Vec<u8, 10> = heapless::Vec::new();
-            let _ = rsp.push(0xC6);
-            let _ = rsp.push(0);
-            let _ = rsp.extend_from_slice(&mac);
-            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
-            true
-        }
-        _ => {
-            // 未实现的自定义命令 → 返回 unknown error
-            log::warn!("[ble_at] MCA custom cmd 0x{func:02X} not implemented");
-            false
+    let Some(rsp) = build_mca_custom_response(func, data) else {
+        log::warn!("[ble_at] MCA custom cmd 0x{func:02X} invalid or unsupported");
+        return false;
+    };
+    send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+    true
+}
+
+fn custom_ack<const N: usize>(func: u8) -> heapless::Vec<u8, N> {
+    let mut response = heapless::Vec::new();
+    let _ = response.extend_from_slice(&[func, 0]);
+    response
+}
+
+fn write_legacy_words(base: u16, bytes: &[u8], word_count: usize) -> bool {
+    if bytes.len() != word_count * 2 {
+        return false;
+    }
+    let mut words: heapless::Vec<u16, 9> = heapless::Vec::new();
+    for pair in bytes.chunks_exact(2) {
+        if words.push(u16::from_be_bytes([pair[0], pair[1]])).is_err() {
+            return false;
         }
     }
+    crate::bus::backends::write_hold_regs(base, &words)
+}
+
+fn read_legacy_words<const N: usize>(response: &mut heapless::Vec<u8, N>, base: u16, count: u16) {
+    for offset in 0..count {
+        let word = crate::bus::backends::read_hold_reg(base + offset).unwrap_or(0);
+        let _ = response.extend_from_slice(&word.to_be_bytes());
+    }
+}
+
+fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 32>> {
+    use crate::config::{hw_version, regs};
+
+    let mut response: heapless::Vec<u8, 32> = custom_ack(func);
+    match func {
+        0xC0 => {
+            if data.is_empty() || !data.len().is_multiple_of(2) {
+                return None;
+            }
+            for pair in data.chunks_exact(2) {
+                let channel = usize::from(pair[0]);
+                if channel >= hw_version::DO_COUNT
+                    || !crate::bus::backends::write_coil(
+                        regs::COIL_DO_BASE + channel as u16,
+                        pair[1] != 0,
+                    )
+                {
+                    return None;
+                }
+            }
+        }
+        0xC1 => {
+            let count = usize::from(*data.first()?);
+            if count == 0 || count > hw_version::DI_COUNT {
+                return None;
+            }
+            let _ = response.push(count as u8);
+            for byte_index in 0..count.div_ceil(8) {
+                let mut packed = 0u8;
+                for bit in 0..8 {
+                    let channel = byte_index * 8 + bit;
+                    if channel < count
+                        && crate::bus::backends::read_disc(channel as u16).unwrap_or(false)
+                    {
+                        packed |= 1 << bit;
+                    }
+                }
+                let _ = response.push(packed);
+            }
+        }
+        0xC2 => read_legacy_words(&mut response, regs::HOLD_SN_BASE, regs::HOLD_SN_COUNT),
+        0xC3 => {
+            if !write_legacy_words(regs::HOLD_SN_BASE, data, regs::HOLD_SN_COUNT as usize) {
+                return None;
+            }
+        }
+        0xC4 => read_legacy_words(&mut response, regs::HOLD_PLACE_BASE, regs::HOLD_PLACE_COUNT),
+        0xC5 => {
+            if !write_legacy_words(regs::HOLD_PLACE_BASE, data, regs::HOLD_PLACE_COUNT as usize) {
+                return None;
+            }
+        }
+        0xC6 => {
+            let mac = crate::bus::config_state::config_read_with(|state| state.cfg.eth_mac)?;
+            let _ = response.extend_from_slice(&mac);
+        }
+        0xC7 => {
+            if data.len() != 6 {
+                return None;
+            }
+            let mut words = [0u16; 6];
+            for (target, value) in words.iter_mut().zip(data.iter().copied()) {
+                *target = u16::from(value);
+            }
+            if !crate::bus::backends::write_hold_regs(regs::HOLD_MAC_BASE, &words) {
+                return None;
+            }
+        }
+        // C8/C9 are constants in the old source but are not dispatched by
+        // vBleMessageDistribution; accepting them would claim a capability MCA never exposed.
+        0xCA => read_legacy_words(&mut response, regs::HOLD_BLE_ADDR_BASE, 1),
+        0xCB => {
+            if !write_legacy_words(regs::HOLD_BLE_ADDR_BASE, data, 1) {
+                return None;
+            }
+        }
+        0xCC => {
+            let value = crate::bus::backends::read_hold_reg(regs::HOLD_HW_VER).unwrap_or(0);
+            let _ = response.extend_from_slice(&value.to_be_bytes());
+        }
+        0xCD => {
+            if data.len() != 12 {
+                return None;
+            }
+            let mut values = [0u16; 12];
+            for (target, value) in values.iter_mut().zip(data.iter().copied()) {
+                *target = u16::from(value);
+            }
+            if !crate::bus::backends::write_hold_regs(regs::HOLD_IP_BASE, &values) {
+                return None;
+            }
+        }
+        0xCE => {
+            let (ip, mask, gateway) = crate::bus::config_state::config_read_with(|state| {
+                (state.cfg.ip, state.cfg.mask, state.cfg.gateway)
+            })?;
+            let _ = response.extend_from_slice(&ip);
+            let _ = response.extend_from_slice(&mask);
+            let _ = response.extend_from_slice(&gateway);
+        }
+        0xCF => {
+            let (version, date) = crate::bus::config_state::config_read_with(|state| {
+                (state.cfg.fw_version, state.cfg.fw_date)
+            })?;
+            let _ = response.push((version / 100) as u8);
+            let _ = response.push(((version % 100) / 10) as u8);
+            let _ = response.push((version % 10) as u8);
+            let _ = response.push((date >> 8) as u8);
+            let _ = response.push(date as u8);
+        }
+        _ => return None,
+    }
+    Some(response)
 }
 
 /// 处理 metuory-wireless-management-app-1.0.78 通过 BLE 发送的设备信息读命令
@@ -1783,6 +1911,13 @@ fn encode_ble_name_read_response(ble_name: &[u8; 8]) -> heapless::Vec<u8, BLE_RE
     response
 }
 
+/// Android/MCA wire contract: 1=Master, 2=Slave. SystemConfig keeps the
+/// runtime-oriented representation 0=Master, nonzero=Slave.
+#[inline]
+fn android_rs485_mode(internal: u8) -> u8 {
+    if internal == 0 { 1 } else { 2 }
+}
+
 /// 返回 true 表示已处理 (调用方应停止继续走 Modbus RTU 路径).
 fn handle_ble_android_read_command(
     func: u8,
@@ -1821,7 +1956,7 @@ fn handle_ble_android_read_command(
                     let do_cnt = crate::config::hw_version::DO_COUNT as u8;
                     let di_cnt = crate::config::hw_version::DI_COUNT as u8;
                     let adc_cnt = crate::config::hw_version::AI_COUNT as u8;
-                    let rs485_cnt = 2u8;
+                    let rs485_cnt = cfg.rs485.len() as u8;
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(4); // length
                     let _ = d.push(do_cnt);
@@ -1986,7 +2121,7 @@ fn handle_ble_android_read_command(
                         | (stop_enc << 1)
                         | data_enc;
                     let _ = d.push(packed);
-                    let _ = d.push(r.mode); // masterSlaveType
+                    let _ = d.push(android_rs485_mode(r.mode));
                     let _ = d.push((r.slave_addr as u16 >> 8) as u8);
                     let _ = d.push(r.slave_addr);
                     let _ = d.push((r.retry_count >> 8) as u8);
@@ -2332,24 +2467,40 @@ pub(crate) fn mod_test_build_rs485_value_response(
 #[cfg(test)]
 mod android_compat_tests {
     use super::{
-        binary_frame_total_len, build_android_read_response_pdu, encode_ble_name_read_response,
+        android_rs485_mode, binary_frame_total_len, build_android_read_response_pdu,
+        encode_ble_name_read_response,
     };
+
+    #[test]
+    fn test_rs485_mode_uses_android_wire_values() {
+        assert_eq!(
+            android_rs485_mode(0),
+            1,
+            "internal master -> Android master"
+        );
+        assert_eq!(android_rs485_mode(1), 2, "internal slave -> Android slave");
+        assert_eq!(
+            android_rs485_mode(2),
+            2,
+            "internal gateway -> Android slave"
+        );
+    }
 
     // ---- READ_HARDWARE_INFO (0x087C, 2 regs) ----
     #[test]
     fn test_read_hardware_info_format() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 2,
+            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 3,
         )
         .expect("must handle");
-        // 期望: [unit(1)][func=0x04(1)][length=4(1)][DO=8(1)][DI=8(1)][ADC=6(1)][RS485=2(1)]
+        // 期望: [unit(1)][func=0x04(1)][length=4(1)][DO=8(1)][DI=8(1)][ADC=6(1)][RS485=3(1)]
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x04);
         assert_eq!(pdu[2], 4); // length
         assert_eq!(pdu[3], 8); // DO
         assert_eq!(pdu[4], 8); // DI
         assert_eq!(pdu[5], 6); // ADC
-        assert_eq!(pdu[6], 2); // RS485
+        assert_eq!(pdu[6], 3); // RS485
         assert_eq!(pdu.len(), 7);
     }
 
@@ -2863,7 +3014,7 @@ mod android_compat_tests {
     #[test]
     fn test_android_parse_hardware_info() {
         let pdu = build_android_read_response_pdu(
-            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 2,
+            0x01, 0x04, 0x087C, 2, [0; 4], [0; 4], [0; 4], [0; 6], [0; 6], 0, 0, 0x0615, 8, 8, 6, 3,
         )
         .expect("must handle");
         let data = &pdu[2..];
@@ -2872,7 +3023,7 @@ mod android_compat_tests {
         assert_eq!(data[1], 8); // DO
         assert_eq!(data[2], 8); // DI
         assert_eq!(data[3], 6); // ADC
-        assert_eq!(data[4], 2); // RS485
+        assert_eq!(data[4], 3); // RS485
     }
 
     #[test]
@@ -3428,5 +3579,83 @@ mod tests_ble_cmd {
             let length = u16::from_be_bytes([req[4], req[5]]);
             assert_eq!(length, 6, "Length for {} should be 6", name);
         }
+    }
+
+    #[test]
+    fn test_ble_fc16_bulk_writes_logic_region_and_echoes_exact_range() {
+        let address = crate::config::regs::HOLD_DEVICE_CONFIG + 120;
+        let values = [0x1122u16, 0x3344, 0x5566];
+        let mut request = vec![1, 0x10];
+        request.extend_from_slice(&address.to_be_bytes());
+        request.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        request.push((values.len() * 2) as u8);
+        for value in values {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let response = build_embedded_modbus_response(&request).expect("valid BLE Modbus PDU");
+        assert_eq!(&response[..6], &[1, 0x10, request[2], request[3], 0, 3]);
+        assert_eq!(
+            u16::from_le_bytes([response[response.len() - 2], response[response.len() - 1]]),
+            modbus_crc16(&response[..response.len() - 2])
+        );
+        for (offset, expected) in values.into_iter().enumerate() {
+            assert_eq!(
+                crate::bus::backends::read_hold_reg(address + offset as u16),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_ble_fc16_invalid_logic_tail_does_not_partially_write() {
+        let address = crate::config::regs::HOLD_CFG_END;
+        let before = crate::bus::backends::read_hold_reg(address).unwrap_or(0);
+        let request = [
+            1,
+            0x10,
+            (address >> 8) as u8,
+            address as u8,
+            0,
+            2,
+            4,
+            0xAA,
+            0xAA,
+            0xBB,
+            0xBB,
+        ];
+        let response = build_embedded_modbus_response(&request).expect("exception response");
+        assert_eq!(
+            &response[..3],
+            &[1, 0x90, crate::modbus::shared::exc::ILLEGAL_DATA_ADDRESS]
+        );
+        assert_eq!(crate::bus::backends::read_hold_reg(address), Some(before));
+    }
+
+    #[test]
+    fn test_mca_custom_read_shapes_match_legacy_commands() {
+        assert_eq!(build_mca_custom_response(0xC2, &[]).unwrap().len(), 20);
+        assert_eq!(build_mca_custom_response(0xC4, &[]).unwrap().len(), 18);
+        assert_eq!(build_mca_custom_response(0xC6, &[]).unwrap().len(), 8);
+        assert_eq!(build_mca_custom_response(0xCA, &[]).unwrap().len(), 4);
+        assert_eq!(build_mca_custom_response(0xCC, &[]).unwrap().len(), 4);
+        assert_eq!(build_mca_custom_response(0xCE, &[]).unwrap().len(), 14);
+        assert_eq!(build_mca_custom_response(0xCF, &[]).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn test_mca_custom_writes_reject_partial_payloads() {
+        assert!(build_mca_custom_response(0xC0, &[0]).is_none());
+        assert!(build_mca_custom_response(0xC3, &[0; 17]).is_none());
+        assert!(build_mca_custom_response(0xC5, &[0; 15]).is_none());
+        assert!(build_mca_custom_response(0xC7, &[0; 5]).is_none());
+        assert!(build_mca_custom_response(0xCB, &[0]).is_none());
+        assert!(build_mca_custom_response(0xCD, &[0; 11]).is_none());
+    }
+
+    #[test]
+    fn test_mca_custom_undispatched_legacy_constants_are_rejected() {
+        assert!(build_mca_custom_response(0xC8, &[]).is_none());
+        assert!(build_mca_custom_response(0xC9, &[]).is_none());
     }
 }

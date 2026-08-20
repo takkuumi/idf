@@ -44,6 +44,10 @@ const ADDR_DI_LED: u8 = 0x40;
 const ADDR_STATUS_LED: u8 = 0x44;
 const ADDR_DO_LED: u8 = 0x48;
 
+// F16 status LEDs are active-low. These masks match nca9555.h in the
+// production MCA firmware; clearing a bit turns the corresponding LED on.
+const STATUS_LED_BT: u8 = 0xFD;
+
 /// Bit-reverse a byte (matching reference `EXchg_ByteHl`).
 fn bit_reverse(b: u8) -> u8 {
     let mut result: u8 = 0;
@@ -300,6 +304,24 @@ impl Pca9555Duo {
         self.led_bus
             .write_regs2(ADDR_DI_LED, REG_OUTPUT_0, [port0, port1])?;
         *last = (port0, port1);
+        Ok(())
+    }
+
+    /// Keep the physical BT indicator aligned with the GATT connection state.
+    /// This is called from the main task, never from a Bluedroid callback.
+    pub fn set_bt_led(&self, connected: bool) -> AppResult<()> {
+        let mut current = self.status_led.lock();
+        let next = if connected {
+            *current & STATUS_LED_BT
+        } else {
+            *current | !STATUS_LED_BT
+        };
+        if next == *current {
+            return Ok(());
+        }
+        self.led_bus
+            .write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, next)?;
+        *current = next;
         Ok(())
     }
 }

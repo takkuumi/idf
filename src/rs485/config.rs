@@ -3,10 +3,8 @@
 //! 由 `Rs485Config::from_rtu_master` / `from_rtu_slave` 从全局
 //! `config::modbus` 构造，提供给 `Rs485Port::open` 使用。
 
-use crate::config::modbus::{rtu_master, rtu_slave};
-
 /// 单路 RS485 配置
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rs485Config {
     /// UART 端口号: 0 = UART0, 1 = UART1
     pub uart_port: u8,
@@ -46,69 +44,80 @@ impl Default for Rs485Config {
 }
 
 impl Rs485Config {
-    fn apply_saved_port(mut self, index: usize) -> Self {
-        if let Some((baud, data_bits, parity, stop_bits)) =
-            crate::bus::config_state::config_read_with(|state| {
-                let saved = state.cfg.rs485.get(index)?;
-                Some((
-                    saved.baudrate,
-                    saved.data_bits,
-                    saved.parity,
-                    saved.stop_bits,
-                ))
-            })
-            .flatten()
-        {
-            self.baud = match baud {
-                1200 | 2400 | 4800 | 9600 | 14400 | 19200 | 38400 | 57600 | 115200 | 128000
-                | 153600 | 230400 | 256000 | 460800 | 921600 => baud,
-                _ => 9600,
-            };
-            self.data_bits = if data_bits == 7 { 7 } else { 8 };
-            self.parity = match parity {
-                1 => 'O',
-                2 => 'E',
-                _ => 'N',
-            };
-            self.stop_bits = if stop_bits == 2 { 2 } else { 1 };
-        }
+    fn apply_saved(mut self, saved: &crate::device::system_config::Rs485Config) -> Self {
+        self.baud = match saved.baudrate {
+            1200 | 2400 | 4800 | 9600 | 14400 | 19200 | 38400 | 57600 | 115200 | 128000
+            | 153600 | 230400 | 256000 | 460800 | 921600 => saved.baudrate,
+            _ => 9600,
+        };
+        self.data_bits = if saved.data_bits == 7 { 7 } else { 8 };
+        self.parity = match saved.parity {
+            1 => 'O',
+            2 => 'E',
+            _ => 'N',
+        };
+        self.stop_bits = if saved.stop_bits == 2 { 2 } else { 1 };
         self
     }
 
-    /// 从 `config::modbus::rtu_master` 构造 (RS485 #0 = UART1)
-    pub fn from_rtu_master() -> Self {
+    fn physical_port(index: usize) -> Option<Self> {
         use crate::config::pins as p;
-        Self {
-            uart_port: rtu_master::UART_PORT,
-            tx_pin: p::RS485_0_TX,
-            rx_pin: p::RS485_0_RX,
-            de_pin: p::RS485_0_DE,
-            baud: rtu_master::BAUD,
-            data_bits: rtu_master::DATA_BITS,
-            parity: rtu_master::PARITY,
-            stop_bits: rtu_master::STOP_BITS,
-            rts_pin: p::RS485_0_DE,
+        match index {
+            0 => Self {
+                uart_port: p::RS485_0_UART,
+                tx_pin: p::RS485_0_TX,
+                rx_pin: p::RS485_0_RX,
+                de_pin: p::RS485_0_DE,
+                rts_pin: p::RS485_0_DE,
+                ..Self::default()
+            },
+            1 => Self {
+                uart_port: p::RS485_1_UART,
+                tx_pin: p::RS485_1_TX,
+                rx_pin: p::RS485_1_RX,
+                de_pin: p::RS485_1_DE,
+                rts_pin: p::RS485_1_DE,
+                ..Self::default()
+            },
+            2 => Self {
+                uart_port: p::RS485_2_UART,
+                tx_pin: p::RS485_2_TX,
+                rx_pin: p::RS485_2_RX,
+                de_pin: p::RS485_2_DE,
+                rts_pin: p::RS485_2_DE,
+                ..Self::default()
+            },
+            _ => return None,
         }
-        .apply_saved_port(0)
+        .into()
+    }
+
+    /// 根据物理端口和同一份不可变配置快照构造串口参数。
+    pub(crate) fn from_port_with_saved(
+        index: usize,
+        saved: &crate::device::system_config::Rs485Config,
+    ) -> Option<Self> {
+        Some(Self::physical_port(index)?.apply_saved(saved))
+    }
+
+    /// 根据物理端口构造，并覆盖当前 SystemConfig 中的串口参数。
+    pub fn from_port(index: usize) -> Option<Self> {
+        crate::bus::config_state::config_read_with(|state| {
+            Self::from_port_with_saved(index, state.cfg.rs485.get(index)?)
+        })
+        .flatten()
+    }
+
+    /// 从 RS485 #0 (UART1) 构造。
+    pub fn from_rtu_master() -> Self {
+        Self::from_port(0).expect("RS485-1 exists")
     }
 
     /// 从 `config::modbus::rtu_slave` 构造 (RS485 #1 = UART2)
     ///
     /// 注意: UART0 与下载串口复用，调试期间建议改用 UART1
     pub fn from_rtu_slave() -> Self {
-        use crate::config::pins as p;
-        Self {
-            uart_port: rtu_slave::UART_PORT,
-            tx_pin: p::RS485_1_TX,
-            rx_pin: p::RS485_1_RX,
-            de_pin: p::RS485_1_DE,
-            baud: rtu_slave::BAUD,
-            data_bits: rtu_slave::DATA_BITS,
-            parity: rtu_slave::PARITY,
-            stop_bits: rtu_slave::STOP_BITS,
-            rts_pin: p::RS485_1_DE,
-        }
-        .apply_saved_port(1)
+        Self::from_port(1).expect("RS485-2 exists")
     }
 
     /// 构造 RS485 #2 (第 3 端口 = UART0, 对齐参考固件 RS485-3)
@@ -116,19 +125,6 @@ impl Rs485Config {
     /// 默认 9600 8N1, 仅从站监听模式. UART0 与 USB CDC/JTAG 复用,
     /// 启用后将失去调试串口; 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动.
     pub fn from_rtu_port2() -> Self {
-        use crate::config::pins as p;
-        Self {
-            uart_port: p::RS485_2_UART,
-            tx_pin: p::RS485_2_TX,
-            rx_pin: p::RS485_2_RX,
-            de_pin: p::RS485_2_DE,
-            baud: 9600,
-            data_bits: 8,
-            parity: 'N',
-            stop_bits: 1,
-            // RS485-2 无 DE 引脚 (255), 使用 UART 内置 RS485 模式时 RTS=-1 即不启用自动 DE
-            rts_pin: p::RS485_2_DE,
-        }
-        .apply_saved_port(2)
+        Self::from_port(2).expect("RS485-3 exists")
     }
 }

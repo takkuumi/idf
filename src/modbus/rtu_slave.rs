@@ -52,7 +52,9 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,
                     Ok(n) => {
-                        if let Err(e) = handle_request(&mut port, &backend, &buf[..n], slave_addr) {
+                        if let Err(e) =
+                            handle_request(&mut port, &backend, &buf[..n], slave_addr, 1)
+                        {
                             log::warn!("[mb-rtu-slave] handle: {}", e);
                         }
                     }
@@ -76,16 +78,17 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     Ok(())
 }
 
-fn handle_request(
+pub(crate) fn handle_request(
     port: &mut Rs485Port,
     backend: &BusBackend,
     req: &[u8],
     addr: u8,
+    port_index: usize,
 ) -> AppResult<()> {
     // 最小帧: slave(1) + func(1) + crc(2) = 4
     if req.len() < 4 {
         // LOOP14: 帧过短 → 累加从站通信错误
-        crate::modbus::shared::RS485_STATS.inc_slave_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(port_index);
         return Ok(());
     }
 
@@ -106,14 +109,20 @@ fn handle_request(
             recv_crc
         );
         // LOOP14: CRC 错 → 累加从站通信错误
-        crate::modbus::shared::RS485_STATS.inc_slave_comerr();
+        crate::modbus::shared::RS485_STATS.inc_port_comerr(port_index);
         return Ok(());
     }
 
-    crate::modbus::shared::RS485_STATS.mark_slave_ok();
+    crate::modbus::shared::RS485_STATS.mark_port_ok(port_index);
 
     let func = req[1];
     let resp = build_response(backend, slave, func, &req[2..n - 2]);
+    if resp
+        .get(1)
+        .is_some_and(|response_func| response_func & 0x80 != 0)
+    {
+        crate::modbus::shared::RS485_STATS.inc_port_apperr(port_index);
+    }
 
     // 广播不返回响应
     if slave == 0 {
@@ -166,5 +175,58 @@ mod tests {
             u16::from_le_bytes([response[n - 2], response[n - 1]]),
             modbus_crc16(&response[..n - 2])
         );
+    }
+
+    #[test]
+    fn test_rtu_fc16_writes_contiguous_logic_words() {
+        let address = crate::config::regs::HOLD_DEVICE_CONFIG + 123;
+        let pdu = [
+            (address >> 8) as u8,
+            address as u8,
+            0,
+            3,
+            6,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+        ];
+        let response = build_response(&BusBackend, 1, 0x10, &pdu);
+        assert_eq!(&response[..6], &[1, 0x10, pdu[0], pdu[1], 0, 3]);
+        for (offset, expected) in [0x1122, 0x3344, 0x5566].into_iter().enumerate() {
+            assert_eq!(
+                crate::bus::backends::read_hold_reg(address + offset as u16),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtu_fc16_invalid_tail_is_rejected_without_partial_write() {
+        let address = crate::config::regs::HOLD_CFG_END;
+        let before = crate::bus::backends::read_hold_reg(address);
+        let response = build_response(
+            &BusBackend,
+            1,
+            0x10,
+            &[
+                (address >> 8) as u8,
+                address as u8,
+                0,
+                2,
+                4,
+                0xAA,
+                0xAA,
+                0xBB,
+                0xBB,
+            ],
+        );
+        assert_eq!(
+            &response[..3],
+            &[1, 0x90, crate::modbus::shared::exc::ILLEGAL_DATA_ADDRESS]
+        );
+        assert_eq!(crate::bus::backends::read_hold_reg(address), before);
     }
 }
