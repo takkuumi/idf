@@ -232,6 +232,54 @@ strip = true           # 移除调试符号
 panic = "abort"        # panic 直接 abort (省 unwind 表)
 ```
 
+### 正式版本发布（F3 + F4）
+
+发布前先显式设置版本并提交。设备协议使用三位十进制版本编码，因此
+`major/minor/patch` 每段必须是 `0-9` 的单个数字：
+
+```bash
+just set-version 2.2.2
+git add Cargo.toml Cargo.lock sdkconfig.defaults
+git commit -m "chore(build): bump firmware version to 2.2.2"
+just release
+```
+
+`just release` 会从干净的构建目录完整编译 F3、F4 两个硬件版本，输出到：
+
+```text
+release/v2.2.2/
+├── f3/
+│   ├── flash/                  # 四个独立烧录段
+│   ├── gateway-v2.2.2-f3-factory-new-device.bin
+│   ├── gateway-v2.2.2-f3.elf
+│   ├── manifest.json
+│   ├── SHA256SUMS
+│   └── flash-command.txt
+└── f4/
+    └── ...
+```
+
+四段产物及固定烧录地址：
+
+| 产物 | 地址 | 说明 |
+|------|------|------|
+| `bootloader.bin` | `0x0` | ESP32-S3 bootloader |
+| `partition-table.bin` | `0x8000` | 生产分区表 |
+| `ota-data-initial.bin` | `0x10000` | OTA 初始选择数据 |
+| `app.bin` | `0x20000` | 当前版本应用固件 |
+
+发布脚本会校验 DIO/40MHz/8MB、固定地址、app 内嵌版本、factory 分区
+`0x240000` 容量、Git 提交号和所有文件 SHA-256。单型号发布可用
+`just release-f3` 或 `just release-f4`。
+
+正式发布默认拒绝脏工作区和覆盖已有版本目录。仅开发验证时可使用
+`ALLOW_DIRTY_RELEASE=1 just release`；确认重建同一版本时还需显式设置
+`OVERWRITE_RELEASE=1`。
+
+推荐依据每个型号目录中的 `flash-command.txt` 烧录四个独立段。合并的
+`factory-new-device.bin` 仅用于新设备或全量产烧录，从 `0x0` 写入会以
+`0xFF` 覆盖镜像间隙中的既有 NVS 数据，不能用于保留现场配置的升级。
+
 ### Feature 编译
 
 ```bash

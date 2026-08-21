@@ -95,7 +95,10 @@ fn validate_production_envelope() {
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHFREQ_40M", "y");
     require_config(&sdk, "CONFIG_ESPTOOLPY_FLASHSIZE_8MB", "y");
     require_config(&sdk, "CONFIG_APP_PROJECT_VER_FROM_CONFIG", "y");
-    require_config(&sdk, "CONFIG_APP_PROJECT_VER", "\"2.2.1\"");
+    let package_version =
+        std::env::var("CARGO_PKG_VERSION").expect("Cargo must provide CARGO_PKG_VERSION");
+    let expected_project_version = format!("\"{package_version}\"");
+    require_config(&sdk, "CONFIG_APP_PROJECT_VER", &expected_project_version);
 
     let partitions = std::fs::read_to_string(PARTITIONS)
         .unwrap_or_else(|e| panic!("cannot read {PARTITIONS}: {e}"));

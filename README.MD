@@ -1,0 +1,1 @@
+scp -r ./release/* ling@takumi.eu.org:/Users/ling/Workspace/lik/系统固件

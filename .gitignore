@@ -1,6 +1,6 @@
 # Rust / Cargo
 /target
-/Cargo.lock
+/release/
 **/*.rs.bk
 
 # ESP-IDF 构建产物

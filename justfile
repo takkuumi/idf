@@ -46,6 +46,21 @@ build:
 build-release:
     cargo build --bin gateway --release
 
+# 设置统一固件版本（协议版本编码要求 major/minor/patch 均为单数字）
+set-version version:
+    ./scripts/set-version.sh "{{version}}"
+
+# 生产发布：完整编译 F3/F4，并生成四段固件、合并镜像、清单和校验和
+release:
+    ./scripts/release.sh
+
+# 仅发布指定硬件版本
+release-f3:
+    ./scripts/release.sh f3
+
+release-f4:
+    ./scripts/release.sh f4
+
 # ───── 3. 列出可用串口 ─────
 ports:
     espflash list-ports
