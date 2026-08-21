@@ -269,9 +269,9 @@ const NVS_KEY_LENGTH_LEGACY: &str = "proto_len";
 
 /// 设备文本区 NVS key (Android 1.0.78 0x1388-0x1B77, 4000 字节 UTF-16LE)
 const NVS_KEY_DEV_TEXT: &str = "dev_text";
-/// 设备文本区 NVS magic (用于校验 blob 完整性)
+/// 设备文本区 magic (用于校验 blob 完整性)
 const NVS_KEY_DEV_TEXT_MAGIC: &str = "dev_text_mag";
-/// 设备文本区 magic 字 (0xDEAD = "DT")
+/// 设备文本区 magic 字 (0xDE54 = "DT")
 const DEV_TEXT_MAGIC: u16 = 0xDE54;
 
 /// 魔数标识, 用于校验 NVS 是否已初始化
@@ -810,59 +810,48 @@ fn apply_config() -> AppResult<()> {
 // 2. 失败则读另一个 blob → 校验
 // 3. 都失败则尝试 legacy 单 blob 格式 (兼容旧固件)
 // 4. 都失败则返回空默认值
-/// 加载设备文本区 (2000 字 = 4000 字节, NVS blob "dev_text")
+/// 加载设备文本区 (2000 字 = 4000 字节, NVS blob "dev_text")。
 ///
-/// 成功加载条件:
-/// 1. NVS 存在 magic == DEV_TEXT_MAGIC
-/// 2. blob 长度 == 4000 字节
-///
-/// 失败 → 返回默认空 2000 字
+/// 文本区按旧 MCA 格式保持单 blob 擦写，不改变外部布局。magic 是兼容性标记，
+/// 但不能作为唯一有效条件：旧版本可能已经写入完整文本而 magic 尚未提交，
+/// 此时仍应恢复完整 blob，不能把有效文本清空。
 fn load_device_text_from_nvs(nvs: &EspDefaultNvs) -> AppResult<Vec<u16>> {
-    let expected_bytes = DEVICE_TEXT_BLOB_BYTES;
-    // 1. 校验 magic
+    let mut buf = DEVICE_TEXT_BLOB_BUFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let magic = nvs
         .get_u16(NVS_KEY_DEV_TEXT_MAGIC)
         .ok()
         .flatten()
         .unwrap_or(0);
-    if magic != DEV_TEXT_MAGIC {
-        log::info!(
-            "[device] dev_text magic not found (got {:#06X}), using empty",
-            magic
-        );
-        return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
-    }
-    // 2. 读 blob
-    let mut buf = DEVICE_TEXT_BLOB_BUFFER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     buf.fill(0);
-    let blob = match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut buf[..expected_bytes]) {
-        Ok(Some(b)) if b.len() == expected_bytes => b,
-        Ok(Some(b)) => {
+    match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut buf[..DEVICE_TEXT_BLOB_BYTES]) {
+        Ok(Some(blob)) if blob.len() == DEVICE_TEXT_BLOB_BYTES => {
+            let mut data = vec![0u16; regs::DEVICE_TEXT_COUNT as usize];
+            for (i, chunk) in blob.chunks_exact(2).enumerate() {
+                data[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+            }
+            if magic != DEV_TEXT_MAGIC {
+                log::warn!(
+                    "[device] dev_text loaded without valid magic ({magic:#06X}); preserving blob"
+                );
+            } else {
+                log::info!("[device] dev_text loaded: {} bytes", blob.len());
+            }
+            return Ok(data);
+        }
+        Ok(Some(blob)) => {
             log::warn!(
                 "[device] dev_text blob truncated: {}/{}",
-                b.len(),
-                expected_bytes
+                blob.len(),
+                DEVICE_TEXT_BLOB_BYTES
             );
-            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
         }
-        Ok(None) => {
-            log::info!("[device] dev_text blob not present, using empty");
-            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
-        }
-        Err(e) => {
-            log::warn!("[device] dev_text blob read err: {e:?}, using empty");
-            return Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize]);
-        }
-    };
-    // 3. u16 LE 解码
-    let mut data = vec![0u16; regs::DEVICE_TEXT_COUNT as usize];
-    for (i, chunk) in blob.chunks_exact(2).enumerate() {
-        data[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+        Ok(None) => log::info!("[device] dev_text blob not present, using empty"),
+        Err(e) => log::warn!("[device] dev_text blob read err: {e:?}, using empty"),
     }
-    log::info!("[device] dev_text loaded: {} bytes", blob.len());
-    Ok(data)
+    log::info!("[device] no valid dev_text blob, using empty");
+    Ok(vec![0u16; regs::DEVICE_TEXT_COUNT as usize])
 }
 
 /// 持久化设备文本区 (整个 2000 字 = 4000 字节)
@@ -889,26 +878,56 @@ fn save_current_device_text_to_nvs() -> AppResult<()> {
     let mut blob = DEVICE_TEXT_BLOB_BUFFER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let encoded = crate::bus::storage_state::storage_read_with(|snap| {
-        if snap.device_text.len() != regs::DEVICE_TEXT_COUNT as usize {
-            return false;
-        }
-        for (i, &v) in snap.device_text.iter().enumerate() {
-            blob[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
-        }
-        true
-    })
-    .unwrap_or(false);
-    if !encoded {
+    let snapshot = crate::bus::storage_state::storage_read()
+        .ok_or_else(|| AppError::Config("device_text RCU unavailable or invalid length".into()))?;
+    if snapshot.device_text.len() != regs::DEVICE_TEXT_COUNT as usize {
         return Err(AppError::Config(
             "device_text RCU unavailable or invalid length".into(),
         ));
     }
-    persist_device_text_blob(&blob[..DEVICE_TEXT_BLOB_BYTES])
+    for (i, &v) in snapshot.device_text.iter().enumerate() {
+        blob[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    persist_device_text_blob(&blob[..DEVICE_TEXT_BLOB_BYTES]).and_then(|()| {
+        let still_current = crate::bus::storage_state::storage_read()
+            .map(|current| Arc::ptr_eq(&current.device_text, &snapshot.device_text))
+            .unwrap_or(false);
+        if still_current {
+            Ok(())
+        } else {
+            Err(AppError::Config(
+                "device_text changed during persist; retry scheduled".into(),
+            ))
+        }
+    })
+}
+
+/// 文本区写入完成后的立即持久化入口。
+///
+/// MCA 在一次 FC=06/FC=16 写入完成后马上保存文本文件。IDF 保留同样的
+/// 可见语义：通信响应返回前完成一次 NVS 擦写；若介质暂时失败，dirty 标志
+/// 仍由后台重试，避免 RAM 写入被误报为永久保存成功。
+pub fn persist_device_text_now() -> AppResult<()> {
+    let result = save_current_device_text_to_nvs();
+    if result.is_ok() {
+        DEVICE_TEXT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    } else {
+        DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
+    result
 }
 
 fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
+    if blob.len() != DEVICE_TEXT_BLOB_BYTES {
+        return Err(AppError::Config(format!(
+            "dev_text blob len mismatch: {} != {}",
+            blob.len(),
+            DEVICE_TEXT_BLOB_BYTES
+        )));
+    }
     if let Some(result) = try_with_nvs_mut(|nvs| -> AppResult<()> {
+        // 保持 MCA 的单 blob 格式：擦除并重写 4000 字节文本，再写兼容 magic。
+        // FC16 批量写只调用一次；FC06 单字写按旧 MCA 语义立即保存。
         nvs.set_blob(NVS_KEY_DEV_TEXT, blob)
             .map_err(|e| AppError::Config(format!("nvs set dev_text: {e:?}")))?;
         nvs.set_u16(NVS_KEY_DEV_TEXT_MAGIC, DEV_TEXT_MAGIC)
@@ -924,10 +943,8 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-/// 请求持久化设备文本区。仅置 dirty，由 DeviceActor 合并连续块写后异步落盘。
-/// 由 backends::write_hold_reg 在 DEVICE_TEXT_BASE 写后调用
-///
-/// DeviceActor 使用复用 PSRAM 工作区，不在请求路径分配或写 Flash。
+/// 标记设备文本区需要重试。正常 Modbus 文本写入会在响应前调用
+/// [`persist_device_text_now`]；这里只负责介质失败后的后台重试，不改变文本布局。
 pub fn request_save_device_text() {
     DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
 }

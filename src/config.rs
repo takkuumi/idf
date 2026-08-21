@@ -679,6 +679,21 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_text_and_logic_storage_sizes() {
+        assert_eq!(regs::DEVICE_TEXT_BASE, 5000);
+        assert_eq!(regs::DEVICE_TEXT_END, 6999);
+        assert_eq!(regs::DEVICE_TEXT_COUNT, 2000);
+        assert_eq!(
+            (regs::DEVICE_TEXT_END - regs::DEVICE_TEXT_BASE + 1) as usize,
+            2000
+        );
+        assert_eq!(regs::HOLD_PXX_BASE, 0x0880);
+        assert_eq!(regs::HOLD_PXX_END, 0x107F);
+        assert_eq!(regs::HOLD_PXX_COUNT, 2048);
+        assert_eq!(regs::HOLD_DEVICE_CONFIG, 2300);
+    }
+
+    #[test]
     fn test_app_metadata() {
         assert_eq!(APP_NAME, "esp32s3-iot-gateway");
         assert_eq!(MAIN_LOOP_PERIOD_MS, 5);

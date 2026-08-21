@@ -259,6 +259,9 @@ release/v2.2.2/
     └── ...
 ```
 
+也可以直接指定型号执行“编译并刷入”：`just release f3` 或
+`just release f4`；不带型号的 `just release` 只生成发布包，不会猜测设备型号。
+
 四段产物及固定烧录地址：
 
 | 产物 | 地址 | 说明 |
@@ -271,6 +274,34 @@ release/v2.2.2/
 发布脚本会校验 DIO/40MHz/8MB、固定地址、app 内嵌版本、factory 分区
 `0x240000` 容量、Git 提交号和所有文件 SHA-256。单型号发布可用
 `just release-f3` 或 `just release-f4`。
+
+### 编译后刷入设备
+
+刷入必须明确硬件型号，避免 F3/F4 固件误刷：
+
+```bash
+# 编译对应型号、校验清单和 SHA-256，然后刷入四段镜像
+just release-flash f3
+just release-flash f4
+
+# 只刷入已有的 release/v<版本>/<型号> 产物，不重新编译
+just flash-release-artifact f3
+```
+
+刷入流程会先检查连接芯片为 ESP32-S3、Flash 为 8MB，再使用 DIO/40MHz
+写入 `0x0`、`0x8000`、`0x10000`、`0x20000` 四段，并启用回读校验；默认不执行
+`erase-all`，因此不会清除现场业务 NVS。当前 CH340 设备默认要求手动按住 BOOT、
+短按 RST、松开 BOOT 进入下载模式。如设备支持自动复位，可使用：
+
+```bash
+ESPFLASH_BEFORE=default_reset just release-flash f3
+```
+
+串口、波特率和复位方式可通过 `ESPFLASH_PORT`、`ESPFLASH_BAUD`、
+`ESPFLASH_BEFORE`、`ESPFLASH_AFTER` 覆盖。没有设备时可用
+`RELEASE_FLASH_DRY_RUN=1 just release-flash f3` 验证构建、清单和最终命令。
+刷入脚本默认只接受当前 Git 提交且工作区干净的发布包；仅在明确确认时，才使用
+`ALLOW_STALE_RELEASE=1` 或 `ALLOW_DIRTY_RELEASE=1` 放宽对应保护。
 
 正式发布默认拒绝脏工作区和覆盖已有版本目录。仅开发验证时可使用
 `ALLOW_DIRTY_RELEASE=1 just release`；确认重建同一版本时还需显式设置

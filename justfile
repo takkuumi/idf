@@ -50,9 +50,15 @@ build-release:
 set-version version:
     ./scripts/set-version.sh "{{version}}"
 
-# 生产发布：完整编译 F3/F4，并生成四段固件、合并镜像、清单和校验和
-release:
-    ./scripts/release.sh
+# 生产发布：无参数时完整编译 F3/F4；指定 f3/f4 时编译后校验并刷入设备。
+release variant="all":
+    #!/usr/bin/env bash
+    set -e
+    if [[ "{{variant}}" == "all" ]]; then
+        ./scripts/release.sh all
+    else
+        ./scripts/release-flash.sh "{{variant}}"
+    fi
 
 # 仅发布指定硬件版本
 release-f3:
@@ -60,6 +66,14 @@ release-f3:
 
 release-f4:
     ./scripts/release.sh f4
+
+# 生产发布并刷入指定型号。必须明确 f3/f4，默认不全擦，保留业务 NVS。
+release-flash variant:
+    ./scripts/release-flash.sh "{{variant}}"
+
+# 仅刷入已存在且通过清单/SHA-256 校验的发布产物，不重新编译。
+flash-release-artifact variant:
+    ./scripts/release-flash.sh "{{variant}}" --skip-build
 
 # ───── 3. 列出可用串口 ─────
 ports:

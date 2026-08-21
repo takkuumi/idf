@@ -751,6 +751,13 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
         let _guard = rcu_write_guard();
         write_hold_reg_locked(addr, value)
     };
+    if written
+        && (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
+        && let Err(error) = crate::device::persist_device_text_now()
+    {
+        log::error!("[device] dev_text immediate persist failed: {error}");
+        return false;
+    }
     if written && addr < regs::CONTROL_WORD_COUNT {
         crate::control_logic::on_control_word_written(addr, value);
     }
@@ -781,7 +788,10 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             sync_proto_status(&mut snap);
             STORAGE.write(snap);
         }
-        crate::device::request_save_device_text();
+        if let Err(error) = crate::device::persist_device_text_now() {
+            log::error!("[device] dev_text immediate persist failed: {error}");
+            return false;
+        }
         return true;
     }
 
