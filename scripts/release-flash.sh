@@ -24,7 +24,7 @@ case "$VARIANT" in
 esac
 VARIANT_UPPER="$(printf '%s' "$VARIANT" | tr '[:lower:]' '[:upper:]')"
 
-for command_name in python3 git; do
+for command_name in python3 git espflash; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "错误: 缺少依赖: ${command_name}" >&2
         exit 1
@@ -43,9 +43,11 @@ fi
 
 PORT="${ESPFLASH_PORT:-/dev/cu.usbserial-1430}"
 BAUD="${ESPFLASH_BAUD:-460800}"
-# 该设备的 CH340 自动复位可能失败。默认要求手动进入下载模式，
-# 可通过 ESPFLASH_BEFORE=default_reset 使用自动复位。
-BEFORE="${ESPFLASH_BEFORE:-no_reset}"
+# 先用 espflash 的 default-reset 完成 CH340 DTR/RTS 握手，再让 esptool
+# 接管已进入的 ROM/stub。full-flash 使用的就是这条可靠路径。
+RESET_BEFORE="${ESPFLASH_BEFORE:-default_reset}"
+RESET_BEFORE="${RESET_BEFORE//_/-}"
+BEFORE="no_reset"
 AFTER="${ESPFLASH_AFTER:-hard_reset}"
 ALLOW_STALE_RELEASE="${ALLOW_STALE_RELEASE:-0}"
 ALLOW_DIRTY_RELEASE="${ALLOW_DIRTY_RELEASE:-0}"
@@ -160,6 +162,8 @@ APP="$OUT_DIR/flash/${PREFIX}-app.bin"
 
 if [[ "${RELEASE_FLASH_DRY_RUN:-0}" == 1 ]]; then
     echo "=== dry-run：跳过设备连接和烧录 ==="
+    printf 'ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info --port %q --baud %q --before %q --after no-reset --non-interactive\n' \
+        "$PORT" "$BAUD" "$RESET_BEFORE"
     printf 'python3 -m esptool --chip esp32s3 --port %q --baud %q --before %q --after %q write_flash --verify --flash_mode dio --flash_freq 40m --flash_size 8MB\n' \
         "$PORT" "$BAUD" "$BEFORE" "$AFTER"
     printf '  0x0 %q 0x8000 %q 0x10000 %q 0x20000 %q\n' \
@@ -175,11 +179,14 @@ fi
 
 COMMON_ARGS=(--chip esp32s3 --port "$PORT" --baud "$BAUD" --before "$BEFORE" --connect-attempts 7)
 echo "=== 检查设备芯片和 Flash ==="
-CHIP_OUTPUT="$(python3 -m esptool "${COMMON_ARGS[@]}" --after no_reset chip_id 2>&1)" || {
+echo "=== 通过 espflash ${RESET_BEFORE} 自动进入下载模式 ==="
+if ! CHIP_OUTPUT="$(ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info \
+    --port "$PORT" --baud "$BAUD" --before "$RESET_BEFORE" --after no-reset \
+    --non-interactive 2>&1)"; then
     printf '%s\n' "$CHIP_OUTPUT" >&2
-    echo "错误: 无法连接设备。请按住 BOOT，短按 RST，松开 BOOT 后重试；或设置 ESPFLASH_BEFORE=default_reset。" >&2
+    echo "错误: 无法自动进入下载模式。请检查 USB 串口占用，或手动按住 BOOT、短按 RST、松开 BOOT 后重试。" >&2
     exit 1
-}
+fi
 printf '%s\n' "$CHIP_OUTPUT"
 if ! printf '%s\n' "$CHIP_OUTPUT" | grep -Eiq 'ESP32[- ]?S3'; then
     echo "错误: 连接的芯片不是 ESP32-S3，已停止刷写。" >&2

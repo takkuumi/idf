@@ -290,11 +290,12 @@ just flash-release-artifact f3
 
 刷入流程会先检查连接芯片为 ESP32-S3、Flash 为 8MB，再使用 DIO/40MHz
 写入 `0x0`、`0x8000`、`0x10000`、`0x20000` 四段，并启用回读校验；默认不执行
-`erase-all`，因此不会清除现场业务 NVS。当前 CH340 设备默认要求手动按住 BOOT、
-短按 RST、松开 BOOT 进入下载模式。如设备支持自动复位，可使用：
+`erase-all`，因此不会清除现场业务 NVS。当前 CH340 设备由脚本默认调用
+`espflash default-reset` 自动进入下载模式，不需要手动按 BOOT。如需跳过自动复位
+（仅适用于设备已经处于下载器状态），可使用：
 
 ```bash
-ESPFLASH_BEFORE=default_reset just release-flash f3
+ESPFLASH_BEFORE=no_reset just release-flash f3
 ```
 
 串口、波特率和复位方式可通过 `ESPFLASH_PORT`、`ESPFLASH_BAUD`、
