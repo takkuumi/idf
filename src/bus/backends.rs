@@ -14,6 +14,7 @@
 
 use crate::config::{hw_version, regs};
 use crate::error::recovery::{self, DegradedMode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::config_state::{CONFIG, ConfigSnapshot, config_read, config_read_with};
@@ -43,6 +44,31 @@ use super::storage_state::{
 /// 同时保护 STORAGE 和 CONFIG 的 clone-mutate-write 序列. 单一锁简化分析:
 /// 即使写者在 STORAGE 与 CONFIG 之间切换, 整段都是单线程执行, 避免跨域 race.
 static RCU_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// MCA 兼容的 PRegBuf 写保护闸门。
+///
+/// 4222 (SLAVE_DEVICE_CONFIG_END - 1) 写入 0x55AA 后，后续 2300+
+/// Modbus 写入才允许提交到掉电存储；一次批量写完成后立即自动清零。
+/// 这不是业务配置值，不能把它当成普通 holding 寄存器持久化。
+static LOGIC_WRITE_ARMED: AtomicBool = AtomicBool::new(false);
+
+const LOGIC_WRITE_MAGIC: u16 = 0x55AA;
+
+#[inline]
+fn is_logic_config_addr(addr: u16) -> bool {
+    (regs::HOLD_DEVICE_CONFIG..=regs::HOLD_CFG_END).contains(&addr)
+}
+
+/// 为 BLE 自定义整帧配置写入临时打开 MCA PRegBuf 提交闸门。
+/// Modbus/TCP/RTU 必须通过写 4222=0x55AA 走同一公开协议语义。
+pub fn arm_logic_write() {
+    LOGIC_WRITE_ARMED.store(true, Ordering::Release);
+}
+
+#[inline]
+pub fn disarm_logic_write() {
+    LOGIC_WRITE_ARMED.store(false, Ordering::Release);
+}
 
 #[inline]
 fn rcu_write_guard() -> MutexGuard<'static, ()> {
@@ -693,6 +719,7 @@ mod tests {
         // DeviceMMP writes logic entries in contiguous FC=16 blocks. These addresses
         // must use the persistent PRegBuf rather than a transient configuration alias.
         let values = [0x1122, 0x3344, 0x5566, 0x7788];
+        assert!(write_hold_reg(regs::HOLD_PROTECT_WORD, LOGIC_WRITE_MAGIC));
         assert!(write_hold_regs(regs::HOLD_DEVICE_CONFIG, &values));
         for (offset, expected) in values.iter().enumerate() {
             assert_eq!(
@@ -710,12 +737,29 @@ mod tests {
     #[test]
     fn test_pc_logic_single_write_is_readable_and_persistent() {
         let address = regs::HOLD_DEVICE_CONFIG + 119;
+        assert!(write_hold_reg(regs::HOLD_PROTECT_WORD, LOGIC_WRITE_MAGIC));
         assert!(write_hold_reg(address, 0xA55A));
         assert_eq!(read_hold_reg(address), Some(0xA55A));
         assert!(
             crate::bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire),
             "FC06 logic write must schedule NVS persistence"
         );
+    }
+
+    #[test]
+    fn test_logic_write_requires_4222_commit_gate() {
+        disarm_logic_write();
+        crate::bus::storage_state::HOLDING_DIRTY.store(false, Ordering::Release);
+        let address = regs::HOLD_DEVICE_CONFIG + 150;
+        assert!(write_hold_reg(address, 0xCAFE));
+        assert_eq!(read_hold_reg(address), Some(0xCAFE));
+        assert!(!crate::bus::storage_state::HOLDING_DIRTY.load(Ordering::Acquire));
+
+        assert!(write_hold_reg(regs::HOLD_PROTECT_WORD, LOGIC_WRITE_MAGIC));
+        assert!(write_hold_reg(address, 0xBABE));
+        assert_eq!(read_hold_reg(address), Some(0xBABE));
+        assert!(crate::bus::storage_state::HOLDING_DIRTY.load(Ordering::Acquire));
+        assert_eq!(read_hold_reg(regs::HOLD_PROTECT_WORD), Some(0));
     }
 
     #[test]
@@ -801,6 +845,14 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             let start = (addr - regs::DEVICE_TEXT_BASE) as usize;
             Arc::make_mut(&mut snap.device_text)[start..start + values.len()]
                 .copy_from_slice(values);
+            // The PC tool historically sends 4222 before every text chunk as
+            // well. Text persistence is independent of PRegBuf protection;
+            // consume and clear a stale arm so 0x55AA can never survive a
+            // text-only save or the subsequent reload.
+            if LOGIC_WRITE_ARMED.swap(false, Ordering::AcqRel) {
+                Arc::make_mut(&mut snap.holding_buf)
+                    [(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
+            }
             sync_proto_status(&mut snap);
             STORAGE.write(snap);
         }
@@ -819,10 +871,21 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             let mut config_changed = false;
             let mut config_needs_version_bump = false;
             let mut holding_changed = false;
+            let mut logic_changed = false;
+            let mut protect_touched = false;
+            let mut logic_commit = LOGIC_WRITE_ARMED.load(Ordering::Acquire);
             let mut holding = storage_clone();
 
             for (offset, &value) in values.iter().enumerate() {
                 let target = addr + offset as u16;
+                if target == regs::HOLD_PROTECT_WORD {
+                    Arc::make_mut(&mut holding.holding_buf)
+                        [(target - regs::HOLD_PXX_BASE) as usize] = value;
+                    logic_commit = value == LOGIC_WRITE_MAGIC;
+                    holding_changed = true;
+                    protect_touched = true;
+                    continue;
+                }
                 // 原 C++ SLAVE_DEVICE_CONFIG=2300 到 PRegBuf 末尾是单一连续区。
                 let result = if target >= regs::HOLD_DEVICE_CONFIG {
                     WriteResult::NotFound
@@ -851,6 +914,9 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                         let idx = (target - regs::HOLD_PXX_BASE) as usize;
                         Arc::make_mut(&mut holding.holding_buf)[idx] = value;
                         holding_changed = true;
+                        if is_logic_config_addr(target) {
+                            logic_changed = true;
+                        }
                     }
                 }
             }
@@ -862,9 +928,18 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 super::config_state::CONFIG.write(cs);
             }
             if holding_changed {
+                if logic_commit && logic_changed {
+                    Arc::make_mut(&mut holding.holding_buf)
+                        [(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
+                }
                 sync_proto_status(&mut holding);
                 STORAGE.write(holding);
-                super::storage_state::mark_holding_dirty();
+                if logic_commit && logic_changed {
+                    LOGIC_WRITE_ARMED.store(false, Ordering::Release);
+                    super::storage_state::mark_holding_dirty();
+                } else if protect_touched {
+                    LOGIC_WRITE_ARMED.store(logic_commit, Ordering::Release);
+                }
                 if addr >= regs::HOLD_DEVICE_CONFIG {
                     crate::control_logic::mark_config_changed();
                 }
@@ -913,6 +988,18 @@ fn is_writable_hold_reg(addr: u16) -> bool {
 
 /// write_hold_reg 的内部实现, 调用方必须持有 RCU_WRITE_LOCK
 fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
+    // 4222 is the MCA write-protect/commit word.  Arming it must not itself
+    // become a persisted logic value; the next 2300+ write consumes the arm.
+    if addr == regs::HOLD_PROTECT_WORD {
+        let mut snap = storage_clone();
+        let idx = (addr - regs::HOLD_PXX_BASE) as usize;
+        Arc::make_mut(&mut snap.holding_buf)[idx] = value;
+        sync_proto_status(&mut snap);
+        STORAGE.write(snap);
+        LOGIC_WRITE_ARMED.store(value == LOGIC_WRITE_MAGIC, Ordering::Release);
+        return true;
+    }
+
     // 原 C++ PCtrlBuf (FC06/FC16 地址 0..299)。写入后保留在独立快照，
     // 使旧客户端的控制字和重启恢复行为一致；具体 Q/I 联动由组态解析器消费。
     if addr < regs::CONTROL_WORD_COUNT {
@@ -930,6 +1017,10 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         let idx = (addr - regs::DEVICE_TEXT_BASE) as usize;
         let mut snap = storage_clone();
         Arc::make_mut(&mut snap.device_text)[idx] = value;
+        if LOGIC_WRITE_ARMED.swap(false, Ordering::AcqRel) {
+            Arc::make_mut(&mut snap.holding_buf)
+                [(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
+        }
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
         // 触发设备文本 NVS 持久化 (Android 写入后立即落盘, 复位保留)
@@ -974,9 +1065,22 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 // 单字写从 ~50µs 降至 ~2µs (无 heap alloc)
                 let idx = (addr - regs::HOLD_PXX_BASE) as usize;
                 if idx < regs::HOLD_PXX_COUNT {
-                    storage_modify_holding_locked(|buf| {
-                        buf[idx] = value;
-                    });
+                    let armed =
+                        is_logic_config_addr(addr) && LOGIC_WRITE_ARMED.load(Ordering::Acquire);
+                    let mut snap = storage_clone();
+                    Arc::make_mut(&mut snap.holding_buf)[idx] = value;
+                    if armed {
+                        Arc::make_mut(&mut snap.holding_buf)
+                            [(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
+                    }
+                    sync_proto_status(&mut snap);
+                    STORAGE.write(snap);
+                    if armed {
+                        // One FC06 logical write consumes the same one-shot
+                        // commit arm as the legacy Modbus implementation.
+                        LOGIC_WRITE_ARMED.store(false, Ordering::Release);
+                        super::storage_state::mark_holding_dirty();
+                    }
                     if addr >= regs::HOLD_DEVICE_CONFIG {
                         crate::control_logic::mark_config_changed();
                     }

@@ -210,7 +210,16 @@ fn store_device_function_config(data: &[u8]) -> bool {
         data_word += record.len().div_ceil(2);
         pos += len;
     }
-    crate::bus::backends::write_hold_regs(base, &words)
+    // BLE receives the complete legacy configuration frame atomically.  The
+    // MCA transport opens the same 0x55AA PRegBuf commit gate around that
+    // frame; use the shared backend gate so BLE and PC Modbus persistence are
+    // identical.
+    crate::bus::backends::arm_logic_write();
+    let written = crate::bus::backends::write_hold_regs(base, &words);
+    if !written {
+        crate::bus::backends::disarm_logic_write();
+    }
+    written
 }
 
 /// Read the legacy device-function table back in the exact 0xD1 wire layout.
