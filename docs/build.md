@@ -291,8 +291,9 @@ just flash-release-artifact f3
 刷入流程会先检查连接芯片为 ESP32-S3、Flash 为 8MB，再使用 DIO/40MHz
 写入 `0x0`、`0x8000`、`0x10000`、`0x20000` 四段，并启用回读校验；默认不执行
 `erase-all`，因此不会清除现场业务 NVS。当前 CH340 设备由脚本默认调用
-`espflash default-reset` 自动进入下载模式，不需要手动按 BOOT。如需跳过自动复位
-（仅适用于设备已经处于下载器状态），可使用：
+`espflash default-reset` 自动进入下载模式，并在写入后再次用 `espflash reset`
+释放下载器启动应用，不需要手动按 BOOT。如需跳过自动复位（仅适用于设备已经
+处于下载器状态），可使用：
 
 ```bash
 ESPFLASH_BEFORE=no_reset just release-flash f3
@@ -301,6 +302,9 @@ ESPFLASH_BEFORE=no_reset just release-flash f3
 串口、波特率和复位方式可通过 `ESPFLASH_PORT`、`ESPFLASH_BAUD`、
 `ESPFLASH_BEFORE`、`ESPFLASH_AFTER` 覆盖。没有设备时可用
 `RELEASE_FLASH_DRY_RUN=1 just release-flash f3` 验证构建、清单和最终命令。
+F3/F4/Default 是编译期硬件型号，必须与实际主板匹配；例如 F16 主板不能刷 F3，
+否则 MCP23017 初始化会失败且网口不会启动。当前脚本无法仅凭 ESP32 芯片 MAC
+自动识别扩展板型号，刷写前必须确认型号。
 刷入脚本默认只接受当前 Git 提交且工作区干净的发布包；仅在明确确认时，才使用
 `ALLOW_STALE_RELEASE=1` 或 `ALLOW_DIRTY_RELEASE=1` 放宽对应保护。
 

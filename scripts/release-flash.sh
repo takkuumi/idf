@@ -49,6 +49,7 @@ RESET_BEFORE="${ESPFLASH_BEFORE:-default_reset}"
 RESET_BEFORE="${RESET_BEFORE//_/-}"
 BEFORE="no_reset"
 AFTER="${ESPFLASH_AFTER:-hard_reset}"
+RESET_AFTER_BEFORE="${ESPFLASH_RESET_BEFORE:-default-reset}"
 ALLOW_STALE_RELEASE="${ALLOW_STALE_RELEASE:-0}"
 ALLOW_DIRTY_RELEASE="${ALLOW_DIRTY_RELEASE:-0}"
 
@@ -164,10 +165,14 @@ if [[ "${RELEASE_FLASH_DRY_RUN:-0}" == 1 ]]; then
     echo "=== dry-run：跳过设备连接和烧录 ==="
     printf 'ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info --port %q --baud %q --before %q --after no-reset --non-interactive\n' \
         "$PORT" "$BAUD" "$RESET_BEFORE"
-    printf 'python3 -m esptool --chip esp32s3 --port %q --baud %q --before %q --after %q write_flash --verify --flash_mode dio --flash_freq 40m --flash_size 8MB\n' \
-        "$PORT" "$BAUD" "$BEFORE" "$AFTER"
+    printf 'python3 -m esptool --chip esp32s3 --port %q --baud %q --before %q --after no_reset write_flash --verify --flash_mode dio --flash_freq 40m --flash_size 8MB\n' \
+        "$PORT" "$BAUD" "$BEFORE"
     printf '  0x0 %q 0x8000 %q 0x10000 %q 0x20000 %q\n' \
         "$BOOTLOADER" "$PARTITION" "$OTADATA" "$APP"
+    if [[ "$AFTER" != "no_reset" && "$AFTER" != "no-reset" ]]; then
+        printf 'ESPFLASH_SKIP_UPDATE_CHECK=true espflash reset --port %q --baud %q --before %q --after hard-reset --non-interactive\n' \
+            "$PORT" "$BAUD" "$RESET_AFTER_BEFORE"
+    fi
     exit 0
 fi
 
@@ -205,11 +210,19 @@ if ! printf '%s\n' "$FLASH_OUTPUT" | grep -Eiq '8MB|8388608'; then
 fi
 
 echo "=== 开始刷入 ${VARIANT_UPPER} v${VERSION}（保留业务 NVS，不执行全擦） ==="
-python3 -m esptool "${COMMON_ARGS[@]}" --after "$AFTER" write_flash \
+python3 -m esptool "${COMMON_ARGS[@]}" --after no_reset write_flash \
     --verify --flash_mode dio --flash_freq 40m --flash_size 8MB \
     0x0 "$BOOTLOADER" \
     0x8000 "$PARTITION" \
     0x10000 "$OTADATA" \
     0x20000 "$APP"
 
-echo "刷入完成：${VARIANT_UPPER} v${VERSION}，设备将按 ${AFTER} 方式复位。"
+if [[ "$AFTER" != "no_reset" && "$AFTER" != "no-reset" ]]; then
+    echo "=== 通过 espflash ${RESET_AFTER_BEFORE} 释放下载器并启动应用 ==="
+    ESPFLASH_SKIP_UPDATE_CHECK=true espflash reset \
+        --port "$PORT" --baud "$BAUD" --before "$RESET_AFTER_BEFORE" \
+        --after hard-reset --non-interactive
+    echo "刷入完成：${VARIANT_UPPER} v${VERSION}，设备已复位启动。"
+else
+    echo "刷入完成：${VARIANT_UPPER} v${VERSION}，设备保留在下载器状态。"
+fi
