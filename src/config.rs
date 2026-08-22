@@ -390,6 +390,11 @@ pub mod regs {
     pub const COIL_INTERNAL_START: u16 = 0x0400;
     pub const COIL_INTERNAL_STOP: u16 = 0x0401;
     pub const COIL_RESTART: u16 = 0x0402;
+    /// 现场 MCA/IDF 固件均使用的重启控制线。
+    ///
+    /// 旧 MCA 源码将 M2 定义为 0x0402，但已部署设备的 Modbus 地址窗口
+    /// 还把 0x0403 映射为同一条重启线。两个地址都必须保留，不能落入
+    /// 普通 legacy DRegBuf 存储区。
     pub const COIL_LOGIC_RESTART: u16 = 0x0403;
     /// 旧 MCA 扩展线圈窗口: DRegBuf 覆盖 REG_D01..REG_DXX (512..2047).
     pub const LEGACY_COIL_BASE: u16 = 0x0200;

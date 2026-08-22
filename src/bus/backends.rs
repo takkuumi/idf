@@ -94,6 +94,12 @@ pub fn read_coil(addr: u16) -> Option<bool> {
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         return Some(ch < hw_version::DO_COUNT && IO.do_.get_bit(ch));
     }
+    // Internal control coils overlap the legacy DRegBuf address window. They
+    // must be resolved first so the restart aliases are never exposed as
+    // persistent user coils.
+    if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
+        return Some(false);
+    }
     if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
         return storage_read_with(|storage| {
             storage
@@ -105,9 +111,6 @@ pub fn read_coil(addr: u16) -> Option<bool> {
         .flatten();
     }
     if (regs::LEGACY_POINT_WINDOW_COUNT..regs::COIL_DO_BASE).contains(&addr) {
-        return Some(false);
-    }
-    if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
         return Some(false);
     }
     None
@@ -695,6 +698,30 @@ mod tests {
     }
 
     #[test]
+    fn test_mca_restart_aliases_request_reset() {
+        for addr in [regs::COIL_RESTART, regs::COIL_LOGIC_RESTART] {
+            assert!(write_coil(addr, true), "restart alias {addr:#06x}");
+            let request = crate::bus::IO.sys.take_reset_request();
+            assert!(
+                crate::bus::io_state::ResetSource::is_valid(request),
+                "restart alias {addr:#06x} did not request reset"
+            );
+            assert_eq!(crate::bus::io_state::ResetSource::label(request), "modbus");
+            assert!(write_coil(addr, false), "restart alias {addr:#06x}");
+            assert_eq!(crate::bus::IO.sys.take_reset_request(), 0);
+        }
+    }
+
+    #[test]
+    fn test_mca_restart_alias_works_for_multiple_coils() {
+        assert!(write_coils(regs::COIL_LOGIC_RESTART, 1, &[0b0000_0001]));
+        assert_eq!(
+            crate::bus::io_state::ResetSource::label(crate::bus::IO.sys.take_reset_request()),
+            "modbus"
+        );
+    }
+
+    #[test]
     fn test_legacy_multi_coil_crosses_physical_and_internal_boundary() {
         let start = regs::COIL_DO_END - 2;
         assert!(write_coils(start, 4, &[0b0000_1101]));
@@ -1180,24 +1207,21 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         return true;
     }
     match addr {
-        // 旧 FC05 对 M2(0x0402) 的单点写会在应答后重启；FC0F 仍只写 DRegBuf。
+        // 现场设备同时将 0x0402 (旧 MCA M2) 和 0x0403 映射为重启线。
+        // 两个地址都必须在 legacy DRegBuf 窗口之前处理，避免被当作普通线圈保存。
         regs::COIL_RESTART | regs::COIL_LOGIC_RESTART => {
             if value {
-                // PC 配置工具写完逻辑/文本后会立即通过 0x0403 触发重载。
+                // PC 配置工具写完逻辑/文本后会通过任一兼容地址触发重载。
                 // 这些区域平时采用合并异步落盘，但重启会终止 actor，必须在
                 // 接受重启请求前同步提交并校验，否则刚写入的数据会在掉电/重启
                 // 后丢失。失败时不重启，保留 dirty 标志让后台继续重试。
-                if addr == regs::COIL_LOGIC_RESTART {
-                    if let Err(error) = crate::device::holding_store::save_to_nvs() {
-                        log::error!(
-                            "[modbus] logic reload refused: holding persist failed: {error}"
-                        );
-                        return false;
-                    }
-                    if let Err(error) = crate::device::persist_device_text_now() {
-                        log::error!("[modbus] logic reload refused: text persist failed: {error}");
-                        return false;
-                    }
+                if let Err(error) = crate::device::holding_store::save_to_nvs() {
+                    log::error!("[modbus] restart refused: holding persist failed: {error}");
+                    return false;
+                }
+                if let Err(error) = crate::device::persist_device_text_now() {
+                    log::error!("[modbus] restart refused: text persist failed: {error}");
+                    return false;
                 }
                 super::io_global::IO
                     .sys
@@ -1251,6 +1275,40 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
         return true;
     }
 
+    // Control coils overlap the legacy DRegBuf window and must be dispatched
+    // before it, otherwise FC=0F on 0x0403 would silently persist a user coil
+    // instead of requesting the device restart.
+    let all_controls = (0..count).all(|offset| {
+        matches!(
+            addr + offset,
+            regs::COIL_INTERNAL_START
+                | regs::COIL_INTERNAL_STOP
+                | regs::COIL_RESTART
+                | regs::COIL_LOGIC_RESTART
+        )
+    });
+    let any_control = (0..count).any(|offset| {
+        matches!(
+            addr + offset,
+            regs::COIL_INTERNAL_START
+                | regs::COIL_INTERNAL_STOP
+                | regs::COIL_RESTART
+                | regs::COIL_LOGIC_RESTART
+        )
+    });
+    if any_control && !all_controls {
+        return false;
+    }
+    if all_controls {
+        return (0..count).all(|offset| {
+            let bit = offset as usize;
+            write_coil(
+                addr + offset,
+                packed_values[bit / 8] & (1 << (bit % 8)) != 0,
+            )
+        });
+    }
+
     if addr >= regs::LEGACY_COIL_BASE && end_exclusive <= regs::LEGACY_COIL_END as u32 + 1 {
         let _guard = rcu_write_guard();
         let mut snap = storage_clone();
@@ -1280,24 +1338,7 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
         return true;
     }
 
-    // 内部控制线圈是唯一另一段可写窗口。全段验证完成后才执行重启等副作用。
-    let all_controls = (0..count).all(|offset| {
-        matches!(
-            addr + offset,
-            regs::COIL_INTERNAL_START
-                | regs::COIL_INTERNAL_STOP
-                | regs::COIL_RESTART
-                | regs::COIL_LOGIC_RESTART
-        )
-    });
-    all_controls
-        && (0..count).all(|offset| {
-            let bit = offset as usize;
-            write_coil(
-                addr + offset,
-                packed_values[bit / 8] & (1 << (bit % 8)) != 0,
-            )
-        })
+    false
 }
 
 /// 修改 SystemConfig 部分字段后回写 CONFIG RCU. 用于 w5500 DHCP 写回等单写者场景.

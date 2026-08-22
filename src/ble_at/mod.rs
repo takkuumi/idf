@@ -1599,7 +1599,17 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     }
     // ---- MCA 逻辑配置协议 (0xD0-0xD3) ----
     // 0xD0 LOGIC_CONFIG / 0xD1 LOGIC_RETRIEVE / 0xD2 DELETE_CONFIG / 0xD3 COM_REQUEST
-    if (0xD0..=0xD3).contains(&func)
+    if func == 0xD3 {
+        // Legacy MCA sends COM input and COM output status as two complete
+        // frames.  Notify each one independently so Android's frame parser
+        // cannot treat the second response as trailing bytes of the first.
+        let frames = logic_handlers::com_request_frames();
+        for rsp in frames {
+            send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+        }
+        return true;
+    }
+    if (0xD0..=0xD2).contains(&func)
         && let Some(rsp) = logic_handlers::dispatch_logic_cmd(func, &data[8..crc_begin])
     {
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
@@ -1705,6 +1715,8 @@ fn handle_handheld_config_text(
 ///   0xC5 = SET_LOCATION_INFO
 ///   0xC6 = GET_ETH_MAC
 ///   0xC7 = SET_ETH_MAC
+///   0xC8 = GET_SLAVE_PORT
+///   0xC9 = SET_SLAVE_PORT
 ///   0xCA = GET_BLUETOOTH_NO
 ///   0xCB = SET_BLUETOOTH_NO
 ///   0xCC = GET_DEVICE_TYPE
@@ -1725,6 +1737,15 @@ fn handle_mca_custom_command(
         log::warn!("[ble_at] MCA custom cmd 0x{func:02X} invalid or unsupported");
         return false;
     };
+    // 旧 MCA 手持机协议在修改网络参数或以太网 MAC 后会在应答发送完成
+    // 后复位设备。通过 DeviceActor 统一落盘，只有配置成功持久化后才
+    // 请求复位，避免手持机收到成功应答但重启后配置丢失。
+    if matches!(func, 0xC7 | 0xCD) {
+        if !crate::device::request_persist_config_and_reset() {
+            log::error!("[ble_at] MCA custom cmd 0x{func:02X}: config reset request rejected");
+            return false;
+        }
+    }
     send_ble_frame(tx_id, proto_id, &rsp, conn_id);
     true
 }
@@ -1735,23 +1756,29 @@ fn custom_ack<const N: usize>(func: u8) -> heapless::Vec<u8, N> {
     response
 }
 
-fn write_legacy_words(base: u16, bytes: &[u8], word_count: usize) -> bool {
+/// MCA custom commands encode PRegBuf words little-endian (low byte first),
+/// unlike the normal Modbus register wire format.
+fn write_legacy_words_le(base: u16, bytes: &[u8], word_count: usize) -> bool {
     if bytes.len() != word_count * 2 {
         return false;
     }
     let mut words: heapless::Vec<u16, 9> = heapless::Vec::new();
     for pair in bytes.chunks_exact(2) {
-        if words.push(u16::from_be_bytes([pair[0], pair[1]])).is_err() {
+        if words.push(u16::from_le_bytes([pair[0], pair[1]])).is_err() {
             return false;
         }
     }
     crate::bus::backends::write_hold_regs(base, &words)
 }
 
-fn read_legacy_words<const N: usize>(response: &mut heapless::Vec<u8, N>, base: u16, count: u16) {
+fn read_legacy_words_le<const N: usize>(
+    response: &mut heapless::Vec<u8, N>,
+    base: u16,
+    count: u16,
+) {
     for offset in 0..count {
         let word = crate::bus::backends::read_hold_reg(base + offset).unwrap_or(0);
-        let _ = response.extend_from_slice(&word.to_be_bytes());
+        let _ = response.extend_from_slice(&word.to_le_bytes());
     }
 }
 
@@ -1782,28 +1809,46 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
                 return None;
             }
             let _ = response.push(count as u8);
+            // MCA's handheld packet is not the Modbus FC02 bit order.  The
+            // legacy implementation builds each byte by shifting inputs from
+            // the end of each 8-channel group (the first byte contains the
+            // highest channels; channel 0 is the low bit of the final byte).
             for byte_index in 0..count.div_ceil(8) {
                 let mut packed = 0u8;
-                for bit in 0..8 {
-                    let channel = byte_index * 8 + bit;
-                    if channel < count
-                        && crate::bus::backends::read_disc(channel as u16).unwrap_or(false)
-                    {
-                        packed |= 1 << bit;
-                    }
+                let group_start = byte_index * 8;
+                let group_len = (count - group_start).min(8);
+                for offset in 0..group_len {
+                    // The old firmware indexes from the requested count down
+                    // to zero, and emits a byte after every eight samples.
+                    let channel = count - group_start - 1 - offset;
+                    packed = (packed << 1)
+                        | u8::from(
+                            crate::bus::backends::read_disc(channel as u16).unwrap_or(false),
+                        );
+                }
+                if group_len < 8 {
+                    packed <<= 8 - group_len;
+                }
+                // For a full group this is equivalent to the old
+                // `ComState = ComState << 1 | state` loop.  For a short final
+                // group, left-align the remaining bits as the legacy packet
+                // builder did when its count was not a multiple of eight.
+                if group_len == 0 {
+                    packed = 0;
                 }
                 let _ = response.push(packed);
             }
         }
-        0xC2 => read_legacy_words(&mut response, regs::HOLD_SN_BASE, regs::HOLD_SN_COUNT),
+        0xC2 => read_legacy_words_le(&mut response, regs::HOLD_SN_BASE, regs::HOLD_SN_COUNT),
         0xC3 => {
-            if !write_legacy_words(regs::HOLD_SN_BASE, data, regs::HOLD_SN_COUNT as usize) {
+            if !write_legacy_words_le(regs::HOLD_SN_BASE, data, regs::HOLD_SN_COUNT as usize) {
                 return None;
             }
         }
-        0xC4 => read_legacy_words(&mut response, regs::HOLD_PLACE_BASE, regs::HOLD_PLACE_COUNT),
+        0xC4 => read_legacy_words_le(&mut response, regs::HOLD_PLACE_BASE, regs::HOLD_PLACE_COUNT),
         0xC5 => {
-            if !write_legacy_words(regs::HOLD_PLACE_BASE, data, regs::HOLD_PLACE_COUNT as usize) {
+            if !write_legacy_words_le(regs::HOLD_PLACE_BASE, data, regs::HOLD_PLACE_COUNT as usize)
+            {
                 return None;
             }
         }
@@ -1823,17 +1868,31 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
                 return None;
             }
         }
-        // C8/C9 are constants in the old source but are not dispatched by
-        // vBleMessageDistribution; accepting them would claim a capability MCA never exposed.
-        0xCA => read_legacy_words(&mut response, regs::HOLD_BLE_ADDR_BASE, 1),
+        0xC8 => {
+            let value = crate::bus::backends::read_hold_reg(regs::HOLD_TCP_COM_BASE)?;
+            let _ = response.extend_from_slice(&value.to_le_bytes());
+        }
+        0xC9 => {
+            if data.len() != 2
+                || !crate::bus::backends::write_hold_reg(
+                    regs::HOLD_TCP_COM_BASE,
+                    u16::from_le_bytes([data[0], data[1]]),
+                )
+            {
+                return None;
+            }
+        }
+        // The legacy wire format returns every 16-bit PRegBuf value low byte
+        // first (including the Bluetooth number).
+        0xCA => read_legacy_words_le(&mut response, regs::HOLD_BLE_ADDR_BASE, 1),
         0xCB => {
-            if !write_legacy_words(regs::HOLD_BLE_ADDR_BASE, data, 1) {
+            if !write_legacy_words_le(regs::HOLD_BLE_ADDR_BASE, data, 1) {
                 return None;
             }
         }
         0xCC => {
             let value = crate::bus::backends::read_hold_reg(regs::HOLD_HW_VER).unwrap_or(0);
-            let _ = response.extend_from_slice(&value.to_be_bytes());
+            let _ = response.extend_from_slice(&value.to_le_bytes());
         }
         0xCD => {
             if data.len() != 12 {
@@ -1862,6 +1921,9 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             let _ = response.push((version / 100) as u8);
             let _ = response.push(((version % 100) / 10) as u8);
             let _ = response.push((version % 10) as u8);
+            // The current SystemConfig stores the MCA date as packed bytes
+            // (0x0615), while the legacy decimal constant 615 produced the
+            // same wire pair [6, 15].
             let _ = response.push((date >> 8) as u8);
             let _ = response.push(date as u8);
         }
@@ -3643,6 +3705,7 @@ mod tests_ble_cmd {
         assert_eq!(build_mca_custom_response(0xC2, &[]).unwrap().len(), 20);
         assert_eq!(build_mca_custom_response(0xC4, &[]).unwrap().len(), 18);
         assert_eq!(build_mca_custom_response(0xC6, &[]).unwrap().len(), 8);
+        assert_eq!(build_mca_custom_response(0xC8, &[]).unwrap().len(), 4);
         assert_eq!(build_mca_custom_response(0xCA, &[]).unwrap().len(), 4);
         assert_eq!(build_mca_custom_response(0xCC, &[]).unwrap().len(), 4);
         assert_eq!(build_mca_custom_response(0xCE, &[]).unwrap().len(), 14);
@@ -3657,11 +3720,25 @@ mod tests_ble_cmd {
         assert!(build_mca_custom_response(0xC7, &[0; 5]).is_none());
         assert!(build_mca_custom_response(0xCB, &[0]).is_none());
         assert!(build_mca_custom_response(0xCD, &[0; 11]).is_none());
+        assert!(build_mca_custom_response(0xC9, &[0]).is_none());
     }
 
     #[test]
-    fn test_mca_custom_undispatched_legacy_constants_are_rejected() {
-        assert!(build_mca_custom_response(0xC8, &[]).is_none());
-        assert!(build_mca_custom_response(0xC9, &[]).is_none());
+    fn test_mca_custom_words_use_legacy_little_endian_order() {
+        let mut sn = [0u8; 18];
+        for (index, pair) in sn.chunks_exact_mut(2).enumerate() {
+            let value = 0x1200u16 + index as u16;
+            pair.copy_from_slice(&value.to_le_bytes());
+        }
+        assert!(build_mca_custom_response(0xC3, &sn).is_some());
+        let response = build_mca_custom_response(0xC2, &[]).expect("SN read");
+        assert_eq!(&response[2..], &sn);
+    }
+
+    #[test]
+    fn test_mca_custom_slave_port_round_trip() {
+        assert!(build_mca_custom_response(0xC9, &502u16.to_le_bytes()).is_some());
+        let response = build_mca_custom_response(0xC8, &[]).expect("port read");
+        assert_eq!(&response[2..], &502u16.to_le_bytes());
     }
 }

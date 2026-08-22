@@ -222,6 +222,47 @@ fn store_device_function_config(data: &[u8]) -> bool {
     written
 }
 
+/// MCA D0 subcommands 0x20/0x21 are the two RS485 port records.  The legacy
+/// firmware writes five little-endian words straight into PRegBuf, and the
+/// runtime port task reads those same words.  Keeping them in the generic
+/// logic_cfg namespace would acknowledge the packet while leaving the active
+/// serial configuration unchanged.
+fn store_rs485_config(sub: u8, data: &[u8]) -> bool {
+    if data.len() != 10 {
+        return false;
+    }
+    let base = match sub {
+        SUB_RS485_01 => crate::config::regs::HOLD_RS485_BASE,
+        SUB_RS485_02 => {
+            crate::config::regs::HOLD_RS485_BASE + crate::config::regs::HOLD_RS485_STRIDE
+        }
+        _ => return false,
+    };
+    let mut words: HVec<u16, 5> = HVec::new();
+    for pair in data.chunks_exact(2) {
+        if words.push(u16::from_le_bytes([pair[0], pair[1]])).is_err() {
+            return false;
+        }
+    }
+    crate::bus::backends::write_hold_regs(base, &words)
+}
+
+fn load_rs485_config(sub: u8) -> Option<Vec<u8>> {
+    let base = match sub {
+        SUB_RS485_01 => crate::config::regs::HOLD_RS485_BASE,
+        SUB_RS485_02 => {
+            crate::config::regs::HOLD_RS485_BASE + crate::config::regs::HOLD_RS485_STRIDE
+        }
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(10);
+    for offset in 0..5u16 {
+        let word = crate::bus::backends::read_hold_reg(base + offset)?;
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    Some(out)
+}
+
 /// Read the legacy device-function table back in the exact 0xD1 wire layout.
 fn load_device_function_config() -> Option<Vec<u8>> {
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
@@ -312,6 +353,8 @@ pub fn handle_logic_config(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
 
     let success = if sub == SUB_DEVICE_01 {
         store_device_function_config(payload)
+    } else if sub == SUB_RS485_01 || sub == SUB_RS485_02 {
+        store_rs485_config(sub, payload)
     } else if sub <= 0x22 || sub == 0x23 || sub == 0x24 || sub == 0x26 {
         // 通用配置存储 (0x00-0x22, 0x23, 0x24, 0x26)
         store_config(sub, payload)
@@ -344,6 +387,8 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
 
     let config = if sub == SUB_DEVICE_01 {
         load_device_function_config()
+    } else if sub == SUB_RS485_01 || sub == SUB_RS485_02 {
+        load_rs485_config(sub)
     } else {
         load_config(sub)
     };
@@ -393,23 +438,39 @@ pub fn handle_delete_config() -> Option<heapless::Vec<u8, 256>> {
 pub fn handle_com_request() -> Option<heapless::Vec<u8, 256>> {
     log::info!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
 
+    let [di, do_] = com_request_frames();
+    let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let _ = rsp.extend_from_slice(&di);
+    let _ = rsp.extend_from_slice(&do_);
+    Some(rsp)
+}
+
+/// Build the two independent legacy D3 response payloads.  The MCA firmware
+/// appends two complete vComboPacket frames to the TX buffer; the BLE transport
+/// must therefore wrap and notify them separately instead of nesting both
+/// payloads in one outer frame.
+pub fn com_request_frames() -> [heapless::Vec<u8, 256>; 2] {
+    log::info!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
+
     // 读取当前 DI 状态 (离散输入位图)
     let di_bitmap = read_io_bitmap(true);
     // 读取当前 DO 状态 (线圈位图)
     let do_bitmap = read_io_bitmap(false);
 
-    let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
+    let mut di_rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
 
     // 第一帧: DI 位图 (cmd=0xD3, sub=0x27)
-    let _ = rsp.push(0xD3);
-    let _ = rsp.push(SUB_COM_INPUT_ANS);
-    let _ = rsp.extend_from_slice(&di_bitmap);
-    // 第二帧: DO 位图 (cmd=0xD3, sub=0x28)
-    let _ = rsp.push(0xD3);
-    let _ = rsp.push(SUB_COM_OUTPUT_ANS);
-    let _ = rsp.extend_from_slice(&do_bitmap);
+    let _ = di_rsp.push(0xD3);
+    let _ = di_rsp.push(SUB_COM_INPUT_ANS);
+    let _ = di_rsp.extend_from_slice(&di_bitmap);
 
-    Some(rsp)
+    let mut do_rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
+    // 第二帧: DO 位图 (cmd=0xD3, sub=0x28)
+    let _ = do_rsp.push(0xD3);
+    let _ = do_rsp.push(SUB_COM_OUTPUT_ANS);
+    let _ = do_rsp.extend_from_slice(&do_bitmap);
+
+    [di_rsp, do_rsp]
 }
 
 /// 读取 IO 位图 (DI 或 DO)
@@ -422,26 +483,24 @@ fn read_io_bitmap(is_di: bool) -> heapless::Vec<u8, 8> {
     };
     let io = &crate::bus::IO;
 
-    let mut byte = 0u8;
-    let mut bit_pos = 0;
-    for ch in 0..count {
-        let bit = if is_di {
-            io.di.get_bit(ch)
-        } else {
-            io.do_.get_bit(ch)
-        };
-        if bit {
-            byte |= 1 << bit_pos;
+    // The MCA packet builder walks from the last channel to the first and
+    // shifts left, so channel 0 is the least-significant bit of the final
+    // byte in a full 16/48-channel response.
+    for group_start in (0..count).step_by(8) {
+        let group_len = (count - group_start).min(8);
+        let mut byte = 0u8;
+        for offset in 0..group_len {
+            let ch = count - group_start - 1 - offset;
+            let bit = if is_di {
+                io.di.get_bit(ch)
+            } else {
+                io.do_.get_bit(ch)
+            };
+            byte = (byte << 1) | u8::from(bit);
         }
-        bit_pos += 1;
-        if bit_pos >= 8 {
-            let _ = bitmap.push(byte);
-            byte = 0;
-            bit_pos = 0;
+        if group_len < 8 {
+            byte <<= 8 - group_len;
         }
-    }
-    // 剩余位 (不足 8 的倍数)
-    if bit_pos > 0 {
         let _ = bitmap.push(byte);
     }
     bitmap
@@ -463,7 +522,10 @@ pub fn dispatch_logic_cmd(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 256
 
 #[cfg(test)]
 mod tests {
-    use super::{load_device_function_config, store_device_function_config};
+    use super::{
+        SUB_RS485_01, handle_logic_config, handle_logic_retrieve, load_device_function_config,
+        store_device_function_config,
+    };
 
     #[test]
     fn device_function_table_round_trips_through_preg() {
@@ -472,5 +534,19 @@ mod tests {
         let packet = [1, 0, 3, 0x11, 0x22];
         assert!(store_device_function_config(&packet));
         assert_eq!(load_device_function_config(), Some(packet.to_vec()));
+    }
+
+    #[test]
+    fn rs485_logic_config_round_trips_through_runtime_preg() {
+        let mut packet = vec![SUB_RS485_01];
+        for value in [0x1234u16, 7, 3, 450, 60] {
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        let ack = handle_logic_config(&packet).expect("D0 ack");
+        assert_eq!(&ack[..3], &[0xD0, SUB_RS485_01, 0]);
+
+        let response = handle_logic_retrieve(&[SUB_RS485_01]).expect("D1 response");
+        assert_eq!(&response[..2], &[0xD1, SUB_RS485_01]);
+        assert_eq!(&response[2..], &packet[1..]);
     }
 }
