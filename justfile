@@ -50,7 +50,7 @@ build-release:
 set-version version:
     ./scripts/set-version.sh "{{version}}"
 
-# 生产发布：无参数时完整编译 F3/F4；指定 f3/f4 时编译后校验并刷入设备。
+# 生产发布：无参数时完整编译默认/F16、F3、F4；指定型号时编译后校验并刷入设备。
 release variant="all":
     #!/usr/bin/env bash
     set -e
@@ -67,7 +67,10 @@ release-f3:
 release-f4:
     ./scripts/release.sh f4
 
-# 生产发布并刷入指定型号。必须明确 f3/f4，默认不全擦，保留业务 NVS。
+release-default:
+    ./scripts/release.sh default
+
+# 生产发布并刷入指定型号。必须明确型号，默认不全擦，保留业务 NVS。
 release-flash variant:
     ./scripts/release-flash.sh "{{variant}}"
 

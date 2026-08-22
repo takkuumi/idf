@@ -714,6 +714,21 @@ mod tests {
             "FC06 logic write must schedule NVS persistence"
         );
     }
+
+    #[test]
+    fn test_device_text_write_round_trips_at_5000_without_emptying() {
+        let address = regs::DEVICE_TEXT_BASE + 2;
+        let values = [0x0041, 0x4E2D, 0x6587, 0x0000];
+        assert!(write_hold_regs(address, &values));
+        for (offset, expected) in values.iter().enumerate() {
+            assert_eq!(
+                read_hold_reg(address + offset as u16),
+                Some(*expected),
+                "device text word {} must round-trip",
+                offset
+            );
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -751,12 +766,10 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
         let _guard = rcu_write_guard();
         write_hold_reg_locked(addr, value)
     };
-    if written
-        && (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
-        && let Err(error) = crate::device::persist_device_text_now()
-    {
-        log::error!("[device] dev_text immediate persist failed: {error}");
-        return false;
+    if written && (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr) {
+        // 文本可能由多个 FC06 分片组成；只标记 dirty，由 DeviceActor 合并后
+        // 一次擦写并校验，避免每个字符都触发 4KB NVS 擦写。
+        crate::device::request_save_device_text();
     }
     if written && addr < regs::CONTROL_WORD_COUNT {
         crate::control_logic::on_control_word_written(addr, value);
@@ -788,10 +801,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             sync_proto_status(&mut snap);
             STORAGE.write(snap);
         }
-        if let Err(error) = crate::device::persist_device_text_now() {
-            log::error!("[device] dev_text immediate persist failed: {error}");
-            return false;
-        }
+        crate::device::request_save_device_text();
         return true;
     }
 

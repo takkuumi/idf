@@ -9,15 +9,16 @@ SKIP_BUILD=0
 if [[ "${2:-}" == "--skip-build" ]]; then
     SKIP_BUILD=1
 elif [[ $# -gt 1 ]]; then
-    echo "用法: $0 <f3|f4> [--skip-build]" >&2
+    echo "用法: $0 <default|f16|f3|f4> [--skip-build]" >&2
     exit 2
 fi
 
 case "$VARIANT" in
-    f3|f4) ;;
+    f16) VARIANT=default ;;
+    default|f3|f4) ;;
     *)
-        echo "错误: 必须明确选择硬件型号 f3 或 f4，避免刷入错误固件。" >&2
-        echo "用法: just release-flash f3" >&2
+        echo "错误: 必须明确选择硬件型号 default/f16、f3 或 f4，避免刷入错误固件。" >&2
+        echo "用法: just release-flash default" >&2
         exit 2
         ;;
 esac

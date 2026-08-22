@@ -6,9 +6,10 @@ cd "$ROOT_DIR"
 
 VARIANT_ARG="${1:-all}"
 case "$VARIANT_ARG" in
-    all) VARIANTS=(f3 f4) ;;
-    f3|f4) VARIANTS=("$VARIANT_ARG") ;;
-    *) echo "错误: 仅支持 all、f3 或 f4" >&2; exit 2 ;;
+    all) VARIANTS=(default f3 f4) ;;
+    default|f3|f4) VARIANTS=("$VARIANT_ARG") ;;
+    f16) VARIANTS=(default) ;;
+    *) echo "错误: 仅支持 all、default/f16、f3 或 f4" >&2; exit 2 ;;
 esac
 
 for command_name in cargo espflash python3 git; do
@@ -81,8 +82,13 @@ build_variant() {
     echo ""
     echo "=== 完整编译 ${variant_upper} / v${VERSION} ==="
     cargo clean --target-dir "$target_dir"
-    CARGO_TARGET_DIR="$target_dir" cargo build \
-        --release --locked --bin gateway --features "$variant"
+    if [[ "$variant" == default || "$variant" == f16 ]]; then
+        CARGO_TARGET_DIR="$target_dir" cargo build \
+            --release --locked --bin gateway
+    else
+        CARGO_TARGET_DIR="$target_dir" cargo build \
+            --release --locked --bin gateway --features "$variant"
+    fi
 
     local elf="$target_dir/xtensa-esp32s3-espidf/release/gateway"
     if [[ ! -f "$elf" ]]; then

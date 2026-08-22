@@ -311,6 +311,9 @@ const DEVICE_TEXT_BLOB_BYTES: usize = regs::DEVICE_TEXT_COUNT as usize * 2;
 /// 4000B 有效数据使用 4097B 一次性工作区，确保优先分配到 PSRAM并长期复用。
 static DEVICE_TEXT_BLOB_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
     LazyLock::new(|| Mutex::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
+/// NVS 回读校验缓冲。与写入缓冲分离，避免把 NVS 返回的借用切片带出锁作用域。
+static DEVICE_TEXT_VERIFY_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
+    LazyLock::new(|| Mutex::new(vec![0u8; BLOB_ALLOC_BYTES].into_boxed_slice()));
 
 // ----------------------------------------------------------------------------
 // 全局状态
@@ -902,11 +905,11 @@ fn save_current_device_text_to_nvs() -> AppResult<()> {
     })
 }
 
-/// 文本区写入完成后的立即持久化入口。
+/// 文本区的同步持久化入口，供需要在返回前确认 Flash 的调用方使用。
 ///
-/// MCA 在一次 FC=06/FC=16 写入完成后马上保存文本文件。IDF 保留同样的
-/// 可见语义：通信响应返回前完成一次 NVS 擦写；若介质暂时失败，dirty 标志
-/// 仍由后台重试，避免 RAM 写入被误报为永久保存成功。
+/// 普通 Modbus/BLE 分片写只置 dirty，由 DeviceActor 合并后落盘，避免一次
+/// 文本传输触发数十次 4KB 擦写。该入口仍保留完整的写后读校验；失败时 dirty
+/// 不会被清除，后台会继续重试。
 pub fn persist_device_text_now() -> AppResult<()> {
     let result = save_current_device_text_to_nvs();
     if result.is_ok() {
@@ -926,12 +929,49 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
         )));
     }
     if let Some(result) = try_with_nvs_mut(|nvs| -> AppResult<()> {
-        // 保持 MCA 的单 blob 格式：擦除并重写 4000 字节文本，再写兼容 magic。
-        // FC16 批量写只调用一次；FC06 单字写按旧 MCA 语义立即保存。
-        nvs.set_blob(NVS_KEY_DEV_TEXT, blob)
-            .map_err(|e| AppError::Config(format!("nvs set dev_text: {e:?}")))?;
+        // 先比较现有内容。文本分片会反复触发 dirty，但内容没变化时绝不能
+        // 再次调用 set_blob；EspNvs::set_blob 会先擦除旧 key，失败时会留下空 key。
+        let mut verify = DEVICE_TEXT_VERIFY_BUFFER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let unchanged = match nvs.get_blob(NVS_KEY_DEV_TEXT, &mut verify[..DEVICE_TEXT_BLOB_BYTES])
+        {
+            Ok(Some(current)) if current.len() == DEVICE_TEXT_BLOB_BYTES => current == blob,
+            Ok(None) => false,
+            Ok(Some(current)) => {
+                log::warn!(
+                    "[device] dev_text existing blob has unexpected length: {}",
+                    current.len()
+                );
+                false
+            }
+            Err(error) => {
+                log::warn!("[device] dev_text pre-read failed, attempting write: {error:?}");
+                false
+            }
+        };
+        if !unchanged {
+            // 保持 MCA 的单 blob 格式：擦除并重写 4000 字节文本，再写兼容 magic。
+            // FC16 批量写只调用一次；FC06 分片由 DeviceActor 合并后写一次。
+            nvs.set_blob(NVS_KEY_DEV_TEXT, blob)
+                .map_err(|e| AppError::Config(format!("nvs set dev_text: {e:?}")))?;
+        }
         nvs.set_u16(NVS_KEY_DEV_TEXT_MAGIC, DEV_TEXT_MAGIC)
             .map_err(|e| AppError::Config(format!("nvs set dev_text magic: {e:?}")))?;
+        let current = nvs
+            .get_blob(NVS_KEY_DEV_TEXT, &mut verify[..DEVICE_TEXT_BLOB_BYTES])
+            .map_err(|e| AppError::Config(format!("nvs verify dev_text: {e:?}")))?
+            .ok_or_else(|| AppError::Config("nvs verify dev_text: key missing".into()))?;
+        if current != blob {
+            return Err(AppError::Config(format!(
+                "nvs verify dev_text: content mismatch ({} bytes)",
+                current.len()
+            )));
+        }
+        log::info!(
+            "[device] dev_text persisted and verified: {} bytes",
+            current.len()
+        );
         Ok(())
     }) {
         result?;
@@ -943,10 +983,17 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-/// 标记设备文本区需要重试。正常 Modbus 文本写入会在响应前调用
-/// [`persist_device_text_now`]；这里只负责介质失败后的后台重试，不改变文本布局。
+/// 标记设备文本区需要持久化。DeviceActor 会合并连续分片并在空闲时重试，
+/// 不改变 MCA 的单 blob 文本布局。
 pub fn request_save_device_text() {
     DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    // 初始化资源不足时 actor 可能尚未启动；此时至少同步尝试一次，避免
+    // “写成功但永远没有消费者”导致重启后丢失。actor 启动后 dirty 仍会重试。
+    if !actor_is_started()
+        && let Err(error) = persist_device_text_now()
+    {
+        log::warn!("[device] dev_text actor unavailable; sync persist deferred: {error}");
+    }
 }
 
 /// LOOP13: 异步持久化 holding_buf (走 Actor mailbox)
