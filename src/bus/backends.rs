@@ -1079,6 +1079,22 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
         // 旧 FC05 对 M2(0x0402) 的单点写会在应答后重启；FC0F 仍只写 DRegBuf。
         regs::COIL_RESTART | regs::COIL_LOGIC_RESTART => {
             if value {
+                // PC 配置工具写完逻辑/文本后会立即通过 0x0403 触发重载。
+                // 这些区域平时采用合并异步落盘，但重启会终止 actor，必须在
+                // 接受重启请求前同步提交并校验，否则刚写入的数据会在掉电/重启
+                // 后丢失。失败时不重启，保留 dirty 标志让后台继续重试。
+                if addr == regs::COIL_LOGIC_RESTART {
+                    if let Err(error) = crate::device::holding_store::save_to_nvs() {
+                        log::error!(
+                            "[modbus] logic reload refused: holding persist failed: {error}"
+                        );
+                        return false;
+                    }
+                    if let Err(error) = crate::device::persist_device_text_now() {
+                        log::error!("[modbus] logic reload refused: text persist failed: {error}");
+                        return false;
+                    }
+                }
                 super::io_global::IO
                     .sys
                     .request_reset(super::io_state::ResetSource::MODBUS);
