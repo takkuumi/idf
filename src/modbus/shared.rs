@@ -89,21 +89,61 @@ impl ModbusBackend for BusBackend {
 }
 
 /// 标准 Modbus CRC-16 (polynomial 0xA001, init 0xFFFF, LSB first)
+const fn build_crc16_table() -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut byte = 0usize;
+    while byte < table.len() {
+        let mut crc = byte as u16;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+}
+
+// 编译期生成，运行时只读 flash；避免每个字节的 8 次分支/移位。
+const MODBUS_CRC16_TABLE: [u16; 256] = build_crc16_table();
+
 #[inline]
 pub fn modbus_crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
+    let mut crc = 0xFFFFu16;
     for &byte in data {
-        crc ^= byte as u16;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc >>= 1;
-                crc ^= 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
+        crc = (crc >> 8) ^ MODBUS_CRC16_TABLE[(crc as u8 ^ byte) as usize];
     }
     crc
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::modbus_crc16;
+
+    #[test]
+    fn crc_table_matches_bitwise_reference_for_all_bytes() {
+        let mut frame = [0u8; 257];
+        for (index, byte) in frame.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut expected = 0xFFFFu16;
+        for &byte in &frame {
+            expected ^= byte as u16;
+            for _ in 0..8 {
+                expected = if expected & 1 != 0 {
+                    (expected >> 1) ^ 0xA001
+                } else {
+                    expected >> 1
+                };
+            }
+        }
+        assert_eq!(modbus_crc16(&frame), expected);
+    }
 }
 
 // ----------------------------------------------------------------------------

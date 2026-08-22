@@ -1088,20 +1088,18 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 return true;
             }
             WriteResult::NotFound => {
-                // LOOP14: storage_modify_holding 替代 storage_clone — 不再 4KB Box 全拷贝,
-                // 单字写从 ~50µs 降至 ~2µs (无 heap alloc)
                 let idx = (addr - regs::HOLD_PXX_BASE) as usize;
                 if idx < regs::HOLD_PXX_COUNT {
                     let armed =
                         is_logic_config_addr(addr) && LOGIC_WRITE_ARMED.load(Ordering::Acquire);
-                    let mut snap = storage_clone();
-                    Arc::make_mut(&mut snap.holding_buf)[idx] = value;
-                    if armed {
-                        Arc::make_mut(&mut snap.holding_buf)
-                            [(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
-                    }
-                    sync_proto_status(&mut snap);
-                    STORAGE.write(snap);
+                    // 专用 holding COW 路径只复制一次 holding_buf，并集中维护
+                    // dirty 标志；避免普通写路径重复构造快照和遗漏持久化通知。
+                    storage_modify_holding_raw_locked(|buf| {
+                        buf[idx] = value;
+                        if armed {
+                            buf[(regs::HOLD_PROTECT_WORD - regs::HOLD_PXX_BASE) as usize] = 0;
+                        }
+                    });
                     if armed {
                         // One FC06 logical write consumes the same one-shot
                         // commit arm as the legacy Modbus implementation.
@@ -1413,9 +1411,15 @@ pub fn storage_modify_holding<F: FnOnce(&mut [u16])>(f: F) {
 
 /// `storage_modify_holding` 的锁内版本；避免 Modbus 写路径重复获取非重入锁而自锁。
 fn storage_modify_holding_locked<F: FnOnce(&mut [u16])>(f: F) {
+    storage_modify_holding_raw_locked(f);
+    super::storage_state::mark_holding_dirty();
+}
+
+/// 锁内 COW 修改，不改变 dirty 状态。诊断/运行时 holding 写入必须保持旧有
+/// 非持久化语义时使用；调用方若属于配置提交路径再显式标记 dirty。
+fn storage_modify_holding_raw_locked<F: FnOnce(&mut [u16])>(f: F) {
     let mut snap = storage_clone();
     f(Arc::make_mut(&mut snap.holding_buf));
     sync_proto_status(&mut snap);
     STORAGE.write(snap);
-    super::storage_state::mark_holding_dirty();
 }
