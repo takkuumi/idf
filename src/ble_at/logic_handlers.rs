@@ -158,6 +158,88 @@ fn store_config(sub: u8, data: &[u8]) -> bool {
     }
 }
 
+/// Store the legacy device-function table in the same PRegBuf window used by
+/// the handheld B1/B3 commands.  The old MCA 0xD0 packet is little-endian and
+/// each record includes its one-byte length at the first byte of the record.
+fn store_device_function_config(data: &[u8]) -> bool {
+    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    if data.len() < 2 {
+        return false;
+    }
+    let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if count == 0 || count > 255 {
+        return false;
+    }
+    let table_words = count + 1;
+    if table_words >= crate::config::regs::HOLD_PXX_COUNT {
+        return false;
+    }
+    let mut words: heapless::Vec<u16, 2048> = heapless::Vec::new();
+    for _ in 0..table_words {
+        let _ = words.push(0);
+    }
+    words[0] = count as u16;
+    let mut pos = 2usize;
+    let mut data_word = table_words;
+    for index in 0..count {
+        let Some(&len_byte) = data.get(pos) else {
+            return false;
+        };
+        let len = len_byte as usize;
+        if len == 0 || pos + len > data.len() {
+            return false;
+        }
+        if data_word >= crate::config::regs::HOLD_PXX_COUNT {
+            return false;
+        }
+        let pointer = base as usize + data_word;
+        if pointer > u16::MAX as usize {
+            return false;
+        }
+        words[index + 1] = pointer as u16;
+        let record = &data[pos..pos + len];
+        for chunk in record.chunks(2) {
+            if words.len() >= crate::config::regs::HOLD_PXX_COUNT {
+                return false;
+            }
+            let value = u16::from_le_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]);
+            if words.push(value).is_err() {
+                return false;
+            }
+        }
+        data_word += record.len().div_ceil(2);
+        pos += len;
+    }
+    crate::bus::backends::write_hold_regs(base, &words)
+}
+
+/// Read the legacy device-function table back in the exact 0xD1 wire layout.
+fn load_device_function_config() -> Option<Vec<u8>> {
+    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    let count = crate::bus::backends::read_hold_reg(base)? as usize;
+    if count == 0 || count > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(&(count as u16).to_le_bytes());
+    for index in 0..count {
+        let pointer = crate::bus::backends::read_hold_reg(base + 1 + index as u16)?;
+        let len = (crate::bus::backends::read_hold_reg(pointer)? & 0xff) as usize;
+        if len == 0 || out.len() + len > 254 {
+            return None;
+        }
+        for byte_index in 0..len {
+            let word = crate::bus::backends::read_hold_reg(pointer + (byte_index / 2) as u16)?;
+            out.push(if byte_index % 2 == 0 {
+                word as u8
+            } else {
+                (word >> 8) as u8
+            });
+        }
+    }
+    Some(out)
+}
+
 /// 从 NVS 读取配置
 fn load_config(sub: u8) -> Option<Vec<u8>> {
     let key = nvs_key_for(sub);
@@ -219,13 +301,10 @@ pub fn handle_logic_config(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
         payload.len()
     );
 
-    let success = if sub <= 0x22 || sub == 0x23 || sub == 0x24 || sub == 0x26 {
+    let success = if sub == SUB_DEVICE_01 {
+        store_device_function_config(payload)
+    } else if sub <= 0x22 || sub == 0x23 || sub == 0x24 || sub == 0x26 {
         // 通用配置存储 (0x00-0x22, 0x23, 0x24, 0x26)
-        store_config(sub, payload)
-    } else if sub == 0x01 {
-        // 0x01: 设备功能配置 (写入 PRegBuf SLAVE_DEVICE_CONFIG 区域)
-        // 对齐参考固件 vConfigDeviceSingle01: payload[0..2] = count (LE),
-        // 然后 N 个变长条目写入寄存器 2300+
         store_config(sub, payload)
     } else {
         log::warn!("[logic_cfg] D0: unsupported sub=0x{:02X}", sub);
@@ -254,7 +333,12 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
         sub_name(sub)
     );
 
-    match load_config(sub) {
+    let config = if sub == SUB_DEVICE_01 {
+        load_device_function_config()
+    } else {
+        load_config(sub)
+    };
+    match config {
         Some(cfg_data) => {
             let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
             let _ = rsp.push(0xD1);
@@ -365,5 +449,19 @@ pub fn dispatch_logic_cmd(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 256
         0xD2 => handle_delete_config(),
         0xD3 => handle_com_request(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_device_function_config, store_device_function_config};
+
+    #[test]
+    fn device_function_table_round_trips_through_preg() {
+        // count=1, record length=3, record bytes include the length byte as
+        // required by the legacy 0xD0/0xD1 protocol.
+        let packet = [1, 0, 3, 0x11, 0x22];
+        assert!(store_device_function_config(&packet));
+        assert_eq!(load_device_function_config(), Some(packet.to_vec()));
     }
 }

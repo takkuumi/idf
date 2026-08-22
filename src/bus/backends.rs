@@ -149,7 +149,10 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             Some(config_read_with(|cs| cs.cfg.fw_date).unwrap_or(0x0615))
         }
         // ---- BLE Android 兼容寄存器 (Modbus TCP 也可读) ----
-        regs::INREG_HW_VER => Some(config_read_with(|cs| cs.cfg.hw_version).unwrap_or(0x0100)),
+        regs::INREG_HW_VER => Some(
+            config_read_with(|cs| cs.cfg.hw_version)
+                .unwrap_or(crate::config::hw_version::MODEL_CODE),
+        ),
         regs::INREG_IP_BASE => Some(
             config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[0], cs.cfg.ip[1]])).unwrap_or(0),
         ),

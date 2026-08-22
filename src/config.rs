@@ -154,6 +154,15 @@ pub mod hw_version {
     #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const NAME: &str = "F16";
 
+    /// Legacy MCA device-model code returned by BLE 0xCC and Android
+    /// READ_DEVICE_PRODUCT (holding register 2213 / 0x08A5).
+    /// MCA reports both the F16/NCA9555 build and the F3 build as 0x00F3;
+    /// the F4 build reports 0x00F4.
+    #[cfg(feature = "f4")]
+    pub const MODEL_CODE: u16 = 0x00F4;
+    #[cfg(not(feature = "f4"))]
+    pub const MODEL_CODE: u16 = 0x00F3;
+
     /// DI 通道数
     #[cfg(feature = "f3")]
     pub const DI_COUNT: usize = 16;
@@ -668,6 +677,19 @@ mod tests {
         assert_eq!(hw_version::NAME, "F16");
         assert_eq!(hw_version::DI_COUNT, 16);
         assert_eq!(hw_version::DO_COUNT, 16);
+        assert_eq!(hw_version::MODEL_CODE, 0x00F3);
+    }
+
+    #[test]
+    #[cfg(feature = "f3")]
+    fn test_f3_model_code_matches_mca() {
+        assert_eq!(hw_version::MODEL_CODE, 0x00F3);
+    }
+
+    #[test]
+    #[cfg(feature = "f4")]
+    fn test_f4_model_code_matches_mca() {
+        assert_eq!(hw_version::MODEL_CODE, 0x00F4);
     }
 
     #[test]

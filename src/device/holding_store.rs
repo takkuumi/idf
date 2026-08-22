@@ -139,16 +139,14 @@ pub fn save_to_nvs() -> AppResult<()> {
     match validation {
         Some(Ok(())) => {}
         Some(Err(error)) => {
-            if holding_dirty {
-                HOLDING_DIRTY.store(true, Ordering::Release);
-            }
-            if legacy_dirty {
-                LEGACY_IO_DIRTY.store(true, Ordering::Release);
-            }
+            // Persist the raw register image even while a project is being
+            // transferred and its logic table is temporarily incomplete.
+            // Validation belongs to the polling engine; blocking persistence
+            // here caused a power-cycle to erase a valid partial/legacy table
+            // (and made subsequent logic reads return zeros).
             log::warn!(
-                "[holding] incomplete/invalid 2300+ configuration not persisted yet: {error}"
+                "[holding] 2300+ configuration is currently invalid; persisting raw data: {error}"
             );
-            return Ok(());
         }
         None => {
             if holding_dirty {
@@ -225,6 +223,9 @@ pub fn save_to_nvs() -> AppResult<()> {
         }
         Err(error) => {
             HOLDING_DIRTY.store(true, Ordering::Release);
+            if legacy_dirty {
+                LEGACY_IO_DIRTY.store(true, Ordering::Release);
+            }
             log::warn!("[holding] raw persist failed, dirty retained: {error}");
             Err(error)
         }

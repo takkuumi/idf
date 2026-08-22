@@ -173,7 +173,8 @@ impl SystemConfig {
         Self {
             sn,
             name,
-            hw_version: 0x0100,
+            // MCA compatibility: F16/F3 = 0x00F3, F4 = 0x00F4.
+            hw_version: crate::config::hw_version::MODEL_CODE,
             // 匹配 MCA F16 + NCA9555F16: MCA_FIRMWARE_VERSION=221, Date=0x0615
             // Android 端 fwVersionBytesToStr 解析: fw=221 → "2.2.1", dt=0x0615 → "1557"
             fw_version: 221,

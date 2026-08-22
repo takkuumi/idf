@@ -388,6 +388,18 @@ pub fn init() -> AppResult<()> {
         log::warn!("[device] NVS unavailable, using default SystemConfig");
         SystemConfig::defaults()
     };
+    // Older IDF builds used 0x0100 as a placeholder model.  Repair that
+    // value on boot so the handheld's device-model field remains MCA
+    // compatible, while preserving intentional user-written model values.
+    let legacy_model = crate::config::hw_version::MODEL_CODE;
+    if matches!(cfg.hw_version, 0 | 0xFFFF | 0x0100) {
+        cfg.hw_version = legacy_model;
+        let mut nvs_guard = nvs_lock();
+        if let Some(nvs) = nvs_guard.as_mut() {
+            cfg.save_to_nvs(nvs)?;
+        }
+        log::info!("[device] repaired legacy hardware model to 0x{legacy_model:04X}");
+    }
     cfg.fill_hw_macs();
     // fw_version 始终从 Cargo.toml 同步, 防止固件升级后版本号不更新
     cfg.fw_version = SystemConfig::fw_version_from_cargo();

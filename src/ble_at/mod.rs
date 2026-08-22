@@ -1678,6 +1678,12 @@ fn handle_handheld_config_text(
             if !crate::bus::backends::write_hold_regs(write_addr, &values) {
                 return false;
             }
+            // Android parses every write response as the standard Modbus
+            // address/count echo (the old MCA did the same).  Returning only
+            // [unit, func] made the handheld report a silent failed save even
+            // though the RAM write had succeeded.
+            let _ = rsp.extend_from_slice(&write_addr.to_be_bytes());
+            let _ = rsp.extend_from_slice(&(count as u16).to_be_bytes());
         }
         _ => return false,
     }
