@@ -26,6 +26,9 @@
 
 详细架构见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 
+完整 Flash、SRAM、PSRAM、任务栈和协议地址布局见
+[整体内存布局](MEMORY_LAYOUT.md)。
+
 ## 功能
 - ✅ Modbus TCP (502): FC=03/04/06/16
 - ✅ Modbus RTU Master/Slave: 19200 8N1

@@ -108,7 +108,7 @@ target = "xtensa-esp32s3-espidf"
 
 [target.xtensa-esp32s3-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "scripts/cargo-runner.sh"
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
@@ -299,6 +299,9 @@ just flash-release-artifact f3
 ESPFLASH_BEFORE=no_reset just release-flash f3
 ```
 
+若 CH340 的 `default-reset` 握手失败，发布脚本会自动执行双极性 DTR/RTS
+控制线序列，并以 `no-reset` 重试，不要求人工按 BOOT/RST。
+
 串口、波特率和复位方式可通过 `ESPFLASH_PORT`、`ESPFLASH_BAUD`、
 `ESPFLASH_BEFORE`、`ESPFLASH_AFTER` 覆盖。没有设备时可用
 `RELEASE_FLASH_DRY_RUN=1 just release-flash f3` 验证构建、清单和最终命令。
@@ -380,11 +383,16 @@ espflash flash --monitor target/xtensa-esp32s3-espidf/release/gateway
 espflash flash --monitor --port /dev/cu.usbserial-XXXX target/xtensa-esp32s3-espidf/release/gateway
 ```
 
-### 方式 2: cargo run（用 .cargo/config.toml 配置的 runner）
+### 方式 2: cargo run（用安全 runner 完整烧录）
 
 ```bash
 cargo run --release
 ```
+
+安全 runner 只接受名称为 `gateway` 的正式应用 ELF，并强制同时使用项目
+Bootloader、`partitions.csv` 和 factory/otadata 参数。`target/**/deps/gateway-*`
+测试运行器会被拒绝，禁止将单个 ELF 直接传给 `espflash flash`，否则会覆盖为
+默认单 factory 分区表并导致设备启动循环。
 
 ### 方式 3: esptool.py（备用）
 

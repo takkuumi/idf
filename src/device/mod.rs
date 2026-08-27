@@ -169,12 +169,15 @@ impl Actor for DeviceActor {
             }
         }
         if Instant::now() >= self.next_config_persist
-            && CONFIG_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel)
+            && CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire)
         {
             self.next_config_persist = Instant::now() + Duration::from_secs(1);
+            let generation = CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire);
             if let Err(e) = apply_config() {
                 CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
                 log::error!("[device] config idle persist failed: {e}");
+            } else if CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+                CONFIG_DIRTY.store(false, std::sync::atomic::Ordering::Release);
             }
         }
         if Instant::now() >= self.next_web_system_info_persist {
@@ -237,6 +240,8 @@ const NVS_KEY_ACTIVE: &str = "proto_act";
 static DEVICE_TEXT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SystemConfig 延迟合并持久化；避免 FC=06 连续配置把 mailbox/NVS 打满。
 static CONFIG_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 配置写入代数，防止异步落盘期间的新写入被清除 dirty 标志。
+static CONFIG_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 为原 C++/PC 工具的通用 PRegBuf 字段补齐出厂值。
 /// 只在整组仍为空或擦除态时初始化，绝不覆盖用户已保存的端口/远端地址。
@@ -258,6 +263,97 @@ fn initialize_legacy_preg_defaults(buf: &mut [u16]) {
     let remote_end = remote_start + 5;
     if remote_end <= buf.len() && is_uninitialized(&buf[remote_start..remote_end]) {
         buf[remote_start..remote_end].copy_from_slice(&[502, 192, 168, 0, 1]);
+    }
+}
+
+/// Import the Bluetooth ID kept in the legacy MCA PRegBuf (D98..D101).
+///
+/// Older IDF images persisted this value only in the raw holding snapshot,
+/// while the BLE stack now uses `SystemConfig::ble_name` as its authoritative
+/// source.  On first boot after an upgrade, prefer a non-empty legacy value
+/// when the structured config still contains the factory default, then mirror
+/// the authoritative bytes back into the holding window.  This closes the
+/// otherwise silent gap where Modbus reads showed an ID but the GAP name stayed
+/// `Mesh` after reboot.
+fn reconcile_legacy_ble_name(cfg: &mut SystemConfig, holding: &mut [u16]) -> bool {
+    let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
+    let end = start + regs::HOLD_BLE_ADDR_COUNT as usize;
+    if end > holding.len() {
+        return false;
+    }
+
+    let mut legacy = [0u8; 8];
+    for (index, word) in holding[start..end].iter().copied().enumerate() {
+        let [hi, lo] = word.to_be_bytes();
+        legacy[index * 2] = hi;
+        legacy[index * 2 + 1] = lo;
+    }
+    // An erased/invalid holding slot is commonly filled with 0xFFFF.  Never
+    // turn that marker into a visible BLE name; IDs are ASCII in the MCA
+    // protocol and may contain NUL padding only.
+    let legacy_non_empty = legacy.iter().any(|&byte| byte != 0)
+        && legacy
+            .iter()
+            .all(|&byte| byte == 0 || (0x20..=0x7E).contains(&byte));
+    let defaults = SystemConfig::defaults().ble_name;
+    let config_is_factory = cfg.ble_name == defaults || cfg.ble_name.iter().all(|&b| b == 0);
+
+    if legacy_non_empty && config_is_factory {
+        cfg.ble_name = legacy;
+        log::info!(
+            "[device] imported legacy BLE ID from D98..D101: '{}'",
+            cfg.ble_name_str()
+        );
+    }
+
+    // Keep the legacy register view physically coherent for code paths that
+    // access the raw snapshot directly (the public read path aliases cfg).
+    let mut changed = false;
+    for (index, chunk) in cfg.ble_name.chunks_exact(2).enumerate() {
+        let word = u16::from_be_bytes([chunk[0], chunk[1]]);
+        if holding[start + index] != word {
+            holding[start + index] = word;
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod legacy_ble_tests {
+    use super::{reconcile_legacy_ble_name, system_config::SystemConfig};
+    use crate::config::regs;
+
+    #[test]
+    fn imports_legacy_d98_id_when_structured_config_is_factory_default() {
+        let mut cfg = SystemConfig::defaults();
+        let mut holding = vec![0u16; regs::HOLD_PXX_COUNT];
+        let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
+        for (index, word) in [0x4E6F, 0x6465, 0x3232, 0x3100].into_iter().enumerate() {
+            holding[start + index] = word;
+        }
+
+        assert!(reconcile_legacy_ble_name(&mut cfg, &mut holding));
+        assert_eq!(cfg.ble_name_str(), "Node221");
+        assert_eq!(
+            &holding[start..start + 4],
+            &[0x4E6F, 0x6465, 0x3232, 0x3100]
+        );
+    }
+
+    #[test]
+    fn structured_config_wins_and_mirrors_into_d98_window() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.ble_name = *b"CfgName\0";
+        let mut holding = vec![0u16; regs::HOLD_PXX_COUNT];
+        let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
+
+        assert!(reconcile_legacy_ble_name(&mut cfg, &mut holding));
+        assert_eq!(
+            &holding[start..start + 4],
+            &[0x4366, 0x674E, 0x616D, 0x6500]
+        );
+        assert_eq!(cfg.ble_name_str(), "CfgName");
     }
 }
 
@@ -425,6 +521,21 @@ pub fn init() -> AppResult<()> {
         };
         initialize_legacy_preg_defaults(&mut holding_state.words);
 
+        // D98..D101 belonged to the legacy MCA PRegBuf.  Keep upgrades from
+        // older images lossless: import that value into SystemConfig once,
+        // then mirror the authoritative config back to the raw holding view.
+        let previous_ble_name = cfg.ble_name;
+        let holding_ble_changed = reconcile_legacy_ble_name(&mut cfg, &mut holding_state.words);
+        if cfg.ble_name != previous_ble_name {
+            let mut nvs_guard = nvs_lock();
+            if let Some(nvs) = nvs_guard.as_mut() {
+                if let Err(error) = cfg.save_to_nvs(nvs) {
+                    log::error!("[device] failed to persist migrated BLE ID: {error}");
+                }
+            } else {
+                log::warn!("[device] NVS unavailable; migrated BLE ID remains RAM-only");
+            }
+        }
         let snap = StorageSnapshot {
             proto: ProtoStore {
                 data: Arc::from(data),
@@ -440,6 +551,12 @@ pub fn init() -> AppResult<()> {
             legacy_coils: Arc::from(holding_state.legacy_coils.into_boxed_slice()),
         };
         storage_write(snap);
+        if holding_ble_changed {
+            // Mark only after the repaired snapshot is published; the actor
+            // will write the mirror to the raw holding partition on its next
+            // quiet tick.
+            crate::bus::storage_state::mark_holding_dirty();
+        }
 
         let cs = ConfigSnapshot { cfg: cfg.clone() };
         config_write(cs);
@@ -639,7 +756,16 @@ pub fn request_reload() -> bool {
 
 /// 请求应用配置 (由 Modbus 写 CFG_APPLY=0xB5B5 或 AT+CFGAPPLY 调用)
 pub fn request_persist_config() {
+    CONFIG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a system-configuration snapshot is waiting for NVS persistence.
+/// Exposed for protocol-level write/commit tests and diagnostics; reads are
+/// lock-free and have no effect on the deferred persistence worker.
+#[inline]
+pub fn config_is_dirty() -> bool {
+    CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// 异步落盘当前系统配置，且仅在落盘成功后复位。
@@ -668,6 +794,28 @@ pub fn reload_sync() -> AppResult<()> {
 /// 同步应用配置 (供 AT 命令直接调用)
 pub fn apply_config_sync() -> AppResult<()> {
     apply_config()
+}
+
+/// 同步持久化系统配置（供 Modbus/其它重启前路径调用）。
+///
+/// 配置写入首先更新 CONFIG RCU，并由 DeviceActor 异步合并落盘。若随后
+/// 立即写入重启线，异步任务可能尚未运行，导致 BLE 名称、SN、位置等值在
+/// 重启后回退。重启前必须走这个同步屏障，只有 NVS 写成功才允许复位。
+pub fn persist_config_now() -> AppResult<()> {
+    // Avoid touching NVS for an ordinary reboot when no configuration write is
+    // pending.  This keeps the restart coil usable during degraded storage
+    // conditions while still providing a hard persistence barrier after a
+    // Modbus D98..D101 (or any other system-config) write.
+    if CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire) {
+        let generation = CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        apply_config()?;
+        if CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+            CONFIG_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 // ----------------------------------------------------------------------------

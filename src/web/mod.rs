@@ -31,7 +31,7 @@
 //!   (16 字节 TRNG 随机 token 的 hex 编码, HttpOnly; Path=/; Max-Age=86400)
 //! - 服务端 `SESSION` 全局保存活跃 token, `is_authenticated()` 常量时间比较
 //! - `/logout` 销毁服务端会话 + 清除浏览器 Cookie
-//! - 默认密码: admin/admin123 (可修改, 明文存储到 NVS, 对齐 MCA `/WebPwd.txt`)
+//! - 默认密码: admin/admin123456 (可修改, 明文存储到 NVS, 对齐 MCA `/WebPwd.txt`)
 //!
 //! ## 性能
 //!
@@ -77,7 +77,7 @@ const JSON_RESPONSE_MAX: usize = 128;
 /// 默认用户名
 const DEFAULT_USERNAME: &str = "admin";
 /// 默认密码 (NVS 未保存时使用)
-const DEFAULT_PASSWORD: &str = "admin123";
+const DEFAULT_PASSWORD: &str = "admin123456";
 
 /// NVS 密码 key
 const NVS_KEY_WEB_PWD: &str = "web_pwd";
@@ -1195,6 +1195,10 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     // NVS/Flash；网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
     crate::device::request_persist_config();
     if ble_name.is_some() {
+        // Keep the legacy D98..D101 holding window coherent with the
+        // structured SystemConfig value. Older Modbus/PC clients read this
+        // window directly, while BLE and FC04 use the structured field.
+        crate::bus::backends::sync_ble_name_holding();
         #[cfg(feature = "ble-at")]
         crate::ble_at::notify_ble_name_changed();
     }
@@ -1652,6 +1656,9 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
         cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
     });
     log::info!("[http] update BLE name: {:?}", name);
+    // The legacy Modbus/PC window (D98..D101) is an externally visible alias
+    // of SystemConfig::ble_name. Keep it synchronized for every Web write.
+    crate::bus::backends::sync_ble_name_holding();
     crate::device::request_persist_config();
     // GAP 名称立即更新；配置快照由 DeviceActor 合并落盘。
     #[cfg(feature = "ble-at")]
@@ -1960,6 +1967,12 @@ mod tests {
     fn test_json_response_format() {
         let r = json_response("login", "0");
         assert_eq!(r, r#"{"type":"login","code":"0","msg":"","data":{}}"#);
+    }
+
+    #[test]
+    fn test_default_web_credentials_match_provisioning_contract() {
+        assert_eq!(DEFAULT_USERNAME, "admin");
+        assert_eq!(DEFAULT_PASSWORD, "admin123456");
     }
 
     #[test]

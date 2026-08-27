@@ -155,6 +155,10 @@ pub fn handle_cfgbtname(args: &str) -> String {
         let mut name = [0u8; 8];
         name[..args.len()].copy_from_slice(args.as_bytes());
         with_cfg_mut(|c| c.ble_name = name);
+        // BLE name is an externally visible identity. Persist it immediately
+        // so an AT write cannot appear successful and then revert after reset.
+        crate::bus::backends::sync_ble_name_holding();
+        device::request_persist_config();
         // LOOP7: 写完立即同步 GAP 设备名
         crate::ble_at::update_gap_device_name();
         ok_none()
@@ -324,6 +328,15 @@ pub fn handle_cfgwrite(args: &str) -> String {
     }
     use crate::device::system_config::WriteResult;
     let result = with_cfg_mut(|c| c.write_reg(addr, value));
+    if !matches!(&result, WriteResult::NotFound)
+        && (regs::HOLD_BLE_ADDR_BASE..regs::HOLD_BLE_ADDR_BASE + regs::HOLD_BLE_ADDR_COUNT)
+            .contains(&addr)
+    {
+        crate::bus::backends::sync_ble_name_holding();
+        // CFGWRITE 走同一 SystemConfig 别名路径时，也要让 GAP 广播名称
+        // 在下一 BLE tick 更新；持久化仍由下面的结果分支负责。
+        crate::ble_at::notify_ble_name_changed();
+    }
     match result {
         WriteResult::Ok => ok_none(),
         WriteResult::Persist => {
@@ -391,5 +404,13 @@ mod tests {
     #[test]
     fn cfginfo_includes_third_legacy_port() {
         assert!(handle_cfginfo("").contains("rs485_2="));
+    }
+
+    #[test]
+    fn cfgbtname_updates_authoritative_config_and_marks_it_dirty() {
+        let response = handle_cfgbtname("Node221");
+        assert!(response.starts_with("OK"), "{response}");
+        assert_eq!(with_cfg(|cfg| cfg.ble_name_str()), "Node221");
+        assert!(device::config_is_dirty());
     }
 }

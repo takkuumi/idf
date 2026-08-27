@@ -287,7 +287,7 @@ fn main() -> AppResult<()> {
 
     // 8.4 启动 HTTP Web 配置服务器 (端口 80, JSON API)
     // 提供 13 个 REST 路由 (login / getsysteminfo / getiodata / updateota 等).
-    // 随机 Cookie 会话认证，密码存储在 NVS (默认 admin/admin123).
+    // 随机 Cookie 会话认证，密码存储在 NVS (默认 admin/admin123456).
     // 启动失败仅记日志, 不阻断主流程.
     {
         if let Err(e) = web::start() {

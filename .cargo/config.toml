@@ -3,7 +3,7 @@ target = "xtensa-esp32s3-espidf"
 
 [target.xtensa-esp32s3-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "scripts/cargo-runner.sh"
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]

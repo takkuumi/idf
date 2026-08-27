@@ -189,8 +189,15 @@ if ! CHIP_OUTPUT="$(ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info \
     --port "$PORT" --baud "$BAUD" --before "$RESET_BEFORE" --after no-reset \
     --non-interactive 2>&1)"; then
     printf '%s\n' "$CHIP_OUTPUT" >&2
-    echo "错误: 无法自动进入下载模式。请检查 USB 串口占用，或手动按住 BOOT、短按 RST、松开 BOOT 后重试。" >&2
-    exit 1
+    echo "=== default-reset 失败，使用 CH340 控制线序列后以 no-reset 重试 ==="
+    "$ROOT_DIR/scripts/enter-bootloader.sh" "$PORT"
+    if ! CHIP_OUTPUT="$(ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info \
+        --port "$PORT" --baud "$BAUD" --before no-reset --after no-reset \
+        --non-interactive 2>&1)"; then
+        printf '%s\n' "$CHIP_OUTPUT" >&2
+        echo "错误: 自动进入下载模式失败，请检查 USB 串口连接或占用。" >&2
+        exit 1
+    fi
 fi
 printf '%s\n' "$CHIP_OUTPUT"
 if ! printf '%s\n' "$CHIP_OUTPUT" | grep -Eiq 'ESP32[- ]?S3'; then

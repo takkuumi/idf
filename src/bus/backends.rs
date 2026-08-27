@@ -59,6 +59,44 @@ fn is_logic_config_addr(addr: u16) -> bool {
     (regs::HOLD_DEVICE_CONFIG..=regs::HOLD_CFG_END).contains(&addr)
 }
 
+#[inline]
+fn is_ble_name_hold_addr(addr: u16) -> bool {
+    (regs::HOLD_BLE_ADDR_BASE..regs::HOLD_BLE_ADDR_BASE + regs::HOLD_BLE_ADDR_COUNT).contains(&addr)
+}
+
+/// 配置快照更新后通知 BLE 任务重建广播数据。
+/// 批量写入由调用方在整批完成后只调用一次，避免每个 word 都触发更新。
+#[inline]
+fn notify_ble_name_changed() {
+    #[cfg(feature = "ble-at")]
+    crate::ble_at::notify_ble_name_changed();
+}
+
+/// Mirror the structured BLE ID into the legacy PRegBuf view while the caller
+/// already owns `RCU_WRITE_LOCK`.  D98..D101 are a public compatibility window;
+/// keeping both snapshots equal prevents direct raw-buffer readers from seeing
+/// the previous ID between a write and the next reboot.
+fn mirror_ble_name_to_holding_locked(cfg: &SystemConfig, storage: &mut StorageSnapshot) {
+    let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
+    let target = Arc::make_mut(&mut storage.holding_buf);
+    for (index, chunk) in cfg.ble_name.chunks_exact(2).enumerate() {
+        target[start + index] = u16::from_be_bytes([chunk[0], chunk[1]]);
+    }
+}
+
+/// Publish the current structured BLE ID into the raw D98..D101 compatibility
+/// image. Used by non-Modbus configuration APIs (AT/Web) that mutate
+/// `SystemConfig` directly.
+pub(crate) fn sync_ble_name_holding() {
+    let _guard = rcu_write_guard();
+    let cfg = config_clone();
+    let mut storage = storage_clone();
+    mirror_ble_name_to_holding_locked(&cfg.cfg, &mut storage);
+    sync_proto_status(&mut storage);
+    STORAGE.write(storage);
+    super::storage_state::mark_holding_dirty();
+}
+
 /// 为 BLE 自定义整帧配置写入临时打开 MCA PRegBuf 提交闸门。
 /// Modbus/TCP/RTU 必须通过写 4222=0x55AA 走同一公开协议语义。
 pub fn arm_logic_write() {
@@ -790,6 +828,37 @@ mod tests {
     }
 
     #[test]
+    fn test_pc_device_config_ble_id_updates_authoritative_config() {
+        // DeviceMMP writes D98..D101 as part of the D20..D101 block.  Verify
+        // the batch path (not only SystemConfig::write_reg) updates the same
+        // value exposed by FC04 0x08E2 and schedules persistence.
+        let values = [0x4E6F, 0x6465, 0x2D32, 0x3231]; // "Node-221"
+        assert!(write_hold_regs(regs::HOLD_BLE_ADDR_BASE, &values));
+        for (offset, expected) in values.iter().enumerate() {
+            assert_eq!(
+                read_hold_reg(regs::HOLD_BLE_ADDR_BASE + offset as u16),
+                Some(*expected)
+            );
+            assert_eq!(
+                read_input_reg(regs::INREG_BLE_ID_BASE + offset as u16),
+                Some(*expected)
+            );
+        }
+        let name = config_read_with(|snapshot| snapshot.cfg.ble_name_str()).unwrap();
+        assert_eq!(name, "Node-221");
+        let raw = storage_read_with(|snapshot| {
+            let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
+            snapshot.holding_buf[start..start + values.len()].to_vec()
+        })
+        .expect("holding snapshot");
+        assert_eq!(raw, values, "legacy D98..D101 mirror must stay coherent");
+        assert!(
+            crate::device::config_is_dirty(),
+            "D98..D101 write must schedule SystemConfig persistence"
+        );
+    }
+
+    #[test]
     fn test_device_text_write_round_trips_at_5000_without_emptying() {
         let address = regs::DEVICE_TEXT_BASE + 2;
         let values = [0x0041, 0x4E2D, 0x6587, 0x0000];
@@ -845,6 +914,9 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
         // 一次擦写并校验，避免每个字符都触发 4KB NVS 擦写。
         crate::device::request_save_device_text();
     }
+    if written && is_ble_name_hold_addr(addr) {
+        notify_ble_name_changed();
+    }
     if written && addr < regs::CONTROL_WORD_COUNT {
         crate::control_logic::on_control_word_written(addr, value);
     }
@@ -892,6 +964,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
     if addr >= regs::HOLD_CFG_BASE && end_exclusive <= regs::HOLD_CFG_END as u32 + 1 {
         let mut request_config_persist = false;
         let mut request_runtime_apply = false;
+        let mut ble_name_changed = false;
         {
             let _guard = rcu_write_guard();
             let mut cs = config_clone();
@@ -919,6 +992,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 } else {
                     cs.cfg.write_reg(target, value)
                 };
+                let config_write_succeeded = !matches!(&result, WriteResult::NotFound);
                 match result {
                     WriteResult::Ok => config_changed = true,
                     WriteResult::Persist => {
@@ -946,8 +1020,18 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                         }
                     }
                 }
+                if config_write_succeeded && is_ble_name_hold_addr(target) {
+                    ble_name_changed = true;
+                }
             }
 
+            if ble_name_changed {
+                // D98..D101 are also part of the legacy raw holding image.
+                // Publish the same bytes there in this transaction so FC03,
+                // diagnostics and persistence all observe one value.
+                mirror_ble_name_to_holding_locked(&cs.cfg, &mut holding);
+                holding_changed = true;
+            }
             if config_changed {
                 if config_needs_version_bump {
                     cs.cfg.cfg_version = cs.cfg.cfg_version.wrapping_add(1);
@@ -976,6 +1060,13 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             crate::device::request_apply_config();
         } else if request_config_persist {
             crate::device::request_persist_config();
+        }
+        if ble_name_changed {
+            // Keep the legacy raw image durable as well as the structured
+            // SystemConfig field. This is needed by old FC03 readers and by
+            // the upgrade reconciliation path on the next boot.
+            super::storage_state::mark_holding_dirty();
+            notify_ble_name_changed();
         }
         return true;
     }
@@ -1071,6 +1162,13 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
             }
             WriteResult::Persist => {
                 // 写 RCU + 触发 NVS 持久化. 不增 cfg_version (运行时不需要重新初始化).
+                if is_ble_name_hold_addr(addr) {
+                    let mut holding = storage_clone();
+                    mirror_ble_name_to_holding_locked(&cs.cfg, &mut holding);
+                    sync_proto_status(&mut holding);
+                    STORAGE.write(holding);
+                    super::storage_state::mark_holding_dirty();
+                }
                 super::config_state::CONFIG.write(cs);
                 crate::device::request_persist_config();
                 return true;
@@ -1213,6 +1311,10 @@ pub fn write_coil(addr: u16, value: bool) -> bool {
                 // 这些区域平时采用合并异步落盘，但重启会终止 actor，必须在
                 // 接受重启请求前同步提交并校验，否则刚写入的数据会在掉电/重启
                 // 后丢失。失败时不重启，保留 dirty 标志让后台继续重试。
+                if let Err(error) = crate::device::persist_config_now() {
+                    log::error!("[modbus] restart refused: system config persist failed: {error}");
+                    return false;
+                }
                 if let Err(error) = crate::device::holding_store::save_to_nvs() {
                     log::error!("[modbus] restart refused: holding persist failed: {error}");
                     return false;

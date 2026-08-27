@@ -90,7 +90,7 @@ espflash --version             # 应可用
 
 | 文件 | 作用 |
 |------|------|
-| `.cargo/config.toml` | `target = "xtensaespidf"`，linker = `xtensa-esp32s3-elf-gcc`，runner = `espflash flash --monitor` |
+| `.cargo/config.toml` | `target = "xtensaespidf"`，linker = `xtensa-esp32s3-elf-gcc`，runner = `scripts/cargo-runner.sh`（拒绝测试 ELF，并强制完整分区参数） |
 | `rust-toolchain.toml` | `channel = "nightly"`，`targets = ["xtensaespidf"]`，含 `rust-src`/`rustfmt`/`clippy` |
 | `sdkconfig.defaults` | ESP32-S3R2 + 2MB Quad PSRAM + BLE + W5500 + Task Watchdog |
 | `partitions.csv` | 8MB Flash 分区表（factory 3MB + ota_0/ota_1 各 2.25MB） |
@@ -223,7 +223,7 @@ cargo espflash --release --chip esp32s3 /dev/cu.usbserial-XXXX --monitor
 #### 方式 2：cargo run（用 .cargo/config.toml 的 runner）
 
 ```bash
-# runner = "espflash flash --monitor"
+# runner = "scripts/cargo-runner.sh"
 cargo run --release
 ```
 

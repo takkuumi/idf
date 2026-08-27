@@ -497,11 +497,11 @@ pub mod regs {
     // 主站 COM 数量 + IP (2269-2273)
     pub const HOLD_MASTER_COM: u16 = 2269;
     pub const HOLD_MASTER_IP_BASE: u16 = 2270;
-    // 旧 MCA 的 2274..2277 是 8 字节蓝牙地址 (SLAVE_REG_BT_ARRD1..4)，
-    // 属于通用 PRegBuf；蓝牙名称不占用 Modbus holding 地址。
+    // 旧 MCA 的 2274..2277 (D98..D101, SLAVE_REG_BT_ARRD1..4) 是 BLE
+    // 节点名称的兼容保持寄存器窗口，与 FC=04 0x08E2..0x08E5 共享 ble_name。
     pub const HOLD_BLE_ADDR_BASE: u16 = 2274;
     pub const HOLD_BLE_ADDR_COUNT: u16 = 4;
-    /// Deprecated name retained for source/API compatibility; value is the MCA BLE address.
+    /// Deprecated name retained for source/API compatibility; aliases the BLE node-name window.
     pub const HOLD_BLE_NAME_BASE: u16 = HOLD_BLE_ADDR_BASE;
     pub const HOLD_BLE_NAME_COUNT: u16 = HOLD_BLE_ADDR_COUNT;
     // 传感器标定 (2280-2295, 8 sensors × 2 values)

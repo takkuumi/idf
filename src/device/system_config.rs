@@ -463,7 +463,17 @@ impl SystemConfig {
         if let Some(v) = read_mac(&self.eth_mac, regs::HOLD_MAC_BASE, addr) {
             return Some(v);
         }
-        // 2274..2277 是旧 MCA 的蓝牙地址，必须由通用 PRegBuf 原样保存。
+        // BLE 节点名称兼容窗口。D98..D101 (2274..2277) 与 FC=04
+        // 0x08E2..0x08E5 访问同一份 ble_name，避免 PC/手持机分别维护两份值。
+        if (regs::HOLD_BLE_ADDR_BASE..regs::HOLD_BLE_ADDR_BASE + regs::HOLD_BLE_ADDR_COUNT)
+            .contains(&addr)
+        {
+            let idx = (addr - regs::HOLD_BLE_ADDR_BASE) as usize * 2;
+            return Some(u16::from_be_bytes([
+                self.ble_name[idx],
+                self.ble_name[idx + 1],
+            ]));
+        }
         // 前 3 个物理 RS485 端口。BT/NET 两个兼容块由通用 PRegBuf 保存，
         // 不能别名到 rs485[0]，否则 PC 写 NET 会覆盖 RS485-1。
         for i in 0..self.rs485.len() {
@@ -585,7 +595,17 @@ impl SystemConfig {
         if let Some(()) = write_mac(&mut self.eth_mac, regs::HOLD_MAC_BASE, addr, value) {
             return WriteResult::Apply;
         }
-        // 2274..2277 由调用方写入连续 PRegBuf，不得改写运行时 BLE 名称。
+        // BLE 节点名称兼容窗口。D98..D101 写入必须更新唯一权威 ble_name，
+        // 与 FC=04 0x08E2..0x08E5、BLE 自定义 0xCB 写入保持一致。
+        if (regs::HOLD_BLE_ADDR_BASE..regs::HOLD_BLE_ADDR_BASE + regs::HOLD_BLE_ADDR_COUNT)
+            .contains(&addr)
+        {
+            let idx = (addr - regs::HOLD_BLE_ADDR_BASE) as usize * 2;
+            let [hi, lo] = value.to_be_bytes();
+            self.ble_name[idx] = hi;
+            self.ble_name[idx + 1] = lo;
+            return WriteResult::Persist;
+        }
         // 前 3 个物理 RS485；后两个 BT/NET 兼容块走 PRegBuf。
         for i in 0..self.rs485.len() {
             let base = regs::HOLD_RS485_BASE + (i as u16) * regs::HOLD_RS485_STRIDE;
@@ -935,13 +955,39 @@ mod tests {
         assert_eq!(result, WriteResult::Persist);
     }
 
-    /// 2274..2277 是旧 MCA 蓝牙地址，必须回退到通用 PRegBuf。
+    /// D98..D101 是旧 MCA 的 BLE 节点名称兼容窗口，必须别名到 ble_name。
     #[test]
-    fn test_write_reg_ble_address_falls_back_to_preg() {
+    fn test_ble_name_hold_alias_roundtrip() {
         let mut cfg = SystemConfig::defaults();
-        let result = cfg.write_reg(regs::HOLD_BLE_ADDR_BASE, 0x4747);
-        assert_eq!(result, WriteResult::NotFound);
-        assert_eq!(cfg.read_reg(regs::HOLD_BLE_ADDR_BASE), None);
+        let original_mac = cfg.ble_mac;
+        for (offset, word) in [0x4142, 0x4344, 0x4546, 0x4748].into_iter().enumerate() {
+            let result = cfg.write_reg(regs::HOLD_BLE_ADDR_BASE + offset as u16, word);
+            assert_eq!(result, WriteResult::Persist);
+            assert_eq!(
+                cfg.read_reg(regs::HOLD_BLE_ADDR_BASE + offset as u16),
+                Some(word)
+            );
+        }
+        assert_eq!(&cfg.ble_name, b"ABCDEFGH");
+        assert_eq!(
+            cfg.ble_mac, original_mac,
+            "BLE hardware MAC must stay independent"
+        );
+    }
+
+    #[test]
+    fn test_ble_name_input_and_hold_windows_are_same_value() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.ble_name = *b"Mesh001\0";
+        for offset in 0..regs::HOLD_BLE_ADDR_COUNT {
+            let hold = cfg
+                .read_reg(regs::HOLD_BLE_ADDR_BASE + offset)
+                .expect("D98..D101 must be readable");
+            let input = cfg
+                .read_reg(regs::INREG_BLE_ID_BASE + offset)
+                .expect("FC=04 BLE ID window must be readable");
+            assert_eq!(hold, input, "BLE ID windows differ at word {offset}");
+        }
     }
 
     /// 写入 RS485 配置 (HOLD_RS485_BASE) 必须返回 Persist.

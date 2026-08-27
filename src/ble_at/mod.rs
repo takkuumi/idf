@@ -107,7 +107,7 @@ static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
 /// LOOP7: BLE 名字变化通知 (Metuory 写完 ble_name 后置位, process_tick 处理)
 static PENDING_GAP_NAME_UPDATE: AtomicBool = AtomicBool::new(false);
 
-/// LOOP7: 标记 BLE 名字待更新 (在 write_hold_reg 写完 0x08E2 时调用)
+/// LOOP7: 标记 BLE 名字待更新（FC=03 D98..D101、BLE 配置入口写入后调用）
 pub fn notify_ble_name_changed() {
     PENDING_GAP_NAME_UPDATE.store(true, Ordering::SeqCst);
 }
@@ -392,6 +392,30 @@ fn start_advertising() {
     if ret != esp_idf_sys::ESP_OK {
         log::error!("[ble_at] start_advertising failed: 0x{:x}", ret);
     }
+}
+
+/// Convert the persisted MCA Bluetooth ID into the over-the-air GAP name.
+///
+/// MCA stores only the eight-byte ID in D98..D101 and advertises `M` followed
+/// by that ID (an empty ID uses `Mesh`).  The register/Android value remains
+/// unprefixed; the prefix is applied only at the GAP boundary so a D98 write
+/// updates both the persisted ID and the discoverable Bluetooth name.
+fn gap_name_from_ble_id(id: &str) -> heapless::String<16> {
+    let id = id.trim_end_matches('\0');
+    let mut name = heapless::String::new();
+    if id.is_empty() {
+        let _ = name.push_str("Mesh");
+    } else if id
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'm' || *byte == b'M')
+    {
+        let _ = name.push_str(id);
+    } else {
+        let _ = name.push('M');
+        let _ = name.push_str(id);
+    }
+    name
 }
 
 /// LOOP17: 统一的 ADV data 配置入口.
@@ -895,9 +919,9 @@ pub fn start() -> AppResult<()> {
     //   metuory 1.0.78 SearchDeviceActivity.onScanning 过滤 name.startsWith("m") (忽略大小写),
     //   非 m 前缀的设备名 (如旧 fallback "GW-S3") 不会出现在扫描列表 → 手持机搜不到蓝牙.
     //   必须保证任意路径 (NVS 空 / ble_name_str 返回空) 下设备名都以 m/M 开头.
-    let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Mesh".to_owned());
+    let configured_id =
+        crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str()).unwrap_or_default();
+    let configured_name = gap_name_from_ble_id(&configured_id);
     let name = CString::new(configured_name.as_str())
         .map_err(|_| crate::error::AppError::BleMesh("BLE name contains NUL".into()))?;
     let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(name.as_ptr()) };
@@ -984,16 +1008,17 @@ pub fn start() -> AppResult<()> {
 pub fn update_gap_device_name() {
     // LOOP11: 零拷贝, 闭包内返回 String (ble_name_str() 返回 String, 不含借用)
     // LOOP17: 统一 fallback 为 "Mesh" (与 start() 完全一致), 防止空名导致 metuory 过滤失败.
-    let configured_name = crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Mesh".to_owned());
-    log::warn!(
-        "[ble_at] update_gap_device_name: cfg.ble_name='{}'",
+    let configured_id =
+        crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str()).unwrap_or_default();
+    let configured_name = gap_name_from_ble_id(&configured_id);
+    log::info!(
+        "[ble_at] update_gap_device_name: ble_id='{}', gap_name='{}'",
+        configured_id,
         configured_name
     );
     if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
         let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
-        log::warn!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
+        log::info!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
         if ret == esp_idf_sys::ESP_OK {
             // 关键: set_device_name 后必须重发 config_adv_data 让新名字进入 ADV 包
             // 仅在服务已启动时重发, 否则首次启动链仍由 CREAT_ATTR_TAB_EVT 负责
@@ -1782,6 +1807,26 @@ fn read_legacy_words_le<const N: usize>(
     }
 }
 
+/// 写入 MCA 蓝牙 ID 的原始字节。
+///
+/// 0xCB 的 payload 不是 Modbus word，而是手持机提供的 ID 字节流。旧固件
+/// 虽然把前两个字节暂存在一个 little-endian word 中，但对外返回的仍是
+/// 原始字节顺序；直接更新 `SystemConfig::ble_name` 可以同时兼容 2 字节旧
+/// ID 与 8 字节 UTF-8 ID，避免经过 BE/LE word 转换后出现字符反转。
+fn write_ble_name_bytes(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return false;
+    }
+    crate::bus::backends::config_modify(|cfg| {
+        cfg.ble_name.fill(0);
+        cfg.ble_name[..bytes.len()].copy_from_slice(bytes);
+    });
+    crate::bus::backends::sync_ble_name_holding();
+    crate::device::request_persist_config();
+    notify_ble_name_changed();
+    true
+}
+
 fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 32>> {
     use crate::config::{hw_version, regs};
 
@@ -1882,11 +1927,15 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
                 return None;
             }
         }
-        // The legacy wire format returns every 16-bit PRegBuf value low byte
-        // first (including the Bluetooth number).
-        0xCA => read_legacy_words_le(&mut response, regs::HOLD_BLE_ADDR_BASE, 1),
+        // Bluetooth ID is a byte string at the custom-protocol boundary.  Keep
+        // the old 2-byte response shape; the newer 0x08E2/4-register command
+        // returns the complete 8-byte window below.
+        0xCA => {
+            let name = crate::bus::config_state::config_read_with(|state| state.cfg.ble_name)?;
+            let _ = response.extend_from_slice(&name[..2]);
+        }
         0xCB => {
-            if !write_legacy_words_le(regs::HOLD_BLE_ADDR_BASE, data, 1) {
+            if !write_ble_name_bytes(data) {
                 return None;
             }
         }
@@ -2341,7 +2390,7 @@ fn build_android_read_response_pdu(
     cfg_mask: [u8; 4],
     cfg_gw: [u8; 4],
     cfg_mac: [u8; 6],
-    cfg_ble_mac: [u8; 6],
+    cfg_ble_id: [u8; 6],
     cfg_hw_ver: u16,
     cfg_fw_ver: u16,
     cfg_fw_date: u16,
@@ -2408,10 +2457,14 @@ fn build_android_read_response_pdu(
             d
         }
         (0x08E2, 4) => {
-            let mut id = [0u8; 4];
-            id.copy_from_slice(&cfg_ble_mac[2..6]);
+            // The Android protocol exposes the persisted BLE ID, not the
+            // hardware controller MAC.  Keep the helper in lock-step with
+            // the runtime path and preserve the complete eight-byte window.
+            let mut id = [0u8; 8];
+            id[..cfg_ble_id.len()].copy_from_slice(&cfg_ble_id);
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
-            let _ = d.push(4);
+            let name_len = id.iter().position(|&byte| byte == 0).unwrap_or(id.len());
+            let _ = d.push(name_len as u8);
             let _ = d.extend_from_slice(&id);
             d
         }
@@ -2536,8 +2589,16 @@ pub(crate) fn mod_test_build_rs485_value_response(
 mod android_compat_tests {
     use super::{
         android_rs485_mode, binary_frame_total_len, build_android_read_response_pdu,
-        encode_ble_name_read_response,
+        encode_ble_name_read_response, gap_name_from_ble_id,
     };
+
+    #[test]
+    fn test_gap_name_keeps_legacy_mca_prefix_contract() {
+        assert_eq!(gap_name_from_ble_id(""), "Mesh");
+        assert_eq!(gap_name_from_ble_id("esh001"), "Mesh001");
+        assert_eq!(gap_name_from_ble_id("1234"), "M1234");
+        assert_eq!(gap_name_from_ble_id("Mesh001"), "Mesh001");
+    }
 
     #[test]
     fn test_rs485_mode_uses_android_wire_values() {
@@ -2677,7 +2738,8 @@ mod android_compat_tests {
     // ---- READ_BLUETOOTH_ID (0x08E2, 4 regs) ----
     #[test]
     fn test_read_ble_id_format() {
-        // 旧 helper 使用 cfg_ble_mac[2..6]; 实际生产代码用 cfg.ble_name (默认 "Mesh")
+        // The helper argument supplies the persisted BLE-ID bytes; it must not
+        // derive the value from the hardware BLE MAC.
         let pdu = build_android_read_response_pdu(
             0x01,
             0x03,
@@ -2687,7 +2749,7 @@ mod android_compat_tests {
             [0; 4],
             [0; 4],
             [0; 6],
-            [0x80, 0xB5, 0x4E, 0x5B, 0x24, 0xE5], // BLE MAC
+            [b'N', b'o', b'd', b'e', b'2', b'2'],
             0,
             0,
             0x0615,
@@ -2699,10 +2761,9 @@ mod android_compat_tests {
         .expect("must handle");
         assert_eq!(pdu[0], 0x01);
         assert_eq!(pdu[1], 0x03);
-        assert_eq!(pdu[2], 4);
-        // 旧 helper: BLE MAC[2..6] = [0x4E, 0x5B, 0x24, 0xE5]
-        assert_eq!(&pdu[3..7], &[0x4E, 0x5B, 0x24, 0xE5]);
-        assert_eq!(pdu.len(), 7);
+        assert_eq!(pdu[2], 6);
+        assert_eq!(&pdu[3..9], b"Node22");
+        assert_eq!(pdu.len(), 9);
     }
 
     #[test]
@@ -3719,8 +3780,27 @@ mod tests_ble_cmd {
         assert!(build_mca_custom_response(0xC5, &[0; 15]).is_none());
         assert!(build_mca_custom_response(0xC7, &[0; 5]).is_none());
         assert!(build_mca_custom_response(0xCB, &[0]).is_none());
+        assert!(build_mca_custom_response(0xCB, &[0; 9]).is_none());
         assert!(build_mca_custom_response(0xCD, &[0; 11]).is_none());
         assert!(build_mca_custom_response(0xC9, &[0]).is_none());
+    }
+
+    #[test]
+    fn test_mca_custom_bluetooth_id_keeps_raw_byte_order() {
+        let value = *b"Node-221";
+        assert!(build_mca_custom_response(0xCB, &value).is_some());
+        let stored = crate::bus::config_state::config_read()
+            .expect("config snapshot")
+            .cfg
+            .ble_name;
+        assert_eq!(stored, value, "0xCB must not reverse bytes through u16");
+
+        let response = build_mca_custom_response(0xCA, &[]).expect("read response");
+        assert_eq!(
+            &response[2..],
+            b"No",
+            "legacy 0xCA returns first two ID bytes"
+        );
     }
 
     #[test]
