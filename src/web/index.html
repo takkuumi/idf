@@ -504,7 +504,8 @@ async function pollStatus() {
       const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
       return `${h}h ${m}m ${sec}s`;
     };
-    const resetReason = ['POWERON','SW','RTC_WDT','WDT','DEEP_SLEEP','RESTART','EXT_CPU','BOD','USB_UART','JTAG','EFUSE','PWR_GLITCH','RTC_STORE','SPI_FLASH','SYSCPU','BROWNOUT'];
+    // esp_reset_reason_t 使用稀疏的固定枚举值，不能按旧数组顺序错位显示。
+    const resetReason = {0:'UNKNOWN',1:'POWERON',2:'EXTERNAL',3:'SOFTWARE',4:'PANIC',5:'INT_WDT',6:'TASK_WDT',7:'WDT',8:'DEEPSLEEP',9:'BROWNOUT',10:'SDIO',11:'USB',12:'JTAG',13:'RTC_WDT_SYS',14:'RTC_WDT_CPU',15:'RTC_WDT_RTC'};
     $('#st_uptime').textContent = fmtSec(d.uptime || 0);
     $('#st_eth').textContent = d.ethernet_link ? 'PHY UP' : 'PHY DOWN';
     $('#st_ble').textContent = d.ble_connected ? '已连接' : (d.ble_notify ? '通知已开' : '未连接');

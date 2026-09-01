@@ -456,7 +456,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     let resp = match port.send_recv(&req, timeout_ms) {
         Ok(r) => r,
         Err(_) => {
-            // LOOP14: 主站通信错误 (超时) → 累加 RS485_1_COMERR
+            // LOOP14: 主站通信错误 (超时) → 置 RS485_1_COMERR=0x04
             crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
             return Err(crate::error::AppError::Modbus("timeout".into()));
         }
@@ -471,7 +471,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
         ));
     }
     if resp.len() < 5 {
-        // LOOP14: 帧太短 (通信错误) → 累加 COMERR
+        // LOOP14: 帧太短 (通信错误) → 置 COMERR=0x04
         crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "short resp: {} bytes",
@@ -481,7 +481,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
 
     // 校验从站地址
     if resp[0] != item.slave {
-        // LOOP14: 从站地址不匹配 (通信错误) → 累加 COMERR
+        // LOOP14: 从站地址不匹配 (通信错误) → 置 COMERR=0x04
         crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "slave mismatch: {}!={}",
@@ -494,7 +494,7 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     let crc = modbus_crc16(&resp[..n - 2]);
     let recv_crc = u16::from_le_bytes([resp[n - 2], resp[n - 1]]);
     if crc != recv_crc {
-        // LOOP14: CRC 校验失败 (通信错误) → 累加 COMERR
+        // LOOP14: CRC 校验失败 (通信错误) → 置 COMERR=0x04
         crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
         return Err(crate::error::AppError::Modbus(format!(
             "crc mismatch: {:#06x}!={:#06x}",
@@ -510,7 +510,10 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
                 "invalid exception length: {n}"
             )));
         }
-        crate::modbus::shared::RS485_STATS.inc_port_apperr(stats_port);
+        // 异常响应本身证明链路有效：清除通信错误并记录从站返回的
+        // Modbus 异常码，和旧 MCA 的 Modbus_App_Error 语义一致。
+        crate::modbus::shared::RS485_STATS.mark_port_ok(stats_port);
+        crate::modbus::shared::RS485_STATS.set_port_apperr(stats_port, resp[2]);
         return Err(crate::error::AppError::Modbus(format!(
             "exception: {:02x}",
             resp[2]
@@ -523,6 +526,10 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
             resp[1], item.func
         )));
     }
+
+    // 地址、CRC 和功能码均正确，说明物理链路已恢复。后续 payload
+    // 解析失败属于应用层错误，不应继续保留旧的通信错误状态。
+    crate::modbus::shared::RS485_STATS.mark_port_ok(stats_port);
 
     // 解析寄存器数据 (FC=03/04) 并写回 bus
     if item.func == 0x03 || item.func == 0x04 {

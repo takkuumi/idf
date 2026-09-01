@@ -167,7 +167,14 @@ fn main() -> AppResult<()> {
 
     // 4. 复位原因记录 (在 device::init 之前, 避免线程竞争)
     let reset_reason = unsafe { esp_idf_sys::esp_reset_reason() as u32 as u8 };
-    log::info!("[main] reset reason={}", reset_reason);
+    let previous_reset_reason = device::load_last_reset_reason();
+    log::info!(
+        "[main] reset reason={} ({}) previous={} ({})",
+        reset_reason,
+        health::reset_reason_name(reset_reason),
+        previous_reset_reason,
+        health::reset_reason_name(previous_reset_reason)
+    );
 
     // 4.1 RS485 拨码开关读取 (对齐参考固件 RS485_ADDRESS)
     // 使用 ESP-IDF 原生 GPIO API, 不消费 Peripherals 句柄, 可在 Hal::init 后随时调用.
@@ -199,9 +206,14 @@ fn main() -> AppResult<()> {
     // 6. 复位计数持久化 (NVS 已就绪, 直接读写, 不用 catch_unwind)
     let mut reset_count = device::load_reset_count();
     reset_count = reset_count.wrapping_add(1);
-    match device::save_reset_count(reset_count) {
-        Ok(()) => log::info!("[main] reset count={}", reset_count),
-        Err(e) => log::warn!("[main] save reset count failed: {}", e),
+    match device::save_reset_record(reset_count, reset_reason) {
+        Ok(()) => log::info!(
+            "[main] reset count={} reason={} ({})",
+            reset_count,
+            reset_reason,
+            health::reset_reason_name(reset_reason)
+        ),
+        Err(e) => log::warn!("[main] save reset record failed: {}", e),
     }
     // 复位计数/原因直接写 IO.sys 原子, 不再经 legacy Bus (阶段 D)
     bus::IO.sys.set_reset_count(reset_count);

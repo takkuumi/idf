@@ -83,7 +83,8 @@
   getsystemstatus/getnfcstatus` 六个只读接口均返回 HTTP 200，中文 UTF-8 正常。
 - 设备连续运行 240 秒，无重启、stack canary、pthread 创建失败、EMFILE 或服务
   停滞；空闲总 heap 稳定约 2054KB，历史最低约 2038KB。RTU1 未连接从站时告警
-  已按 10 秒聚合，通信错误计数仍逐次保留。
+  已按 10 秒聚合；`RS485_n_COMERR/APPERR` 按旧 MCA 协议保持当前状态码（通信错误
+  为 `0x04`、应用错误为异常码、有效帧成功后清零），不是累计计数器。
 - 首次调试时误把 `espflash` 返回会话号当作写入完成并提前终止进程，factory 尾段
   未写完，bootloader 正确拒绝该镜像并回退旧 `ota_0`。后续必须等待烧录进程自然
   退出，并以 bootloader 完整加载全部 segment 为成功判据。

@@ -87,7 +87,7 @@ pub(crate) fn handle_request(
 ) -> AppResult<()> {
     // 最小帧: slave(1) + func(1) + crc(2) = 4
     if req.len() < 4 {
-        // LOOP14: 帧过短 → 累加从站通信错误
+        // LOOP14: 帧过短 → 置从站通信错误=0x04
         crate::modbus::shared::RS485_STATS.inc_port_comerr(port_index);
         return Ok(());
     }
@@ -108,7 +108,7 @@ pub(crate) fn handle_request(
             crc,
             recv_crc
         );
-        // LOOP14: CRC 错 → 累加从站通信错误
+        // LOOP14: CRC 错 → 置从站通信错误=0x04
         crate::modbus::shared::RS485_STATS.inc_port_comerr(port_index);
         return Ok(());
     }
@@ -121,7 +121,8 @@ pub(crate) fn handle_request(
         .get(1)
         .is_some_and(|response_func| response_func & 0x80 != 0)
     {
-        crate::modbus::shared::RS485_STATS.inc_port_apperr(port_index);
+        let code = resp.get(2).copied().unwrap_or(1);
+        crate::modbus::shared::RS485_STATS.set_port_apperr(port_index, code);
     }
 
     // 广播不返回响应

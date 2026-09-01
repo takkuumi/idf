@@ -21,6 +21,30 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+/// 将 ESP-IDF 复位原因转换为稳定的诊断名称。
+/// 数字值直接来自 `esp_reset_reason_t`，未知值保留十六进制由调用方输出。
+pub fn reset_reason_name(reason: u8) -> &'static str {
+    match reason {
+        0 => "UNKNOWN",
+        1 => "POWERON",
+        2 => "EXTERNAL",
+        3 => "SOFTWARE",
+        4 => "PANIC",
+        5 => "INT_WDT",
+        6 => "TASK_WDT",
+        7 => "WDT",
+        8 => "DEEPSLEEP",
+        9 => "BROWNOUT",
+        10 => "SDIO",
+        11 => "USB",
+        12 => "JTAG",
+        13 => "RTC_WDT_SYS",
+        14 => "RTC_WDT_CPU",
+        15 => "RTC_WDT_RTC",
+        _ => "UNKNOWN",
+    }
+}
+
 /// 最大监控任务数
 const MAX_TASKS: usize = 24;
 
@@ -392,5 +416,19 @@ pub fn print_stack_watermarks() {
             max_used_pct,
             max_used_task
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reset_reason_name;
+
+    #[test]
+    fn reset_reason_names_match_esp_idf_values() {
+        assert_eq!(reset_reason_name(1), "POWERON");
+        assert_eq!(reset_reason_name(4), "PANIC");
+        assert_eq!(reset_reason_name(6), "TASK_WDT");
+        assert_eq!(reset_reason_name(9), "BROWNOUT");
+        assert_eq!(reset_reason_name(0xFF), "UNKNOWN");
     }
 }

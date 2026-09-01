@@ -147,17 +147,19 @@ mod crc_tests {
 }
 
 // ----------------------------------------------------------------------------
-// LOOP14: RS485 错误计数器 (0x0880-0x0883)
+// LOOP14: RS485 错误状态 (0x0880-0x0883)
 // ----------------------------------------------------------------------------
 //
 // metuory 仪表盘显示这 4 个寄存器诊断 RS485 通信健康:
-//   0x0880 RS485_1_COMERR: 主站通信错误 (超时/CRC 错/从站不匹配), 累加.
-//   0x0881 RS485_1_APPERR: 主站收到异常响应 (Illegal F/R/V/Slave Failure), 累加.
-//   0x0882 RS485_2_COMERR: 从站通信错误 (CRC 错/帧截断), 累加.
-//   0x0883 RS485_2_APPERR: 从站请求解析错误 (功能码非法/寄存器非法), 累加.
+//   0x0880 RS485_1_COMERR: 主站通信错误 (超时/CRC 错/从站不匹配), 当前状态码.
+//   0x0881 RS485_1_APPERR: 主站收到异常响应 (Illegal F/R/V/Slave Failure), 当前错误码.
+//   0x0882 RS485_2_COMERR: 从站通信错误 (CRC 错/帧截断), 当前状态码.
+//   0x0883 RS485_2_APPERR: 从站请求解析错误 (功能码非法/寄存器非法), 当前错误码.
 //
-// 对齐 MCA modbus_master.cpp 的错误计数语义, metuory 端按此显示诊断值.
-// 实现: 4 个 AtomicU32 无锁累加, 在 rtu_master/slave 异常点调用.
+// 对齐 MCA modbus_slave.cpp 的协议语义: 通信错误为 RSP_ERR_WRITE (0x04)，
+// 应用错误为 Modbus 异常码；任何有效通信成功后两者清零。它们不是累计计数器，
+// 否则无从站时会持续增长并与旧设备、手持机及 PC 工具不兼容。
+// 实现仍使用原子变量，无锁且不阻塞实时路径。
 // read_hold_reg(0x0880..=0x0883) 前置拦截读取 RS485_STATS, 不走 holding_buf 兜底.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -166,7 +168,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// 后点亮；1 秒窗口在 500ms 页面轮询下可见，同时不会把历史成功永久显示为在线。
 const RS485_ACTIVITY_WINDOW_MS: u32 = 1_000;
 
-/// RS485 通信/应用错误计数器 (无锁原子, 全局静态)
+const RS485_COMM_ERROR: u32 = 0x04;
+
+/// RS485 通信/应用错误状态 (无锁原子, 全局静态)
 pub struct Rs485Stats {
     port_comerr: [AtomicU32; 3],
     port_apperr: [AtomicU32; 3],
@@ -201,14 +205,32 @@ impl Rs485Stats {
     #[inline]
     pub fn inc_port_comerr(&self, port: usize) {
         if let Some(value) = self.port_comerr.get(port) {
-            value.fetch_add(1, Ordering::Relaxed);
+            // 保留旧 MCA 的 RSP_ERR_WRITE=0x04 语义；方法名暂不改，
+            // 以免影响现有协议模块调用方。
+            value.store(RS485_COMM_ERROR, Ordering::Release);
         }
     }
 
     #[inline]
     pub fn inc_port_apperr(&self, port: usize) {
+        self.set_port_apperr(port, 1);
+    }
+
+    /// 记录当前应用层错误码 (0 表示清除)。
+    #[inline]
+    pub fn set_port_apperr(&self, port: usize, code: u8) {
         if let Some(value) = self.port_apperr.get(port) {
-            value.fetch_add(1, Ordering::Relaxed);
+            value.store(u32::from(code), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn clear_errors(&self, port: usize) {
+        if let Some(value) = self.port_comerr.get(port) {
+            value.store(0, Ordering::Release);
+        }
+        if let Some(value) = self.port_apperr.get(port) {
+            value.store(0, Ordering::Release);
         }
     }
 
@@ -236,25 +258,25 @@ impl Rs485Stats {
         self.port_apperr(1)
     }
 
-    /// 累加主站通信错误 (timeout/CRC/slave mismatch)
+    /// 记录主站通信错误 (timeout/CRC/slave mismatch)
     #[inline]
     pub fn inc_master_comerr(&self) {
         self.inc_port_comerr(0);
     }
 
-    /// 累加主站应用错误 (Illegal F/R/V/Slave Failure)
+    /// 记录主站应用错误 (Illegal F/R/V/Slave Failure)
     #[inline]
     pub fn inc_master_apperr(&self) {
         self.inc_port_apperr(0);
     }
 
-    /// 累加从站通信错误 (CRC 错/帧截断)
+    /// 记录从站通信错误 (CRC 错/帧截断)
     #[inline]
     pub fn inc_slave_comerr(&self) {
         self.inc_port_comerr(1);
     }
 
-    /// 累加从站应用错误 (非法功能码/非法寄存器)
+    /// 记录从站应用错误 (非法功能码/非法寄存器)
     #[inline]
     pub fn inc_slave_apperr(&self) {
         self.inc_port_apperr(1);
@@ -271,6 +293,7 @@ impl Rs485Stats {
         if let Some(value) = self.port_last_ok_ms.get(port) {
             value.store(Self::uptime_ms().max(1), Ordering::Relaxed);
         }
+        self.clear_errors(port);
     }
 
     #[inline]
@@ -306,7 +329,7 @@ fn activity_is_recent(last_ms: u32, now_ms: u32) -> bool {
     last_ms != 0 && now_ms.wrapping_sub(last_ms) <= RS485_ACTIVITY_WINDOW_MS
 }
 
-/// 全局 RS485 错误计数静态实例
+/// 全局 RS485 错误状态静态实例
 pub static RS485_STATS: Rs485Stats = Rs485Stats::new();
 
 /// Modbus 异常码
@@ -815,19 +838,29 @@ mod tests {
     }
 
     #[test]
-    fn test_rs485_error_counters_are_isolated_by_physical_port() {
+    fn test_rs485_error_states_are_isolated_by_physical_port() {
         let stats = Rs485Stats::new();
         stats.inc_port_comerr(0);
         stats.inc_port_apperr(1);
         stats.inc_port_comerr(2);
         stats.inc_port_comerr(2);
-        assert_eq!(stats.port_comerr(0), 1);
+        assert_eq!(stats.port_comerr(0), 0x04);
         assert_eq!(stats.port_apperr(0), 0);
         assert_eq!(stats.port_comerr(1), 0);
         assert_eq!(stats.port_apperr(1), 1);
-        assert_eq!(stats.port_comerr(2), 2);
+        assert_eq!(stats.port_comerr(2), 0x04);
         assert_eq!(stats.port_apperr(2), 0);
         assert_eq!(stats.port_comerr(3), 0);
+    }
+
+    #[test]
+    fn test_valid_frame_clears_previous_error_state() {
+        let stats = Rs485Stats::new();
+        stats.inc_port_comerr(0);
+        stats.set_port_apperr(0, 0x02);
+        stats.mark_port_ok(0);
+        assert_eq!(stats.port_comerr(0), 0);
+        assert_eq!(stats.port_apperr(0), 0);
     }
 
     #[test]

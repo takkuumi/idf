@@ -251,7 +251,6 @@ impl crate::hal::digital_io::DigitalIo for IoExtender {
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::config::hw_version;
 
     #[test]

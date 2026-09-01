@@ -54,8 +54,8 @@ pub enum DeviceCmd {
     Commit,
     /// 异步从 NVS 重新加载协议数据
     Reload,
-    /// 异步持久化复位计数到 NVS
-    PersistResetCount(u16),
+    /// 异步持久化复位计数和最近一次复位原因到 NVS
+    PersistResetRecord { count: u16, reason: u8 },
     /// 异步持久化 BLE Mesh net_idx / app_idx 到 NVS
     PersistMeshKeys { net_idx: u16, app_idx: u16 },
     /// LOOP13: 异步持久化 holding_buf 到 NVS (FUNC_COUNT/SENSOR_MIN/MAX/用户 P 区)
@@ -107,14 +107,19 @@ impl Actor for DeviceActor {
                     bus::storage_state::proto_status_set(3);
                 }
             }
-            DeviceCmd::PersistResetCount(cnt) => {
+            DeviceCmd::PersistResetRecord { count: cnt, reason } => {
                 match try_with_nvs_mut(|nvs| {
                     nvs.set_u16(NVS_KEY_RESET_CNT, cnt)
-                        .map_err(|e| AppError::Config(format!("nvs set rst_cnt: {e:?}")))
+                        .map_err(|e| AppError::Config(format!("nvs set rst_cnt: {e:?}")))?;
+                    nvs.set_u8(NVS_KEY_RESET_REASON, reason)
+                        .map_err(|e| AppError::Config(format!("nvs set rst_reason: {e:?}")))
                 }) {
-                    Some(Ok(())) => log::debug!("[device] reset_count={cnt} persisted"),
-                    Some(Err(e)) => log::error!("[device] reset_count persist failed: {e}"),
-                    None => log::warn!("[device] NVS unavailable, reset_count not persisted"),
+                    Some(Ok(())) => log::debug!(
+                        "[device] reset record persisted count={cnt} reason={reason} ({})",
+                        crate::health::reset_reason_name(reason)
+                    ),
+                    Some(Err(e)) => log::error!("[device] reset record persist failed: {e}"),
+                    None => log::warn!("[device] NVS unavailable, reset record not persisted"),
                 }
             }
             DeviceCmd::PersistMeshKeys { net_idx, app_idx } => {
@@ -375,6 +380,8 @@ pub const PROTO_MAGIC: u16 = 0x4757; // 'G'<<8 | 'W'
 
 /// 复位计数 NVS key
 const NVS_KEY_RESET_CNT: &str = "rst_cnt";
+/// 最近一次启动观察到的复位原因 (esp_reset_reason_t)
+const NVS_KEY_RESET_REASON: &str = "rst_reason";
 /// BLE Mesh net_idx NVS key (配网后由 BLE Mesh 回调写入)
 const NVS_KEY_MESH_NET_IDX: &str = "mesh_nidx";
 /// BLE Mesh app_idx NVS key (配网后由 BLE Mesh 回调写入)
@@ -700,12 +707,17 @@ pub fn load_reset_count() -> u16 {
     try_with_nvs(|nvs| nvs.get_u16(NVS_KEY_RESET_CNT).ok().flatten().unwrap_or(0)).unwrap_or(0)
 }
 
-/// 保存复位计数到 NVS (异步, 不阻塞调用方)
+/// 读取上一次启动记录的复位原因；没有记录时返回 0 (UNKNOWN)。
+pub fn load_last_reset_reason() -> u8 {
+    try_with_nvs(|nvs| nvs.get_u8(NVS_KEY_RESET_REASON).ok().flatten().unwrap_or(0)).unwrap_or(0)
+}
+
+/// 保存复位计数和复位原因到 NVS (异步, 不阻塞调用方)
 ///
 /// 实际 NVS 写入由 device-store 监听线程在后台完成, 主线程立即返回 Ok(())。
 /// 失败时通过 log 记录, 不影响业务逻辑。
-pub fn save_reset_count(cnt: u16) -> AppResult<()> {
-    try_send_device_cmd(DeviceCmd::PersistResetCount(cnt))
+pub fn save_reset_record(count: u16, reason: u8) -> AppResult<()> {
+    try_send_device_cmd(DeviceCmd::PersistResetRecord { count, reason })
         .then_some(())
         .ok_or_else(|| AppError::Config("device actor unavailable or mailbox full".into()))
 }
