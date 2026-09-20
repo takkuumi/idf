@@ -6,7 +6,7 @@
 
 pub const KIB: usize = 1024;
 
-pub const MAIN: usize = 24 * KIB;
+pub const MAIN: usize = 32 * KIB;
 pub const DEVICE_ACTOR: usize = 12 * KIB;
 pub const MODBUS_RTU_PORT0: usize = 8 * KIB;
 pub const MODBUS_RTU_PORT1: usize = 8 * KIB;
@@ -48,8 +48,8 @@ mod tests {
 
     #[test]
     fn test_all_user_stacks_stay_within_internal_sram_budget() {
-        assert_eq!(DEFAULT_USER_STACK_TOTAL, 72 * KIB);
-        assert_eq!(ALL_USER_STACK_TOTAL, 86 * KIB);
+        assert_eq!(DEFAULT_USER_STACK_TOTAL, 80 * KIB);
+        assert_eq!(ALL_USER_STACK_TOTAL, 94 * KIB);
         assert_eq!(KNOWN_SYSTEM_STACK_TOTAL, 36 * KIB);
         assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
     }

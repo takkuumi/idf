@@ -227,19 +227,19 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
             config_read_with(|cs| u16::from_be_bytes([cs.cfg.ip[2], cs.cfg.ip[3]])).unwrap_or(0),
         ),
         2249 => Some(
-            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[0], cs.cfg.mask[1]]))
-                .unwrap_or(0),
-        ),
-        2250 => Some(
-            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[2], cs.cfg.mask[3]]))
-                .unwrap_or(0),
-        ),
-        2251 => Some(
             config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[0], cs.cfg.gateway[1]]))
                 .unwrap_or(0),
         ),
-        2252 => Some(
+        2250 => Some(
             config_read_with(|cs| u16::from_be_bytes([cs.cfg.gateway[2], cs.cfg.gateway[3]]))
+                .unwrap_or(0),
+        ),
+        2251 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[0], cs.cfg.mask[1]]))
+                .unwrap_or(0),
+        ),
+        2252 => Some(
+            config_read_with(|cs| u16::from_be_bytes([cs.cfg.mask[2], cs.cfg.mask[3]]))
                 .unwrap_or(0),
         ),
         regs::INREG_MAC_BASE => Some(

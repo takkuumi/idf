@@ -78,6 +78,7 @@ pub fn tick_do_output(hal: &Hal) {
                 Err(e) => {
                     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                     if state.consecutive_failures == 1
+                        || state.consecutive_failures == 3
                         || state.consecutive_failures.is_multiple_of(100)
                     {
                         log::error!(
@@ -86,7 +87,9 @@ pub fn tick_do_output(hal: &Hal) {
                             e
                         );
                     }
-                    // 保持 last 不变，确保下次仍识别为未同步；100ms 后重试。
+                    // P0-4: 保持 last 不变，确保下次仍识别为未同步；
+                    // 同时保持dirty标志以便100ms后重试
+                    DO_DIRTY.store(true, Ordering::Release);
                     state.tick_count = FALLBACK_TICKS.saturating_sub(RETRY_TICKS);
                 }
             }

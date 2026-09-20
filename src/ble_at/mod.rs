@@ -1263,19 +1263,25 @@ pub fn feed_data(data: &[u8]) {
 ///
 /// 输出用 BLE 帧格式包装 (与 metuory-wireless-management-app-1.0.78 一致):
 ///   tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | unit(1) | func(1) | data(N) | crc(2)
-/// 其中 pdu_data = Modbus RTU 响应 (slave + func + body + crc)
+/// 其中 pdu_data = unit + func + body；CRC 只在完整 BLE 帧末尾出现一次。
 fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> bool {
-    let Some(rtu_rsp) = build_embedded_modbus_response(frame) else {
+    let Some(response_pdu) = build_embedded_modbus_response(frame) else {
         return false;
     };
     // 用 BLE 帧格式包装 (Android 期望)
-    send_ble_frame(tx_id, proto_id, &rtu_rsp, conn_id);
+    send_ble_frame(tx_id, proto_id, &response_pdu, conn_id);
     true
 }
 
-/// Execute the Modbus PDU carried by a BLE binary frame. BLE supplies the
-/// outer CRC, so `frame` is `[unit, function, pdu...]`; the returned payload is
-/// a complete RTU-shaped response consumed by the existing Android codec.
+/// Execute the Modbus PDU carried by a BLE binary frame.
+///
+/// The handheld protocol is MBAP-like: `frame` is
+/// `[unit, function, pdu...]` and the complete BLE frame already has one CRC
+/// after its length-delimited payload. The response therefore must remain
+/// `[unit, function, response-data...]`. Appending a second, RTU-level CRC
+/// makes FC06/FC0F/FC10 responses two bytes longer than the Android codec's
+/// address/value or address/count contract and causes configuration writes to
+/// be reported as failed.
 fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>> {
     let (&slave, rest) = frame.split_first()?;
     let (&func, pdu) = rest.split_first()?;
@@ -1285,8 +1291,6 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
     let mut response = heapless::Vec::<u8, 256>::new();
     response.push(slave).ok()?;
     response.extend_from_slice(&pdu_buf[..pdu_len]).ok()?;
-    let crc = modbus_crc16(&response);
-    response.extend_from_slice(&crc.to_le_bytes()).ok()?;
     Some(response)
 }
 
@@ -1912,6 +1916,17 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             if !crate::bus::backends::write_hold_regs(regs::HOLD_MAC_BASE, &words) {
                 return None;
             }
+            // 兼容旧固件行为：修改 MAC 地址后需要重启设备才能使 W5500 应用新配置
+            // 参考 MCA_F16V2_1_F48_BLE/BleMsgDeal.cpp:535-538
+            // 旧固件调用 save_config_to_file() 同步持久化后再设置 bIsRestart = true
+            if let Err(e) = crate::device::persist_config_now() {
+                log::error!("[ble_at] 0xC7: failed to persist config before reset: {e}");
+                return None;
+            }
+            crate::bus::IO
+                .sys
+                .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
+            log::info!("[ble_at] 0xC7: MAC address persisted, device will reset shortly");
         }
         0xC8 => {
             let value = crate::bus::backends::read_hold_reg(regs::HOLD_TCP_COM_BASE)?;
@@ -1947,13 +1962,41 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             if data.len() != 12 {
                 return None;
             }
+            // 手持机发送顺序: IP(0-3) → Gateway(4-7) → Mask(8-11)
+            // 但寄存器存储顺序: IP(2247-2250) → Mask(2251-2254) → Gateway(2255-2258)
+            // 需要重新排序
             let mut values = [0u16; 12];
-            for (target, value) in values.iter_mut().zip(data.iter().copied()) {
-                *target = u16::from(value);
-            }
+            // IP: byte 0-3 → reg 2247-2250
+            values[0] = u16::from(data[0]);
+            values[1] = u16::from(data[1]);
+            values[2] = u16::from(data[2]);
+            values[3] = u16::from(data[3]);
+            // Mask: byte 8-11 → reg 2251-2254
+            values[4] = u16::from(data[8]);
+            values[5] = u16::from(data[9]);
+            values[6] = u16::from(data[10]);
+            values[7] = u16::from(data[11]);
+            // Gateway: byte 4-7 → reg 2255-2258
+            values[8] = u16::from(data[4]);
+            values[9] = u16::from(data[5]);
+            values[10] = u16::from(data[6]);
+            values[11] = u16::from(data[7]);
             if !crate::bus::backends::write_hold_regs(regs::HOLD_IP_BASE, &values) {
                 return None;
             }
+            // 兼容旧固件行为：修改网络配置后需要重启设备才能使 W5500 应用新配置
+            // 参考 MCA_F16V2_1_F48_BLE/BleMsgDeal.cpp:364-367
+            // 旧固件调用 save_config_to_file() 同步持久化后再设置 bIsRestart = true
+            // 我们必须在设置重启标志前同步持久化，否则配置会丢失（DeviceActor idle
+            // 检查间隔 1 秒，远大于主循环的 100ms 重启延迟）
+            if let Err(e) = crate::device::persist_config_now() {
+                log::error!("[ble_at] 0xCD: failed to persist config before reset: {e}");
+                return None;
+            }
+            crate::bus::IO
+                .sys
+                .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
+            log::info!("[ble_at] 0xCD: IP/MASK/GW persisted, device will reset shortly");
         }
         0xCE => {
             let (ip, mask, gateway) = crate::bus::config_state::config_read_with(|state| {
@@ -2115,14 +2158,15 @@ fn handle_ble_android_read_command(
                     Some(d)
                 }
                 // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
-                //   [length_byte=24][ip(8)][mask(8)][gw(8)]
+                //   [length_byte=24][ip(8)][gw(8)][mask(8)]
+                //   注意：手持机发送顺序是 IP → Gateway → Mask (与写入顺序一致)
                 //   每个 octet 编码为 BE u16 (高字节=0), 即 192 → [0x00, 0xC0]
                 //   ipBytesToStr 读 4 BE short: ip[0..2], ip[2..4], ip[4..6], ip[6..8]
                 //   getIPComponentLength() = ipLength/3 = 24/3 = 8
                 (0x08C7, 12) => {
                     let ip = cfg.ip;
-                    let mask = cfg.mask;
                     let gw = cfg.gateway;
+                    let mask = cfg.mask;
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
                     // IP 每个 octet → 2 bytes BE (高字节 0)
@@ -2130,11 +2174,13 @@ fn handle_ble_android_read_command(
                         let _ = d.push(0);
                         let _ = d.push(b);
                     }
-                    for &b in &mask {
+                    // Gateway (与手持机写入顺序一致)
+                    for &b in &gw {
                         let _ = d.push(0);
                         let _ = d.push(b);
                     }
-                    for &b in &gw {
+                    // Mask
+                    for &b in &mask {
                         let _ = d.push(0);
                         let _ = d.push(b);
                     }
@@ -2429,18 +2475,19 @@ fn build_android_read_response_pdu(
             d
         }
         (0x08C7, 12) => {
-            // Android: [24][ip(8)][mask(8)][gw(8)]  (25B rsp_data, 每 octet BE u16)
+            // Android: [24][ip(8)][gw(8)][mask(8)]  (25B rsp_data, 每 octet BE u16)
+            // 注意：手持机发送顺序是 IP → Gateway → Mask (与写入顺序一致)
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
             let _ = d.push(24);
             for &b in &cfg_ip {
                 let _ = d.push(0);
                 let _ = d.push(b);
             }
-            for &b in &cfg_mask {
+            for &b in &cfg_gw {
                 let _ = d.push(0);
                 let _ = d.push(b);
             }
-            for &b in &cfg_gw {
+            for &b in &cfg_mask {
                 let _ = d.push(0);
                 let _ = d.push(b);
             }
@@ -3497,10 +3544,10 @@ mod tests {
 // 单元测试 — Android BLE 帧包装 (Android metuory-wireless-management-app 兼容)
 // ============================================================================
 //
-// 关键修复: 之前 Modbus RTU 响应未用 BLE 帧包装, 导致 Android 无法解析
+// BLE 业务帧兼容性测试
 // Android 期望响应格式:
 //   tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | pdu_data(N) | crc(2 LE)
-// 其中 pdu_data = Modbus RTU 响应 (slave + func + body + crc)
+// 其中 pdu_data = unit + func + body；末尾 CRC 是整帧唯一的 CRC。
 //
 // 测试验证:
 // 1. 帧结构正确
@@ -3562,16 +3609,6 @@ mod tests_ble_cmd {
         ))
     }
 
-    /// 模拟 Modbus RTU 响应 (Android 收到后解析)
-    fn build_modbus_rtu_response(slave: u8, func: u8, body: &[u8]) -> Vec<u8> {
-        let mut out = vec![slave, func];
-        out.extend_from_slice(body);
-        let crc = crate::modbus::shared::modbus_crc16(&out);
-        out.push(crc as u8);
-        out.push((crc >> 8) as u8);
-        out
-    }
-
     #[test]
     fn test_ble_request_construction_matches_android() {
         // 模拟 Android READ_SN: FC=03, addr=0x0894, count=9
@@ -3590,33 +3627,22 @@ mod tests_ble_cmd {
     }
 
     #[test]
-    fn test_modbus_rtu_response_for_sn() {
-        // 9 regs read = 18 bytes data
-        let sn_data = b"ESP32S3-UNKNOWN-00"; // 18 bytes
-        let body: Vec<u8> = std::iter::once((sn_data.len() * 2) as u8)
-            .chain(sn_data.iter().copied())
-            .collect();
-        // body = [18, 18 bytes SN]
-        let rtu_rsp = build_modbus_rtu_response(1, 0x03, &body);
-        // Expected: [slave=1, func=0x03, byte_count=18, 18 bytes data, CRC_LO, CRC_HI]
-        assert_eq!(rtu_rsp.len(), 23);
-        assert_eq!(rtu_rsp[0], 1); // slave
-        assert_eq!(rtu_rsp[1], 0x03); // func
-        assert_eq!(rtu_rsp[2], 18); // byte_count
-        assert_eq!(&rtu_rsp[3..21], sn_data); // SN bytes
-        let crc = crate::modbus::shared::modbus_crc16(&rtu_rsp[..21]);
-        assert_eq!(u16::from_le_bytes([rtu_rsp[21], rtu_rsp[22]]), crc);
-    }
-
-    #[test]
     fn test_android_parses_our_response() {
-        // 模拟 Android 接收设备响应:
-        // 设备发送 BLE 帧: tx_id + proto_id + length + modbus_rtu_response + crc
-        let sn_data = b"ESP32S3-UNKNOWN-00";
-        let body: Vec<u8> = std::iter::once((sn_data.len() * 2) as u8)
-            .chain(sn_data.iter().copied())
-            .collect();
-        let rtu_rsp = build_modbus_rtu_response(1, 0x03, &body);
+        // Use the production Modbus dispatcher, then wrap exactly once as the
+        // Android CommandBuilderUtil/CommandParserUtil contract requires.
+        let address = crate::config::regs::HOLD_SN_BASE;
+        let request = [
+            1,
+            0x03,
+            (address >> 8) as u8,
+            address as u8,
+            0,
+            crate::config::regs::HOLD_SN_COUNT as u8,
+        ];
+        let response = build_embedded_modbus_response(&request).expect("valid SN read");
+        assert_eq!(response[0], 1);
+        assert_eq!(response[1], 0x03);
+        assert_eq!(response[2], (crate::config::regs::HOLD_SN_COUNT * 2) as u8);
 
         // 模拟 send_ble_frame 的输出
         let tx_id: u16 = 0x1234;
@@ -3624,8 +3650,8 @@ mod tests_ble_cmd {
         let mut frame = Vec::new();
         frame.extend_from_slice(&tx_id.to_be_bytes());
         frame.extend_from_slice(&proto_id.to_be_bytes());
-        frame.extend_from_slice(&(rtu_rsp.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&rtu_rsp);
+        frame.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&response);
         let crc = crate::modbus::shared::modbus_crc16(&frame);
         frame.push(crc as u8);
         frame.push((crc >> 8) as u8);
@@ -3634,26 +3660,16 @@ mod tests_ble_cmd {
         let (tx, proto, len, unit, func, pdu_data, crc_ok) = parse_ble_response(&frame).unwrap();
         assert_eq!(tx, 0x1234);
         assert_eq!(proto, 0x5678);
-        assert_eq!(len as usize, rtu_rsp.len()); // length = pdu_data.len()
+        assert_eq!(len as usize, response.len());
         assert_eq!(unit, 1);
         assert_eq!(func, 0x03);
-        assert_eq!(pdu_data, rtu_rsp);
         assert!(crc_ok, "CRC should be valid");
-
-        // Android 然后从 pdu_data 解析 Modbus RTU:
-        // pdu_data = [slave=1, func=0x03, byte_count=18, SN data, CRC]
-        assert_eq!(pdu_data[0], 1); // slave
-        assert_eq!(pdu_data[1], 0x03); // func
-        assert_eq!(pdu_data[2], 18); // byte_count
-
-        // Android parseSNItem:
-        // buffer[0] = 18 (length)
-        // bytes = buffer[1..19] = 18 bytes of SN
-        let length = pdu_data[2];
-        let sn_bytes = &pdu_data[3..3 + length as usize];
-        assert_eq!(sn_bytes, sn_data);
-        let sn_str = std::str::from_utf8(sn_bytes).unwrap();
-        assert_eq!(sn_str, "ESP32S3-UNKNOWN-00");
+        assert_eq!(pdu_data.as_slice(), &response[2..]);
+        assert_eq!(
+            pdu_data.len(),
+            1 + crate::config::regs::HOLD_SN_COUNT as usize * 2
+        );
+        assert_eq!(pdu_data[0], (crate::config::regs::HOLD_SN_COUNT * 2) as u8);
     }
 
     #[test]
@@ -3723,15 +3739,109 @@ mod tests_ble_cmd {
         }
 
         let response = build_embedded_modbus_response(&request).expect("valid BLE Modbus PDU");
-        assert_eq!(&response[..6], &[1, 0x10, request[2], request[3], 0, 3]);
         assert_eq!(
-            u16::from_le_bytes([response[response.len() - 2], response[response.len() - 1]]),
-            modbus_crc16(&response[..response.len() - 2])
+            response.as_slice(),
+            &[1, 0x10, request[2], request[3], 0, 3]
         );
         for (offset, expected) in values.into_iter().enumerate() {
             assert_eq!(
                 crate::bus::backends::read_hold_reg(address + offset as u16),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_handheld_fc16_ip_write_is_atomic_and_has_exact_android_ack() {
+        use crate::config::regs;
+
+        // CommandBuilderUtil.writeIPCMD sends 12 big-endian registers in the
+        // order IP, mask, gateway. Each IPv4 octet occupies one u16.
+        let values = [
+            192u16, 168, 51, 221, // IP
+            255, 255, 255, 0, // mask
+            192, 168, 51, 1, // gateway
+        ];
+        let mut request = vec![1, 0x10];
+        request.extend_from_slice(&regs::HOLD_IP_BASE.to_be_bytes());
+        request.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        request.push((values.len() * 2) as u8);
+        for value in values {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let response = build_embedded_modbus_response(&request).expect("valid IP write");
+
+        // Android parseResWriteIP expects exactly addr(2) + count(2) after
+        // unit/function. There is no nested RTU CRC in this BLE protocol.
+        assert_eq!(
+            response.as_slice(),
+            &[
+                1,
+                0x10,
+                (regs::HOLD_IP_BASE >> 8) as u8,
+                regs::HOLD_IP_BASE as u8,
+                0,
+                12,
+            ]
+        );
+        let snapshot =
+            crate::bus::config_state::config_read().expect("config snapshot after IP write");
+        let cfg = &snapshot.cfg;
+        assert_eq!(cfg.ip, [192, 168, 51, 221]);
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
+        assert!(
+            crate::device::config_is_dirty(),
+            "handheld config writes must be queued for NVS persistence"
+        );
+    }
+
+    #[test]
+    fn test_all_handheld_system_config_writes_have_exact_fc16_ack() {
+        use crate::config::regs;
+
+        // These are all fixed system-configuration write ranges used by
+        // CMDTransmissionTypeEnum in the handheld app. They share the same
+        // FC16 response parser and must never carry an embedded RTU CRC.
+        let cases: &[(u16, &[u16])] = &[
+            (regs::HOLD_SN_BASE, &[0x534E; 9]),
+            (regs::HOLD_PLACE_BASE, &[0x4C4F; 8]),
+            (regs::HOLD_RS485_BASE, &[0x7101, 1, 2, 1_000, 20]),
+            (
+                regs::HOLD_RS485_BASE + regs::HOLD_RS485_STRIDE,
+                &[0x7102, 2, 3, 1_100, 30],
+            ),
+            (
+                regs::HOLD_RS485_BASE + 2 * regs::HOLD_RS485_STRIDE,
+                &[0x7102, 3, 4, 1_200, 40],
+            ),
+            (regs::HOLD_BLE_ADDR_BASE, &[0x4E4F, 0x4445, 0x2D32, 0x3231]),
+        ];
+
+        for &(address, values) in cases {
+            let count = values.len() as u16;
+            let mut request = vec![1, 0x10];
+            request.extend_from_slice(&address.to_be_bytes());
+            request.extend_from_slice(&count.to_be_bytes());
+            request.push((values.len() * 2) as u8);
+            for &value in values {
+                request.extend_from_slice(&value.to_be_bytes());
+            }
+
+            let response = build_embedded_modbus_response(&request)
+                .unwrap_or_else(|| panic!("handheld write rejected at 0x{address:04X}"));
+            assert_eq!(
+                response.as_slice(),
+                &[
+                    1,
+                    0x10,
+                    (address >> 8) as u8,
+                    address as u8,
+                    (count >> 8) as u8,
+                    count as u8,
+                ],
+                "unexpected handheld FC16 acknowledgement at 0x{address:04X}"
             );
         }
     }

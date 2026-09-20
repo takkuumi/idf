@@ -64,7 +64,7 @@ pub struct Rs485Config {
     pub stop_bits: u8,
     pub parity: u8,       // 0=None 1=Odd 2=Even
     pub slave_addr: u8,   // 0=主站
-    pub mode: u8,         // 0=Master 1=Slave 2=Gateway
+    pub mode: u8,         // 0=Master 1=Slave 2=Gateway 3=Transparent(LoRa透传)
     pub retry_count: u16, // LOOP5: 之前漏存, 现加上 (Word3 of RS485 config)
     pub timeout_ms: u16,  // LOOP5: Word4 of RS485 config
     pub interval_ms: u16, // LOOP5: Word5 of RS485 config

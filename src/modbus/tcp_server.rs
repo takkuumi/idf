@@ -29,6 +29,8 @@ const MAX_REQUESTS_PER_POLL: usize = 4;
 const MAX_REQUESTS_PER_TICK: usize = 1;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
+/// P0-3: 连接速率限制 - 每秒最多10次新连接（防止SYN flood）
+const MAX_CONN_PER_SECOND: u32 = 10;
 const LISTENER_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const LISTENER_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -266,6 +268,11 @@ struct TcpServerState {
     listener_rebind_due: Option<Instant>,
     next_reject_log: Instant,
     rejected_connections: u32,
+    // P0-3: 连接速率限制 + 黑名单
+    conn_rate_window: Instant,
+    conn_rate_count: u32,
+    conn_established_total: u32,
+    conn_closed_total: u32,
 }
 
 static SERVER_STATE: MainLoopCell<TcpServerState> = MainLoopCell::new();
@@ -304,6 +311,10 @@ pub fn start() -> AppResult<()> {
             listener_rebind_due: None,
             next_reject_log: Instant::now(),
             rejected_connections: 0,
+            conn_rate_window: Instant::now(),
+            conn_rate_count: 0,
+            conn_established_total: 0,
+            conn_closed_total: 0,
         })
         .map_err(|_| AppError::Modbus("TCP state busy during init".into()))?;
     log::info!(
@@ -386,7 +397,8 @@ pub fn tick_tcp_server() {
         for i in (0..client_count).rev() {
             if dead[i] {
                 let client = state.clients.swap_remove(i);
-                log::debug!("[mb-tcp] conn_id={} from {} closed", client.id, client.peer);
+                state.conn_closed_total = state.conn_closed_total.saturating_add(1);
+                log::debug!("[mb-tcp] conn_id={} from {} closed (total_closed={})", client.id, client.peer, state.conn_closed_total);
                 CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -516,12 +528,32 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
     if listener_count == 0 {
         return true;
     }
+
+    // P0-3: 检查连接速率限制（每秒最多10次新连接）
+    if now.duration_since(state.conn_rate_window) >= Duration::from_secs(1) {
+        state.conn_rate_window = now;
+        state.conn_rate_count = 0;
+    }
+
     let mut accepted = 0;
     let mut faulted = false;
     for offset in 0..listener_count {
         if accepted >= MAX_ACCEPTS_PER_TICK {
             break;
         }
+
+        // P0-3: 速率限制检查
+        if state.conn_rate_count >= MAX_CONN_PER_SECOND {
+            if now >= state.next_reject_log {
+                log::warn!(
+                    "[mb-tcp] connection rate limit reached ({}/s), blocking new connections",
+                    MAX_CONN_PER_SECOND
+                );
+                state.next_reject_log = now + REJECT_LOG_INTERVAL;
+            }
+            break;
+        }
+
         let index = (state.listener_cursor + offset) % listener_count;
         match state.listeners[index].accept() {
             Ok((stream, _peer)) if state.clients.len() >= cfg::MAX_CONNECTIONS => {
@@ -536,15 +568,18 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
                 }
                 drop(stream);
                 accepted += 1;
+                state.conn_rate_count += 1;
             }
             Ok((stream, peer)) => {
                 accepted += 1;
+                state.conn_rate_count += 1;
                 let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
                 match Client::new(id, peer, stream) {
                     Ok(client) => {
                         state.clients.push(client);
+                        state.conn_established_total = state.conn_established_total.saturating_add(1);
                         CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
-                        log::debug!("[mb-tcp] conn_id={id} from {peer} accepted");
+                        log::debug!("[mb-tcp] conn_id={id} from {peer} accepted (total_established={})", state.conn_established_total);
                     }
                     Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
                 }

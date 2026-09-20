@@ -338,7 +338,7 @@ pub mod modbus {
         pub const MAX_CONNECTIONS: usize = 8;
         /// 已建立连接的空闲回收时间。原 2 秒“读超时”不能直接当连接空闲超时，
         /// 否则常见 PLC/SCADA 长连接在两次轮询间就被服务端主动断开。
-        pub const IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+        pub const IDLE_TIMEOUT_MS: u64 = 2 * 60 * 1000;
         /// 弱网下完整 MBAP 帧的接收上限。计时从首字节开始，后续零散字节不续期，
         /// 防止 slowloris 客户端永久占用固定的 8 个连接槽。
         pub const PARTIAL_FRAME_TIMEOUT_MS: u64 = 30_000;
@@ -486,10 +486,10 @@ pub mod regs {
     pub const HOLD_TCP_COM_COUNT: u16 = 4;
     // IP 地址 (2247-2250 = 2 words)
     pub const HOLD_IP_BASE: u16 = 2247;
-    // 子网掩码 (2251-2254)
-    pub const HOLD_MASK_BASE: u16 = 2251;
-    // 网关 (2255-2258)
-    pub const HOLD_GW_BASE: u16 = 2255;
+    // 网关 (2251-2254) - 注意：手持机发送顺序是 IP → Gateway → Mask
+    pub const HOLD_GW_BASE: u16 = 2251;
+    // 子网掩码 (2255-2258)
+    pub const HOLD_MASK_BASE: u16 = 2255;
     // DNS (2259-2262)
     pub const HOLD_DNS_BASE: u16 = 2259;
     // MAC 地址 (2263-2268 = 6 bytes in 3 words)
@@ -620,10 +620,10 @@ mod tests {
         assert_eq!(regs::HOLD_TCP_COM_BASE, 2243);
         // SLAVE_REG_PIP1 = 2247
         assert_eq!(regs::HOLD_IP_BASE, 2247);
-        // SLAVE_REG_PNTEMASK1 = 2251
-        assert_eq!(regs::HOLD_MASK_BASE, 2251);
-        // SLAVE_REG_PGW1 = 2255
-        assert_eq!(regs::HOLD_GW_BASE, 2255);
+        // SLAVE_REG_PGW1 = 2251 (注意：手持机发送顺序是 IP → GW → Mask)
+        assert_eq!(regs::HOLD_GW_BASE, 2251);
+        // SLAVE_REG_PNTEMASK1 = 2255
+        assert_eq!(regs::HOLD_MASK_BASE, 2255);
         // SLAVE_REG_DNS1 = 2259
         assert_eq!(regs::HOLD_DNS_BASE, 2259);
         // SLAVE_REG_MAC1 = 2263

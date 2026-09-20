@@ -26,6 +26,7 @@ static PORT2_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port2", 30);
 enum PortMode {
     Master,
     Slave,
+    Transparent, // P0-1: 串口透传模式（LoRa/串口转TCP）
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +68,16 @@ fn apply_runtime_policy(
     }
     RuntimeConfig {
         wire,
-        // The MCA register contract only distinguishes internal mode 0
-        // (master) from every other value (slave).
-        mode: if dip_address.is_none() && saved.mode == 0 {
-            PortMode::Master
-        } else {
+        // P0-1: 支持透传模式 (mode=3)
+        // 0=Master, 1=Slave, 2=Gateway(保留), 3=Transparent
+        mode: if dip_address.is_some() {
             PortMode::Slave
+        } else {
+            match saved.mode {
+                0 => PortMode::Master,
+                3 => PortMode::Transparent,
+                _ => PortMode::Slave,
+            }
         },
         slave_addr: dip_address.unwrap_or(saved.slave_addr.clamp(1, 247)),
         retry_count: u32::from(saved.retry_count.min(5)),
@@ -251,6 +256,30 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
                     Err(error) => {
                         if last_warn.elapsed() >= Duration::from_secs(10) {
                             log::warn!("[modbus-rtu] RS485-{} read error: {error}", index + 1);
+                            last_warn = std::time::Instant::now();
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            PortMode::Transparent => {
+                // P0-1: 透传模式 - 串口数据透传到TCP或其他总线
+                // 简化实现：读取串口数据，写入日志（实际可转发到TCP socket）
+                let mut frame = [0u8; 256];
+                match opened.read(&mut frame, 100) {
+                    Ok(0) => std::thread::sleep(Duration::from_millis(50)),
+                    Ok(length) => {
+                        // TODO: 将数据转发到TCP socket或BLE
+                        log::debug!(
+                            "[modbus-rtu] RS485-{} transparent rx {} bytes",
+                            index + 1,
+                            length
+                        );
+                        // 当前仅记录，未来可扩展为双向透传
+                    }
+                    Err(error) => {
+                        if last_warn.elapsed() >= Duration::from_secs(10) {
+                            log::warn!("[modbus-rtu] RS485-{} transparent read error: {error}", index + 1);
                             last_warn = std::time::Instant::now();
                         }
                         std::thread::sleep(Duration::from_millis(50));
