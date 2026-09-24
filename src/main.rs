@@ -2,7 +2,7 @@
 //!
 //! 系统组成：
 //! - 以太网 (W5500 over SPI2) + 应用层简单冗余
-//! - BLE Mesh (Proxy + Node + Generic OnOff 模型) — ESP32-S3R2 内置
+//! - BLE GATT 配置/手持机协议；BLE Mesh 配网不在当前默认业务路径
 //! - 8 路 DI / 8 路 DO
 //! - 6 路 AI (ADC1) / 4 路 AO (LEDC PWM)
 //! - 2 路 RS485 (UART1/UART2)
@@ -13,7 +13,7 @@
 //! 2. 硬件抽象 (HAL) 初始化
 //! 3. 应用层总线初始化
 //! 4. 启动以太网任务
-//! 5. 启动 BLE Mesh 任务
+//! 5. 启动 BLE GATT 服务
 //! 6. 启动 RS485 + Modbus 任务
 //! 7. 启动 IO/AI/AO 采样任务
 //! 8. 进入主循环：复位计数、喂狗、状态上报
@@ -240,7 +240,7 @@ fn main() -> AppResult<()> {
         }
     }
 
-    // 6. 通信协议注册表 (插件化管理 Modbus RTU/TCP + BLE Mesh)
+    // 6. 通信协议注册表 (插件化管理 Modbus RTU/TCP；BLE GATT 独立启动)
     let mut protocols = protocol::ProtocolRegistry::new();
 
     // 6. 启动 BLE GATT Server (标准 BLE)

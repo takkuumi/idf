@@ -1,6 +1,6 @@
 [package]
 name = "esp32s3-iot-gateway"
-version = "2.2.4"
+version = "2.2.6"
 edition = "2024"
 authors = ["idf"]
 description = "ESP32-S3R2 嵌入式网关：以太网 W5500 + BLE + IO + AI/AO + RS485 + Modbus"

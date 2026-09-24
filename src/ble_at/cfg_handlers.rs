@@ -22,7 +22,7 @@
 //!   AT+CFGREAD=<addr>                按 Modbus 地址读 U16
 //!   AT+CFGWRITE=<addr>,<value>        按 Modbus 地址写 U16
 
-use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16};
+use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16, parse_u32};
 use crate::config::regs;
 use crate::device::{self, SystemConfig, parse_ipv4};
 
@@ -194,9 +194,10 @@ pub fn handle_cfg485(args: &str) -> String {
         ok_data(&s)
     } else if parts.len() == 7 {
         // 写
-        let baud = match parse_u16(parts[1]) {
-            Some(v) => v as u32 * 100,
+        let baud = match parse_u32(parts[1]) {
+            Some(v) if (300..=921_600).contains(&v) => v,
             None => return err(11, "invalid baud"),
+            _ => return err(11, "baud out of range (300..921600)"),
         };
         let data = match parse_u16(parts[2]) {
             Some(v @ 7) | Some(v @ 8) => v as u8,
@@ -239,7 +240,13 @@ pub fn handle_cfgapply(_args: &str) -> String {
     // cfg_version 自增
     with_cfg_mut(|c| c.cfg_version = c.cfg_version.wrapping_add(1));
     match device::apply_config_sync() {
-        Ok(_) => ok_data("applied (restart to take effect)"),
+        Ok(_) => {
+            // Synchronous NVS commit is followed by the same runtime apply
+            // notification used by Modbus/Web. Previously AT+CFGAPPLY saved
+            // the values but left Ethernet on the old address until reboot.
+            device::request_apply_config();
+            ok_data("applied")
+        }
         Err(e) => err(20, &format!("apply: {}", e)),
     }
 }
@@ -250,7 +257,10 @@ pub fn handle_cfgapply(_args: &str) -> String {
 pub fn handle_cfgreset(_args: &str) -> String {
     with_cfg_mut(|c| *c = SystemConfig::defaults());
     match device::apply_config_sync() {
-        Ok(_) => ok_data("reset to defaults"),
+        Ok(_) => {
+            device::request_apply_config();
+            ok_data("reset to defaults")
+        }
         Err(e) => err(20, &format!("apply: {}", e)),
     }
 }
@@ -404,6 +414,13 @@ mod tests {
     #[test]
     fn cfginfo_includes_third_legacy_port() {
         assert!(handle_cfginfo("").contains("rs485_2="));
+    }
+
+    #[test]
+    fn cfg485_keeps_full_baud_value() {
+        let response = handle_cfg485("0,115200,8,1,0,1,0");
+        assert_eq!(response, "OK\r\n");
+        assert_eq!(with_cfg(|cfg| cfg.rs485[0].baudrate), 115_200);
     }
 
     #[test]

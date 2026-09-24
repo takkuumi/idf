@@ -16,11 +16,11 @@
 
 ## 架构
 
-**4 个用户 pthread + main_loop tick**:
-- main_loop: 100ms 主循环, 调度所有业务
-- DeviceActor: NVS 持久化
-- mb-rtu-master/slave: Modbus RTU
-- mb-tcp-listen: Modbus TCP
+**main_loop + 有界后台任务**:
+- main_loop: 5ms 调度周期，负责 IO、BLE、以太网心跳和 Modbus TCP
+- DeviceActor: 串行 NVS/Flash 持久化
+- 每个启用的 RS485 端口独立运行 Master/Slave 任务
+- HTTP、NFC、UDP 及 BLE 使用固定栈和有界缓冲；任务由健康监控统一检查
 
 合并到 main_loop 的模块: ai-sample, ao-output, di-scan, do-output, eth-heartbeat
 
@@ -30,7 +30,7 @@
 [整体内存布局](MEMORY_LAYOUT.md)。
 
 ## 功能
-- ✅ Modbus TCP (502): FC=03/04/06/16
+- ✅ Modbus TCP (502/503/504/5002): FC=01/02/03/04/05/06/15/16
 - ✅ Modbus RTU Master/Slave: 19200 8N1
 - ✅ BLE GATT 通知: Android 手持机兼容 (metuory-wireless-management-app-1.0.78)
 - ✅ AI 6 通道 100ms 采样, 滑动平均
@@ -39,7 +39,7 @@
 - ✅ DO 16 通道事件驱动输出
 - ✅ NVS 配置持久化
 - ✅ RCU 无锁共享状态
-- ⏳ OTA 升级 (TODO)
+- ✅ Web OTA 升级（factory/ota 分区、回滚确认）
 
 ## 编译
 
@@ -71,7 +71,7 @@ espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 
 ## 测试
 
-- 单元测试: `cargo test --bin gateway --no-run` (需在设备上跑)
+- 单元测试编译: `cargo test --bin gateway --no-run`（ESP-IDF 目标不在主机执行）
 - Modbus TCP: `python3 -c "import socket; ..."` 见 [log/modbus/tcp_test.md](log/modbus/tcp_test.md)
 - BLE Android 兼容: 见 [log/ble/android_read_2026-07-21.md](log/ble/android_read_2026-07-21.md)
 

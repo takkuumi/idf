@@ -4,7 +4,7 @@
 //! 本模块作为**以太网冗余链路**或**AP 配置入口**:
 //!
 //! - **Station 模式** (默认): 连接到上游 AP, 作为以太网故障时的备份链路
-//! - **AP 模式** (TODO): 自身作为 AP, 提供手机直连配置入口 (与 BLE AT 命令并行)
+//! - **AP 模式**：当前未启用；手机配置入口使用 BLE GATT。
 //!
 //! # 与以太网的协作
 //!
@@ -12,12 +12,8 @@
 //! - 未来可加入链路优先级: eth_up 时关 Wi-Fi, eth_down 时启用 Wi-Fi (省电)
 //! - 与 BLE 共存: ESP32-S3 内置 coexistence, sdkconfig 已配置
 //!
-//! # TODO
-//!
-//! - SSID/password 从 SystemConfig 加载 (运行时可配)
-//! - AP 模式实现 (提供手机 APP 配置入口)
-//! - 链路故障切换: 检测 eth link down → 启用 Wi-Fi; eth up → 关闭 Wi-Fi
-//! - 路由表管理: eth/wifi 优先级, 避免双接口路由冲突
+//! 当前构建默认不启用 Wi-Fi；该模块只在 `wifi` feature 显式启用时启动固定
+//! Station 配置。它不参与以太网故障切换，也不提供 AP 配网入口。
 
 use std::sync::Arc;
 

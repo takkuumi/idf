@@ -201,7 +201,7 @@ impl Hal {
     /// 获取数字 IO 抽象接口 (DI/DO 统一访问)
     ///
     /// 仅在 io-di-do 或 F3/F4 feature 启用时可用。
-    /// 实际硬件 DI/DO 走 PCA9555 I2C 扩展, 待实现后此处返回 PCA9555 实例。
+    /// 默认/F16 返回 PCA9555 实例，F3/F4 返回对应 I2C 扩展实例。
     #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
     pub fn dio(&self) -> &dyn DigitalIo {
         // 默认版本: PCA9555 通过软件 I2C (NCA9555 on GPIO 35/36)

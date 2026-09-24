@@ -247,7 +247,7 @@ fn store_rs485_config(sub: u8, data: &[u8]) -> bool {
     crate::bus::backends::write_hold_regs(base, &words)
 }
 
-fn load_rs485_config(sub: u8) -> Option<Vec<u8>> {
+fn load_rs485_config(sub: u8) -> Option<HVec<u8, 256>> {
     let base = match sub {
         SUB_RS485_01 => crate::config::regs::HOLD_RS485_BASE,
         SUB_RS485_02 => {
@@ -255,23 +255,23 @@ fn load_rs485_config(sub: u8) -> Option<Vec<u8>> {
         }
         _ => return None,
     };
-    let mut out = Vec::with_capacity(10);
+    let mut out = HVec::new();
     for offset in 0..5u16 {
         let word = crate::bus::backends::read_hold_reg(base + offset)?;
-        out.extend_from_slice(&word.to_le_bytes());
+        out.extend_from_slice(&word.to_le_bytes()).ok()?;
     }
     Some(out)
 }
 
 /// Read the legacy device-function table back in the exact 0xD1 wire layout.
-fn load_device_function_config() -> Option<Vec<u8>> {
+fn load_device_function_config() -> Option<HVec<u8, 256>> {
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
     let count = crate::bus::backends::read_hold_reg(base)? as usize;
     if count == 0 || count > 255 {
         return None;
     }
-    let mut out = Vec::with_capacity(256);
-    out.extend_from_slice(&(count as u16).to_le_bytes());
+    let mut out = HVec::new();
+    out.extend_from_slice(&(count as u16).to_le_bytes()).ok()?;
     for index in 0..count {
         let pointer = crate::bus::backends::read_hold_reg(base + 1 + index as u16)?;
         let len = (crate::bus::backends::read_hold_reg(pointer)? & 0xff) as usize;
@@ -284,14 +284,15 @@ fn load_device_function_config() -> Option<Vec<u8>> {
                 word as u8
             } else {
                 (word >> 8) as u8
-            });
+            })
+            .ok()?;
         }
     }
     Some(out)
 }
 
 /// 从 NVS 读取配置
-fn load_config(sub: u8) -> Option<Vec<u8>> {
+fn load_config(sub: u8) -> Option<HVec<u8, 256>> {
     let key = nvs_key_for(sub);
     let mut buf = [0u8; 256];
     let blob = crate::device::try_with_nvs(|nvs| nvs.get_blob(&key, &mut buf).ok())
@@ -304,7 +305,9 @@ fn load_config(sub: u8) -> Option<Vec<u8>> {
     if blob.len() < 2 + len {
         return None;
     }
-    Some(blob[2..2 + len].to_vec())
+    let mut out = HVec::new();
+    out.extend_from_slice(&blob[2..2 + len]).ok()?;
+    Some(out)
 }
 
 /// 删除所有配置 (NVS erase)
@@ -395,9 +398,9 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
     match config {
         Some(cfg_data) => {
             let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
-            let _ = rsp.push(0xD1);
-            let _ = rsp.push(sub);
-            let _ = rsp.extend_from_slice(&cfg_data);
+            rsp.push(0xD1).ok()?;
+            rsp.push(sub).ok()?;
+            rsp.extend_from_slice(&cfg_data).ok()?;
             log::info!(
                 "[logic_cfg] D1: sub=0x{:02X} ({}) → {} bytes",
                 sub,
@@ -533,7 +536,8 @@ mod tests {
         // required by the legacy 0xD0/0xD1 protocol.
         let packet = [1, 0, 3, 0x11, 0x22];
         assert!(store_device_function_config(&packet));
-        assert_eq!(load_device_function_config(), Some(packet.to_vec()));
+        let loaded = load_device_function_config().expect("stored table must load");
+        assert_eq!(loaded.as_slice(), packet);
     }
 
     #[test]

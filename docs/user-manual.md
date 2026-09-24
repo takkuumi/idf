@@ -1,8 +1,12 @@
 # ESP32-S3R2 工业网关 用户手册
 
-> 固件版本：v2.2.1 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：1.1
+> 固件版本：v2.2.6 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-09-24）
 >
 > 适用硬件版本：Default / F3 / F4（详见第 2 章）
+
+> **能力边界**：当前生产固件启用 BLE GATT 手持机配置服务；BLE Mesh 配网、Wi-Fi
+> 故障切换和 RS485 透传不属于默认生产业务路径。本文中这些旧版章节只作历史协议
+> 参考，不应作为已交付能力或验收依据。
 
 ---
 
@@ -31,7 +35,7 @@
 | 片上 Flash | 8 MB Quad SPI |
 | 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI2 @ 20MHz） |
 | RS485 | 2 路（UART1 主站 + UART2 从站，独立隔离） |
-| 蓝牙 | BLE 5.0 + Bluetooth Mesh（Bluedroid 协议栈） |
+| 蓝牙 | BLE 5.0 GATT（Bluedroid 协议栈） |
 | Wi-Fi | 802.11 b/g/n（可选，作为以太网冗余链路，需 `--features wifi` 编译） |
 | 数字输入 DI | 8 / 16 / 48 路（按硬件版本，光耦隔离） |
 | 数字输出 DO | 8 / 16 路（按硬件版本，开漏输出 100mA） |
@@ -48,7 +52,7 @@
 | **Modbus RTU 主站** | UART1 上轮询 1~247 号从站，200ms 周期，支持 FC=01/02/03/04 |
 | **Modbus RTU 从站** | UART2 上响应主站请求，本机地址 1，支持 FC=01/02/03/04/05/06/0F/10 |
 | **Modbus TCP Server** | TCP 502 端口，最多 4 路并发连接，MBAP 协议 |
-| **BLE Mesh** | Generic OnOff Server/Client 模型，Proxy 节点，静态 OOB 配网 |
+| **BLE GATT** | 手持机配置服务、AT 命令和 Modbus 兼容协议 |
 | **BLE GATT AT 通道** | 自定义服务（UUID 0xFF01），用于配置阶段读写参数 |
 | **OTA 升级** | BLE AT 与 Modbus 双触发入口，支持分区切换与回滚 |
 | **协议存储区** | 1500 个 U16 用户自定义协议数据，NVS 持久化 |
@@ -155,7 +159,7 @@ GND           ──────────── GND
 
 - SPI 时钟 20MHz，Mode 0
 - W5500 PHY 地址固定为 0（内部 PHY）
-- 默认 DHCP 获取 IP；可改为静态 IP（见 4.2 节）
+- 默认使用静态 IP；可通过 `AT+CFGDHCP=1` 或 Web 配置切换 DHCP（见 4.2 节）
 
 ### 3.4 RS485 接线
 
@@ -317,7 +321,7 @@ GPIO21 DI2 / F3-F4 I2C SDA
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | 模式 | Station | 连接上游 AP，作为以太网故障备份链路 |
-| SSID/Password | 硬编码在 `config::wifi` | TODO: 从 SystemConfig 动态加载 |
+| SSID/Password | `config::wifi` 固定 Station 配置 | Wi-Fi 不参与以太网故障切换，也不提供 AP 配网 |
 | 共存 | 启用 COEX 软件分时调度 | 与 BLE 共用 2.4GHz 射频 |
 | 启动失败处理 | 仅记日志，不阻断主流程 | 备份链路可缺失 |
 
@@ -327,11 +331,11 @@ GPIO21 DI2 / F3-F4 I2C SDA
 
 | 参数 | 默认值 |
 |------|--------|
-| DHCP | 启用 |
-| 静态 IP | 192.168.1.100 |
+| DHCP | 禁用（默认静态 IP） |
+| 静态 IP | 192.168.51.226 |
 | 子网掩码 | 255.255.255.0 |
-| 网关 | 192.168.1.1 |
-| DNS | 192.168.1.1 |
+| 网关 | 192.168.51.1 |
+| DNS | 192.168.51.1 |
 
 可通过 AT+CFGIP 或 Modbus 0x0224-0x022A 修改。
 
@@ -755,7 +759,7 @@ c.write_register(address=0x45DC, value=0xC5C5)
 - `stop`：停止位（1/2）
 - `parity`：0=None 1=Odd 2=Even
 - `slave`：从站地址（0=主站模式，1-247=从站）
-- `mode`：0=Master 1=Slave 2=Gateway
+- `mode`：0=Master 1=Slave；2 为保留值，当前按 Slave 运行。透传模式未启用。
 
 **示例**：
 ```
@@ -769,15 +773,16 @@ c.write_register(address=0x45DC, value=0xC5C5)
 
 **格式**：`AT+CFGAPPLY`
 
-**说明**：持久化配置到 NVS 并应用到运行时。
+**说明**：持久化配置到 NVS 并应用到运行时；网络配置会立即重配以太网，不会因
+普通 Apply 自动重启设备。手持机专用网络写入成功后才会执行持久化屏障和计划复位。
 
 **示例**：
 ```
 > AT+CFGAPPLY
-< OK applied (restart to take effect)
+< OK applied
 ```
 
-> 部分配置（如网络、RS485）需重启后生效。
+> 普通 Apply 会持久化并触发网络/串口运行时重配；手持机网络写入和“保存并重启”才会触发设备复位。
 
 #### AT+CFGRESET - 恢复默认配置
 

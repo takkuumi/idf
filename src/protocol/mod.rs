@@ -1,6 +1,6 @@
 //! 通信协议插件化 (通信协议抽象层)
 //!
-//! 统一 Modbus RTU/TCP、BLE Mesh 等通信协议的启动/停止/状态查询接口。
+//! 统一 Modbus RTU/TCP 协议的启动/停止/状态查询接口；BLE GATT 配置服务独立启动。
 //! 上层通过 [`ProtocolRegistry`] 管理所有协议, 无需关心具体实现。
 //!
 //! # 设计目标
@@ -12,10 +12,9 @@
 //! # 使用方式
 //!
 //! ```no_run
-//! use crate::protocol::{ProtocolRegistry, BleMeshProtocol, ModbusRtuProtocol};
+//! use crate::protocol::{ProtocolRegistry, ModbusRtuProtocol};
 //!
 //! let mut protocols = ProtocolRegistry::new();
-//! protocols.register(Box::new(BleMeshProtocol::new(hal.clone())));
 //! protocols.register(Box::new(ModbusRtuProtocol::new(hal.clone())));
 //! protocols.start_all()?;
 //! ```
@@ -36,7 +35,7 @@ use std::sync::Arc;
 
 /// 通信协议抽象 trait
 ///
-/// 所有通信协议 (Modbus RTU/TCP, BLE Mesh, 未来 MQTT/OPC-UA 等) 实现此 trait,
+/// 所有纳入注册表的通信协议 (当前为 Modbus RTU/TCP) 实现此 trait,
 /// 通过 [`ProtocolRegistry`] 统一管理。
 ///
 /// # 线程安全
@@ -44,7 +43,7 @@ use std::sync::Arc;
 /// 实现需满足 `Send + Sync`, 内部状态使用原子操作或 Spin 保护,
 /// 因为 `start(&self)` 接受不可变引用 (适配器模式, 无需 `&mut self`).
 pub trait Protocol: Send + Sync {
-    /// 协议名称 (如 "modbus-rtu", "modbus-tcp", "ble-mesh")
+    /// 协议名称 (如 "modbus-rtu", "modbus-tcp")
     fn name(&self) -> &str;
 
     /// 启动协议任务 (spawn 线程, 立即返回)

@@ -31,9 +31,6 @@ use crate::hal::Hal;
 
 /// 心跳周期 (s)
 const HEARTBEAT_PERIOD_S: u64 = 5;
-/// 心跳失败上限 (>= 即触发复位)
-const HEARTBEAT_MAX_FAIL: u32 = 3; // 旧值, 实际由 recovery 模块分级处理
-
 struct EthStartupGuard {
     spi_host: esp_idf_sys::spi_host_device_t,
     bus_initialized: bool,

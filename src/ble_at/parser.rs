@@ -126,6 +126,20 @@ pub fn parse_u16(s: &str) -> Option<u16> {
     }
 }
 
+/// 解析 u32 参数（RS485 波特率等配置值可能超过 u16）。
+#[inline]
+pub fn parse_u32(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
+}
+
 /// 解析 u16 列表: "1,2,3" -> [1,2,3]
 /// 用 heapless::Vec 避免 heap 分配 (Modbus 单帧最多 125 reg, AT+BULKW 上限 64)
 pub fn parse_u16_list(s: &str) -> heapless::Vec<u16, 128> {
@@ -193,6 +207,13 @@ mod tests {
         assert_eq!(parse_u16(""), None);
         assert_eq!(parse_u16("abc"), None);
         assert_eq!(parse_u16("99999999"), None); // overflow
+    }
+
+    #[test]
+    fn test_parse_u32_for_baudrate() {
+        assert_eq!(parse_u32("115200"), Some(115_200));
+        assert_eq!(parse_u32("0x1C200"), Some(115_200));
+        assert_eq!(parse_u32("4294967296"), None);
     }
 
     #[test]

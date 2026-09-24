@@ -150,6 +150,20 @@ pub enum WriteResult {
 pub const SENSOR_CHANNELS: usize = 8; // 校准寄存器通道数 (对齐参考固件 SENSOR_NUM=8)
 
 impl SystemConfig {
+    /// Repair the field swap written by older BLE handheld firmware.
+    ///
+    /// Affected snapshots have a non-contiguous value in `mask` (for example
+    /// `192.168.51.1`) and a valid contiguous netmask in `gateway`. Normal
+    /// configurations do not satisfy this pattern, so they remain unchanged.
+    pub fn repair_legacy_network_swap(&mut self) -> bool {
+        if is_ipv4_netmask(&self.gateway) && !is_ipv4_netmask(&self.mask) {
+            core::mem::swap(&mut self.mask, &mut self.gateway);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 默认配置 (出厂值)
     ///
     /// LOOP9: 字符串默认值改回 ASCII 编码 (与 MCA 参考固件 + metuory 1.0.78 一致).
@@ -182,7 +196,7 @@ impl SystemConfig {
             cfg_version: 0,
             eth_mac: [0; 6],
             dhcp: false,
-            ip: [192, 168, 51, 221],
+            ip: [192, 168, 51, 226],
             mask: [255, 255, 255, 0],
             gateway: [192, 168, 51, 1],
             dns: [192, 168, 51, 1],
@@ -736,6 +750,22 @@ impl SystemConfig {
             self.ble_mac[5]
         )
     }
+}
+
+fn is_ipv4_netmask(value: &[u8; 4]) -> bool {
+    if *value == [0; 4] {
+        return false;
+    }
+    let bits = u32::from_be_bytes(*value);
+    let mut saw_zero = false;
+    for bit in (0..32).rev() {
+        if (bits >> bit) & 1 == 0 {
+            saw_zero = true;
+        } else if saw_zero {
+            return false;
+        }
+    }
+    true
 }
 
 // ----------------------------------------------------------------------------
@@ -1349,5 +1379,24 @@ mod tests {
             expected >= 4 && expected <= 8,
             "AI_COUNT must be 4..=8 (MCA F16/F48)"
         );
+    }
+
+    #[test]
+    fn test_repair_legacy_network_swap() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.ip = [192, 168, 51, 220];
+        cfg.mask = [192, 168, 51, 1];
+        cfg.gateway = [255, 255, 255, 0];
+        assert!(cfg.repair_legacy_network_swap());
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
+    }
+
+    #[test]
+    fn test_repair_network_swap_leaves_valid_config_unchanged() {
+        let mut cfg = SystemConfig::defaults();
+        assert!(!cfg.repair_legacy_network_swap());
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
     }
 }

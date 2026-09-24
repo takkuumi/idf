@@ -42,7 +42,7 @@ pub const BLE_PROCESS_PERIOD_MS: u64 = 10;
 pub mod pins {
     // ---- 以太网 W5500 (SPI3_HOST) ----
     // W5500: 硬件 TCP/IP 以太网控制器, SPI 接口, 内置 32KB 缓冲, 8 socket
-    // SPI mode 0, 最高 80MHz (实际用 20MHz 保证稳定性)
+    // SPI mode 0, 最高 80MHz（当前驱动使用 40MHz，生产硬件已验证）
     // 引脚来自 LILYGO T-ETH-Lite-ESP32-S3 utilities.h (LILYGO_T_ETH_LITE_ESP32S3)
     pub const ETH_SPI_HOST: u8 = 2; // SPI3_HOST (ESP-IDF v5.x: SPI2_HOST=1, SPI3_HOST=2)
     pub const ETH_SPI_MISO: u8 = 11;
@@ -102,15 +102,13 @@ pub mod pins {
     pub const FIB1_PIN: u8 = 39;
     pub const FIB2_PIN: u8 = 40;
 
-    // ---- 数字输入 DI (8 路) ----
-    // TODO: 实际硬件 DI 通过 PCA9555 (NCA9555) I2C 扩展, 不使用 ESP32 GPIO 直驱
-    // 当前为占位, 避免与 W5500/RS485/电源/NCA9555 引脚冲突
-    // 可用空闲 GPIO: 7(DE0), 8(DE1), 15, 16, 17, 18 (仅 6 个, 不足 8DI)
+    // ---- 数字输入 DI (兼容占位窗口) ----
+    // 默认/F16 实际由 PCA9555 软件 I2C 驱动；这些 GPIO 仅保留给旧配置接口，
+    // 不得作为现场 DI 引脚使用。
     pub const DI_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
 
-    // ---- 数字输出 DO (8 路) ----
-    // TODO: 实际硬件 DO 通过 PCA9555 (NCA9555) I2C 扩展
-    // 当前为占位, 实际不可用 (ESP32-S3 上无足够空闲 GPIO 给 8DO)
+    // ---- 数字输出 DO (兼容占位窗口) ----
+    // 默认/F16 实际由 PCA9555 软件 I2C 驱动；这些 GPIO 仅保留给旧配置接口。
     pub const DO_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
 
     // ---- AI 模拟输入 (ADC1, 6 通道, 12-bit SAR ADC) ----
@@ -351,11 +349,10 @@ pub mod modbus {
 }
 
 // ----------------------------------------------------------------------------
-// Wi-Fi 参数 (ESP32-S3 内置, 作为以太网冗余或 AP 配置入口)
+// Wi-Fi 参数 (仅在 wifi feature 显式启用时使用；不参与以太网故障切换)
 // ----------------------------------------------------------------------------
-// TODO: 从 SystemConfig 动态加载 (运行时可通过 BLE AT 修改)
 pub mod wifi {
-    /// 默认 Station SSID (TODO: 从 SystemConfig 加载)
+    /// 固定 Station SSID（当前未接入 SystemConfig）
     pub const SSID: &str = "iot-gateway";
     /// 默认 Station 密码 (空字符串 = 开放网络)
     pub const PASSWORD: &str = "";
@@ -486,11 +483,11 @@ pub mod regs {
     pub const HOLD_TCP_COM_COUNT: u16 = 4;
     // IP 地址 (2247-2250 = 2 words)
     pub const HOLD_IP_BASE: u16 = 2247;
-    // 网关 (2251-2254) - 注意：手持机发送顺序是 IP → Gateway → Mask
-    pub const HOLD_GW_BASE: u16 = 2251;
-    // 子网掩码 (2255-2258)
-    pub const HOLD_MASK_BASE: u16 = 2255;
-    // DNS (2259-2262)
+    // 子网掩码 (2251-2254), 对齐 MCA SLAVE_REG_PNTEMASK1..4
+    pub const HOLD_MASK_BASE: u16 = 2251;
+    // 网关 (2255-2258), 对齐 MCA SLAVE_REG_PGW1..4
+    pub const HOLD_GW_BASE: u16 = 2255;
+    // DNS (2259-2260)
     pub const HOLD_DNS_BASE: u16 = 2259;
     // MAC 地址 (2263-2268 = 6 bytes in 3 words)
     pub const HOLD_MAC_BASE: u16 = 2263;
@@ -620,10 +617,10 @@ mod tests {
         assert_eq!(regs::HOLD_TCP_COM_BASE, 2243);
         // SLAVE_REG_PIP1 = 2247
         assert_eq!(regs::HOLD_IP_BASE, 2247);
-        // SLAVE_REG_PGW1 = 2251 (注意：手持机发送顺序是 IP → GW → Mask)
-        assert_eq!(regs::HOLD_GW_BASE, 2251);
-        // SLAVE_REG_PNTEMASK1 = 2255
-        assert_eq!(regs::HOLD_MASK_BASE, 2255);
+        // SLAVE_REG_PNTEMASK1 = 2251
+        assert_eq!(regs::HOLD_MASK_BASE, 2251);
+        // SLAVE_REG_PGW1 = 2255
+        assert_eq!(regs::HOLD_GW_BASE, 2255);
         // SLAVE_REG_DNS1 = 2259
         assert_eq!(regs::HOLD_DNS_BASE, 2259);
         // SLAVE_REG_MAC1 = 2263

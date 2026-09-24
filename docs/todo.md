@@ -1,4 +1,17 @@
-# 已知 TODO 清单
+# 已知 TODO 清单（历史归档）
+
+> 本文保留早期迭代记录，不作为当前固件能力说明。当前生产状态以源码、
+> `docs/README.md`、`docs/architecture.md` 和最新 `docs/LOOP.md` 为准。
+> 已经在源码中完成的旧 TODO 不再逐条回填；新问题必须追加日期和验证证据。
+
+## 当前仍有效的生产事项
+
+- [ ] Android 手持机网络写入的 BLE 端到端回归（读、只改 IP、断电复读）。
+- [ ] 默认配置、OTA、BLE/Modbus/Web/NFC 的 72 小时连续浸泡测试。
+- [ ] 若产品需要 Wi-Fi，先定义 SystemConfig 字段和链路策略；当前 `wifi` feature
+      是固定 Station 配置，不提供 AP 配网或以太网故障切换。
+- [ ] RS485 透传/Gateway 模式尚未提供转发端点，配置值按 Slave 运行；不得在产品
+      文档中宣称已支持透传。
 
 > 待对照实际硬件、ESP-IDF v5.5.4 头文件、esp-idf-hal 0.45 实际 API 校准
 
@@ -528,7 +541,8 @@ AT+CFGWRITE=<addr>,<value>            按 Modbus 地址写 U16
 
 #### [device/system_config.rs](../src/device/system_config.rs) - 系统配置
 
-- [x] **运行时应用已实现**：`apply_config()` 持久化后 200ms 软重启（`esp_restart`），让新配置在启动时完整生效。设计说明：网络/RS485/BLE 配置运行时切换风险高（资源句柄所有权问题），软重启是最稳妥方案
+- [x] **运行时应用已实现**：`apply_config()` 持久化后由各模块运行时重配；普通
+  Apply 不重启，只有手持机网络写入和显式保存并重启路径触发计划复位。
 - [x] **eth_mac/ble_mac 默认值**：新增 `fill_hw_macs()` 在 `init()` 中从 `esp_read_mac()` 读取 ESP_MAC_ETH/ESP_MAC_BT 自动填充
 - [x] **hw_version/fw_version 同步**：新增 `fw_version_from_cargo()` 从 `env!("CARGO_PKG_VERSION")` 解析 `(major << 8) | minor`，`init()` 中强制同步。`hw_version` 仍需硬件识别（GPIO 或烧录时配置）
 - [ ] **配置版本回写**：Modbus `write_hold_reg` 在 Apply 时 `cfg_version.wrapping_add(1)`，需校验 NVS 持久化的 cfg_version 与 RAM 一致
@@ -613,16 +627,16 @@ AT+VERSION                      → OK <name> v<x.x>
 - [ ] **ProtoStore 占用 Bus 大小**：3000 字节常驻 SRAM，对 384KB SRAM 无压力，但 `Bus::clone()` 会复制整个数组（如果有调用方）
 - [x] **commit 期间总线锁占用已加去抖**：`watch_loop` 在处理 COMMIT 前检查 `bus.proto.status == 1`，RELOAD 前检查 `status == 2`，已在写入中/加载中则跳过本次请求
 
-#### [ble_at/mod.rs](../src/ble_at/mod.rs) - GATT 服务
+#### [ble_at/mod.rs](../src/ble_at/mod.rs) - GATT 服务（以下为历史记录，已由当前源码实现）
 
-- [ ] **GATT 服务注册未实现**：当前仅 AT 命令处理线程可用，无实际 BLE GATT 服务。需用 `esp_idf_svc::ble::gatt::Server` 注册：
+- [x] **GATT 服务注册**：当前 `src/ble_at/mod.rs` 已创建服务、RX Write 和 TX Notify 特征；以下早期条目仅保留作迁移记录：
   - Service UUID `0xFF01`
   - RX Char UUID `0xFF02` (Write)
   - TX Char UUID `0xFF03` (Notify)
-- [ ] **`feed_data()` / `take_response()` 调用方**：需在 GATT write/notify 回调中调用，当前无调用方
+- [x] **`feed_data()` / `take_response()` 调用方**：已接入 GATT 回调和 main-loop 队列
 - [ ] **BLE Mesh + GATT 共存**：sdkconfig 已开 `BT_GATTS_ENABLE`，但需实测验证
-- [ ] **MTU 协商**：单条 AT 命令可能超 23 字节（默认 MTU），需主动请求 MTU=250
-- [ ] **AT 命令分片**：BULKW 50 个 U16 约 200 字节，超过 MTU 需分片重组，当前 `RX_BUFFER` 已支持 `\n` 终结符
+- [x] **MTU 协商**：BLE 服务设置本地 MTU 500，并按协商 MTU 分片
+- [x] **AT/二进制命令分片**：固定槽重组并在 main-loop 消费
 - [x] **`std::sync::Mutex` 与 `parking_lot::Mutex` 已统一**：ble_at/mod.rs 改用 `parking_lot::Mutex`，`lock()` 不返回 Result
 - [ ] **响应缓冲区溢出**：`TX_BUFFER: String<512>`，BULKR 返回 50 个 U16 约 250 字节，够用；但 200 字节需校验
 
@@ -753,12 +767,12 @@ AT+VERSION                      → OK <name> v<x.x>
 
 ## 后续优化建议
 
-- [ ] **OTA 升级**：分区表已预留 ota_0/ota_1，需实现 esp_ota_* API 封装
+- [x] **OTA 升级**：Web/AT OTA 已实现，并带镜像确认与回滚保护
 - [ ] **NVS 配置**：把 Modbus 轮询表、设备地址、波特率等存入 NVS，支持运行时修改
 - [x] **看门狗**：`CONFIG_ESP_TASK_WDT_INIT=y` + main_loop 100ms 喂狗，关键任务均通过 `health::subscribe_wdt()` 订阅
 - [x] **日志分级**：运行时通过 Modbus 寄存器 0x0106 调节 (0=Err 1=Warn 2=Info 3=Debug 4=Trace)
 - [x] **健康检查**：`TaskHb` 心跳 + `check_all()` 停滞检测 + 0x0105 任务健康位图 (部分实现)
-- [ ] **Modbus 网关模式**：实现 RTU ↔ TCP 透传（RTU 收到 → TCP 转发；TCP 收到 → RTU 转发）
+- [ ] **Modbus 网关模式**：当前未实现转发端点，RS485 mode=2/3 按 Slave 安全运行
 
 ## 已完成的工业可靠性改进（阶段一遗留）
 
@@ -768,5 +782,5 @@ AT+VERSION                      → OK <name> v<x.x>
 - [x] **Modbus RTU 帧间静默**：3.5 字符时间 (9600bps≈4ms) + `uart_set_rx_timeout(port, 3)`
 - [x] **Rs485Port::read bug 修复**：两阶段读取 + `uart_get_buffered_data_len` 替代不存在的 API
 - [x] **AI 滑动平均位移优化**：AVG_SHIFT=3 用位移替代除法
-- [x] **CfgApply 软重启延时**：200ms → 500ms (给 AT 响应留足时间)
+- [x] **CfgApply 响应时序**：配置先持久化再返回；普通 Apply 不触发软重启。
 - [x] **运行时日志级别调节**：Modbus 寄存器 0x0106 + `log::set_max_level` 即时生效

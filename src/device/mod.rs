@@ -261,7 +261,8 @@ fn initialize_legacy_preg_defaults(buf: &mut [u16]) {
     let ports_start = index(regs::HOLD_UNKNOWN_BASE);
     let ports_end = ports_start + regs::HOLD_UNKNOWN_COUNT as usize;
     if ports_end <= buf.len() && is_uninitialized(&buf[ports_start..ports_end]) {
-        buf[ports_start..ports_end].copy_from_slice(&regs::UNKNOWN_DEFAULTS);
+        // Bug Fix: 使用正确的默认端口 [502, 503, 504, 5002]，而不是旧值 [5500, 5501, 5502, 5503]
+        buf[ports_start..ports_end].copy_from_slice(&regs::TCP_PORTS_DEFAULT);
     }
 
     let remote_start = index(regs::HOLD_MASTER_COM);
@@ -491,6 +492,19 @@ pub fn init() -> AppResult<()> {
         log::warn!("[device] NVS unavailable, using default SystemConfig");
         SystemConfig::defaults()
     };
+    // v2.2.6 briefly wrote Android's mask/gateway fields in reverse. Repair
+    // only the unmistakable legacy pattern before starting the network stack.
+    if cfg.repair_legacy_network_swap() {
+        let mut nvs_guard = nvs_lock();
+        if let Some(nvs) = nvs_guard.as_mut() {
+            cfg.save_to_nvs(nvs)?;
+        }
+        log::warn!(
+            "[device] repaired legacy network field swap: mask={} gw={}",
+            cfg.mask_str(),
+            cfg.gw_str()
+        );
+    }
     // Older IDF builds used 0x0100 as a placeholder model.  Repair that
     // value on boot so the handheld's device-model field remains MCA
     // compatible, while preserving intentional user-written model values.

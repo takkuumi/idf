@@ -1287,11 +1287,56 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
     let (&func, pdu) = rest.split_first()?;
     let backend = crate::modbus::shared::BusBackend;
     let mut pdu_buf = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
-    let pdu_len = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+    // Android 1.0.78's DeviceFragment passes maskBuffer as the Java method's
+    // `gateway` parameter and gatewayBuffer as `mask`; the wire bytes are
+    // already IP, mask, gateway. Do not swap based on those misleading names.
+    let handheld_ip_write = func == 0x10
+        && pdu.len() == 29
+        && u16::from_be_bytes([pdu[0], pdu[1]]) == crate::config::regs::HOLD_IP_BASE
+        && u16::from_be_bytes([pdu[2], pdu[3]]) == 12
+        && pdu[4] == 24;
+    let pdu_len = if handheld_ip_write {
+        if validate_handheld_ip_write_pdu(pdu) {
+            let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+            if written >= 2 && pdu_buf[0] == 0x10 {
+                match crate::device::persist_config_now() {
+                    Ok(()) => {
+                        crate::bus::IO
+                            .sys
+                            .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
+                        written
+                    }
+                    Err(error) => {
+                        log::error!("[ble_at] handheld IP write persistence failed: {error}");
+                        pdu_buf[0] = 0x90;
+                        pdu_buf[1] = 0x04; // Slave device failure
+                        2
+                    }
+                }
+            } else {
+                written
+            }
+        } else {
+            pdu_buf[0] = 0x90;
+            pdu_buf[1] = 0x03; // Illegal data value
+            2
+        }
+    } else {
+        crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf)
+    };
     let mut response = heapless::Vec::<u8, 256>::new();
     response.push(slave).ok()?;
     response.extend_from_slice(&pdu_buf[..pdu_len]).ok()?;
     Some(response)
+}
+
+/// Validate Android's 12-register IP payload. The actual app call site emits
+/// IP, mask, gateway despite its misleading gateway/mask parameter names.
+fn validate_handheld_ip_write_pdu(pdu: &[u8]) -> bool {
+    if pdu.len() != 29 || pdu[4] != 24 || pdu[5..29].chunks_exact(2).any(|word| word[0] != 0) {
+        return false;
+    }
+    true
 }
 
 // ============================================================================
@@ -1962,28 +2007,42 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             if data.len() != 12 {
                 return None;
             }
-            // 手持机发送顺序: IP(0-3) → Gateway(4-7) → Mask(8-11)
-            // 但寄存器存储顺序: IP(2247-2250) → Mask(2251-2254) → Gateway(2255-2258)
-            // 需要重新排序
-            let mut values = [0u16; 12];
-            // IP: byte 0-3 → reg 2247-2250
-            values[0] = u16::from(data[0]);
-            values[1] = u16::from(data[1]);
-            values[2] = u16::from(data[2]);
-            values[3] = u16::from(data[3]);
-            // Mask: byte 8-11 → reg 2251-2254
-            values[4] = u16::from(data[8]);
-            values[5] = u16::from(data[9]);
-            values[6] = u16::from(data[10]);
-            values[7] = u16::from(data[11]);
-            // Gateway: byte 4-7 → reg 2255-2258
-            values[8] = u16::from(data[4]);
-            values[9] = u16::from(data[5]);
-            values[10] = u16::from(data[6]);
-            values[11] = u16::from(data[7]);
-            if !crate::bus::backends::write_hold_regs(regs::HOLD_IP_BASE, &values) {
+            // 旧 MCA 自定义 0xCD 载荷与 GET_NET_INFO 一样按 IP→Mask→Gateway 排列。
+            // 寄存器布局也按 IP(2247)→Mask(2251)→Gateway(2255) 排列。
+
+            // 写入IP到2247-2250
+            let ip_values = [
+                u16::from(data[0]),
+                u16::from(data[1]),
+                u16::from(data[2]),
+                u16::from(data[3]),
+            ];
+            if !crate::bus::backends::write_hold_regs(regs::HOLD_IP_BASE, &ip_values) {
                 return None;
             }
+
+            // 子网掩码写入 MASK_BASE (2251-2254)
+            let mask_values = [
+                u16::from(data[8]),
+                u16::from(data[9]),
+                u16::from(data[10]),
+                u16::from(data[11]),
+            ];
+            if !crate::bus::backends::write_hold_regs(regs::HOLD_MASK_BASE, &mask_values) {
+                return None;
+            }
+
+            // 网关写入 GW_BASE (2255-2258)
+            let gateway_values = [
+                u16::from(data[4]),
+                u16::from(data[5]),
+                u16::from(data[6]),
+                u16::from(data[7]),
+            ];
+            if !crate::bus::backends::write_hold_regs(regs::HOLD_GW_BASE, &gateway_values) {
+                return None;
+            }
+
             // 兼容旧固件行为：修改网络配置后需要重启设备才能使 W5500 应用新配置
             // 参考 MCA_F16V2_1_F48_BLE/BleMsgDeal.cpp:364-367
             // 旧固件调用 save_config_to_file() 同步持久化后再设置 bIsRestart = true
@@ -2002,6 +2061,8 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             let (ip, mask, gateway) = crate::bus::config_state::config_read_with(|state| {
                 (state.cfg.ip, state.cfg.mask, state.cfg.gateway)
             })?;
+            // 旧固件处理逻辑（BleMsgDeal.cpp:380-393）：
+            // 返回顺序：IP → 子网掩码 → 网关；Android parseIP 同样按此解析。
             let _ = response.extend_from_slice(&ip);
             let _ = response.extend_from_slice(&mask);
             let _ = response.extend_from_slice(&gateway);
@@ -2068,6 +2129,23 @@ fn encode_ble_name_read_response(ble_name: &[u8; 8]) -> heapless::Vec<u8, BLE_RE
     let mut response = heapless::Vec::new();
     let _ = response.push(name_len as u8);
     let _ = response.extend_from_slice(ble_name);
+    response
+}
+
+/// Android 1.0.78 `parseIP` expects a length byte followed by IP, mask, gateway;
+/// each octet is encoded as a big-endian u16 with a zero high byte.
+fn encode_android_ip_read_response<const N: usize>(
+    ip: &[u8; 4],
+    mask: &[u8; 4],
+    gateway: &[u8; 4],
+) -> heapless::Vec<u8, N> {
+    let mut response = heapless::Vec::new();
+    let _ = response.push(24);
+    for address in [ip, mask, gateway] {
+        for &octet in address {
+            let _ = response.extend_from_slice(&[0, octet]);
+        }
+    }
     response
 }
 
@@ -2158,8 +2236,8 @@ fn handle_ble_android_read_command(
                     Some(d)
                 }
                 // READ_IP (0x08C7, 0x000C): Android 期望 EXACTLY 25 字节
-                //   [length_byte=24][ip(8)][gw(8)][mask(8)]
-                //   注意：手持机发送顺序是 IP → Gateway → Mask (与写入顺序一致)
+                //   [length_byte=24][ip(8)][mask(8)][gw(8)]
+                //   Android parseIP explicitly reads IP, mask, then gateway.
                 //   每个 octet 编码为 BE u16 (高字节=0), 即 192 → [0x00, 0xC0]
                 //   ipBytesToStr 读 4 BE short: ip[0..2], ip[2..4], ip[4..6], ip[6..8]
                 //   getIPComponentLength() = ipLength/3 = 24/3 = 8
@@ -2167,23 +2245,7 @@ fn handle_ble_android_read_command(
                     let ip = cfg.ip;
                     let gw = cfg.gateway;
                     let mask = cfg.mask;
-                    let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
-                    let _ = d.push(24); // length = getIPBufferLength() = 12*2 = 24
-                    // IP 每个 octet → 2 bytes BE (高字节 0)
-                    for &b in &ip {
-                        let _ = d.push(0);
-                        let _ = d.push(b);
-                    }
-                    // Gateway (与手持机写入顺序一致)
-                    for &b in &gw {
-                        let _ = d.push(0);
-                        let _ = d.push(b);
-                    }
-                    // Mask
-                    for &b in &mask {
-                        let _ = d.push(0);
-                        let _ = d.push(b);
-                    }
+                    let d = encode_android_ip_read_response(&ip, &mask, &gw);
                     log::info!(
                         "[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
                         ip[0],
@@ -2474,25 +2536,7 @@ fn build_android_read_response_pdu(
             let _ = d.push((cfg_hw_ver & 0xFF) as u8);
             d
         }
-        (0x08C7, 12) => {
-            // Android: [24][ip(8)][gw(8)][mask(8)]  (25B rsp_data, 每 octet BE u16)
-            // 注意：手持机发送顺序是 IP → Gateway → Mask (与写入顺序一致)
-            let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
-            let _ = d.push(24);
-            for &b in &cfg_ip {
-                let _ = d.push(0);
-                let _ = d.push(b);
-            }
-            for &b in &cfg_gw {
-                let _ = d.push(0);
-                let _ = d.push(b);
-            }
-            for &b in &cfg_mask {
-                let _ = d.push(0);
-                let _ = d.push(b);
-            }
-            d
-        }
+        (0x08C7, 12) => encode_android_ip_read_response(&cfg_ip, &cfg_mask, &cfg_gw),
         (0x08D7, 6) => {
             // Android: [12][mac(12)]  (13B rsp_data, 每 mac byte BE u16)
             let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
@@ -3752,11 +3796,12 @@ mod tests_ble_cmd {
     }
 
     #[test]
-    fn test_handheld_fc16_ip_write_is_atomic_and_has_exact_android_ack() {
+    fn test_handheld_fc16_ip_write_keeps_app_wire_order() {
         use crate::config::regs;
 
-        // CommandBuilderUtil.writeIPCMD sends 12 big-endian registers in the
-        // order IP, mask, gateway. Each IPv4 octet occupies one u16.
+        // DeviceFragment sends 12 registers as IP, mask, gateway. The Java
+        // method's parameter names are reversed at the call site, but bytes
+        // on the wire already match the register ABI.
         let values = [
             192u16, 168, 51, 221, // IP
             255, 255, 255, 0, // mask
@@ -3770,19 +3815,21 @@ mod tests_ble_cmd {
             request.extend_from_slice(&value.to_be_bytes());
         }
 
-        let response = build_embedded_modbus_response(&request).expect("valid IP write");
+        assert!(validate_handheld_ip_write_pdu(&request[2..]));
 
-        // Android parseResWriteIP expects exactly addr(2) + count(2) after
-        // unit/function. There is no nested RTU CRC in this BLE protocol.
+        let backend = crate::modbus::shared::BusBackend;
+        let mut pdu_response = [0u8; crate::modbus::shared::PDU_BUF_SIZE];
+        let response_len =
+            crate::modbus::shared::handle_pdu(&backend, 0x10, &request[2..], &mut pdu_response);
+        // FC16 acknowledgement echoes start register and count without RTU CRC.
         assert_eq!(
-            response.as_slice(),
+            &pdu_response[..response_len],
             &[
-                1,
                 0x10,
                 (regs::HOLD_IP_BASE >> 8) as u8,
                 regs::HOLD_IP_BASE as u8,
                 0,
-                12,
+                12
             ]
         );
         let snapshot =
@@ -3793,8 +3840,16 @@ mod tests_ble_cmd {
         assert_eq!(cfg.gateway, [192, 168, 51, 1]);
         assert!(
             crate::device::config_is_dirty(),
-            "handheld config writes must be queued for NVS persistence"
+            "handheld network writes must queue config persistence"
         );
+    }
+
+    #[test]
+    fn test_handheld_fc16_ip_write_rejects_non_octet_register_values() {
+        let mut pdu = [0u8; 29];
+        pdu[4] = 24;
+        pdu[5] = 1;
+        assert!(!validate_handheld_ip_write_pdu(&pdu));
     }
 
     #[test]
