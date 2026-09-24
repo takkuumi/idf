@@ -2065,6 +2065,9 @@ mod tests {
         assert!(pages::INDEX_HTML.contains("onclick=\"saveIdentity()\""));
         assert!(pages::INDEX_HTML.contains("网络参数已保存，重启设备后生效"));
         assert!(pages::INDEX_HTML.contains("设备基本信息已保存"));
+        assert!(pages::INDEX_HTML.contains("async function runAction"));
+        assert!(pages::INDEX_HTML.contains("classList.add('busy')"));
+        assert!(pages::INDEX_HTML.contains("id=\"network_save_btn\""));
     }
 
     #[test]

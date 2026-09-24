@@ -9,9 +9,9 @@
 :root{--bg:#0f1419;--card:#1a1f26;--border:#2a3340;--text:#e0e0e0;--dim:#7a8a9a;
 --accent:#4a9eff;--green:#34d399;--red:#f87171;--amber:#fbbf24}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-background:var(--bg);color:var(--text);line-height:1.5}
-.top{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;
-background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+background:radial-gradient(circle at 12% -10%,#18324a 0,transparent 32%),var(--bg);color:var(--text);line-height:1.5}
+.top{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;
+background:rgba(26,31,38,.94);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
 .top h1{font-size:16px;font-weight:600}
 .top .ver{font-size:12px;color:var(--dim);margin-left:10px}
 .top a{color:var(--accent);font-size:13px;text-decoration:none}
@@ -23,7 +23,7 @@ background:#141920;border:1px solid var(--border);border-radius:7px}
 border:1px solid transparent;border-radius:5px;transition:.2s;display:flex;align-items:center;justify-content:center}
 .tab:hover{color:var(--text);background:#1c232c}
 .tab.active{color:#fff;background:#253548;border-color:#3c5b7d}
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:14px}
+.card{background:linear-gradient(145deg,rgba(31,40,50,.96),rgba(24,29,36,.96));border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin-bottom:12px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
 .card h2{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
 .field label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
@@ -35,11 +35,11 @@ border-radius:5px;color:var(--text);font-size:13px;outline:none}
 .read-value{display:flex;align-items:center;width:100%;min-height:36px;padding:8px 10px;background:#252b32;
 border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflow-wrap:anywhere}
 .read-value::before{content:"";width:6px;height:6px;border-radius:50%;background:#657483;margin-right:8px;flex-shrink:0}
-.btn{padding:9px 20px;border:none;border-radius:5px;font-size:13px;font-weight:500;cursor:pointer;transition:.2s}
+.btn{padding:8px 18px;border:none;border-radius:5px;font-size:13px;font-weight:500;cursor:pointer;transition:.2s;position:relative}
 .btn-p{background:var(--accent);color:#fff}.btn-p:hover{opacity:.85}
 .btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
 .btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
-.btn:disabled{cursor:not-allowed;opacity:.55}
+.btn:disabled{cursor:not-allowed;opacity:.65}.btn.busy{padding-left:34px}.btn.busy:before{content:"";position:absolute;left:14px;top:50%;width:12px;height:12px;margin-top:-7px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .di-list,.do-list,.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
 .io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
 .led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
@@ -61,7 +61,7 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:6px;font-size:13px;
 transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 .toast.show{transform:translateY(0);opacity:1}
-.toast.ok{background:#0d3320;color:var(--green);border:1px solid #1a5c3a}
+.toast.ok{background:#0d3320;color:var(--green);border:1px solid #1a5c3a}.toast.info{background:#102d46;color:#8bc7ff;border:1px solid #245b85}
 .toast.err{background:#3d1a1a;color:var(--red);border:1px solid #5c2a2a}
 .ota-bar{height:8px;background:#2a3340;border-radius:4px;margin:10px 0;overflow:hidden}
 .ota-bar i{display:block;height:100%;background:var(--accent);border-radius:4px;width:0;transition:width .3s}
@@ -144,7 +144,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>固件版本</label><output class="read-value" id="s_version">-</output></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="saveSystemInfo()">保存系统信息</button>
+        <button class="btn btn-p" id="system_info_save_btn" onclick="saveSystemInfo()">保存系统信息</button>
       </div>
     </div>
     <div class="card">
@@ -158,7 +158,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>DHCP</label><output class="read-value" id="n_dhcp">-</output></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="saveNetwork()">保存网络参数</button>
+        <button class="btn btn-p" id="network_save_btn" onclick="saveNetwork()">保存网络参数</button>
         <button class="btn btn-w" id="network_reboot_btn" onclick="saveNetwork(true)">保存网络参数并重启</button>
       </div>
     </div>
@@ -170,7 +170,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>蓝牙地址</label><input id="n_ble" maxlength="8"></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="saveIdentity()">保存设备基本信息</button>
+        <button class="btn btn-p" id="identity_save_btn" onclick="saveIdentity()">保存设备基本信息</button>
       </div>
     </div>
   </div>
@@ -189,7 +189,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>新密码</label><input id="pw_new" type="password"></div>
       </div>
       <div class="nav">
-        <button class="btn btn-w" onclick="changePwd()">修改密码</button>
+        <button class="btn btn-w" id="password_save_btn" onclick="changePwd()">修改密码</button>
       </div>
     </div>
     <div class="card">
@@ -199,8 +199,8 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>NFC 状态</label><output class="read-value" id="nfc_state">-</output></div>
       </div>
       <div class="nav">
-        <button class="btn btn-p" onclick="nfcBackup()">备份配置</button>
-        <button class="btn btn-w" onclick="nfcRestore()">恢复配置</button>
+        <button class="btn btn-p" id="nfc_backup_btn" onclick="nfcBackup()">备份配置</button>
+        <button class="btn btn-w" id="nfc_restore_btn" onclick="nfcRestore()">恢复配置</button>
       </div>
     </div>
     <div class="card">
@@ -214,7 +214,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <div class="field"><label>固件文件 (.bin)</label><input type="file" id="ota_file" accept=".bin"></div>
       <div class="ota-bar hidden" id="ota_bar"><i id="ota_prog"></i></div>
       <div class="nav">
-        <button class="btn btn-p" onclick="uploadOta()">上传固件</button>
+        <button class="btn btn-p" id="ota_upload_btn" onclick="uploadOta()">上传固件</button>
       </div>
     </div>
   </div>
@@ -243,6 +243,29 @@ function toast(msg, ok) {
   el.textContent = msg;
   el.className = 'toast show ' + (ok ? 'ok' : 'err');
   toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// 所有写操作共用轻量状态机：按钮锁定、旋转指示、完成/失败 toast。
+// 不引入前端依赖，状态只保留在当前页面，适合设备端内嵌页面。
+async function runAction(id, busyLabel, task) {
+  const button = id ? $('#' + id) : null;
+  if (button && button.disabled) return;
+  const original = button && button.textContent;
+  if (button) {
+    button.disabled = true;
+    button.classList.add('busy');
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = busyLabel + '…';
+  }
+  try { return await task(); }
+  finally {
+    if (button && document.body.contains(button) && !button.dataset.keepBusy) {
+      button.disabled = false;
+      button.classList.remove('busy');
+      button.removeAttribute('aria-busy');
+      button.textContent = original;
+    }
+  }
 }
 
 function apiError(code, fallback) {
@@ -299,7 +322,7 @@ async function loadNet() {
 // 网络参数与设备基本信息独立保存，避免一个按钮隐式提交另一组未确认的修改。
 async function saveNetwork(restartAfter = false) {
   if (restartAfter && !confirm('确认保存网络参数并重启设备? 当前连接将暂时中断.')) return;
-  try {
+  const action = async () => { try {
     const fd = new URLSearchParams({
       ip: $('#n_ip').value,
       mask: $('#n_mask').value,
@@ -315,11 +338,12 @@ async function saveNetwork(restartAfter = false) {
       toast('网络参数已保存，重启设备后生效', true);
       await loadNet();
     }
-  } catch(e) { toast(saveError('网络参数', e), false); }
+  } catch(e) { toast(saveError('网络参数', e), false); } };
+  return restartAfter ? action() : runAction('network_save_btn', '保存中', action);
 }
 
 async function saveIdentity() {
-  try {
+  return runAction('identity_save_btn', '保存中', async () => { try {
     const fd = new URLSearchParams({
       addressinfo: $('#n_loc').value,
       sn: $('#n_sn').value,
@@ -330,12 +354,12 @@ async function saveIdentity() {
     if (j.code !== '0') throw new Error(apiError(j.code, '设备基本信息保存失败'));
     toast('设备基本信息已保存', true);
     await loadNet();
-  } catch(e) { toast(saveError('设备基本信息', e), false); }
+  } catch(e) { toast(saveError('设备基本信息', e), false); } });
 }
 
 // Save system info
 async function saveSystemInfo() {
-  try {
+  return runAction('system_info_save_btn', '保存中', async () => { try {
     const fd = new URLSearchParams({
       devicename: $('#s_devicename').value,
       manufacturer: $('#s_manufacturer').value,
@@ -346,7 +370,7 @@ async function saveSystemInfo() {
     if (j.code !== '0') throw new Error(apiError(j.code, '系统信息保存失败'));
     toast('系统信息已保存', true);
     await loadSysInfo();
-  } catch(e) { toast(saveError('系统信息', e), false); }
+  } catch(e) { toast(saveError('系统信息', e), false); } });
 }
 
 // Load RS485 port config — 与原 C++ WebIndex 的 9 个参数完全对应
@@ -396,7 +420,7 @@ async function loadPorts() {
         </div>
       </div>`;
     }
-    html += '<div class="nav"><button class="btn btn-p" onclick="savePorts()">保存端口配置</button>' +
+    html += '<div class="nav"><button class="btn btn-p" id="ports_save_btn" onclick="savePorts()">保存端口配置</button>' +
       '<button class="btn btn-w" id="ports_reboot_btn" onclick="savePorts(true)">保存端口配置并重启</button></div>';
     $('#port_cards').innerHTML = html;
   } catch(e) { console.error('port', e); }
@@ -405,7 +429,7 @@ async function loadPorts() {
 // Save RS485 port config — 9 个字段全部提交，不使用隐式默认值覆盖用户设置
 async function savePorts(restartAfter = false) {
   if (restartAfter && !confirm('确认保存 3 个 RS485 端口配置并重启设备? 当前连接将暂时中断.')) return;
-  try {
+  const action = async () => { try {
     for (let i = 0; i < 3; i++) {
       const fd = new URLSearchParams({
         index: i,
@@ -429,7 +453,8 @@ async function savePorts(restartAfter = false) {
       toast('3 个 RS485 端口配置已保存，重启设备后生效', true);
       await loadPorts();
     }
-  } catch(e) { toast('端口配置保存失败: ' + e.message, false); }
+  } catch(e) { toast('端口配置保存失败: ' + e.message, false); } };
+  return restartAfter ? action() : runAction('ports_save_btn', '保存中', action);
 }
 
 // Poll IO data
@@ -530,6 +555,7 @@ async function toggleDO(addr, val) {
     const r = await fetch('/iocontrol', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') { toast('控制失败: ' + j.code, false); }
+    else toast('输出已更新', true);
   } catch(e) { toast('控制失败: ' + e, false); }
 }
 
@@ -538,7 +564,7 @@ async function changePwd() {
   const opwd = $('#pw_old').value;
   const npwd = $('#pw_new').value;
   if (!opwd || !npwd) { toast('请填写旧密码和新密码', false); return; }
-  try {
+  return runAction('password_save_btn', '提交中', async () => { try {
     const fd = new URLSearchParams({ opwd, npwd });
     const r = await fetch('/updatepwd', { method: 'POST', body: fd });
     const j = await r.json();
@@ -548,7 +574,7 @@ async function changePwd() {
     } else {
       toast('修改失败: ' + (j.code === '0x00010001' ? '旧密码错误' : j.code), false);
     }
-  } catch(e) { toast('修改失败: ' + e, false); }
+  } catch(e) { toast('修改失败: ' + e, false); } });
 }
 
 async function pollNfcStatus() {
@@ -562,22 +588,22 @@ async function pollNfcStatus() {
 }
 
 async function nfcBackup() {
-  try {
+  return runAction('nfc_backup_btn', '备份中', async () => { try {
     const r = await fetch('/nfcbackup', { method: 'POST' });
     const j = await r.json();
     toast(j.code === '0' ? 'NFC 备份请求已提交' : 'NFC 备份失败: ' + j.code, j.code === '0');
     setTimeout(pollNfcStatus, 5500);
-  } catch(e) { toast('NFC 备份失败: ' + e, false); }
+  } catch(e) { toast('NFC 备份失败: ' + e, false); } });
 }
 
 async function nfcRestore() {
   if (!confirm('确认用 NFC 快照覆盖当前设备配置?')) return;
-  try {
+  return runAction('nfc_restore_btn', '恢复中', async () => { try {
     const r = await fetch('/nfcrestore', { method: 'POST' });
     const j = await r.json();
     toast(j.code === '0' ? 'NFC 恢复请求已提交' : 'NFC 恢复失败: ' + j.code, j.code === '0');
     setTimeout(pollNfcStatus, 5500);
-  } catch(e) { toast('NFC 恢复失败: ' + e, false); }
+  } catch(e) { toast('NFC 恢复失败: ' + e, false); } });
 }
 
 let rebooting = false;
@@ -621,6 +647,12 @@ async function uploadOta() {
   if (!file) { toast('请选择固件文件', false); return; }
   if (!confirm('确认上传固件? 设备将在上传完成后自动重启.')) return;
 
+  const uploadButton = $('#ota_upload_btn');
+  uploadButton.disabled = true;
+  uploadButton.classList.add('busy');
+  uploadButton.setAttribute('aria-busy', 'true');
+  uploadButton.textContent = '上传中…';
+
   $('#ota_bar').classList.remove('hidden');
   const prog = $('#ota_prog');
   prog.style.width = '0%';
@@ -638,6 +670,7 @@ async function uploadOta() {
     try {
       const j = JSON.parse(xhr.responseText);
       if (j.code === '0') {
+        uploadButton.dataset.keepBusy = '1';
         toast('固件上传成功, 设备正在重启...', true);
         setTimeout(() => {
           let s = 10;
@@ -646,11 +679,20 @@ async function uploadOta() {
             if (s <= 0) { clearInterval(iv); location.href = '/'; }
           }, 1000);
         }, 2000);
-      } else { toast('上传失败: ' + j.code, false); }
-    } catch(e) { toast('上传失败', false); }
+      } else { toast('上传失败: ' + j.code, false); resetOtaButton(); }
+    } catch(e) { toast('上传失败', false); resetOtaButton(); }
   };
-  xhr.onerror = () => toast('上传失败: 网络错误', false);
+  xhr.onerror = () => { toast('上传失败: 网络错误', false); resetOtaButton(); };
   xhr.send(file);
+}
+
+function resetOtaButton() {
+  const button = $('#ota_upload_btn');
+  delete button.dataset.keepBusy;
+  button.disabled = false;
+  button.classList.remove('busy');
+  button.removeAttribute('aria-busy');
+  button.textContent = '上传固件';
 }
 
 // Init
