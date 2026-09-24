@@ -1,7 +1,8 @@
 # 并发与锁安全分析 (Zero-parking_lot 之后)
 
 > 本文档跟踪 2026-07-18 完成的无锁 (zero-parking_lot) 重构后的并发模型.
-> 历史版本 (parking_lot::Mutex 时代) 的描述已废弃, 见 `docs/CHANGES_SUMMARY.md`.
+> 历史版本 (parking_lot::Mutex 时代) 的描述已废弃；变更摘要见
+> [`../archive/reports/changes-summary-history.md`](../archive/reports/changes-summary-history.md)。
 
 ## 当前同步原语
 

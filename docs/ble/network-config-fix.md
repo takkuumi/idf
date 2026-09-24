@@ -35,4 +35,4 @@
   rustfmt。
 - 串口启动回归和真实设备 Modbus 寄存器读回已完成；Android 手持机 BLE 写入
   仍需在客户端连接后做一次端到端确认，记录见
-  [`log/ble/network_config_2026-09-23.md`](log/ble/network_config_2026-09-23.md)。
+  [`log/ble/network_config_2026-09-23.md`](../../log/ble/network_config_2026-09-23.md)。

@@ -345,9 +345,9 @@ modbus_write_coil 512 1
 
 ## 十、文档清单
 
-1. **RELIABILITY_AUDIT.md** - 可靠性审计报告（详细分析）
-2. **FIXES_SUMMARY.md** - 修复总结（技术细节）
-3. **FIXES_完成报告.md** - 本文档（管理层报告）
+1. [可靠性审计历史报告](../audits/reliability-audit-2026-09-20.md)
+2. [修复总结历史报告](fixes-summary-2.2.5.md)
+3. 本文档（2.2.5 完成报告）
 
 ---
 

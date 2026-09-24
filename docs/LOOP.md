@@ -139,7 +139,7 @@
 | 产品经理 | 对照 MCA_F16V2_1_F48_BLE + metuory-wireless-management-app-1.0.78 提出缺失功能 |
 | 高级 Rust 开发 | 实施功能与修复 BUG |
 | 高级测试 | 测试 + 提出问题 |
-| 高级系统架构 | 架构把关 (`docs/ARCHITECTURE.md`) |
+| 高级系统架构 | 架构把关 (`docs/architecture.md`) |
 | 工业软件审计 | 审计每次实施 |
 
 ## 任务完成清单
@@ -317,7 +317,7 @@ main_loop (5ms network tick)
 - mb-rtu-slave (Modbus RTU 从站)
 ```
 
-详细架构: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+详细架构: [`docs/architecture.md`](architecture.md)
 
 ## 注意事项
 
@@ -1008,7 +1008,7 @@ just test-compile    # 仅编译测试 binary
   保持标准寄存器顺序。
 - 默认固件与测试目标编译通过并已完整刷入 factory。串口确认启动正常；真实
   Modbus TCP 读回 IP、掩码、网关正确。Android 手持机 FC16 写入/复位闭环因本轮
-  未连接手持机客户端而未执行，记录在 `log/ble/network_config_2026-09-23.md`。
+  未连接手持机客户端而未执行，记录在 `../log/ble/network_config_2026-09-23.md`。
 
 ## LOOP36 生产前全栈审计与文档收口 (2026-09-24)
 

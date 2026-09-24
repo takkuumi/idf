@@ -444,10 +444,10 @@ M src/bus/backends.rs         (+8/-0)
 ### 8.3 文档列表
 
 ```
-RELIABILITY_AUDIT.md         - 可靠性审计报告
-FIXES_SUMMARY.md            - 修复总结（技术细节）
-FIXES_完成报告.md            - 完成报告（管理层）
-REAL_DEVICE_TEST_REPORT.md  - 本文档（真机测试报告）
+[可靠性审计历史报告](../audits/reliability-audit-2026-09-20.md)
+[修复总结历史报告](fixes-summary-2.2.5.md)
+[完成报告历史文档](fixes-completion-2.2.5.md)
+本文档（2.2.5 真机测试报告）
 ```
 
 ---

@@ -33,7 +33,7 @@
 | 内部 SRAM | 512 KB |
 | 片外 PSRAM | 2 MB Quad SPI（80MHz） |
 | 片上 Flash | 8 MB Quad SPI |
-| 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI2 @ 20MHz） |
+| 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI2 @ 40MHz） |
 | RS485 | 2 路（UART1 主站 + UART2 从站，独立隔离） |
 | 蓝牙 | BLE 5.0 GATT（Bluedroid 协议栈） |
 | Wi-Fi | 802.11 b/g/n（可选，作为以太网冗余链路，需 `--features wifi` 编译） |
@@ -157,7 +157,7 @@ GND           ──────────── GND
                           RJ45 → 网线
 ```
 
-- SPI 时钟 20MHz，Mode 0
+- SPI 时钟 40MHz，Mode 0
 - W5500 PHY 地址固定为 0（内部 PHY）
 - 默认使用静态 IP；可通过 `AT+CFGDHCP=1` 或 Web 配置切换 DHCP（见 4.2 节）
 

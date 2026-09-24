@@ -4,10 +4,10 @@
 
 本文档面向新加入项目的开发者，覆盖从环境搭建、编译烧录、架构理解到典型扩展开发（新硬件版本、Modbus 寄存器、AT 命令、NVS 持久化、OTA）的全流程。
 
-- 项目路径：`/Users/ling/Workspace/idf`
+- 项目路径：工程根目录
 - Rust edition：2024
 - ESP-IDF：v5.5.4（通过 `esp_idf_sys` 绑定）
-- esp-idf-hal 0.45 + esp-idf-svc 0.50
+- esp-idf-hal 0.46 + esp-idf-svc 0.52
 - 目标芯片：ESP32-S3R2（Xtensa LX7 双核 240MHz，512KB 物理 SRAM，2MB Quad PSRAM）
 
 ---

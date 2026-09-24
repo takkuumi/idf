@@ -1,5 +1,7 @@
 # ESP32-S3 工业网关 (esp32s3-iot-gateway)
 
+文档导航见 [文档索引](index.md)。
+
 基于 ESP-IDF v5.5 + Rust 重构的工业控制系统固件。
 
 ## 硬件
@@ -12,7 +14,7 @@
 - **AO**: LEDC_CH0-3 (GPIO15-18), 5kHz PWM
 - **电源使能**: GPIO21 (LED), GPIO33 (RELAY)
 
-详细引脚分配见 [docs/pinmap.md](pinmap.md)
+详细引脚分配见 [引脚映射](pinmap.md)
 
 ## 架构
 
@@ -24,7 +26,7 @@
 
 合并到 main_loop 的模块: ai-sample, ao-output, di-scan, do-output, eth-heartbeat
 
-详细架构见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)
+详细架构见 [架构说明](architecture.md)
 
 完整 Flash、SRAM、PSRAM、任务栈和协议地址布局见
 [整体内存布局](MEMORY_LAYOUT.md)。
@@ -61,7 +63,7 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     target/xtensa-esp32s3-espidf/debug/gateway
 ```
 
-详细烧录指南见 [docs/FLASH.md](FLASH.md)
+详细烧录指南见 [烧录指南](FLASH.md)
 
 ## 监控
 
@@ -72,8 +74,8 @@ espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 ## 测试
 
 - 单元测试编译: `cargo test --bin gateway --no-run`（ESP-IDF 目标不在主机执行）
-- Modbus TCP: `python3 -c "import socket; ..."` 见 [log/modbus/tcp_test.md](log/modbus/tcp_test.md)
-- BLE Android 兼容: 见 [log/ble/android_read_2026-07-21.md](log/ble/android_read_2026-07-21.md)
+- Modbus TCP: [手工测试工具](../tests/manual/test_modbus_network.py)
+- BLE Android 兼容: [协议流程](ble/BLE_ANDROID_FLOW.md) 和 [手持机测试计划](testing/handheld-network-config.md)
 
 ## 测试日志
 
@@ -90,5 +92,5 @@ espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 - 产品经理: 对照 metuory-wireless-management-app-1.0.78 提出缺失功能
 - 高级 Rust 开发工程师: 实施功能与修复 BUG
 - 高级测试工程师: 持续测试
-- 高级系统架构师: 架构层把关 (见 ARCHITECTURE.md)
+- 架构说明见 architecture.md
 - 工业软件审计专家: 审计每次实施

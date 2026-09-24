@@ -24,4 +24,4 @@
 ## 结果
 
 尚未执行真实手持机端到端用例。编译检查与设备串口记录见
-[`log/ble/network_config_2026-09-23.md`](log/ble/network_config_2026-09-23.md)。
+[`log/ble/network_config_2026-09-23.md`](../../log/ble/network_config_2026-09-23.md)。

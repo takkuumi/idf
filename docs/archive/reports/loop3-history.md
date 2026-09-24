@@ -18,7 +18,7 @@
 | 产品经理 | 对照 MCA_F16V2_1_F48_BLE + metuory-wireless-management-app-1.0.78 提出缺失功能 |
 | 高级 Rust 开发 | 实施功能与修复 BUG |
 | 高级测试 | 测试 + 提出问题 |
-| 高级系统架构 | 架构把关 (`docs/ARCHITECTURE.md`) |
+| 高级系统架构 | 架构把关 (`docs/architecture.md`) |
 | 工业软件审计 | 审计每次实施 |
 
 ## LOOP8 修复要点 (2026-07-24)

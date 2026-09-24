@@ -81,7 +81,7 @@ P0: 根本修复 pthread Stack canary + ENOMEM
 
 ## Architecture Overview
 
-**4 个用户 pthread + main_loop 调度 7 个模块**（见 `docs/ARCHITECTURE.md`）：
+**main_loop + 有界后台任务**（见 `docs/architecture.md`）：
 - **pthread**：DeviceActor（8KB）、mb-rtu-master/slave、mb-tcp-listen。
 - **main_loop 100ms tick**：ai-sample（100ms）、ao-output（100ms）、di-scan（20ms）、do-output（100ms + notify）、eth-heartbeat（5s）。
 - **状态共享**：所有 IO 状态走 `std::sync::Mutex<Option<State>>` + `try_lock`（死锁安全）。

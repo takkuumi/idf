@@ -2,6 +2,8 @@
 /target
 /release/
 **/*.rs.bk
+__pycache__/
+*.pyc
 
 # ESP-IDF 构建产物
 /build
