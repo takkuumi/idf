@@ -965,8 +965,8 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
             &json_response("updatesysteminfoconfig", "0x01000003"),
         );
     }
-    if let Some(name) = addressinfo {
-        let name_bytes = name.as_bytes();
+    if let Some(addressinfo) = addressinfo.as_ref() {
+        let name_bytes = addressinfo.as_bytes();
         crate::bus::backends::config_modify(|cfg| {
             cfg.name.fill(0);
             cfg.name[..name_bytes.len()].copy_from_slice(name_bytes);
@@ -1191,8 +1191,7 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         log::info!("[http] update device identity");
     }
 
-    // Web 请求线程只更新 RCU 并投递合并持久化标志，禁止在 socket 线程同步写
-    // NVS/Flash；网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
+    // 网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
     crate::device::request_persist_config();
     if ble_name.is_some() {
         // Keep the legacy D98..D101 holding window coherent with the
@@ -1376,8 +1375,6 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         interval
     );
 
-    // 三个端口由 Web 连续提交。端口保存只落盘，不得重配 W5500，否则第一个
-    // 请求会中断后两个请求，造成页面提示成功但仅端口 1 实际保存。
     crate::device::request_persist_config();
     send_json(stream, 200, &json_response("updateportconfig", "0"))
 }
