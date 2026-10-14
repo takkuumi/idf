@@ -47,3 +47,10 @@
 - 断网、拔插 W5500、BLE 反复连接、RS485 从站掉线和 Web 并发保存测试。
 - OTA 写入中断、掉电和回滚测试。
 - 不同硬件变体（默认/F3/F4）的独立烧录与参数回读。
+
+## 2026-10-14 验证记录
+
+- 默认配置：`cargo test --bin gateway --no-run`、`cargo build --release` 通过，编译警告为 0。
+- F3：`CARGO_TARGET_DIR=target/release-f3 cargo build --release --locked --bin gateway --features f3` 通过。
+- F4：`CARGO_TARGET_DIR=target/release-f4 cargo build --release --locked --bin gateway --features f4` 通过。
+- 真实设备基础回归：应用启动、BLE 广播、Web、Modbus TCP 和网络参数重启后回读已通过；本轮代码变更仍需按完整烧录门槛重新刷入后执行现场长测。
