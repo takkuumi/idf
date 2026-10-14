@@ -492,17 +492,30 @@ pub fn init() -> AppResult<()> {
         log::warn!("[device] NVS unavailable, using default SystemConfig");
         SystemConfig::defaults()
     };
+    let mut network_repaired = false;
     // v2.2.6 briefly wrote Android's mask/gateway fields in reverse. Repair
     // only the unmistakable legacy pattern before starting the network stack.
     if cfg.repair_legacy_network_swap() {
-        let mut nvs_guard = nvs_lock();
-        if let Some(nvs) = nvs_guard.as_mut() {
-            cfg.save_to_nvs(nvs)?;
-        }
+        network_repaired = true;
         log::warn!(
             "[device] repaired legacy network field swap: mask={} gw={}",
             cfg.mask_str(),
             cfg.gw_str()
+        );
+    }
+    // Never start Ethernet with a malformed persisted network snapshot. Keep
+    // identity/serial/BLE fields, replace only network fields with defaults,
+    // then persist the repaired snapshot after the RCU is published.
+    if let Err(error) = cfg.validate_for_persistence() {
+        let defaults = SystemConfig::defaults();
+        cfg.dhcp = defaults.dhcp;
+        cfg.ip = defaults.ip;
+        cfg.mask = defaults.mask;
+        cfg.gateway = defaults.gateway;
+        cfg.dns = defaults.dns;
+        network_repaired = true;
+        log::error!(
+            "[device] invalid persisted network config ({error}); restored network defaults"
         );
     }
     // Older IDF builds used 0x0100 as a placeholder model.  Repair that
@@ -581,6 +594,9 @@ pub fn init() -> AppResult<()> {
 
         let cs = ConfigSnapshot { cfg: cfg.clone() };
         config_write(cs);
+        if network_repaired {
+            request_persist_config();
+        }
 
         // LOOP13: 加载 DO 位图到 IO.do_. 安全优先: init 默认 0 (DO 全断),
         //         加载后才覆盖为持久值, 上电期间硬件上电保护先于 DO 加载生效.

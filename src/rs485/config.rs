@@ -110,14 +110,24 @@ impl Rs485Config {
 
     /// 从 RS485 #0 (UART1) 构造。
     pub fn from_rtu_master() -> Self {
-        Self::from_port(0).expect("RS485-1 exists")
+        Self::from_port(0).unwrap_or_else(|| {
+            log::error!(
+                "[rs485] configuration snapshot unavailable for port 1; using safe defaults"
+            );
+            Self::physical_port(0).unwrap_or_default()
+        })
     }
 
     /// 从 `config::modbus::rtu_slave` 构造 (RS485 #1 = UART2)
     ///
     /// 注意: UART0 与下载串口复用，调试期间建议改用 UART1
     pub fn from_rtu_slave() -> Self {
-        Self::from_port(1).expect("RS485-2 exists")
+        Self::from_port(1).unwrap_or_else(|| {
+            log::error!(
+                "[rs485] configuration snapshot unavailable for port 2; using safe defaults"
+            );
+            Self::physical_port(1).unwrap_or_default()
+        })
     }
 
     /// 构造 RS485 #2 (第 3 端口 = UART0, 对齐参考固件 RS485-3)
@@ -125,6 +135,11 @@ impl Rs485Config {
     /// 默认 9600 8N1, 仅从站监听模式. UART0 与 USB CDC/JTAG 复用,
     /// 启用后将失去调试串口; 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动.
     pub fn from_rtu_port2() -> Self {
-        Self::from_port(2).expect("RS485-3 exists")
+        Self::from_port(2).unwrap_or_else(|| {
+            log::error!(
+                "[rs485] configuration snapshot unavailable for port 3; using safe defaults"
+            );
+            Self::physical_port(2).unwrap_or_default()
+        })
     }
 }

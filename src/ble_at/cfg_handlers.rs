@@ -24,6 +24,7 @@
 
 use crate::ble_at::parser::{err, ok_data, ok_none, parse_u16, parse_u32};
 use crate::config::regs;
+use crate::device::system_config::is_ipv4_netmask;
 use crate::device::{self, SystemConfig, parse_ipv4};
 
 // ----------------------------------------------------------------------------
@@ -95,15 +96,30 @@ pub fn handle_cfgip(args: &str) -> String {
             Some(v) => v,
             None => return err(11, "invalid mask"),
         };
+        if !is_ipv4_netmask(&mask) {
+            return err(11, "mask is not contiguous");
+        }
         let gw = match parse_ipv4(parts[2]) {
             Some(v) => v,
             None => return err(11, "invalid gw"),
         };
         let dns = if parts.len() == 4 {
-            parse_ipv4(parts[3]).unwrap_or([192, 168, 1, 1])
+            match parse_ipv4(parts[3]) {
+                Some(v) => v,
+                None => return err(11, "invalid dns"),
+            }
         } else {
             gw
         };
+        if ip == [0; 4] || ip[0] >= 224 {
+            return err(11, "invalid ip");
+        }
+        if gw == [0; 4] || gw[0] >= 224 {
+            return err(11, "invalid gw");
+        }
+        if dns == [0; 4] || dns[0] >= 224 {
+            return err(11, "invalid dns");
+        }
         with_cfg_mut(|c| {
             c.ip = ip;
             c.mask = mask;
@@ -120,7 +136,8 @@ pub fn handle_cfgip(args: &str) -> String {
 // ----------------------------------------------------------------------------
 pub fn handle_cfgdhcp(args: &str) -> String {
     let v = match parse_u16(args) {
-        Some(v) => v,
+        Some(v @ 0..=1) => v,
+        Some(_) => return err(11, "dhcp must be 0 or 1"),
         None => return err(10, "invalid value"),
     };
     with_cfg_mut(|c| c.dhcp = v != 0);
@@ -429,5 +446,16 @@ mod tests {
         assert!(response.starts_with("OK"), "{response}");
         assert_eq!(with_cfg(|cfg| cfg.ble_name_str()), "Node221");
         assert!(device::config_is_dirty());
+    }
+
+    #[test]
+    fn cfgip_rejects_invalid_dns_instead_of_substituting_a_default() {
+        let response = handle_cfgip("192.168.51.220,255.255.255.0,192.168.51.1,not-an-ip");
+        assert!(response.contains("invalid dns"), "{response}");
+    }
+
+    #[test]
+    fn cfgdhcp_accepts_only_boolean_values() {
+        assert!(handle_cfgdhcp("2").contains("dhcp must be 0 or 1"));
     }
 }

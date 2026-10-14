@@ -1,158 +1,49 @@
-# 生产环境稳定性保障方案
+# 生产可靠性基线
 
-## 已发现的崩溃问题
+本文档记录当前固件的可靠性措施、验证证据和发布门槛。它描述可以检查的工程事实，不把未经长时间测试的系统称为“绝对可靠”。
 
-### 已修复的崩溃
+## 故障边界
 
-| # | 崩溃现象 | 根因 | 修复 |
-|---|---------|------|------|
-| 1 | `device init ok` 后 `LoadProhibited` (读取 NULL) | `esp_reset_reason()` 在后台线程运行时调用导致竞态 | 移到 `device::init()` 之前执行 |
-| 2 | `device init ok` 后 `InstrFetchProhibited` (PC=0，函数指针损坏) | `catch_unwind` 在 ESP-IDF 上不稳定 | 去掉 catch_unwind，直接调用 |
-| 3 | `process_loop` 线程静默崩溃 | 4096 字节栈溢出 (log::info! + Mutex 操作) | 移除独立线程，改为 main loop 轮询 |
-| 4 | Task watchdog 触发 (main loop 阻塞 10s+) | process_tick 内部死循环未返回 | process_tick 改为单次调用 |
-| 5 | BLE 响应从未到达 Android | send_ble_frame 写入 BINARY_TX 但无人消费 | process_tick 优先消费 BINARY_TX |
-| 6 | 连接后 25 秒 Android 主动断开 | send_indicate 在 GATT 回调中调用导致死锁 | 数据队列 + main loop 发送 |
+固件将故障分成四类：可重试的外设错误、可降级的链路错误、需要保留现场的严重错误，以及由 ESP-IDF 看门狗或 panic 处理器接管的致命错误。网络、BLE、NFC、Web 和 Modbus 启动失败不会阻塞其它已经可用的服务；主循环和关键后台任务由 Task WDT、心跳和栈水位监控共同保护。
 
-### 未修复的残余风险
+## 已实现的保护
 
-#### 1. 11 个线程使用默认 3KB 栈（严重）
+| 区域 | 当前措施 |
+|---|---|
+| 启动 | 固定 DIO/40 MHz/8 MB 分区；NVS、holding 和协议数据分别校验；损坏数据回退到默认或另一槽位 |
+| 配置 | SystemConfig 单 blob；holding 使用带 generation/CRC 的 A/B 槽；网络配置在写入 NVS 前统一校验 |
+| 网络参数 | 启动时修复历史 mask/gateway 交换；非法静态 IP、掩码、网关和 DNS 不会写入持久化存储；DHCP 只接受 0/1 |
+| Web/BLE/Modbus | 写入入口共享同一配置快照；保存请求合并落盘；“保存并重启”先完成同步持久化屏障 |
+| OTA | 写入前校验大小，结束时由 `esp_ota_end` 校验镜像，启动后服务稳定 30 秒才取消 bootloader 回滚 |
+| 任务 | 关键线程使用集中栈预算；任务心跳、Task WDT、FreeRTOS 栈 canary 和周期性高水位报告同时启用 |
+| 通信 | TCP 请求、部分帧、发送队列和客户端数量均有上限；监听器支持事务性重绑定和自动恢复 |
+| 现场分析 | reset reason、计数、panic 日志和 core dump 分区保留；主循环周期、堆和栈水位定期记录 |
 
-以下线程没有显式设置 `.stack_size()`，使用 ESP-IDF 默认 ~3KB：
+## 配置安全规则
 
-```
-wifi/mod.rs:108      - Wi-Fi 线程
-io/di.rs:45          - DI 扫描线程
-io/do_.rs:40         - DO 输出线程
-ethernet/w5500.rs:296 - 以太网心跳线程
-channel/ai.rs:40     - AI 采样线程
-channel/ao.rs:38     - AO 输出线程
-modbus/rtu_master.rs:57  - RTU 主站线程
-modbus/rtu_slave.rs:31   - RTU 从站线程
-modbus/tcp_server.rs:39  - TCP 监听线程
-modbus/tcp_server.rs:56  - TCP 连接处理线程
-```
+所有入口必须遵守以下顺序：解析输入、校验完整参数、更新 RCU 快照、请求持久化。网络配置不得在 socket、BLE 回调或 Modbus 回调中直接执行长时间 Flash 操作；只有重启前路径使用同步持久化屏障。NVS 不可用时保留 dirty 状态并继续重试，不能清除“待保存”标志。
 
-**风险**: 3KB 栈对 Rust 线程过小，`log::info!` + 字符串格式化 + FFI 调用很容易溢出。
-**修复方案**: 每个 `.spawn()` 添加 `.stack_size(8192)`。
+启动发现非法持久化网络配置时，只替换网络字段为出厂值，保留 SN、设备名、BLE 名和 RS485 参数，并在配置快照发布后重新落盘。这样不会带着坏地址启动以太网，也不会丢失其它现场参数。
 
-#### 2. 11 个 unwrap/expect 调用点
+## 发布门槛
 
-这些调用点如果触发会直接 panic，导致系统重启：
+每个发布候选必须通过：
 
-```bash
-# 分布在 device/mod.rs, bus.rs, config.rs 等
-# 主要是 NVS 操作和 Mutex 锁
-```
+1. `cargo test --bin gateway --no-run`；测试运行器禁止直接烧入设备。
+2. `cargo build --release`，并检查警告数为零。
+3. `git diff --check`、Python 手工测试脚本语法检查和发布产物 SHA-256 校验。
+4. 使用完整 bootloader、分区表、otadata、factory 镜像烧录；烧录过程不得中断，业务 NVS 不得全擦。
+5. 启动日志包含 `device init ok`、BLE advertising、Web listening、Modbus TCP bound 和 `entering main loop`。
+6. 实机回读网络 IP、掩码、网关；修改 IP 后重启，再次确认掩码和网关未交换。
+7. OTA 镜像完成升级后保持运行至少 30 秒，确认新镜像被标记有效；失败时能回滚到旧镜像。
 
-**风险**: NVS 损坏或 Mutex 死锁时直接 panic。
-**修复方案**: 替换为 `?` 操作符 + 错误处理，或 `unwrap_or_default()`。
+## 长时间验证
 
-#### 3. 连续 core dump 损坏 NVS
+生产前应记录至少 72 小时的真实设备运行数据：reset count/reason、最低堆、最低 internal SRAM、所有任务最低栈余量、TCP/BLE 重连次数、RS485 超时和 NVS 持久化错误。任何任务出现 stall、栈余量进入临界阈值、持久化错误持续增长或无故复位，都必须回到故障分析流程，不能仅通过增加重试次数掩盖。
 
-每次崩溃后，ESP-IDF 尝试保存 core dump 到 flash，但 core dump 分区配置损坏，失败后仍会耗用 flash 写入寿命。
+## 仍需持续验证的项目
 
-**风险**: Flash 磨损 + NVS 区域被 core dump 覆盖。
-**修复方案**: 在 `sdkconfig.defaults` 中启用 core dump 分区，或禁用 core dump。
-
-## 生产环境保障措施
-
-### 1. 线程栈大小 - 立即修复项
-
-```rust
-// 所有 .spawn() 必须设置栈大小
-std::thread::Builder::new()
-    .name("task-name".into())
-    .stack_size(8192)  // 最小 8KB
-    .spawn(move || { ... });
-```
-
-建议值:
-| 线程类型 | 建议栈大小 | 原因 |
-|---------|-----------|------|
-| IO 扫描 (DI/DO) | 8192 | log::info! + I2C 操作 |
-| 模拟量 (AI/AO) | 8192 | ADC/LEDC 操作 |
-| Modbus RTU | 16384 | CRC + UART + 协议处理 |
-| Modbus TCP | 16384 | Socket + 多连接 |
-| 以太网 | 8192 | SPI + LwIP |
-| 配置监听 | 16384 | NVS + CRC + 日志 |
-
-### 2. 无 panic 设计
-
-```rust
-// 错误处理原则
-// ❌ 不要：
-let v = some_result.unwrap();
-let v = some_result.expect("message");
-
-// ✅ 要：
-let v = some_result?;  // 或
-let v = some_result.unwrap_or_default();
-let v = some_result.unwrap_or_else(|e| {
-    log::error!("fallback: {}", e);
-    Default::default()
-});
-```
-
-### 3. 多层 watchdog 保护
-
-```
-主循环喂狗 (100ms) ──→ Task WDT (10s 超时)
-        ↓
-健康检查 (1s/次) ──→ 线程 stall 检测
-        ↓
-复位计数 ──→ 连续复位超过 N 次 → 进入安全模式
-```
-
-### 4. 安全模式
-
-当系统检测到连续崩溃时:
-```
-正常模式 → 检测到崩溃 → 保存复位原因
-    ↓                      ↓
-重启次数 < 5           重启次数 >= 5
-    ↓                      ↓
-正常启动              安全模式启动
-                         ↓
-                    只启动最小功能
-                    (以太网 + 基础 Modbus)
-                    等待 OTA 恢复
-```
-
-### 5. 内存保护
-
-```rust
-// PSRAM 分配策略 (已在 sdkconfig 中配置)
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096   // <4KB 走 SRAM
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384 // 保留 16KB SRAM
-
-// 大数组必须走堆分配
-// ❌ 不要：
-let data = [0u16; 1500];  // 3000 bytes on stack
-
-// ✅ 要：
-let data = vec![0u16; 1500];  // 堆分配
-```
-
-### 6. 生产部署检查清单
-
-- [ ] 所有 `.spawn()` 有 `.stack_size(8192)` 
-- [ ] 无 `.unwrap()` / `.expect()` 在生产路径中
-- [ ] health::check_all() 在主循环中调用
-- [ ] 复位计数持久化 + 连续复位检测
-- [ ] Panic hook 记录 backtrace
-- [ ] Core dump 分区已配置
-- [ ] NVS A/B 双 blob 保护
-- [ ] 看门狗已启用 (CONFIG_ESP_TASK_WDT)
-- [ ] Modbus 异常超时处理
-- [ ] BLE 断线自动重广播
-
-### 7. TODO 优先级
-
-| 优先级 | 事项 | 影响 |
-|-------|------|------|
-| P0 | 所有线程加 stack_size(8192) | 防止线程栈溢出崩溃 |
-| P0 | 去掉 unwrap/expect | 防止 NVS/Mutex panic |
-| P1 | 配置 core dump 分区 | 崩溃时可分析 |
-| P1 | 连续复位检测 + 安全模式 | 避免启动循环 |
-| P2 | 内存压力测试 | 验证 7×24 稳定性 |
-| P2 | 网络断线自动恢复 | 工业现场可靠性 |
+- 真实负载下的 72 小时压力和断电恢复测试。
+- 断网、拔插 W5500、BLE 反复连接、RS485 从站掉线和 Web 并发保存测试。
+- OTA 写入中断、掉电和回滚测试。
+- 不同硬件变体（默认/F3/F4）的独立烧录与参数回读。

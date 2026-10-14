@@ -417,11 +417,49 @@ impl SystemConfig {
     }
 
     pub fn save_to_nvs(&self, nvs: &mut EspDefaultNvs) -> AppResult<()> {
+        self.validate_for_persistence()?;
         let buf = self.encode();
         nvs.set_blob(NVS_KEY_BLOB, &buf)
             .map_err(|e| AppError::Config(format!("nvs set blob: {e:?}")))?;
         nvs.set_u32(NVS_KEY_MAGIC, NVS_MAGIC)
             .map_err(|e| AppError::Config(format!("nvs set magic: {e:?}")))?;
+        Ok(())
+    }
+
+    /// Validate values that can make the network stack fail at boot.
+    ///
+    /// Every protocol entry point eventually reaches this boundary before a
+    /// configuration snapshot is written to NVS.  Keeping the check here
+    /// prevents a malformed Modbus/AT register sequence from replacing a
+    /// known-good persistent configuration.
+    pub fn validate_for_persistence(&self) -> AppResult<()> {
+        if self.dhcp {
+            return Ok(());
+        }
+        if !is_ipv4_netmask(&self.mask) {
+            return Err(AppError::Config(format!(
+                "invalid IPv4 netmask: {}",
+                self.mask_str()
+            )));
+        }
+        if self.ip == [0; 4] || self.ip[0] >= 224 {
+            return Err(AppError::Config(format!(
+                "invalid static IPv4: {}",
+                self.ip_str()
+            )));
+        }
+        if self.gateway == [0; 4] || self.gateway[0] >= 224 {
+            return Err(AppError::Config(format!(
+                "invalid IPv4 gateway: {}",
+                self.gw_str()
+            )));
+        }
+        if self.dns == [0; 4] || self.dns[0] >= 224 {
+            return Err(AppError::Config(format!(
+                "invalid IPv4 DNS: {}",
+                self.dns_str()
+            )));
+        }
         Ok(())
     }
 
@@ -752,7 +790,7 @@ impl SystemConfig {
     }
 }
 
-fn is_ipv4_netmask(value: &[u8; 4]) -> bool {
+pub(crate) fn is_ipv4_netmask(value: &[u8; 4]) -> bool {
     if *value == [0; 4] {
         return false;
     }
@@ -1398,5 +1436,21 @@ mod tests {
         assert!(!cfg.repair_legacy_network_swap());
         assert_eq!(cfg.mask, [255, 255, 255, 0]);
         assert_eq!(cfg.gateway, [192, 168, 51, 1]);
+    }
+
+    #[test]
+    fn test_network_persistence_validation_rejects_invalid_static_values() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.mask = [255, 0, 255, 0];
+        assert!(cfg.validate_for_persistence().is_err());
+
+        cfg = SystemConfig::defaults();
+        cfg.ip = [224, 168, 51, 220];
+        assert!(cfg.validate_for_persistence().is_err());
+
+        cfg = SystemConfig::defaults();
+        cfg.dhcp = true;
+        cfg.mask = [0, 0, 0, 0];
+        assert!(cfg.validate_for_persistence().is_ok());
     }
 }
