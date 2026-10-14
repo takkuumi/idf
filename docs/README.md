@@ -13,6 +13,7 @@
 - **AI**: ADC1_CH0-5 (GPIO1-6), 12-bit
 - **AO**: LEDC_CH0-3 (GPIO15-18), 5kHz PWM
 - **电源使能**: GPIO21 (LED), GPIO33 (RELAY)
+- **NFC**: 板载 ST25DV，经软件 I2C 访问；LoRa 硬件尚未在当前工程中确认或实现。
 
 详细引脚分配见 [引脚映射](pinmap.md)
 

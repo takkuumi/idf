@@ -680,7 +680,13 @@ fn nfc_loop(mut data_buf: PsramBuffer<u8>, mut nfc_words: PsramBuffer<u16>) {
             log::info!("[nfc] tag detected");
             present = true;
         }
-        let active_dev = dev.as_ref().expect("NFC device checked above");
+        let Some(active_dev) = dev.as_ref() else {
+            // The tag may be removed between probing and this iteration. Keep
+            // the worker alive and let the bounded retry path probe again.
+            *NFC_STATE.lock() = NfcState::Idle;
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        };
         {
             let mut state = NFC_STATE.lock();
             if matches!(*state, NfcState::Idle | NfcState::Init) {
