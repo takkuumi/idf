@@ -462,11 +462,14 @@ fn main_loop(
                     crate::bus::IoEvent::ResetRequested => {
                         // 已在 1s tick 中处理, 忽略
                     }
-                    crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b) => {
+                    crate::bus::IoEvent::IpAssigned(ip_b, mask_b, gw_b, event_ms) => {
                         // GOT_IP 同时覆盖 DHCP 租约和静态 IP 生效。只有当前配置本来
                         // 就是 DHCP 模式时才回写租约，避免静态地址启动后被误标成 DHCP。
                         log::info!(
-                            "[eth] main loop: IP assigned {}.{}.{}.{}",
+                            "[eth] IP assigned at uptime={}ms (event dispatch={}ms): {}.{}.{}.{}",
+                            event_ms,
+                            ((unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32)
+                                .wrapping_sub(event_ms),
                             ip_b[0],
                             ip_b[1],
                             ip_b[2],
@@ -480,6 +483,9 @@ fn main_loop(
                                 apply_assigned_ip_to_config(c, ip_b, mask_b, gw_b);
                             });
                         }
+                    }
+                    crate::bus::IoEvent::EthernetLink(up, event_ms) => {
+                        crate::ethernet::w5500::log_link_transition(up, event_ms);
                     }
                 }
             }

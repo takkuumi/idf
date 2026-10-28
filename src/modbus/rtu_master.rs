@@ -277,6 +277,15 @@ fn parse_poll_table(
             if !result_range_is_valid(dest_reg, count) {
                 return Err("master result outside monitor/user areas");
             }
+            let dest_end = dest_reg
+                .checked_add(count)
+                .ok_or("master result destination overflow")?;
+            if items.iter().any(|item: &PollItem| {
+                let existing_end = item.dest_reg.saturating_add(item.count);
+                dest_reg < existing_end && item.dest_reg < dest_end
+            }) {
+                return Err("overlapping master result destinations");
+            }
 
             items
                 .push(PollItem {
@@ -726,6 +735,19 @@ mod tests {
         assert_eq!(
             parse_poll_table(&words),
             Err("master result outside monitor/user areas")
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_overlapping_destination_ranges() {
+        let mut words = configured_words();
+        let logic = crate::config::regs::HOLD_DEVICE_CONFIG + 3;
+        let index = (logic + 16 - crate::config::regs::HOLD_PXX_BASE) as usize;
+        // First item writes 4001..4002; the next item must not alias 4002.
+        words[index] = 4002;
+        assert_eq!(
+            parse_poll_table(&words),
+            Err("overlapping master result destinations")
         );
     }
 

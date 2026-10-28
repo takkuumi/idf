@@ -992,6 +992,10 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 } else {
                     cs.cfg.write_reg(target, value)
                 };
+                if matches!(result, WriteResult::InvalidValue) {
+                    // Reject the whole batch before publishing either clone.
+                    return false;
+                }
                 let config_write_succeeded = !matches!(&result, WriteResult::NotFound);
                 match result {
                     WriteResult::Ok => config_changed = true,
@@ -1019,6 +1023,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                             logic_changed = true;
                         }
                     }
+                    WriteResult::InvalidValue => unreachable!("invalid writes returned above"),
                 }
                 if config_write_succeeded && is_ble_name_hold_addr(target) {
                     ble_name_changed = true;
@@ -1211,6 +1216,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 }
                 return false;
             }
+            WriteResult::InvalidValue => return false,
         }
     }
     // ---- CONTROL_PLC 别名区 (40001-40300, LOOP12) ----

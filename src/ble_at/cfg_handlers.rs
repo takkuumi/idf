@@ -229,7 +229,8 @@ pub fn handle_cfg485(args: &str) -> String {
             _ => return err(11, "parity must be 0/1/2"),
         };
         let slave = match parse_u16(parts[5]) {
-            Some(v) => v as u8,
+            Some(v @ 1..=247) => v as u8,
+            Some(_) => return err(11, "slave out of range (1..247)"),
             None => return err(11, "invalid slave"),
         };
         let mode = match parse_u16(parts[6]) {
@@ -383,6 +384,7 @@ pub fn handle_cfgwrite(args: &str) -> String {
             ok_data("reset to defaults")
         }
         WriteResult::NotFound => err(12, "field not found"),
+        WriteResult::InvalidValue => err(11, "value out of range"),
     }
 }
 

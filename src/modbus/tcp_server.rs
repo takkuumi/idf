@@ -398,7 +398,12 @@ pub fn tick_tcp_server() {
             if dead[i] {
                 let client = state.clients.swap_remove(i);
                 state.conn_closed_total = state.conn_closed_total.saturating_add(1);
-                log::debug!("[mb-tcp] conn_id={} from {} closed (total_closed={})", client.id, client.peer, state.conn_closed_total);
+                log::debug!(
+                    "[mb-tcp] conn_id={} from {} closed (total_closed={})",
+                    client.id,
+                    client.peer,
+                    state.conn_closed_total
+                );
                 CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -577,9 +582,13 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
                 match Client::new(id, peer, stream) {
                     Ok(client) => {
                         state.clients.push(client);
-                        state.conn_established_total = state.conn_established_total.saturating_add(1);
+                        state.conn_established_total =
+                            state.conn_established_total.saturating_add(1);
                         CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
-                        log::debug!("[mb-tcp] conn_id={id} from {peer} accepted (total_established={})", state.conn_established_total);
+                        log::debug!(
+                            "[mb-tcp] conn_id={id} from {peer} accepted (total_established={})",
+                            state.conn_established_total
+                        );
                     }
                     Err(e) => log::warn!("[mb-tcp] configure {peer}: {e}"),
                 }

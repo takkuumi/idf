@@ -21,6 +21,7 @@ static PORT_STARTED: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
 static PORT0_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port0", 30);
 static PORT1_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port1", 30);
 static PORT2_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port2", 30);
+static DISABLED_PORT3_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PortMode {
@@ -99,6 +100,40 @@ fn stack_size(index: usize) -> usize {
         1 => crate::safety::stack_budget::MODBUS_RTU_PORT1,
         _ => crate::safety::stack_budget::MODBUS_RTU_PORT2,
     }
+}
+
+fn configured_runtime_poll_table() -> Result<heapless::Vec<rtu_master::PollItem, 64>, &'static str>
+{
+    let configured = rtu_master::load_poll_table()?;
+    let enabled = crate::config::modbus::rtu_port2::ENABLED;
+    let (active, skipped) = filter_disabled_port3(configured, enabled)?;
+    if skipped != 0 && !DISABLED_PORT3_CONFIG_WARNED.swap(true, Ordering::AcqRel) {
+        log::warn!(
+            "[modbus-rtu] skipped {skipped} RS485-3 poll items: UART0 runtime is disabled to retain the console"
+        );
+    }
+    Ok(active)
+}
+
+fn filter_disabled_port3(
+    configured: heapless::Vec<rtu_master::PollItem, 64>,
+    port3_enabled: bool,
+) -> Result<(heapless::Vec<rtu_master::PollItem, 64>, usize), &'static str> {
+    if port3_enabled {
+        return Ok((configured, 0));
+    }
+    let mut active = heapless::Vec::new();
+    let mut skipped = 0;
+    for item in configured {
+        if item.port == 3 {
+            skipped += 1;
+        } else {
+            active
+                .push(item)
+                .map_err(|_| "too many active RS485 poll items")?;
+        }
+    }
+    Ok((active, skipped))
 }
 
 fn spawn_port(index: usize) -> AppResult<()> {
@@ -196,7 +231,7 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
         };
         match desired.mode {
             PortMode::Master => {
-                match rtu_master::load_poll_table() {
+                match configured_runtime_poll_table() {
                     Ok(updated) if updated != poll_table => {
                         rtu_master::publish_result_ranges(&updated);
                         poll_table = updated;
@@ -323,5 +358,52 @@ mod tests {
         let runtime = apply_runtime_policy(1, &saved, wire, 9);
         assert_eq!(runtime.slave_addr, 247, "DIP only governs RS485-1");
         assert_eq!(runtime.wire.baud, 115_200);
+    }
+
+    #[test]
+    fn default_physical_roles_match_legacy_mca_policy() {
+        let cfg = crate::device::system_config::SystemConfig::defaults();
+        let port1 = apply_runtime_policy(
+            0,
+            &cfg.rs485[0],
+            Rs485Config::from_port_with_saved(0, &cfg.rs485[0]).unwrap(),
+            0,
+        );
+        let port2 = apply_runtime_policy(
+            1,
+            &cfg.rs485[1],
+            Rs485Config::from_port_with_saved(1, &cfg.rs485[1]).unwrap(),
+            0,
+        );
+        assert_eq!(port1.mode, PortMode::Master);
+        assert_eq!(port2.mode, PortMode::Slave);
+    }
+
+    #[test]
+    fn disabled_uart0_does_not_keep_port3_result_range_valid() {
+        let items = heapless::Vec::from_slice(&[
+            rtu_master::PollItem {
+                port: 1,
+                slave: 1,
+                func: 3,
+                start: 0,
+                count: 1,
+                dest_reg: 4001,
+            },
+            rtu_master::PollItem {
+                port: 3,
+                slave: 1,
+                func: 3,
+                start: 0,
+                count: 1,
+                dest_reg: 4002,
+            },
+        ])
+        .unwrap();
+        let (active, skipped) = filter_disabled_port3(items, false).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].port, 1);
+        assert_eq!(active[0].dest_reg, 4001);
     }
 }

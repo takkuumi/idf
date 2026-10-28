@@ -30,7 +30,9 @@ pub enum IoEvent {
     /// 设备复位请求
     ResetRequested,
     /// IP 已分配 (DHCP 完成), 携带 (ip, mask, gw)
-    IpAssigned([u8; 4], [u8; 4], [u8; 4]),
+    IpAssigned([u8; 4], [u8; 4], [u8; 4], u32),
+    /// Ethernet PHY link 状态变化及事件发生时的启动后毫秒时间戳。
+    EthernetLink(bool, u32),
 }
 
 /// 全局事件队列 (容量 32, 满了覆盖最旧)

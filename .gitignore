@@ -29,6 +29,13 @@ flash_project_args
 !/log/stress/
 /log/stress/*
 !/log/stress/stack_capacity_2026-07-29.md
+!/log/hardware/
+/log/hardware/*
+!/log/hardware/stability-validation-2026-10-28.log
+!/log/hardware/stability-validation-2026-10-28-summary.md
+!/log/hardware/stability-soak-72h-2026-10-28.log
+!/log/hardware/status-soak-72h-2026-10-28.log
+!/log/hardware/status-soak-72h-clean-2026-10-28.log
 
 # Mac
 .DS_Store

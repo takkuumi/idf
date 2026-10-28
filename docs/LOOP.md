@@ -1031,3 +1031,36 @@ just test-compile    # 仅编译测试 binary
 - 默认固件完整协议栈 72 小时浸泡测试。
 - 若产品启用 Wi-Fi 或 RS485 透传，必须先完成对应功能设计和实机验证；当前固件不宣称
   这两项能力已启用。
+
+## LOOP37 holding A/B 写入并发与真机恢复复核 (2026-10-28)
+
+- 调查发现 `BUG.MD` 中保存和恢复日志对应不同芯片 MAC，原有证据不能证明同一设备发生 generation 回退。当前设备两个槽原始读回均通过 CRC，generation 7/8，加载器选择较新的 slot 1。
+- 为手持机 BLE 即时保存与 DeviceActor 延迟保存加互斥，串行化 active generation/slot 选择、擦写、回读校验和 active 状态发布，避免并发覆盖同一 inactive slot。
+- 启动诊断现在输出较旧有效槽和无效槽头/CRC 信息，便于定位后续真实损坏或格式不匹配。
+- `cargo check`、默认测试目标编译、release build 通过；完整 factory 刷写保留 holding/NVS 后启动加载 slot 1 generation 8。
+- 保存互斥改动前构建的固件完成约 10 分钟设备 soak，Modbus TCP 每秒读取组态区均成功；之后复位再次加载 slot 1 generation 8，两个原始槽 CRC 均有效。Web 初始未认证请求返回预期 301，随后认证状态查询返回 code 0。包含互斥改动的最终 release 固件再次完整刷写后启动正常并加载 slot 1 generation 8；本轮没有对最终互斥版重复 10 分钟 soak 或并发写压力。
+- 边界：本次没有模拟擦除/写入中途物理断电；长时结果仅代表本次 10 分钟观测，不代表 100% 或 72 小时稳定性。
+
+
+## LOOP38 固件稳定性浸泡与 holding 双槽复核 (2026-10-28)
+
+- 默认 v2.2.7 release 镜像完整刷入真实设备，所有烧录分段读回校验通过，保留 NVS/holding。
+- 四个 Modbus TCP 端口持续 30 分钟，完成 7,180 次轮询，无协议或传输错误；四端口满 8 客户端通过，第 9 个客户端按上限关闭。
+- Web 状态直连轮询 60/60 成功；链路持续在线、恢复模式 Normal、故障计数为零，堆内存低水位保持稳定。
+- 对 PLC alias 40051 原值执行 10 次同值写入；再执行 `0x0000 → 0xA55A → 0x0000` 两次真实值保存与复位恢复。Flash 双槽 generation 15/16 CRC 均有效；两次重启分别选择正确的新槽，最终寄存器恢复 `0x0000`。
+- 复位启动日志确认 BLE 广播、W5500/IP、Web、NFC 检测和四个 Modbus TCP 监听均恢复。完整日志及 CRC/构建结果见 `log/hardware/stability-validation-2026-10-28-summary.md`。
+- 持久化写入附近有一个 60 秒窗口记录 16 次超过 5ms 的主循环迭代、峰值 35ms；后续两个窗口恢复为零 miss、峰值低于 4.7ms。保留为瞬时调度延迟观察项。
+- 边界：未模拟 Flash 写入中断电源；Rust 测试镜像只做编译检查；无真实 AI 电流源、RS485 从站或手持机 BLE 客户端；本轮 30 分钟不替代 72 小时 soak。
+- 已于 `2026-10-28T11:26:47Z` 启动同一设备/镜像的只读 72 小时四端口浸泡，实时记录 `log/hardware/stability-soak-72h-2026-10-28.log`；尚未完成，不计为通过。
+- 已另启 Web 健康状态旁路监控，60 秒采样一次 uptime、reset_count、heap、link、恢复模式及故障计数，日志为 `log/hardware/status-soak-72h-2026-10-28.log`；尚未完成，不计为通过。
+- Modbus 字节分片/流水/非法长度与功能码、慢片段客户端回收，以及畸形/慢 HTTP 请求后服务恢复测试通过；测试输出追加在 `log/hardware/stability-validation-2026-10-28.log`。
+- Web 监控已增加 12 小时会话续期和登录页重试；3 秒续期实测 8/8 成功。无故障注入的干净 Web 72 小时监控从 `2026-10-28T13:19:27Z` 重新开始，日志为 `log/hardware/status-soak-72h-clean-2026-10-28.log`。
+
+## LOOP39 HTTP 慢滴送看门狗风险修复与 v2.2.8 生产候选 (2026-10-28)
+
+- 修复 Web 单线程 HTTP parser 的总耗时无界问题：以前每次 socket read 虽有 3 秒超时，但攻击者可持续在超时前滴送数据，长期阻塞已订阅 Task WDT 的 Web task。
+- 请求行、headers 和普通 POST body 共享 8 秒绝对 deadline；每次阻塞读取把 socket timeout 缩短到剩余时间。OTA 保持独立流式进度超时和 WDT 喂狗路径。
+- 新增 slow-drip 单测并完成编译；生产特性 default/F3/F4 与 Modbus TCP-only check、Clippy `-D warnings`、fmt 均通过。
+- 固件升至 v2.2.8，完整 factory 布局刷写；bootloader、partition、otadata、app 分段均通过回读校验，NVS/holding 保留。app SHA-256: `5754f7ad6bf583c776f4f58b65d5f059c91426386195cb9940a38c4405e89655`，Modbus FW version=`0x00E4`。
+- 真实设备慢滴送 HTTP header/body 分别在 8.09s/8.03s 断开；之后 Web 返回 HTTP 200、Modbus 四端口恢复。此前错误的长测 UART `busy` 由遗留 espflash monitor 占用造成，已停止并重连采集器。
+- v2.2.8 的 Modbus/Web/UART 72 小时计时分别于 `14:25:26Z`、`14:25:50Z`、`14:26:20Z` 启动；仍在运行，未完成，不计为通过。当前实时日志分别是 `v2.2.8-soak-modbus-72h-2026-10-28.log`、`v2.2.8-soak-web-72h-2026-10-28.log`、`v2.2.8-soak-serial-72h-2026-10-28.log`。

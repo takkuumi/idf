@@ -57,7 +57,7 @@ const RS485_ENTRY_SIZE: usize = 15;
 // 数据结构
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rs485Config {
     pub baudrate: u32,
     pub data_bits: u8,
@@ -145,6 +145,8 @@ pub enum WriteResult {
     Reset,
     /// 地址不在配置区, 调用方应尝试 holding_buf 兜底
     NotFound,
+    /// 地址属于配置区，但值违反该字段协议范围；调用方必须拒绝整个写入。
+    InvalidValue,
 }
 
 pub const SENSOR_CHANNELS: usize = 8; // 校准寄存器通道数 (对齐参考固件 SENSOR_NUM=8)
@@ -204,18 +206,15 @@ impl SystemConfig {
             ble_name,
             rs485: [
                 Rs485Config::default(),
-                Rs485Config::default(),
-                // RS485-3 默认: 9600 baud, slave, addr=1
+                // MCA default policy: RS485-1 is master, RS485-2 is slave.
                 Rs485Config {
-                    baudrate: 9600,
-                    data_bits: 8,
-                    stop_bits: 1,
-                    parity: 0,
-                    slave_addr: 1,
-                    mode: 1, // Slave
-                    retry_count: 0,
-                    timeout_ms: 1000,
-                    interval_ms: 20,
+                    mode: 1,
+                    ..Rs485Config::default()
+                },
+                // RS485-3 is slave-only when explicitly enabled.
+                Rs485Config {
+                    mode: 1,
+                    ..Rs485Config::default()
                 },
             ],
             tcp_ports: regs::TCP_PORTS_DEFAULT,
@@ -666,21 +665,45 @@ impl SystemConfig {
                 let r = &mut self.rs485[i];
                 match off {
                     0 => {
+                        let parity = (value >> 10) & 0x3;
+                        if parity > 2 {
+                            return WriteResult::InvalidValue;
+                        }
                         let baud_idx = ((value >> 12) & 0xF) as u32;
                         let baud_table: [u32; 16] = [
                             9600, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200,
                             128000, 153600, 230400, 256000, 460800, 921600,
                         ];
                         r.baudrate = *baud_table.get(baud_idx as usize).unwrap_or(&9600);
-                        r.parity = ((value >> 10) & 0x3) as u8;
+                        r.parity = parity as u8;
                         r.stop_bits = (((value >> 9) & 0x1) + 1) as u8;
                         r.data_bits = if (value >> 8) & 0x1 != 0 { 7 } else { 8 };
                         r.mode = if value & 0xFF == 1 { 0 } else { 1 };
                     }
-                    1 => r.slave_addr = value as u8,
-                    2 => r.retry_count = value, // LOOP5 修复: 之前 2..=4 => {} 漏存 retry/timeout/interval
-                    3 => r.timeout_ms = value,
-                    4 => r.interval_ms = value,
+                    1 => {
+                        if !(1..=247).contains(&value) {
+                            return WriteResult::InvalidValue;
+                        }
+                        r.slave_addr = value as u8;
+                    }
+                    2 => {
+                        if value > 5 {
+                            return WriteResult::InvalidValue;
+                        }
+                        r.retry_count = value;
+                    }
+                    3 => {
+                        if !(20..=5000).contains(&value) {
+                            return WriteResult::InvalidValue;
+                        }
+                        r.timeout_ms = value;
+                    }
+                    4 => {
+                        if !(20..=5000).contains(&value) {
+                            return WriteResult::InvalidValue;
+                        }
+                        r.interval_ms = value;
+                    }
                     _ => {}
                 }
                 // RS485 配置 — 用户可编辑, Persist (运行时切换由 rs485::port 监听).
@@ -1182,6 +1205,8 @@ mod tests {
     #[test]
     fn test_rs485_persist_three_physical_ports() {
         let mut cfg = SystemConfig::defaults();
+        assert_eq!(cfg.rs485[0].mode, 0, "RS485-1 defaults to master");
+        assert_eq!(cfg.rs485[1].mode, 1, "RS485-2 defaults to slave");
         // PC/C++: 115200 / Even / 1 stop / 8 data / Master = 0x9801
         let word1 = 0x9801u16;
         // idx=0, baud=115200, parity=Even, stop=1, data=8, mode=0
@@ -1210,6 +1235,28 @@ mod tests {
         assert_eq!(cfg.write_reg(0x08B5, 0x9000), WriteResult::NotFound);
         assert_eq!(cfg.rs485[0].baudrate, before.baudrate);
         assert_eq!(cfg.read_reg(0x08B5), None);
+    }
+
+    #[test]
+    fn test_rs485_rejects_out_of_runtime_range_values_without_mutation() {
+        let mut cfg = SystemConfig::defaults();
+        let before = cfg.rs485[0].clone();
+        for (addr, value) in [
+            (regs::HOLD_RS485_BASE + 1, 248),
+            (regs::HOLD_RS485_BASE + 2, 6),
+            (regs::HOLD_RS485_BASE + 3, 19),
+            (regs::HOLD_RS485_BASE + 3, 5001),
+            (regs::HOLD_RS485_BASE + 4, 19),
+            (regs::HOLD_RS485_BASE + 4, 5001),
+        ] {
+            assert_eq!(cfg.write_reg(addr, value), WriteResult::InvalidValue);
+            assert_eq!(cfg.rs485[0], before, "invalid write {addr:#06x}={value}");
+        }
+        assert_eq!(
+            cfg.write_reg(regs::HOLD_RS485_BASE, 0x4C01),
+            WriteResult::InvalidValue
+        );
+        assert_eq!(cfg.rs485[0], before, "reserved parity must be rejected");
     }
 
     /// RS485 写入后, 立即读取必须返回相同值 (RCU RMW 闭环)

@@ -83,7 +83,7 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
             // 原 MCA: sensorValue = map(raw, max, min, 4095, 0),
             // gucAnalogData = 4095 - sensorValue。因此 raw 越接近 max，输出越接近 0。
             // 代数等价形式是直接把 [min,max] 映射到 [4095,0]。
-            let scaled = map_range(avg, cal_min, cal_max, 4095, 0);
+            let scaled = legacy_scaled_value(avg, cal_min, cal_max);
             let status = if (cal_max as i32 - avg as i32) > 240 {
                 0
             } else {
@@ -107,6 +107,14 @@ fn effective_calibration(min: u16, max: u16) -> (u16, u16) {
     } else {
         (ai_calib::SENSOR_MIN, ai_calib::SENSOR_MAX)
     }
+}
+
+/// 对齐旧 MCA `Get_Analog()` 的最终输出：先把 ADC 值映射到 0..4095，
+/// 然后清除小于 20 的零点噪声。映射直接写成等价的正向表达式，
+/// 避免旧实现 `4095 - map(raw, max, min, 4095, 0)` 的双重反向造成误读。
+fn legacy_scaled_value(raw: u16, cal_min: u16, cal_max: u16) -> u16 {
+    let scaled = map_range(raw, cal_min, cal_max, 4095, 0);
+    if scaled < 20 { 0 } else { scaled }
 }
 
 /// 读取 SENSOR_MIN/MAX 校准值数组 (LOOP12: 返回 [u16; CHANNEL_COUNT] 同步 cfg 切换).
@@ -198,5 +206,17 @@ mod tests {
         // 最终输出使用 [min,max] -> [4095,0]，与原固件取反后的结果一致。
         assert_eq!(map_range(3016, 605, 3016, 4095, 0), 0);
         assert_eq!(map_range(605, 605, 3016, 4095, 0), 4095);
+    }
+
+    #[test]
+    fn test_legacy_scaled_value_matches_mca_transfer_and_zero_deadband() {
+        assert_eq!(legacy_scaled_value(605, 605, 3016), 4095);
+        assert_eq!(legacy_scaled_value(3016, 605, 3016), 0);
+        // 与旧固件的 gucAnalogData < 20 清零行为一致。
+        assert_eq!(legacy_scaled_value(3005, 605, 3016), 0);
+        assert_eq!(legacy_scaled_value(3004, 605, 3016), 20);
+        // 输入越界时沿旧固件映射结果饱和到 0..4095。
+        assert_eq!(legacy_scaled_value(0, 605, 3016), 4095);
+        assert_eq!(legacy_scaled_value(4095, 605, 3016), 0);
     }
 }

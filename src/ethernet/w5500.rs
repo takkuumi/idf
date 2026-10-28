@@ -527,6 +527,7 @@ extern "C" fn ip_event_cb(
                 (gw_raw >> 16) as u8,
                 (gw_raw >> 24) as u8,
             ],
+            (esp_idf_sys::esp_timer_get_time() / 1_000) as u32,
         ));
     }
 }
@@ -587,6 +588,79 @@ extern "C" fn eth_event_cb(
     } else if disconnected {
         ETH_LINK_UP.store(false, Ordering::Release);
     }
+    if connected || disconnected {
+        let event_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32;
+        crate::bus::send_event(crate::bus::IoEvent::EthernetLink(connected, event_ms));
+    }
+}
+
+/// Log PHY transitions from the main loop, keeping formatting and driver IO out
+/// of ESP-IDF's system event task. `event_ms` is captured in the event callback,
+/// so this reports both the true transition time and dispatch latency.
+pub(crate) fn log_link_transition(up: bool, event_ms: u32) {
+    let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32;
+    let dispatch_ms = now_ms.wrapping_sub(event_ms);
+    if !up {
+        log::warn!(
+            "[eth-link] DOWN at uptime={}ms (event dispatch={}ms)",
+            event_ms,
+            dispatch_ms
+        );
+        return;
+    }
+
+    let handle = ETH_HANDLE.load(Ordering::Acquire);
+    if handle.is_null() {
+        log::warn!(
+            "[eth-link] UP at uptime={}ms (event dispatch={}ms), negotiated speed/duplex unavailable",
+            event_ms,
+            dispatch_ms
+        );
+        return;
+    }
+
+    let mut speed = esp_idf_sys::eth_speed_t_ETH_SPEED_10M;
+    let mut duplex = esp_idf_sys::eth_duplex_t_ETH_DUPLEX_HALF;
+    let speed_ret = unsafe {
+        esp_idf_sys::esp_eth_ioctl(
+            handle,
+            esp_idf_sys::esp_eth_io_cmd_t_ETH_CMD_G_SPEED,
+            &mut speed as *mut _ as *mut _,
+        )
+    };
+    let duplex_ret = unsafe {
+        esp_idf_sys::esp_eth_ioctl(
+            handle,
+            esp_idf_sys::esp_eth_io_cmd_t_ETH_CMD_G_DUPLEX_MODE,
+            &mut duplex as *mut _ as *mut _,
+        )
+    };
+    if speed_ret != esp_idf_sys::ESP_OK || duplex_ret != esp_idf_sys::ESP_OK {
+        log::warn!(
+            "[eth-link] UP at uptime={}ms (event dispatch={}ms), negotiated speed/duplex query failed: speed=0x{:08X} duplex=0x{:08X}",
+            event_ms,
+            dispatch_ms,
+            speed_ret,
+            duplex_ret
+        );
+        return;
+    }
+
+    let speed_mbps = match speed {
+        esp_idf_sys::eth_speed_t_ETH_SPEED_100M => 100,
+        _ => 10,
+    };
+    let duplex_name = match duplex {
+        esp_idf_sys::eth_duplex_t_ETH_DUPLEX_FULL => "full",
+        _ => "half",
+    };
+    log::info!(
+        "[eth-link] UP at uptime={}ms (event dispatch={}ms), negotiated={}Mbps/{}-duplex",
+        event_ms,
+        dispatch_ms,
+        speed_mbps,
+        duplex_name
+    );
 }
 
 // ---- 心跳：每 5s 检测网关连通性；连续失败进入网络降级，绝不自动重启 ----

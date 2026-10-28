@@ -52,6 +52,10 @@ const LEGACY_TOTAL_BYTES: usize = LEGACY_HEADER_BYTES + HOLDING_DATA_BYTES;
 static ACTIVE_SLOT: AtomicU8 = AtomicU8::new(NO_ACTIVE_SLOT);
 static ACTIVE_GENERATION: AtomicU32 = AtomicU32::new(0);
 static LEGACY_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+/// Serialize generation/target-slot selection and the flash write. Immediate
+/// BLE saves and delayed DeviceActor saves may otherwise race and choose the
+/// same inactive A/B slot.
+static PERSIST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 static HOLDING_BUFFER: LazyLock<Mutex<Box<[u8]>>> =
     LazyLock::new(|| Mutex::new(vec![0u8; RAW_TOTAL_BYTES].into_boxed_slice()));
@@ -117,6 +121,9 @@ impl LoadedHoldingState {
 /// 保存当前 holding_buf。函数名保留以避免改变 DeviceActor 调用接口；实际权威
 /// 存储已经迁到独立 raw partition。
 pub fn save_to_nvs() -> AppResult<()> {
+    let _persist_guard = PERSIST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let holding_dirty = HOLDING_DIRTY.swap(false, Ordering::AcqRel);
     let legacy_dirty = LEGACY_IO_DIRTY.swap(false, Ordering::AcqRel);
     if !holding_dirty && !legacy_dirty {
@@ -305,15 +312,56 @@ fn load_best_raw_slot() -> AppResult<Option<DecodedSlot>> {
     };
     let mut best: Option<DecodedSlot> = None;
     for slot in 0..SLOT_COUNT as u8 {
-        if let Some(decoded) = read_slot(partition, slot, &mut buffer)?
-            && best
-                .as_ref()
-                .is_none_or(|current| generation_is_newer(decoded.generation, current.generation))
-        {
-            best = Some(decoded);
+        match read_slot(partition, slot, &mut buffer)? {
+            Some(decoded)
+                if best.as_ref().is_none_or(|current| {
+                    generation_is_newer(decoded.generation, current.generation)
+                }) =>
+            {
+                best = Some(decoded);
+            }
+            Some(decoded) => {
+                log::warn!(
+                    "[holding] slot {} valid but older: generation {} (current newer)",
+                    slot,
+                    decoded.generation
+                );
+            }
+            None => {
+                log_invalid_slot(slot, &buffer);
+            }
         }
     }
     Ok(best)
+}
+
+fn log_invalid_slot(slot: u8, blob: &[u8]) {
+    if blob.len() < RAW_HEADER_BYTES {
+        log::warn!("[holding] slot {} invalid: short header", slot);
+        return;
+    }
+    let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap_or_default());
+    let version = u16::from_le_bytes(blob[4..6].try_into().unwrap_or_default());
+    let words = u16::from_le_bytes(blob[6..8].try_into().unwrap_or_default());
+    let generation = u32::from_le_bytes(blob[8..12].try_into().unwrap_or_default());
+    let stored_crc = u32::from_le_bytes(blob[12..16].try_into().unwrap_or_default());
+    let computed_crc = if version == RAW_VERSION && blob.len() >= RAW_TOTAL_BYTES {
+        crate::device::crc32(&blob[RAW_HEADER_BYTES..RAW_TOTAL_BYTES])
+    } else if version == LEGACY_RAW_VERSION && blob.len() >= LEGACY_RAW_TOTAL_BYTES {
+        crate::device::crc32(&blob[RAW_HEADER_BYTES..LEGACY_RAW_TOTAL_BYTES])
+    } else {
+        0
+    };
+    log::warn!(
+        "[holding] slot {} invalid: magic=0x{:08X} version={} words={} generation={} crc=0x{:08X}/0x{:08X}",
+        slot,
+        magic,
+        version,
+        words,
+        generation,
+        stored_crc,
+        computed_crc
+    );
 }
 
 fn write_slot(slot: u8, blob: &mut [u8]) -> AppResult<()> {

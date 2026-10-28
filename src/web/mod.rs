@@ -46,7 +46,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bus::storage_state::storage_read_with;
 use crate::bus::{IO, config_state::config_read_with};
@@ -74,6 +74,10 @@ const MAX_HTTP_PATH: usize = 192;
 const MAX_COOKIE_VALUE: usize = 512;
 const MAX_FORM_VALUE: usize = 256;
 const JSON_RESPONSE_MAX: usize = 128;
+/// Header and ordinary request bodies must complete within a bounded window.
+/// A socket read timeout alone is insufficient: a peer can drip one byte just
+/// before every timeout and monopolize this single Web task indefinitely.
+const REQUEST_PARSE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 默认用户名
 const DEFAULT_USERNAME: &str = "admin";
 /// 默认密码 (NVS 未保存时使用)
@@ -612,9 +616,15 @@ fn json_response(response_type: &str, code: &str) -> heapless::String<JSON_RESPO
 fn read_bounded_header_line(
     reader: &mut BufReader<TcpStream>,
     line: &mut heapless::String<MAX_HEADER_LINE>,
+    deadline: Instant,
 ) -> std::io::Result<usize> {
     line.clear();
     loop {
+        set_read_timeout_to_deadline(
+            reader.get_ref(),
+            deadline,
+            "http header parse deadline exceeded",
+        )?;
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return Ok(line.len());
@@ -643,6 +653,20 @@ fn read_bounded_header_line(
     }
 }
 
+fn set_read_timeout_to_deadline(
+    stream: &TcpStream,
+    deadline: Instant,
+    message: &'static str,
+) -> std::io::Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message));
+    };
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message));
+    }
+    stream.set_read_timeout(Some(remaining.min(Duration::from_secs(3))))
+}
+
 /// 解析请求行 + headers (不含 body)
 ///
 /// LOOP9 安全加固:
@@ -651,11 +675,12 @@ fn read_bounded_header_line(
 // OTA 走流式 (handle_ota_upload_stream), 其余路由走 read_exact 上限 MAX_BODY_SIZE.
 fn parse_request_headers(
     stream: TcpStream,
-) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>)> {
+) -> std::io::Result<(HttpRequest, usize, BufReader<TcpStream>, Instant)> {
     let mut reader = BufReader::new(stream);
+    let deadline = Instant::now() + REQUEST_PARSE_TIMEOUT;
     // 读请求行 (限制长度)
     let mut request_line = heapless::String::<MAX_HEADER_LINE>::new();
-    if read_bounded_header_line(&mut reader, &mut request_line)? == 0 {
+    if read_bounded_header_line(&mut reader, &mut request_line, deadline)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "empty http request",
@@ -681,7 +706,7 @@ fn parse_request_headers(
     let mut header_bytes = request_line.len();
     loop {
         let mut line = heapless::String::<MAX_HEADER_LINE>::new();
-        if read_bounded_header_line(&mut reader, &mut line)? == 0 {
+        if read_bounded_header_line(&mut reader, &mut line, deadline)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "http headers not terminated",
@@ -729,13 +754,47 @@ fn parse_request_headers(
         },
         content_length,
         reader,
+        deadline,
     ))
+}
+
+/// Read a bounded ordinary HTTP body with a total deadline. OTA uses its own
+/// streaming path and idle-progress timeout, so it intentionally does not use
+/// this helper.
+fn read_bounded_body(
+    reader: &mut BufReader<TcpStream>,
+    body: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut received = 0;
+    while received < body.len() {
+        set_read_timeout_to_deadline(
+            reader.get_ref(),
+            deadline,
+            "http body parse deadline exceeded",
+        )?;
+        match reader.read(&mut body[received..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "http body truncated",
+                ));
+            }
+            Ok(count) => received += count,
+            Err(ref error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    || error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// 解析请求行 + headers + body (body 走 read_exact, 上限 MAX_BODY_SIZE).
 /// OTA 路由不调用此函数 (走流式).
 fn parse_request(stream: TcpStream) -> std::io::Result<HttpRequest> {
-    let (mut req, content_length, mut reader) = parse_request_headers(stream)?;
+    let (mut req, content_length, mut reader, deadline) = parse_request_headers(stream)?;
     if content_length > MAX_BODY_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -744,7 +803,7 @@ fn parse_request(stream: TcpStream) -> std::io::Result<HttpRequest> {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body)?;
+        read_bounded_body(&mut reader, &mut body, deadline)?;
     }
     req.body = body;
     Ok(req)
@@ -759,6 +818,7 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let path_peek = parse_request_headers(stream)?;
     let req = path_peek.0;
     let content_length = path_peek.1;
+    let deadline = path_peek.3;
     let mut reader = path_peek.2;
 
     log::debug!(
@@ -794,7 +854,7 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body)?;
+        read_bounded_body(&mut reader, &mut body, deadline)?;
         req.body = body;
         let stream = reader.into_inner();
         return dispatch_request(stream, req);
@@ -1288,64 +1348,83 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         return send_json(stream, 405, &json_response("updateportconfig", "405"));
     }
 
-    let index: usize = req
+    let mut invalid = || {
+        send_json(
+            stream,
+            200,
+            &json_response("updateportconfig", "0x01000003"),
+        )
+    };
+    let Some(index) = req
         .form_field("index")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.parse::<usize>().ok())
+    else {
+        return invalid();
+    };
     // C++ 字段名为 retrycount/responeinteval/tti，新前端 index.html 用 retry/timeout/interval；
     // 同时兼容两套命名 (旧前端优先，C++ 兼容)
-    let baud_idx: u32 = req
-        .form_field("baud")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let baud: u32 = if (baud_idx as usize) < C_BAUD_TABLE.len() {
-        C_BAUD_TABLE[baud_idx as usize]
-    } else {
-        9600
+    let Some(baud_idx) = req.form_field("baud").and_then(|s| s.parse::<usize>().ok()) else {
+        return invalid();
     };
-    let mode: u8 = req
+    let Some(mode) = req
         .form_field("masterslaveport")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let slave_addr: u16 = req
+        .and_then(|s| s.parse::<u8>().ok())
+    else {
+        return invalid();
+    };
+    let Some(slave_addr) = req
         .form_field("slaveaddress")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let databits: u8 = req
-        .form_field("datalen")
-        .and_then(|s| s.parse().ok())
-        .map(|v: u16| if v == 1 { 7 } else { 8 })
-        .unwrap_or(8);
-    let stopbits: u8 = req
-        .form_field("stopbit")
-        .and_then(|s| s.parse().ok())
-        .map(|v: u16| if v == 1 { 2 } else { 1 })
-        .unwrap_or(1);
-    let parity: u8 = req
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return invalid();
+    };
+    let Some(data_len) = req.form_field("datalen").and_then(|s| s.parse::<u8>().ok()) else {
+        return invalid();
+    };
+    let Some(stop_bit) = req.form_field("stopbit").and_then(|s| s.parse::<u8>().ok()) else {
+        return invalid();
+    };
+    let Some(parity) = req
         .form_field("checkmode")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let retry: u16 = req
+        .and_then(|s| s.parse::<u8>().ok())
+    else {
+        return invalid();
+    };
+    let Some(retry) = req
         .form_field("retrycount")
         .or_else(|| req.form_field("retry"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let timeout: u16 = req
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return invalid();
+    };
+    let Some(timeout) = req
         .form_field("responeinteval")
         .or_else(|| req.form_field("timeout"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
-    let interval: u16 = req
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return invalid();
+    };
+    let Some(interval) = req
         .form_field("tti")
         .or_else(|| req.form_field("interval"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return invalid();
+    };
+    let baud = C_BAUD_TABLE.get(baud_idx).copied().unwrap_or_default();
+    let databits = if data_len == 1 { 7 } else { 8 };
+    let stopbits = if stop_bit == 1 { 2 } else { 1 };
 
     if index >= 3
-        || baud_idx as usize >= C_BAUD_TABLE.len()
+        || baud_idx >= C_BAUD_TABLE.len()
         || mode > 2
+        || data_len > 1
+        || stop_bit > 1
         || !(1..=247).contains(&slave_addr)
         || parity > 2
+        || retry > 5
+        || !(20..=5000).contains(&timeout)
+        || !(20..=5000).contains(&interval)
     {
         return send_json(
             stream,
@@ -1959,6 +2038,60 @@ fn escape_json(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slow_tcp_pair(
+        bytes: &'static [u8],
+        delay: Duration,
+    ) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let client = TcpStream::connect(addr).expect("connect test client");
+        let (server, _) = listener.accept().expect("accept test client");
+        let writer = std::thread::spawn(move || {
+            let mut client = client;
+            for byte in bytes {
+                if client.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(delay);
+            }
+        });
+        (server, writer)
+    }
+
+    #[test]
+    fn test_http_header_total_deadline_stops_slow_drip() {
+        let (stream, writer) =
+            slow_tcp_pair(b"GET /status HTTP/1.1\r\n", Duration::from_millis(30));
+        let mut reader = BufReader::new(stream);
+        let mut line = heapless::String::<MAX_HEADER_LINE>::new();
+        let start = Instant::now();
+        let result =
+            read_bounded_header_line(&mut reader, &mut line, start + Duration::from_millis(120));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "elapsed={:?}",
+            start.elapsed()
+        );
+        writer.join().expect("slow header writer");
+    }
+
+    #[test]
+    fn test_http_body_total_deadline_stops_slow_drip() {
+        let (stream, writer) = slow_tcp_pair(b"abcdefghijkl", Duration::from_millis(30));
+        let mut reader = BufReader::new(stream);
+        let mut body = [0u8; 12];
+        let start = Instant::now();
+        let result = read_bounded_body(&mut reader, &mut body, start + Duration::from_millis(120));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "elapsed={:?}",
+            start.elapsed()
+        );
+        writer.join().expect("slow body writer");
+    }
 
     #[test]
     fn test_json_response_format() {

@@ -170,7 +170,10 @@ fn store_device_function_config(data: &[u8]) -> bool {
     if count == 0 || count > 255 {
         return false;
     }
-    let table_words = count + 1;
+    // PRegBuf layout: count, `count` record pointers, then one terminal offset.
+    // `parse_poll_table` reads the terminal offset at base + count + 1, so the
+    // first record must start after all count + 2 header words.
+    let table_words = count + 2;
     if table_words >= crate::config::regs::HOLD_PXX_COUNT {
         return false;
     }
@@ -210,6 +213,13 @@ fn store_device_function_config(data: &[u8]) -> bool {
         data_word += record.len().div_ceil(2);
         pos += len;
     }
+    // This offset bounds the final variable-length record and is mandatory for
+    // the runtime parser. Without it, the runtime treats the config as corrupt
+    // after reboot even though the raw words were persisted successfully.
+    if data_word > u16::MAX as usize || data_word >= crate::config::regs::HOLD_PXX_COUNT {
+        return false;
+    }
+    words[count + 1] = data_word as u16;
     // BLE receives the complete legacy configuration frame atomically.  The
     // MCA transport opens the same 0x55AA PRegBuf commit gate around that
     // frame; use the shared backend gate so BLE and PC Modbus persistence are
@@ -219,7 +229,20 @@ fn store_device_function_config(data: &[u8]) -> bool {
     if !written {
         crate::bus::backends::disarm_logic_write();
     }
-    written
+    if !written {
+        return false;
+    }
+
+    // The holding store coalesces ordinary Modbus writes for two seconds. A
+    // handheld D0 transaction has an explicit success ACK, so make that ACK
+    // mean the complete table has reached the verified A/B flash slot.
+    match crate::device::holding_store::save_to_nvs() {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("[logic_cfg] table persist failed: {error}");
+            false
+        }
+    }
 }
 
 /// MCA D0 subcommands 0x20/0x21 are the two RS485 port records.  The legacy

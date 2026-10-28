@@ -415,9 +415,9 @@ async function loadPorts() {
             ${modes.map((m,n) => `<option value="${n}" ${n===v('masterslaveport_',0)?'selected':''}>${m}</option>`).join('')}
           </select></div>
           <div class="field"><label>从站地址</label><input id="p_addr_${i}" type="number" min="1" max="247" value="${v('slaveaddress_',1)}"></div>
-          <div class="field"><label>重试次数</label><input id="p_retry_${i}" type="number" min="0" max="65535" value="${v('retrycount_',3)}"></div>
-          <div class="field"><label>发送响应间隔(ms)</label><input id="p_timeout_${i}" type="number" min="0" max="65535" value="${v('responeinteval_',1000)}"></div>
-          <div class="field"><label>通信间隔(ms)</label><input id="p_tti_${i}" type="number" min="0" max="65535" value="${v('tti_',20)}"></div>
+          <div class="field"><label>重试次数 (0–5)</label><input id="p_retry_${i}" type="number" min="0" max="5" value="${v('retrycount_',3)}"></div>
+          <div class="field"><label>响应超时 (20–5000 ms)</label><input id="p_timeout_${i}" type="number" min="20" max="5000" value="${v('responeinteval_',1000)}"></div>
+          <div class="field"><label>轮询间隔 (20–5000 ms)</label><input id="p_tti_${i}" type="number" min="20" max="5000" value="${v('tti_',20)}"></div>
         </div>
       </div>`;
     }

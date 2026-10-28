@@ -1814,11 +1814,9 @@ fn handle_mca_custom_command(
     // 旧 MCA 手持机协议在修改网络参数或以太网 MAC 后会在应答发送完成
     // 后复位设备。通过 DeviceActor 统一落盘，只有配置成功持久化后才
     // 请求复位，避免手持机收到成功应答但重启后配置丢失。
-    if matches!(func, 0xC7 | 0xCD) {
-        if !crate::device::request_persist_config_and_reset() {
-            log::error!("[ble_at] MCA custom cmd 0x{func:02X}: config reset request rejected");
-            return false;
-        }
+    if matches!(func, 0xC7 | 0xCD) && !crate::device::request_persist_config_and_reset() {
+        log::error!("[ble_at] MCA custom cmd 0x{func:02X}: config reset request rejected");
+        return false;
     }
     send_ble_frame(tx_id, proto_id, &rsp, conn_id);
     true
