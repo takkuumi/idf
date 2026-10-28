@@ -61,6 +61,7 @@ def main() -> None:
     initial_reset_count: int | None = None
     samples = 0
     errors = 0
+    transient_retries = 0
     minimum_heap: int | None = None
     print(
         f"start={datetime.now(timezone.utc).isoformat()} host={args.host} duration={args.duration}s interval={args.interval}s",
@@ -73,16 +74,24 @@ def main() -> None:
                 login()
                 login_at = time.monotonic()
                 print(f"web_session_refreshed at={datetime.now(timezone.utc).isoformat()}", flush=True)
-            try:
+            def read_status() -> dict:
                 with opener.open(f"{base}/getsystemstatus", timeout=5) as response:
-                    envelope = json.load(response)
-            except (json.JSONDecodeError, ValueError):
-                # An expired/replaced session may redirect to login HTML. Refresh
-                # once and retry this sample before classifying it as a failure.
+                    return json.load(response)
+
+            try:
+                envelope = read_status()
+            except (OSError, TimeoutError, json.JSONDecodeError, ValueError) as first_error:
+                # A single TCP reset/timeout or an expired-session HTML response
+                # is retried once. The retry is explicitly logged; only a second
+                # failure counts against the soak result.
+                transient_retries += 1
+                print(
+                    f"web_retry n={transient_retries} type={type(first_error).__name__} detail={first_error}",
+                    flush=True,
+                )
                 login()
                 login_at = time.monotonic()
-                with opener.open(f"{base}/getsystemstatus", timeout=5) as response:
-                    envelope = json.load(response)
+                envelope = read_status()
             if envelope.get("type") != "getsystemstatus":
                 login()
                 login_at = time.monotonic()
@@ -122,7 +131,7 @@ def main() -> None:
 
     print(
         f"end={datetime.now(timezone.utc).isoformat()} duration={time.monotonic()-start:.1f}s "
-        f"samples={samples} errors={errors} min_heap={minimum_heap}",
+        f"samples={samples} errors={errors} retries={transient_retries} min_heap={minimum_heap}",
         flush=True,
     )
     if errors:
