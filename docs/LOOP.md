@@ -12,6 +12,13 @@
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
+## LOOP40 手持机组态逻辑掉电丢失修复（2026-10-29）
+
+- 根因：手持机 1.0.78 将 B1/B3 编码在 MBAP transaction id 中，实际 PDU 使用 FC16 向 `2300+` 写入数量/偏移表和逻辑记录；BLE FC16 路径没有像旧 MCA BLE 接收器一样打开 `4222=0x55AA` 提交闸门，PRegBuf 只在 RAM 更新，未置 holding dirty。
+- 修复：BLE 组态区 FC16 写入恢复旧固件的一次性提交语义；解析 2300 表头的终止偏移，在最后一条记录写完后同步完成 holding A/B 保存和 CRC 回读校验，再返回成功响应。空组态在表头写入完成时同步保存；普通 TCP/RTU 写保护策略不变。
+- 回归覆盖：组态末块边界、奇数字节尾记录及空表提交判断；`cargo check`、默认测试目标编译和 Release 构建通过后刷入真实设备。
+- 实机验收：待烧录后通过真实手持机执行配置、断电/上电，并读取 B1/B3 数据核对；在完成该步骤前不宣称手机端掉电恢复已实测通过。
+
 ## Web 首页系统信息展示（2026-10-29）
 
 - [x] “运行监控”首页新增只读系统信息：设备名称、制造商、型号、固件版本。
@@ -648,7 +655,7 @@ espflash reset --port /dev/cu.usbserial-1430
 | 0xD0-D3 | LOGIC/COM_REQUEST | – | ✅ | logic_handlers |
 | 0xD0-DF | READ_RS485_INDEX_VALUE | 用户址 | ✅ | generic FC=04 arm |
 | 0xE0-EF | READ_RS485_CUSTOM_VALUE | 用户址 | ✅ | generic FC=03 arm |
-| 0xB0-B3 | DEVICE_FUNCTION_COUNT/CONFIG | 0x08FC | ⚠️ | 见已知限制 (需自定义子协议) |
+| 0xB0-B3 | DEVICE_FUNCTION_COUNT/CONFIG | 0x08FC+ | ✅ | Android transaction ID + FC16；最终逻辑块同步写 holding A/B |
 | 0xB4-B7 | DEVICE_TEXT_COUNT/DATA | 0x1388 | ⚠️ | 见已知限制 (需分片重组) |
 
 ### MCA 地址对齐审计结论
@@ -692,7 +699,7 @@ espflash reset --port /dev/cu.usbserial-1430
 ### 已知限制 (不在本 LOOP 范围)
 - Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
 - BLE 二进制协议无分片重组缓冲 (>MTU 命令无法解析) — 影响 0xB4-B7 DEVICE_TEXT 多包流程
-- DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 子协议未实现 — 需自定义 read/write arm
+- DEVICE_FUNCTION_COUNT/CONFIG (0xB0-B3) 当前按 Android transaction ID + Modbus FC16 实现；保存语义与实机验收见 LOOP40
 - NFC blob 仅覆盖 holding_buf 前 880 words (后 1168 words 不备份) — 历史记录，器件型号曾误判为 ST25DV64KC
 - AI 通道数硬编码 6 (F4 设备 8 通道需 HAL 层配合)
 - MONITOR_PLC (30001-30128) / CONTROL_PLC (40001-40300) 区未实现 — 仅老 SCADA 系统需要
@@ -825,8 +832,8 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 | # | 原限制 | 状态 | 说明 |
 |---|--------|------|------|
 | 1 | BLE 分片重组 (>MTU 0xB4-B7) | ⏸️ LOOP13 待办 | 无 MCA 参考协议，需 Android BLE write trace 逆向 |
-| 2 | DEVICE_FUNCTION 0xB0/B1 (FUNC_COUNT) | ✅ **LOOP12 已实施** | 复用 `read_hold_reg(0x08FC)`, 25 行 |
-| 2b | DEVICE_FUNCTION 0xB2/B3 (TLV config) | ⏸️ LOOP13 待办 | 需 TLV entry 设计 + 0x08FE+ 冲突解决 (3-5 天) |
+| 2 | DEVICE_FUNCTION 0xB0/B1 (FUNC_COUNT) | ✅ | B0 读取兼容；B1 是 BLE FC16 transaction ID，写完整数量/偏移表 |
+| 2b | DEVICE_FUNCTION 0xB2/B3 (logic config) | ✅ | B3 是 BLE FC16 transaction ID，2300+ 逻辑表落入 holding A/B |
 | 3 | NFC blob 仅 880 words | ✅ **LOOP29 已按实机纠正** | ST25DV16KC: `MEMORY_END=0x07FF`, 0x0120..0x07FF 共 1760 字节/880 words，与原 C++ 对齐 |
 | 4 | AI 通道数硬编码 6 (F4 8 通道) | ✅ **LOOP12 已实施** | cfg 切换: f4=8 通道, 其它=6 通道 |
 | 5 | MONITOR_PLC/CONTROL_PLC 区未实现 | ✅ **LOOP12 已实施** | DI/DO/AI/holding_buf 别名映射 |
@@ -840,12 +847,12 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 - **ETH 链路秒级检测**: `src/ethernet/w5500.rs` 新增 `ETH_LINK_UP` AtomicBool + `spawn_eth_link_watch` (订阅 ETH_EVENT 2/3), heartbeat 顶部查 flag
 - **PLC 别名区**: `config.rs` 新增 4 个常量 (0x7531-0x75B0 / 0x9C41-0x9D6C); `backends.rs` 新增 read/write range arm, 映射到 DI/DO/AI/holding_buf
 - **F4 8 通道 AI**: `io_state.rs::AiState` [6]→[8]; `io_global.rs` LazyLock 6→8; `channel/ai.rs::CHANNEL_COUNT` cfg; `read_sensor_calib` 同步返回类型
-- **DEVICE_FUNCTION 0xB0/0xB1**: `ble_at/mod.rs` 新增 arm, READ/WRITE FUNC_COUNT (0x08FC) 经 `backends::read_hold_reg/write_hold_reg`
+- **DEVICE_FUNCTION 0xB0/0xB1**: B0 读取 FUNC_COUNT；B1 由 Android 作为 transaction ID 携带 FC16 完整表头写入 2300+
 - **NFC EEPROM 容量纠正**: 实机为 ST25DV16KC，撤销此前 0x1FFF/3824 words 的错误扩容结论，恢复 0x07FF/880 words 原 C++ 布局
 
 ### 不实施项 (3 个, 文档化保留)
 - **BLE 分片重组**: 协议规范未知, 需 Android 端 BLE write trace 逆向
-- **0xB2/0xB3 TLV config**: TLV 5-word entry 设计 + 0x08FE+ 寄存器冲突需先决
+- **0xB2/0xB3**: Android 1.0.78 使用 transaction ID 携带 FC16 写逻辑记录，不是独立 Modbus 功能码
 - **Web CSRF/HTTPS/密码哈希**: LOOP11 内网决策保留
 
 ### 编译验证

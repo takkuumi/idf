@@ -1295,6 +1295,13 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
         && u16::from_be_bytes([pdu[0], pdu[1]]) == crate::config::regs::HOLD_IP_BASE
         && u16::from_be_bytes([pdu[2], pdu[3]]) == 12
         && pdu[4] == 24;
+    let handheld_logic_write = func == 0x10
+        && pdu.len() >= 7
+        && u16::from_be_bytes([pdu[0], pdu[1]]) >= crate::config::regs::HOLD_DEVICE_CONFIG
+        && u16::from_be_bytes([pdu[0], pdu[1]]) <= crate::config::regs::HOLD_CFG_END
+        && pdu[4] as usize == pdu.len() - 5
+        && pdu[4].is_multiple_of(2)
+        && u16::from_be_bytes([pdu[2], pdu[3]]) as usize == pdu[4] as usize / 2;
     let pdu_len = if handheld_ip_write {
         if validate_handheld_ip_write_pdu(pdu) {
             let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
@@ -1321,6 +1328,33 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
             pdu_buf[1] = 0x03; // Illegal data value
             2
         }
+    } else if handheld_logic_write {
+        let address = u16::from_be_bytes([pdu[0], pdu[1]]);
+        let count = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
+        // The MCA BLE receive loop arms 0x55AA around every FC16 frame. Preserve
+        // that contract here so handheld B1/B3 configuration data reaches the
+        // durable holding store rather than only the RAM RCU snapshot.
+        crate::bus::backends::arm_logic_write();
+        let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+        if written >= 2 && pdu_buf[0] == 0x10 {
+            let final_logic_block = is_final_handheld_logic_block(address, count);
+            if final_logic_block {
+                match crate::device::holding_store::save_to_nvs() {
+                    Ok(()) => written,
+                    Err(error) => {
+                        log::error!("[ble_at] handheld logic table persistence failed: {error}");
+                        pdu_buf[0] = 0x90;
+                        pdu_buf[1] = 0x04;
+                        2
+                    }
+                }
+            } else {
+                written
+            }
+        } else {
+            crate::bus::backends::disarm_logic_write();
+            written
+        }
     } else {
         crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf)
     };
@@ -1328,6 +1362,58 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
     response.push(slave).ok()?;
     response.extend_from_slice(&pdu_buf[..pdu_len]).ok()?;
     Some(response)
+}
+
+/// Returns true when a handheld FC16 block completes the variable-length
+/// device-function table declared at 2300. The following function text is a
+/// separate NVS object; persisting on this final block makes the DReg/PReg
+/// table durable before its successful BLE response is sent.
+fn is_final_handheld_logic_block(address: u16, count: usize) -> bool {
+    crate::bus::storage_state::storage_read_with(|s| {
+        is_final_logic_table_block(
+            &s.holding_buf,
+            crate::config::regs::HOLD_PXX_BASE,
+            crate::config::regs::HOLD_DEVICE_CONFIG,
+            crate::config::regs::HOLD_CFG_END,
+            address,
+            count,
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn is_final_logic_table_block(
+    holding: &[u16],
+    holding_base: u16,
+    logic_base: u16,
+    holding_end: u16,
+    address: u16,
+    count: usize,
+) -> bool {
+    let Some(base) = logic_base.checked_sub(holding_base).map(usize::from) else {
+        return false;
+    };
+    let Some(&logic_count) = holding.get(base) else {
+        return false;
+    };
+    if logic_count == 0 {
+        return address == logic_base && count >= 2;
+    }
+    if logic_count > 255 {
+        return false;
+    }
+    let Some(end_index) = base.checked_add(logic_count as usize + 1) else {
+        return false;
+    };
+    let Some(&terminal_offset) = holding.get(end_index) else {
+        return false;
+    };
+    if terminal_offset < logic_count + 2 {
+        return false;
+    }
+    let end = address as usize + count;
+    let declared_end = logic_base as usize + terminal_offset as usize;
+    end <= holding_end as usize + 1 && (end == declared_end || end == declared_end + 1)
 }
 
 /// Validate Android's 12-register IP payload. The actual app call site emits
@@ -1613,27 +1699,17 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     {
         return true;
     }
-    // ---- DEVICE_FUNCTION_COUNT (LOOP12: 0xB0/0xB1, 映射到 Modbus 0x08FC) ----
-    // Android 1.0.78 通过自定义 opcodes 读写 FUNC_COUNT 寄存器, 走自定义子协议不走 Modbus FC.
-    // 原 fall through 路径把 0xB0 当作 Modbus FC=176 (illegal function), Android 报 "无自定义功能".
-    //
-    if func == 0xB0 || func == 0xB1 {
+    // ---- DEVICE_FUNCTION_COUNT (B0 custom read; B1 is FC16 tx type) ----
+    // Android's B1/B3 are transaction IDs in the MBAP-like header, not the
+    // Modbus function byte. B1 carries an FC16 write to 0x08FC with the full
+    // [count, offsets..., terminal offset] header; handle it through the same
+    // BLE FC16 persistence path as subsequent B3 record writes.
+    if func == 0xB0 {
         let mut rsp: heapless::Vec<u8, 32> = heapless::Vec::new();
         let _ = rsp.push(unit);
         let _ = rsp.push(func);
-        if func == 0xB0 {
-            // READ 0x08FC
-            let val = crate::bus::backends::read_hold_reg(regs::FUNC_COUNT).unwrap_or(0);
-            let _ = rsp.extend_from_slice(&val.to_be_bytes());
-        } else {
-            // WRITE 0x08FC: data[8..10] = 16-bit BE value
-            if data.len() < 10 {
-                return false;
-            }
-            let val = u16::from_be_bytes([data[8], data[9]]);
-            let _ = crate::bus::backends::write_hold_reg(regs::FUNC_COUNT, val);
-            // WRITE 应答: 不带数据
-        }
+        let val = crate::bus::backends::read_hold_reg(regs::FUNC_COUNT).unwrap_or(0);
+        let _ = rsp.extend_from_slice(&val.to_be_bytes());
         send_ble_frame(tx_id, proto_id, &rsp, conn_id);
         return true;
     }
@@ -1759,7 +1835,17 @@ fn handle_handheld_config_text(
                     return false;
                 }
             }
-            if !crate::bus::backends::write_hold_regs(write_addr, &values) {
+            // Preserve the commit behavior for clients that carry the B3
+            // transmission type in the function byte. The stock Android app
+            // uses function 0x10 and is committed in build_embedded_* above.
+            if func == 0xB3 {
+                crate::bus::backends::arm_logic_write();
+            }
+            let written = crate::bus::backends::write_hold_regs(write_addr, &values);
+            if func == 0xB3 && !written {
+                crate::bus::backends::disarm_logic_write();
+            }
+            if !written {
                 return false;
             }
             // Android parses every write response as the standard Modbus
@@ -3791,6 +3877,66 @@ mod tests_ble_cmd {
                 Some(expected)
             );
         }
+        assert!(
+            crate::bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn test_handheld_logic_table_final_block_matches_declared_end() {
+        use crate::config::regs;
+
+        // Handheld B1 header for one three-byte record:
+        // count=1, record starts at offset 3, terminal offset=5.
+        let mut holding = vec![0u16; regs::HOLD_PXX_COUNT];
+        let base = (regs::HOLD_DEVICE_CONFIG - regs::HOLD_PXX_BASE) as usize;
+        holding[base..base + 3].copy_from_slice(&[1, 3, 5]);
+        assert!(!is_final_logic_table_block(
+            &holding,
+            regs::HOLD_PXX_BASE,
+            regs::HOLD_DEVICE_CONFIG,
+            regs::HOLD_CFG_END,
+            regs::HOLD_DEVICE_CONFIG + 3,
+            1,
+        ));
+        assert!(is_final_logic_table_block(
+            &holding,
+            regs::HOLD_PXX_BASE,
+            regs::HOLD_DEVICE_CONFIG,
+            regs::HOLD_CFG_END,
+            regs::HOLD_DEVICE_CONFIG + 3,
+            2,
+        ));
+        assert!(!is_final_logic_table_block(
+            &holding,
+            regs::HOLD_PXX_BASE,
+            regs::HOLD_DEVICE_CONFIG,
+            regs::HOLD_CFG_END,
+            regs::HOLD_DEVICE_CONFIG + 3,
+            3,
+        ));
+        // Odd byte-sized records round their data write up to a whole word,
+        // while the handheld's terminal offset is floor(byte_offset / 2).
+        assert!(is_final_logic_table_block(
+            &holding,
+            regs::HOLD_PXX_BASE,
+            regs::HOLD_DEVICE_CONFIG,
+            regs::HOLD_CFG_END,
+            regs::HOLD_DEVICE_CONFIG + 3,
+            3,
+        ));
+
+        // An empty B1 table is itself the complete transaction and must also
+        // force the empty configuration to durable flash immediately.
+        holding[base..base + 2].copy_from_slice(&[0, 0]);
+        assert!(is_final_logic_table_block(
+            &holding,
+            regs::HOLD_PXX_BASE,
+            regs::HOLD_DEVICE_CONFIG,
+            regs::HOLD_CFG_END,
+            regs::HOLD_DEVICE_CONFIG,
+            2,
+        ));
     }
 
     #[test]
