@@ -934,13 +934,10 @@ fn dispatch_request(mut stream: TcpStream, req: HttpRequest) -> std::io::Result<
 /// POST /login
 fn handle_login(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
     if req.method != "POST" {
-        // GET: 返回登录页面
-        return send_response(
-            stream,
-            200,
-            "text/html; charset=utf-8",
-            pages::LOGIN_HTML.as_bytes(),
-        );
+        // GET 未认证时只渲染制造商名称。制造商是公开设备标识；其它系统信息
+        // 仍只能通过认证后的 /getsysteminfo 读取，避免借登录页绕过认证。
+        let page = login_page_html();
+        return send_response(stream, 200, "text/html; charset=utf-8", page.as_bytes());
     }
     let username = req.form_field("username").unwrap_or_default();
     let pwd = req.form_field("pwd").unwrap_or_default();
@@ -2037,6 +2034,33 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// 将制造商名称安全地嵌入未登录页面的 HTML 文本节点。
+///
+/// 系统信息允许用户通过 Web 修改，不能把原始值直接拼进页面，否则会把
+/// 制造商字段变成持久化的 HTML/脚本注入点。
+fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 构造登录页。仅注入制造商字段，不提供未认证的系统信息 API。
+fn login_page_html() -> String {
+    pages::LOGIN_HTML.replace(
+        "{{MANUFACTURER}}",
+        &escape_html_text(&load_web_system_info().manufacturer),
+    )
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -2119,6 +2143,22 @@ mod tests {
     }
 
     #[test]
+    fn test_login_manufacturer_is_html_escaped() {
+        assert_eq!(
+            escape_html_text("迈锐<&>\"'"),
+            "迈锐&lt;&amp;&gt;&quot;&#39;"
+        );
+        assert!(pages::LOGIN_HTML.contains("工业测控执行器管理系统"));
+        assert!(pages::LOGIN_HTML.contains("{{MANUFACTURER}}"));
+        let rendered = pages::LOGIN_HTML.replace(
+            "{{MANUFACTURER}}",
+            &escape_html_text("<script>alert(1)</script>"),
+        );
+        assert!(rendered.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!rendered.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
     fn test_url_decode() {
         assert_eq!(
             url_decode_into::<32>("hello%20world").unwrap(),
@@ -2174,7 +2214,9 @@ mod tests {
             );
         }
         assert!(pages::INDEX_HTML.contains("工业测控执行器管理系统"));
-        assert!(pages::LOGIN_HTML.contains("工业控制器登录界面"));
+        assert!(pages::LOGIN_HTML.contains("工业测控执行器管理系统"));
+        assert!(pages::LOGIN_HTML.contains("{{MANUFACTURER}}"));
+        assert!(!pages::LOGIN_HTML.contains("工业控制器登录界面"));
     }
 
     #[test]
