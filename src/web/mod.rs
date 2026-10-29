@@ -90,10 +90,10 @@ const NVS_KEY_WEB_PWD_FLAG: &str = "web_pwd_f";
 const NVS_KEY_WEB_SYSTEM_INFO: &str = "web_sysinfo";
 const WEB_SYSTEM_INFO_FIELD_LEN: usize = 63;
 const WEB_SYSTEM_INFO_BLOB_LEN: usize = (WEB_SYSTEM_INFO_FIELD_LEN + 1) * 3;
-// 与旧固件 WebIndex.cpp 在 /SystemInfo.txt 不存在时保留的页面占位值一致。
+// 未保存系统信息时使用的展示默认值；旧固件从 /SystemInfo.txt 读取这些字段。
 // 一旦用户通过 Web 保存系统信息，NVS 中的显式值优先于这些默认值。
 const DEFAULT_WEB_DEVICE_NAME: &str = "工业测控执行器";
-const DEFAULT_WEB_MANUFACTURER: &str = "上海穆祯智能科技有限公司";
+const DEFAULT_WEB_MANUFACTURER: &str = "深圳迈锐交通有限公司";
 const DEFAULT_WEB_MODEL: &str = "MZ-MCA-SFP";
 #[cfg(feature = "f4")]
 const MCA_WEB_VERSION: &str = "F4";

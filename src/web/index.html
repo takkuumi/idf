@@ -99,6 +99,15 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
   <!-- 运行监控面板 -->
   <div id="p-monitor">
     <div class="card">
+      <h2>系统信息</h2>
+      <div class="row">
+        <div class="field"><label>设备名称</label><output class="read-value" id="info_devicename"></output></div>
+        <div class="field"><label>制造商</label><output class="read-value" id="info_manufacturer"></output></div>
+        <div class="field"><label>型号</label><output class="read-value" id="info_model"></output></div>
+        <div class="field"><label>固件版本</label><output class="read-value" id="info_version"></output></div>
+      </div>
+    </div>
+    <div class="card">
       <h2>I/O口信息 · 设备状态</h2>
       <div class="state-list" id="state_list"></div>
     </div>
@@ -143,7 +152,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
         <div class="field"><label>设备名称</label><input id="s_devicename" maxlength="63"></div>
         <div class="field"><label>制造商</label><input id="s_manufacturer" maxlength="63"></div>
         <div class="field"><label>型号</label><input id="s_model" maxlength="63"></div>
-        <div class="field"><label>固件版本</label><output class="read-value" id="s_version">-</output></div>
+        <div class="field"><label>固件版本</label><output class="read-value" id="s_version"></output></div>
       </div>
       <div class="nav">
         <button class="btn btn-p" id="system_info_save_btn" onclick="saveSystemInfo()">保存系统信息</button>
@@ -293,11 +302,14 @@ async function loadSysInfo() {
     const r = await fetch('/getsysteminfo');
     const j = await r.json();
     if (j.data) {
+      for (const key of ['devicename', 'manufacturer', 'model', 'version']) {
+        $('#info_' + key).textContent = j.data[key] || '';
+      }
       $('#fw_ver').textContent = j.data.version || '';
       $('#s_devicename').value = j.data.devicename || '';
       $('#s_manufacturer').value = j.data.manufacturer || '';
       $('#s_model').value = j.data.model || '';
-      $('#s_version').textContent = j.data.version || '-';
+      $('#s_version').textContent = j.data.version || '';
     }
   } catch(e) { console.error('sysinfo', e); }
 }

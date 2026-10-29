@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-08-14 (LOOP36: Web 持久化实机闭环与 DHCP 状态修复)
+> 最后更新: 2026-10-29 (Web 首页系统信息展示)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,13 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## Web 首页系统信息展示（2026-10-29）
+
+- [x] “运行监控”首页新增只读系统信息：设备名称、制造商、型号、固件版本。
+- [x] 与“基本配置 → 系统信息”共用 `/getsysteminfo` 返回值；保存后重新读取并同步展示。
+- [x] 使用 `textContent` 渲染文本，空字段保持空白；不增加接口、轮询或前端依赖。
+- [x] 未保存系统信息时，制造商默认显示为“深圳迈锐交通有限公司”；已保存的 NVS 值优先。
 
 ## LOOP36 Web 持久化实机闭环与 DHCP 状态修复（2026-08-14）
 
