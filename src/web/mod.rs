@@ -90,6 +90,11 @@ const NVS_KEY_WEB_PWD_FLAG: &str = "web_pwd_f";
 const NVS_KEY_WEB_SYSTEM_INFO: &str = "web_sysinfo";
 const WEB_SYSTEM_INFO_FIELD_LEN: usize = 63;
 const WEB_SYSTEM_INFO_BLOB_LEN: usize = (WEB_SYSTEM_INFO_FIELD_LEN + 1) * 3;
+// 与旧固件 WebIndex.cpp 在 /SystemInfo.txt 不存在时保留的页面占位值一致。
+// 一旦用户通过 Web 保存系统信息，NVS 中的显式值优先于这些默认值。
+const DEFAULT_WEB_DEVICE_NAME: &str = "工业测控执行器";
+const DEFAULT_WEB_MANUFACTURER: &str = "上海穆祯智能科技有限公司";
+const DEFAULT_WEB_MODEL: &str = "MZ-MCA-SFP";
 #[cfg(feature = "f4")]
 const MCA_WEB_VERSION: &str = "F4";
 #[cfg(not(feature = "f4"))]
@@ -156,9 +161,9 @@ fn decode_web_system_info(blob: &[u8]) -> Option<WebSystemInfo> {
 
 fn load_web_system_info_from_nvs() -> WebSystemInfo {
     let fallback = WebSystemInfo {
-        device_name: "工业测控执行器".to_string(),
-        manufacturer: String::new(),
-        model: "MR-MCA-200".to_string(),
+        device_name: DEFAULT_WEB_DEVICE_NAME.to_string(),
+        manufacturer: DEFAULT_WEB_MANUFACTURER.to_string(),
+        model: DEFAULT_WEB_MODEL.to_string(),
     };
     crate::device::try_with_nvs(|nvs| {
         let mut blob = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
