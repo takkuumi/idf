@@ -54,7 +54,8 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .ai-bar{flex:1;height:6px;background:#2a3340;border-radius:3px;overflow:hidden}
 .ai-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:3px;transition:width .3s}
 .ai-val{font-size:18px;font-weight:600;min-width:42px;text-align:right;font-variant-numeric:tabular-nums}
-.ai-ma{font-size:11px;color:var(--dim);min-width:50px}
+.ai-val.invalid{color:var(--dim);font-size:14px}
+.ai-ma{font-size:11px;color:var(--dim);min-width:72px}
 .nav{display:flex;gap:10px;margin-top:14px}
 .port-card{padding:14px 0;border-bottom:1px solid var(--border)}
 .port-card:first-of-type{padding-top:0}.port-card:last-of-type{border-bottom:0;padding-bottom:0}
@@ -509,10 +510,16 @@ async function pollIO() {
       keys.forEach(k => {
         const n = k.replace('ai_addr_', '');
         const v = d.ai_data[k];
-        const pct = Math.min(100, (v / 4095) * 100);
+        const min = Number((d.ai_data_min || {})[`ai_addr_min_${n}`] || 0);
+        const max = Number((d.ai_data_max || {})[`ai_addr_max_${n}`] || 0);
+        const calibrated = min > 0 && max > min;
+        const pct = calibrated ? Math.min(100, (v / 4095) * 100) : 0;
+        const value = calibrated ? v : '—';
+        const state = calibrated ? '校准量/4095' : '未校准/无输入';
         aiHtml += `<div class="ai-item"><span style="min-width:32px;font-size:12px;color:var(--dim)">AI${n}</span>
           <div class="ai-bar"><i style="width:${pct}%"></i></div>
-          <span class="ai-val">${v}</span></div>`;
+          <span class="ai-val${calibrated ? '' : ' invalid'}">${value}</span>
+          <span class="ai-ma">${state}</span></div>`;
       });
     }
     $('#ai_list').innerHTML = aiHtml;

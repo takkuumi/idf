@@ -2193,6 +2193,8 @@ mod tests {
         assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"n_mac\""));
         assert!(pages::INDEX_HTML.contains("onclick=\"saveNetwork()\""));
         assert!(pages::INDEX_HTML.contains("onclick=\"saveIdentity()\""));
+        assert!(pages::INDEX_HTML.contains("未校准/无输入"));
+        assert!(pages::INDEX_HTML.contains("ai_data_min"));
         assert!(pages::INDEX_HTML.contains("网络参数已保存，重启设备后生效"));
         assert!(pages::INDEX_HTML.contains("设备基本信息已保存"));
         assert!(pages::INDEX_HTML.contains("async function runAction"));
