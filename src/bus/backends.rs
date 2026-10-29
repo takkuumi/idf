@@ -59,6 +59,13 @@ fn is_logic_config_addr(addr: u16) -> bool {
     (regs::HOLD_DEVICE_CONFIG..=regs::HOLD_CFG_END).contains(&addr)
 }
 
+/// MCA 组播配置位于原始 PRegBuf 2190..2194，而不是 SystemConfig。
+/// 修改后必须写入 holding A/B 槽，否则重启后 UDP 又会回到未配置状态。
+#[inline]
+fn is_multicast_config_addr(addr: u16) -> bool {
+    (regs::INREG_MULTICAST_IP1_2..=regs::INREG_SWITCH_IP3_4).contains(&addr)
+}
+
 #[inline]
 fn is_ble_name_hold_addr(addr: u16) -> bool {
     (regs::HOLD_BLE_ADDR_BASE..regs::HOLD_BLE_ADDR_BASE + regs::HOLD_BLE_ADDR_COUNT).contains(&addr)
@@ -972,6 +979,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             let mut config_needs_version_bump = false;
             let mut holding_changed = false;
             let mut logic_changed = false;
+            let mut multicast_changed = false;
             let mut protect_touched = false;
             let mut logic_commit = LOGIC_WRITE_ARMED.load(Ordering::Acquire);
             let mut holding = storage_clone();
@@ -1019,6 +1027,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                         let idx = (target - regs::HOLD_PXX_BASE) as usize;
                         Arc::make_mut(&mut holding.holding_buf)[idx] = value;
                         holding_changed = true;
+                        multicast_changed |= is_multicast_config_addr(target);
                         if is_logic_config_addr(target) {
                             logic_changed = true;
                         }
@@ -1058,6 +1067,9 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 }
                 if addr >= regs::HOLD_DEVICE_CONFIG {
                     crate::control_logic::mark_config_changed();
+                }
+                if multicast_changed {
+                    super::storage_state::mark_holding_dirty();
                 }
             }
         }
@@ -1207,6 +1219,9 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                         // One FC06 logical write consumes the same one-shot
                         // commit arm as the legacy Modbus implementation.
                         LOGIC_WRITE_ARMED.store(false, Ordering::Release);
+                        super::storage_state::mark_holding_dirty();
+                    }
+                    if is_multicast_config_addr(addr) {
                         super::storage_state::mark_holding_dirty();
                     }
                     if addr >= regs::HOLD_DEVICE_CONFIG {

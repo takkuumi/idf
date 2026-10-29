@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
 
 use crate::bus::config_state::config_read_with;
+use crate::bus::storage_state::storage_read_with;
 use crate::config::regs;
 use crate::error::AppResult;
 use crate::health::{self, TaskHb};
@@ -57,46 +58,63 @@ const BACKOFF_MS: u64 = 5000;
 ///
 /// LOOP11: 零拷贝, 闭包内构造 MulticastConfig 返回 (避免在 4KB 栈上 clone 大对象).
 fn read_multicast_config() -> MulticastConfig {
-    config_read_with(|cs| {
-        // 2190-2194 是 HOLD_CFG_BASE (0x0880) 偏移的子寄存器, 通过 SystemConfig::read_reg 读取
-        let mcast_ip12 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP1_2).unwrap_or(0);
-        let mcast_ip34 = cs.cfg.read_reg(regs::INREG_MULTICAST_IP3_4).unwrap_or(0);
-        let mcast_port = cs.cfg.read_reg(regs::INREG_MULTICAST_PORT).unwrap_or(0);
-        let switch_ip12 = cs.cfg.read_reg(regs::INREG_SWITCH_IP1_2).unwrap_or(0);
-        let switch_ip34 = cs.cfg.read_reg(regs::INREG_SWITCH_IP3_4).unwrap_or(0);
-
-        let group = if mcast_ip12 == 0 && mcast_ip34 == 0 {
-            DEFAULT_MCAST_ADDR
-        } else {
+    // 2190-2194 属于参考固件的原始 PRegBuf，不是 SystemConfig 结构化字段。
+    // 必须从 holding 快照读取；从 CONFIG.read_reg() 读取会永远得到 None/0，
+    // 使 SWITCH_IP 永远未配置，所有组播包都会被错误丢弃。
+    let [mcast_ip12, mcast_ip34, mcast_port, switch_ip12, switch_ip34] =
+        storage_read_with(|storage| {
+            let read = |addr: u16| {
+                addr.checked_sub(regs::HOLD_PXX_BASE)
+                    .and_then(|offset| storage.holding_buf.get(offset as usize))
+                    .copied()
+                    .unwrap_or(0)
+            };
             [
-                (mcast_ip12 >> 8) as u8,
-                (mcast_ip12 & 0xFF) as u8,
-                (mcast_ip34 >> 8) as u8,
-                (mcast_ip34 & 0xFF) as u8,
+                read(regs::INREG_MULTICAST_IP1_2),
+                read(regs::INREG_MULTICAST_IP3_4),
+                read(regs::INREG_MULTICAST_PORT),
+                read(regs::INREG_SWITCH_IP1_2),
+                read(regs::INREG_SWITCH_IP3_4),
             ]
-        };
-        let port = if mcast_port == 0 {
-            DEFAULT_MCAST_PORT
-        } else {
-            mcast_port
-        };
-        let switch_ip = if switch_ip12 == 0 && switch_ip34 == 0 {
-            None // 旧固件会与 0.0.0.0 精确比较，因此普通来源全部拒绝
-        } else {
-            Some([
-                (switch_ip12 >> 8) as u8,
-                (switch_ip12 & 0xFF) as u8,
-                (switch_ip34 >> 8) as u8,
-                (switch_ip34 & 0xFF) as u8,
-            ])
-        };
-        MulticastConfig {
-            group,
-            port,
-            switch_ip,
-        }
-    })
-    .unwrap_or_else(MulticastConfig::default)
+        })
+        .unwrap_or([0; 5]);
+
+    decode_multicast_config([mcast_ip12, mcast_ip34, mcast_port, switch_ip12, switch_ip34])
+}
+
+fn decode_multicast_config(
+    [mcast_ip12, mcast_ip34, mcast_port, switch_ip12, switch_ip34]: [u16; 5],
+) -> MulticastConfig {
+    let group = if mcast_ip12 == 0 && mcast_ip34 == 0 {
+        DEFAULT_MCAST_ADDR
+    } else {
+        [
+            (mcast_ip12 >> 8) as u8,
+            (mcast_ip12 & 0xFF) as u8,
+            (mcast_ip34 >> 8) as u8,
+            (mcast_ip34 & 0xFF) as u8,
+        ]
+    };
+    let port = if mcast_port == 0 {
+        DEFAULT_MCAST_PORT
+    } else {
+        mcast_port
+    };
+    let switch_ip = if switch_ip12 == 0 && switch_ip34 == 0 {
+        None // 旧固件会与 0.0.0.0 精确比较，因此普通来源全部拒绝
+    } else {
+        Some([
+            (switch_ip12 >> 8) as u8,
+            (switch_ip12 & 0xFF) as u8,
+            (switch_ip34 >> 8) as u8,
+            (switch_ip34 & 0xFF) as u8,
+        ])
+    };
+    MulticastConfig {
+        group,
+        port,
+        switch_ip,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -411,5 +429,27 @@ mod tests {
     fn multicast_source_does_not_treat_ipv6_as_ipv4() {
         let source: SocketAddr = "[::ffff:192.168.51.221]:5002".parse().unwrap();
         assert!(!source_is_allowed(&source, Some([192, 168, 51, 221])));
+    }
+
+    #[test]
+    fn multicast_config_decodes_raw_holding_words() {
+        let cfg = decode_multicast_config([
+            (239 << 8) | 1,
+            (2 << 8) | 3,
+            5003,
+            (192 << 8) | 168,
+            (51 << 8) | 221,
+        ]);
+        assert_eq!(cfg.group, [239, 1, 2, 3]);
+        assert_eq!(cfg.port, 5003);
+        assert_eq!(cfg.switch_ip, Some([192, 168, 51, 221]));
+    }
+
+    #[test]
+    fn multicast_config_keeps_exact_filter_disabled_when_zero() {
+        let cfg = decode_multicast_config([0, 0, 0, 0, 0]);
+        assert_eq!(cfg.group, DEFAULT_MCAST_ADDR);
+        assert_eq!(cfg.port, DEFAULT_MCAST_PORT);
+        assert_eq!(cfg.switch_ip, None);
     }
 }
