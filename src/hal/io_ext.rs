@@ -111,7 +111,7 @@ impl IoExtender {
         let mut bus = self.bus.lock();
         let mut result: u64 = 0;
         for i in 0..self.di_chip_count {
-            let bits = self.di_chips[i].read_inputs(&mut *bus)? as u64;
+            let bits = self.di_chips[i].read_inputs(&mut bus)? as u64;
             result |= bits << (i * 16);
         }
         Ok(result)
@@ -145,7 +145,7 @@ impl IoExtender {
         for i in 0..self.do_chip_count {
             let shift = i * 16;
             let do_bits = ((value >> shift) & 0xFFFF) as u16;
-            self.do_chips[i].write_outputs(&mut *bus, do_bits)?;
+            self.do_chips[i].write_outputs(&mut bus, do_bits)?;
         }
         // 只有全部芯片写成功后，缓存才代表已确认的硬件状态。
         self.do_cache.store_bits(value);
@@ -183,7 +183,7 @@ impl IoExtender {
         let mut bus = self.bus.lock();
         let mut result: u64 = 0;
         for i in 0..self.do_chip_count {
-            let bits = self.do_chips[i].read_outputs(&mut *bus)? as u64;
+            let bits = self.do_chips[i].read_outputs(&mut bus)? as u64;
             result |= bits << (i * 16);
         }
         Ok(result)

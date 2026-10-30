@@ -35,7 +35,7 @@ impl Mcp23017 {
     /// - PORTA + PORTB 全部配置为输入
     /// - 内部上拉使能 (光耦/按钮无外部上拉时必需)
     /// - LOOP13: 强制 IOCON.BANK=0 (写 0x00), 防止 I2C 噪声翻转后寄存器错位
-    ///         (MCP23017 上电默认 BANK=0, 但 I2C 噪声可能导致意外翻转)
+    ///   (MCP23017 上电默认 BANK=0, 但 I2C 噪声可能导致意外翻转)
     pub fn init_as_input(&self, bus: &mut I2cBus) -> AppResult<()> {
         // IOCON (0x0A): 写 0x00 强制 BANK=0, SEQOP=0 (与其他读写寄存器连续访问一致)
         bus.write_reg_byte(self.addr, cfg::REG_IOCON, 0x00)?;
