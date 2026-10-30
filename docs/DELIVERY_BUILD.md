@@ -1,6 +1,6 @@
 # 固件编译与客户交付指南
 
-> 适用产品：ESP32-S3 工业网关固件 v2.2.1
+> 适用产品：ESP32-S3 工业网关固件 v2.2.9 RC1
 >
 > 适用硬件：ESP32-S3 rev 0.2、8MB Flash、2MB PSRAM
 >
@@ -137,7 +137,7 @@ gateway-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
 建议目录结构：
 
 ```text
-gateway-v2.2.1-<commit>/
+gateway-v2.2.9-<commit>/
 ├── flash-download-tool/
 │   ├── bootloader.bin
 │   ├── partition-table.bin
@@ -152,7 +152,7 @@ gateway-v2.2.1-<commit>/
 在项目根目录执行以下命令可生成基础交付目录：
 
 ```bash
-release_id="gateway-v2.2.1-$(git rev-parse --short HEAD)"
+release_id="gateway-v2.2.9-$(git rev-parse --short HEAD)"
 
 mkdir -p "$release_id/flash-download-tool" "$release_id/ota"
 cp target/xtensa-esp32s3-espidf/release/bootloader.bin \

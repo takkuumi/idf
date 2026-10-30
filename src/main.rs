@@ -158,8 +158,25 @@ fn main() -> AppResult<()> {
     // 显式初始化 NVS 分区 (解决 LoadProhibited: BLE 代码加入后启动顺序改变)
     log::info!("[main] initializing NVS flash...");
     unsafe {
-        let ret = esp_idf_sys::nvs_flash_init();
-        if ret != esp_idf_sys::ESP_OK && ret != esp_idf_sys::ESP_ERR_NVS_NO_FREE_PAGES {
+        let mut ret = esp_idf_sys::nvs_flash_init();
+        if ret == esp_idf_sys::ESP_ERR_NVS_NO_FREE_PAGES
+            || ret == esp_idf_sys::ESP_ERR_NVS_NEW_VERSION_FOUND
+        {
+            // ESP-IDF requires erasing and reinitializing NVS when the
+            // partition is truncated or uses a newer on-device format.
+            // The independent raw holding partition remains intact.
+            log::warn!(
+                "[main] NVS requires recovery (err=0x{:x}); erasing NVS partition",
+                ret
+            );
+            let erase = esp_idf_sys::nvs_flash_erase();
+            if erase == esp_idf_sys::ESP_OK {
+                ret = esp_idf_sys::nvs_flash_init();
+            } else {
+                log::error!("[main] NVS recovery erase failed: 0x{:x}", erase);
+            }
+        }
+        if ret != esp_idf_sys::ESP_OK {
             log::warn!("[main] nvs_flash_init: 0x{:x}", ret);
         }
     }

@@ -119,6 +119,7 @@ mod health {{
     use std::sync::atomic::{{AtomicUsize, Ordering}};
     const MAX_TASKS: usize = 24;
     pub fn feed_wdt() {{}}
+    #[allow(deprecated)]
     {item(health, 'fn reserve_task_slot(')}
     #[test]
     fn test_registry_reservation_never_exceeds_reader_array_bound() {{
@@ -169,7 +170,7 @@ mod tcp_ports {{
 mod storage_confirmation {{
     use std::time::{{Duration, Instant}};
     #[derive(Debug)]
-    enum AppError {{ Config(String) }}
+    pub(crate) enum AppError {{ Config(String) }}
     type AppResult<T> = Result<T, AppError>;
     enum DeviceCmd {{ FlushPending {{ ticket: u32 }} }}
     {wait_statics}

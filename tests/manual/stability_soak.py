@@ -50,7 +50,7 @@ def main() -> None:
         "--expected-version",
         type=lambda value: int(value, 0),
         default=None,
-        help="fail if FC04 firmware-version register differs (for example 0x00E4)",
+        help="fail if FC04 firmware-version register differs (for example 0x00E5)",
     )
     parser.add_argument("--duration", type=int, default=600)
     parser.add_argument("--interval", type=float, default=1.0)

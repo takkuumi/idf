@@ -60,7 +60,7 @@ GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/test_udp_reconfi
 
 ```bash
 GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/production_acceptance.py \
-  192.168.51.226 --duration 600 --expected-version 0x00E4
+  192.168.51.226 --duration 600 --expected-version 0x00E5
 ```
 
 ## 7×24 放行门槛

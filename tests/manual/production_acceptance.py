@@ -171,7 +171,7 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0)
     parser.add_argument("--destination", type=int, default=1)
     parser.add_argument("--count", type=int, default=2)
-    parser.add_argument("--expected-version", type=lambda text: int(text, 0), default=0x00E4)
+    parser.add_argument("--expected-version", type=lambda text: int(text, 0), default=0x00E5)
     args = parser.parse_args()
     if args.duration <= 0 or args.interval < 0 or not 1 <= args.count <= 125 or not 0 <= args.destination <= 65536 - args.count:
         parser.error("invalid duration, interval or result window")
