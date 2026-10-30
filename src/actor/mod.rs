@@ -47,9 +47,9 @@ pub trait Actor: 'static + Send {
     fn init(&mut self) {}
     fn shutdown(&mut self) {}
 
-    /// 空闲回调 (mailbox 空时调用): 周期性工作 (如心跳喂狗, 状态轮询).
+    /// 每批最多 8 条消息后的周期回调（包括 mailbox 持续非空时）。
     /// 返回下次轮询前的睡眠时长 (Duration); 默认 10ms 让出 CPU.
-    /// Actor 线程不阻塞 mailbox 入队 (生产者始终能 `try_enqueue` 成功).
+    /// Actor 线程不阻塞 mailbox 入队；有界队列满时 `try_enqueue` 返回失败。
     fn idle(&mut self) -> Duration {
         Duration::from_millis(10)
     }
@@ -122,8 +122,9 @@ pub fn spawn<A: Actor>(mut actor: A) -> std::io::Result<(ActorRef<A>, ActorHandl
             crate::health::subscribe_wdt();
             actor.init();
             loop {
-                // 先尽量排空 mailbox (生产者在此期间仍可入队)
-                while let Some(msg) = mailbox.dequeue() {
+                // 持续生产不能饿死 idle 中的心跳和配置落盘。
+                for _ in 0..8 {
+                    let Some(msg) = mailbox.dequeue() else { break };
                     actor.handle(msg);
                     // LOOP15: 长消息处理 (NVS commit / 序列化 11KB 快照) 可能 > 10s,
                     // 每条消息后喂 WDT 避免触发系统复位

@@ -1,6 +1,6 @@
 [package]
 name = "esp32s3-iot-gateway"
-version = "2.2.8"
+version = "2.2.9"
 edition = "2024"
 authors = ["idf"]
 description = "ESP32-S3R2 嵌入式网关：以太网 W5500 + BLE + IO + AI/AO + RS485 + Modbus"
@@ -39,9 +39,9 @@ f3 = ["io-di-do"]
 f4 = ["io-di-do"]
 
 [dependencies]
-esp-idf-sys = { version = "0.37", features = ["binstart"] }
-esp-idf-hal = { version = "0.46", default-features = false, features = ["std"] }
-esp-idf-svc = { version = "0.52", features = ["alloc"] }
+esp-idf-sys = { version = "0.38", features = ["binstart"] }
+esp-idf-hal = { version = "0.47", default-features = false, features = ["std"] }
+esp-idf-svc = { version = "0.53", features = ["alloc"] }
 
 embedded-hal = "1.0"
 

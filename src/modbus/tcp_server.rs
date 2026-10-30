@@ -443,11 +443,7 @@ fn configured_ports() -> [u16; 4] {
 }
 
 fn ports_are_valid(ports: &[u16; 4]) -> bool {
-    ports.iter().all(|&port| port != 0)
-        && ports
-            .iter()
-            .enumerate()
-            .all(|(i, port)| !ports[..i].contains(port))
+    crate::device::system_config::valid_tcp_ports(ports)
 }
 
 /// 启动和故障恢复使用的完整绑定。调用时会关闭现有 listener；运行期正常配置

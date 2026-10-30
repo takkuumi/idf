@@ -27,6 +27,8 @@
 
 合并到 main_loop 的模块: ai-sample, ao-output, di-scan, do-output, eth-heartbeat
 
+生产实测状态与边界见 [本轮生产核查](testing/production-audit-2026-10-30.md)。
+
 详细架构见 [架构说明](architecture.md)
 
 完整 Flash、SRAM、PSRAM、任务栈和协议地址布局见
@@ -34,9 +36,9 @@
 
 ## 功能
 - ✅ Modbus TCP (502/503/504/5002): FC=01/02/03/04/05/06/15/16
-- ✅ Modbus RTU Master/Slave: 19200 8N1
+- ✅ Modbus RTU Master/Slave: 按端口配置（默认 9600 8N1）
 - ✅ BLE GATT 通知: Android 手持机兼容 (metuory-wireless-management-app-1.0.78)
-- ✅ AI 6 通道 100ms 采样, 滑动平均
+- ✅ AI 默认/F3 为 4 路、F4 为 8 路兼容窗口（硬件 ADC 驱动 6 路，余项为 0），100ms 滑动平均
 - ✅ AO 4 通道 PWM 输出
 - ✅ DI 16 通道去抖扫描
 - ✅ DO 16 通道事件驱动输出

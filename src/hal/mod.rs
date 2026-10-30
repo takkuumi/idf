@@ -52,6 +52,14 @@ pub use pca9555::Pca9555Duo;
 pub use pins::HalPins;
 pub use uart::UartPort;
 
+/// Legacy FIB1/FIB2 detection inputs are active-low (GPIO39/GPIO40).
+/// Shared by the physical indicators and Web; this is an input status,
+/// not a test of optical payload delivery or ring redundancy.
+pub fn fiber_status() -> [bool; 2] {
+    [crate::config::pins::FIB1_PIN, crate::config::pins::FIB2_PIN]
+        .map(|pin| unsafe { esp_idf_sys::gpio_get_level(pin as esp_idf_sys::gpio_num_t) } == 0)
+}
+
 /// 硬件抽象总句柄
 pub struct Hal {
     pub pins: HalPins,
@@ -226,6 +234,19 @@ impl Hal {
         #[cfg(not(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4")))))]
         {
             let _ = connected;
+            Ok(())
+        }
+    }
+
+    /// Update RS485 and fiber indicators together on PCA9555 boards.
+    pub fn set_port_leds(&self, rs485: [bool; 2], fiber: [bool; 2]) -> AppResult<()> {
+        #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
+        {
+            self.pca9555.set_port_leds(rs485, fiber)
+        }
+        #[cfg(not(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4")))))]
+        {
+            let _ = (rs485, fiber);
             Ok(())
         }
     }

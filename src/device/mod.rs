@@ -28,6 +28,7 @@
 //! - 兼容旧格式: 若 `proto_act` 不存在但 `proto_data` 存在, 迁移到 A
 
 pub mod holding_store;
+mod pending_save;
 pub mod system_config;
 
 use std::time::{Duration, Instant};
@@ -62,6 +63,8 @@ pub enum DeviceCmd {
     PersistHolding,
     /// Web“保存并重启”: 只有系统配置成功落盘后才请求复位。
     PersistConfigAndReset,
+    /// Execute the full barrier on DeviceActor's stack, then acknowledge ticket.
+    FlushPending { ticket: u32 },
 }
 
 /// DeviceActor: 单线程消费 DeviceCmd, 独占 NVS/commit/reload 状态.
@@ -70,6 +73,8 @@ pub struct DeviceActor {
     next_device_text_persist: Instant,
     next_config_persist: Instant,
     next_web_system_info_persist: Instant,
+    #[cfg(feature = "io-di-do")]
+    next_do_persist: Instant,
 }
 
 impl DeviceActor {
@@ -79,6 +84,8 @@ impl DeviceActor {
             next_device_text_persist: Instant::now(),
             next_config_persist: Instant::now(),
             next_web_system_info_persist: Instant::now(),
+            #[cfg(feature = "io-di-do")]
+            next_do_persist: Instant::now(),
         }
     }
 }
@@ -88,6 +95,14 @@ impl Actor for DeviceActor {
 
     fn handle(&mut self, msg: DeviceCmd) {
         match msg {
+            DeviceCmd::FlushPending { ticket } => {
+                let result = flush_pending_before_reset();
+                if let Err(error) = &result {
+                    log::error!("[device] requested persistence barrier failed: {error}");
+                }
+                PERSIST_WAIT_OK.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                PERSIST_WAIT_COMPLETED.store(ticket, std::sync::atomic::Ordering::Release);
+            }
             DeviceCmd::Commit => {
                 // 始终执行 commit. proto.status 的 "已开始" 信号由 backends::write_hold_reg
                 // (PROTO_COMMIT 分支) 在排队前 `proto_status_set(1)` 提供, 这里再 set 也是
@@ -162,6 +177,15 @@ impl Actor for DeviceActor {
     fn idle(&mut self) -> Duration {
         // 心跳喂狗 (Actor 线程独占调用, 等同原 watch_loop 每 50ms 一次)
         WATCH_HB.tick();
+        // Flash work belongs to this bounded background actor, not the 5ms
+        // network/IO loop. The existing throttle and value deduplication stay
+        // authoritative; pulse-only outputs are still excluded from saving.
+        #[cfg(feature = "io-di-do")]
+        if Instant::now() >= self.next_do_persist {
+            self.next_do_persist = Instant::now() + Duration::from_secs(1);
+            let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32;
+            persist_do_bits_throttled(now_ms);
+        }
         // 合并 PC/RTU/TCP 的连续 PRegBuf 写，在 Actor 上统一异步落盘。
         if Instant::now() >= self.next_holding_persist
             && (bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
@@ -177,12 +201,8 @@ impl Actor for DeviceActor {
             && CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire)
         {
             self.next_config_persist = Instant::now() + Duration::from_secs(1);
-            let generation = CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-            if let Err(e) = apply_config() {
-                CONFIG_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+            if let Err(e) = persist_config_now() {
                 log::error!("[device] config idle persist failed: {e}");
-            } else if CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-                CONFIG_DIRTY.store(false, std::sync::atomic::Ordering::Release);
             }
         }
         if Instant::now() >= self.next_web_system_info_persist {
@@ -193,10 +213,10 @@ impl Actor for DeviceActor {
             }
         }
         if Instant::now() >= self.next_device_text_persist
-            && DEVICE_TEXT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel)
+            && DEVICE_TEXT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
         {
             self.next_device_text_persist = Instant::now() + Duration::from_secs(1);
-            match save_current_device_text_to_nvs() {
+            match persist_pending_device_text(false) {
                 Ok(()) => {}
                 Err(e) => {
                     DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
@@ -245,6 +265,63 @@ const NVS_KEY_ACTIVE: &str = "proto_act";
 static DEVICE_TEXT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// SystemConfig 延迟合并持久化；避免 FC=06 连续配置把 mailbox/NVS 打满。
 static CONFIG_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CONFIG_PERSIST_LOCK: Mutex<()> = Mutex::new(());
+static DEVICE_TEXT_PERSIST_LOCK: Mutex<()> = Mutex::new(());
+static PERSIST_WAIT_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PERSIST_WAIT_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PERSIST_WAIT_COMPLETED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PERSIST_WAIT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct PersistWaitGuard;
+
+impl Drop for PersistWaitGuard {
+    fn drop(&mut self) {
+        PERSIST_WAIT_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Small-stack callers (HTTP/OTA) enqueue Flash work and await an explicit
+/// completion, rather than nesting NVS on top of their request parser stack.
+/// Busy/full/failed/timed-out saves are reported as failures, never "saved".
+pub fn await_pending_persistence() -> AppResult<()> {
+    use std::sync::atomic::Ordering;
+    if PERSIST_WAIT_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(AppError::Config(
+            "another persistence confirmation is pending".into(),
+        ));
+    }
+    let _guard = PersistWaitGuard;
+    let ticket = PERSIST_WAIT_NEXT
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    if !try_send_device_cmd(DeviceCmd::FlushPending { ticket }) {
+        return Err(AppError::Config(
+            "storage actor unavailable or queue full".into(),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if PERSIST_WAIT_COMPLETED.load(Ordering::Acquire) == ticket {
+            return if PERSIST_WAIT_OK.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(AppError::Config(
+                    "storage actor could not persist configuration".into(),
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Config(
+                "storage confirmation timed out; retry pending".into(),
+            ));
+        }
+        crate::health::feed_wdt();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 /// 配置写入代数，防止异步落盘期间的新写入被清除 dirty 标志。
 static CONFIG_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -493,6 +570,14 @@ pub fn init() -> AppResult<()> {
         SystemConfig::defaults()
     };
     let mut network_repaired = false;
+    if !system_config::valid_tcp_ports(&cfg.tcp_ports) {
+        log::warn!(
+            "[device] invalid saved Modbus TCP ports {:?}; restored defaults",
+            cfg.tcp_ports
+        );
+        cfg.tcp_ports = crate::config::regs::TCP_PORTS_DEFAULT;
+        network_repaired = true;
+    }
     // v2.2.6 briefly wrote Android's mask/gateway fields in reverse. Repair
     // only the unmistakable legacy pattern before starting the network stack.
     if cfg.repair_legacy_network_swap() {
@@ -848,16 +933,42 @@ pub fn persist_config_now() -> AppResult<()> {
     // pending.  This keeps the restart coil usable during degraded storage
     // conditions while still providing a hard persistence barrier after a
     // Modbus D98..D101 (or any other system-config) write.
+    pending_save::commit_pending(
+        &CONFIG_DIRTY,
+        &CONFIG_PERSIST_LOCK,
+        false,
+        apply_config_inner,
+    )?;
     if CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire) {
-        let generation = CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-        apply_config()?;
-        if CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-            CONFIG_DIRTY.store(false, std::sync::atomic::Ordering::Release);
-        }
-        Ok(())
-    } else {
-        Ok(())
+        return Err(AppError::Config(
+            "configuration changed during persist; retry pending".into(),
+        ));
     }
+    Ok(())
+}
+
+/// All planned resets share the same persistence barrier. This is deliberately
+/// synchronous only on a reset/maintenance path, never on periodic sampling.
+pub fn flush_pending_before_reset() -> AppResult<()> {
+    persist_config_now()?;
+    holding_store::save_to_nvs()?;
+    persist_pending_device_text(false)?;
+    crate::web::persist_pending_system_info().map_err(AppError::Config)?;
+    #[cfg(feature = "io-di-do")]
+    {
+        use crate::bus::io_global::{DO_PERSIST_LAST, DO_PERSIST_LAST_MS};
+        use std::sync::atomic::Ordering;
+        let bits = crate::bus::IO.do_.load_bits() & !crate::control_logic::transient_mask();
+        if bits != DO_PERSIST_LAST.load_bits() {
+            save_do_bits_to_nvs(bits)?;
+            DO_PERSIST_LAST.store_bits(bits);
+            DO_PERSIST_LAST_MS.store(
+                (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32,
+                Ordering::Release,
+            );
+        }
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -980,6 +1091,16 @@ fn reload() -> AppResult<()> {
 /// 注: 网络/RS485/BLE 配置的运行时切换不在此函数中处理, 由各模块自行监听 cfg 变化。
 /// 如果用户希望完全重新初始化外设, 可以显式调用 esp_restart()。
 fn apply_config() -> AppResult<()> {
+    pending_save::commit_pending(
+        &CONFIG_DIRTY,
+        &CONFIG_PERSIST_LOCK,
+        true,
+        apply_config_inner,
+    )
+}
+
+fn apply_config_inner() -> AppResult<()> {
+    let generation = CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     log::info!("[device] applying system config (no restart)...");
 
     // 1. 从 CONFIG RCU 取当前 SystemConfig (写者已通过 config_modify 落到 RCU)
@@ -996,6 +1117,12 @@ fn apply_config() -> AppResult<()> {
     } else {
         return Err(AppError::Config(
             "NVS unavailable, config persist deferred".into(),
+        ));
+    }
+
+    if CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire) != generation {
+        return Err(AppError::Config(
+            "configuration changed during persist; retry pending".into(),
         ));
     }
 
@@ -1113,13 +1240,16 @@ fn save_current_device_text_to_nvs() -> AppResult<()> {
 /// 文本传输触发数十次 4KB 擦写。该入口仍保留完整的写后读校验；失败时 dirty
 /// 不会被清除，后台会继续重试。
 pub fn persist_device_text_now() -> AppResult<()> {
-    let result = save_current_device_text_to_nvs();
-    if result.is_ok() {
-        DEVICE_TEXT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
-    } else {
-        DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
-    }
-    result
+    persist_pending_device_text(true)
+}
+
+fn persist_pending_device_text(force: bool) -> AppResult<()> {
+    pending_save::commit_pending(
+        &DEVICE_TEXT_DIRTY,
+        &DEVICE_TEXT_PERSIST_LOCK,
+        force,
+        save_current_device_text_to_nvs,
+    )
 }
 
 fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {

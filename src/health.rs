@@ -148,16 +148,23 @@ const DEFAULT_STALL_THRESHOLD: u32 = 3;
 /// 应在任务启动时 (init 函数中) 调用一次.
 /// 超过 MAX_TASKS 时回退计数并记日志忽略.
 pub fn register(task: &'static TaskHb) {
-    let idx = REGISTRY.count.fetch_add(1, Ordering::AcqRel);
-    if idx >= MAX_TASKS {
-        // 越界: 回退计数, 拒绝注册
-        REGISTRY.count.fetch_sub(1, Ordering::AcqRel);
+    let Some(idx) = reserve_task_slot(&REGISTRY.count) else {
         log::error!("[health] task table full, cannot register '{}'", task.name);
         return;
-    }
+    };
     // SAFETY: task 为 &'static TaskHb, 存为 AtomicPtr 长期有效.
     REGISTRY.tasks[idx].store(task as *const TaskHb as *mut TaskHb, Ordering::Release);
     log::debug!("[health] registered task '{}' (slot {})", task.name, idx);
+}
+
+fn reserve_task_slot(count: &AtomicUsize) -> Option<usize> {
+    // Never transiently publish > MAX_TASKS: check_all can run concurrently
+    // and uses count as its array bound.
+    count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1).filter(|next| *next <= MAX_TASKS)
+        })
+        .ok()
 }
 
 /// 注册真实常驻任务并绑定其配置栈大小，供运行时高水位采样。

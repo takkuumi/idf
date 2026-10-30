@@ -23,6 +23,11 @@ static PORT1_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port1", 30);
 static PORT2_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-port2", 30);
 static DISABLED_PORT3_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
 
+const MAX_RUNTIME_RETRY_COUNT: u16 = 2;
+const MAX_RUNTIME_TIMEOUT_MS: u16 = 2_000;
+const MAX_RUNTIME_INTERVAL_MS: u16 = 1_000;
+const POLL_ROUND_BUDGET_MS: u64 = 5_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PortMode {
     Master,
@@ -80,9 +85,11 @@ fn apply_runtime_policy(
             }
         },
         slave_addr: dip_address.unwrap_or(saved.slave_addr.clamp(1, 247)),
-        retry_count: u32::from(saved.retry_count.min(5)),
-        timeout_ms: u64::from(saved.timeout_ms.clamp(20, 5000)),
-        interval_ms: u64::from(saved.interval_ms.clamp(20, 5000)),
+        // 无从站时首字节快速超时会尽早失败；这里仍限制重试和轮询间隔，
+        // 防止一轮组态在多个离线设备上无限拉长。
+        retry_count: u32::from(saved.retry_count.min(MAX_RUNTIME_RETRY_COUNT)),
+        timeout_ms: u64::from(saved.timeout_ms.clamp(20, MAX_RUNTIME_TIMEOUT_MS)),
+        interval_ms: u64::from(saved.interval_ms.clamp(20, MAX_RUNTIME_INTERVAL_MS)),
     }
 }
 
@@ -191,6 +198,7 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
     let mut active = None;
     let mut port: Option<Rs485Port> = None;
     let mut poll_table = heapless::Vec::<rtu_master::PollItem, 64>::new();
+    let mut poll_cursor = 0usize;
     let mut last_warn = std::time::Instant::now() - Duration::from_secs(10);
 
     loop {
@@ -235,6 +243,7 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
                     Ok(updated) if updated != poll_table => {
                         rtu_master::publish_result_ranges(&updated);
                         poll_table = updated;
+                        poll_cursor = 0;
                     }
                     Ok(_) => {}
                     Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
@@ -243,11 +252,24 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
                     }
                     Err(_) => {}
                 }
-                for item in poll_table
-                    .iter()
-                    .copied()
-                    .filter(|item| usize::from(item.port) == index + 1)
-                {
+                let table_len = poll_table.len();
+                let round_deadline =
+                    std::time::Instant::now() + Duration::from_millis(POLL_ROUND_BUDGET_MS);
+                let mut visited = 0usize;
+                while visited < table_len {
+                    let item = poll_table[(poll_cursor + visited) % table_len];
+                    visited += 1;
+                    if usize::from(item.port) != index + 1 {
+                        continue;
+                    }
+                    if std::time::Instant::now() >= round_deadline {
+                        log::warn!(
+                            "[modbus-rtu] RS485-{} poll round budget {}ms exhausted; deferring remaining items",
+                            index + 1,
+                            POLL_ROUND_BUDGET_MS
+                        );
+                        break;
+                    }
                     hb.tick();
                     health::feed_wdt();
                     if let Err(error) = rtu_master::poll_with_retry(
@@ -267,6 +289,9 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
                             last_warn = std::time::Instant::now();
                         }
                     }
+                }
+                if table_len != 0 {
+                    poll_cursor = (poll_cursor + visited) % table_len;
                 }
                 std::thread::sleep(Duration::from_millis(desired.interval_ms));
             }
@@ -349,9 +374,9 @@ mod tests {
         assert_eq!(runtime.wire.data_bits, 8);
         assert_eq!(runtime.wire.parity, 'N');
         assert_eq!(runtime.wire.stop_bits, 1);
-        assert_eq!(runtime.retry_count, 5);
+        assert_eq!(runtime.retry_count, 2);
         assert_eq!(runtime.timeout_ms, 20);
-        assert_eq!(runtime.interval_ms, 5000);
+        assert_eq!(runtime.interval_ms, 1000);
 
         saved.mode = 1;
         let wire = Rs485Config::from_port_with_saved(1, &saved).unwrap();

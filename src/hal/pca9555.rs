@@ -47,6 +47,28 @@ const ADDR_DO_LED: u8 = 0x48;
 // F16 status LEDs are active-low. These masks match nca9555.h in the
 // production MCA firmware; clearing a bit turns the corresponding LED on.
 const STATUS_LED_BT: u8 = 0xFD;
+const STATUS_LED_RS485: [u8; 2] = [0xFB, 0xF7];
+const STATUS_LED_FIBER: [u8; 2] = [0xEF, 0x7F];
+
+fn with_status_led(current: u8, mask: u8, on: bool) -> u8 {
+    if on { current & mask } else { current | !mask }
+}
+
+fn with_rs485_leds(current: u8, active: [bool; 2]) -> u8 {
+    with_status_led(
+        with_status_led(current, STATUS_LED_RS485[0], active[0]),
+        STATUS_LED_RS485[1],
+        active[1],
+    )
+}
+
+fn with_fiber_leds(current: u8, active: [bool; 2]) -> u8 {
+    with_status_led(
+        with_status_led(current, STATUS_LED_FIBER[0], active[0]),
+        STATUS_LED_FIBER[1],
+        active[1],
+    )
+}
 
 /// Bit-reverse a byte (matching reference `EXchg_ByteHl`).
 fn bit_reverse(b: u8) -> u8 {
@@ -219,6 +241,10 @@ impl Pca9555Duo {
         // DI chip: all inputs
         io_bus.write_reg(ADDR_DI_IO, REG_CONFIG_0, 0xFF)?;
         io_bus.write_reg(ADDR_DI_IO, REG_CONFIG_1, 0xFF)?;
+        // Set safe output latches BEFORE enabling the outputs. PCA9555 reset
+        // output latches are high; cached zeroes must match real hardware.
+        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_0, 0x00)?;
+        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_1, 0x00)?;
         // DO chip: all outputs
         io_bus.write_reg(ADDR_DO_IO, REG_CONFIG_0, 0x00)?;
         io_bus.write_reg(ADDR_DO_IO, REG_CONFIG_1, 0x00)?;
@@ -311,17 +337,30 @@ impl Pca9555Duo {
     /// This is called from the main task, never from a Bluedroid callback.
     pub fn set_bt_led(&self, connected: bool) -> AppResult<()> {
         let mut current = self.status_led.lock();
-        let next = if connected {
-            *current & STATUS_LED_BT
-        } else {
-            *current | !STATUS_LED_BT
-        };
+        let next = with_status_led(*current, STATUS_LED_BT, connected);
         if next == *current {
             return Ok(());
         }
         self.led_bus
             .write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, next)?;
         *current = next;
+        Ok(())
+    }
+
+    /// Update F16 RS485 activity and fiber input indicators in one I2C write.
+    /// The main task owns this work; BT/PWR/RUN/ERR bits are preserved.
+    pub fn set_port_leds(&self, rs485: [bool; 2], fiber: [bool; 2]) -> AppResult<()> {
+        let mut current = self.status_led.lock();
+        let next = with_fiber_leds(with_rs485_leds(*current, rs485), fiber);
+        if next == *current {
+            return Ok(());
+        }
+        self.led_bus
+            .write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, next)?;
+        *current = next;
+        log::info!(
+            "[pca9555] 端口指示灯已写入: rs485={rs485:?} fiber={fiber:?} output=0x{next:02X}"
+        );
         Ok(())
     }
 }
@@ -392,5 +431,61 @@ impl DigitalIo for Pca9555Duo {
         let d0 = bit_reverse(lo) as u64;
         let d1 = bit_reverse(hi) as u64;
         Ok(d0 | (d1 << 8))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rs485_leds_are_active_low_and_independent() {
+        assert_eq!(with_rs485_leds(0xFF, [false, false]), 0xFF);
+        assert_eq!(with_rs485_leds(0xFF, [true, false]), 0xFB);
+        assert_eq!(with_rs485_leds(0xFF, [false, true]), 0xF7);
+        assert_eq!(with_rs485_leds(0xFF, [true, true]), 0xF3);
+    }
+
+    #[test]
+    fn test_rs485_leds_preserve_bt_power_run_and_unrelated_bits() {
+        for current in 0..=u8::MAX {
+            for active in [[false, false], [true, false], [false, true], [true, true]] {
+                let next = with_rs485_leds(current, active);
+                assert_eq!(next & 0xF3, current & 0xF3, "status={current:02X}");
+                assert_eq!(with_rs485_leds(next, active), next);
+            }
+        }
+        let bt_on = with_status_led(0xDE, STATUS_LED_BT, true);
+        let rs485_on = with_rs485_leds(bt_on, [true, true]);
+        assert_eq!(rs485_on, 0xD0);
+        assert_eq!(with_rs485_leds(rs485_on, [false, false]), bt_on);
+        assert_eq!(with_status_led(rs485_on, STATUS_LED_BT, false), 0xD2);
+    }
+
+    #[test]
+    fn test_fiber_leds_are_active_low_and_independent() {
+        assert_eq!(with_fiber_leds(0xFF, [false, false]), 0xFF);
+        assert_eq!(with_fiber_leds(0xFF, [true, false]), 0xEF);
+        assert_eq!(with_fiber_leds(0xFF, [false, true]), 0x7F);
+        assert_eq!(with_fiber_leds(0xFF, [true, true]), 0x6F);
+    }
+
+    #[test]
+    fn test_port_led_groups_preserve_bt_power_run_and_error_bits() {
+        let states = [[false, false], [true, false], [false, true], [true, true]];
+        for current in 0..=u8::MAX {
+            for rs485 in states {
+                for fiber in states {
+                    let next = with_fiber_leds(with_rs485_leds(current, rs485), fiber);
+                    assert_eq!(next & 0x63, current & 0x63, "status={current:02X}");
+                    assert_eq!(
+                        next,
+                        with_rs485_leds(with_fiber_leds(current, fiber), rs485),
+                        "LED groups must not overwrite each other"
+                    );
+                    assert_eq!(with_fiber_leds(with_rs485_leds(next, rs485), fiber), next);
+                }
+            }
+        }
     }
 }

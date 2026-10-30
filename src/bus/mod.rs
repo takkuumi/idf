@@ -24,6 +24,7 @@ pub mod event_bus;
 pub mod io_global;
 pub mod io_state;
 pub mod rcu;
+pub(crate) mod register_snapshot;
 pub mod storage_state;
 
 // 仅重导出被 crate 内部实际使用的符号. 模块本身 (config_state / storage_state /

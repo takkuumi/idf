@@ -5,8 +5,8 @@
 //! blocking Modbus: Q points are interlocked, delay/pulse are scheduled, and
 //! feedback words are derived from configured I/Q points.
 
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 use crate::bus::IO;
@@ -105,7 +105,8 @@ static ANALOG_VALUES: [AtomicU16; ANALOG_RESULT_COUNT] =
     [const { AtomicU16::new(0) }; ANALOG_RESULT_COUNT];
 static ANALOG_VALID: [AtomicU32; ANALOG_MASK_WORDS] =
     [const { AtomicU32::new(0) }; ANALOG_MASK_WORDS];
-static ANALOG_VERSION: AtomicU32 = AtomicU32::new(0);
+static ANALOG_LOCK: Mutex<()> = Mutex::new(());
+static TABLE_REFRESH_LOCK: Mutex<()> = Mutex::new(());
 static LAST_ANALOG_UPDATE_MS: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
@@ -407,8 +408,8 @@ fn parse_table(words: &[u16]) -> LogicTable {
         let Some(pulse) = record_words.get(tail + 1).copied() else {
             continue;
         };
-        let delay_ms = delay.saturating_mul(1000) as u32;
-        let pulse_ms = pulse.saturating_mul(1000) as u32;
+        let delay_ms = seconds_to_millis(delay);
+        let pulse_ms = seconds_to_millis(pulse);
         table.entries.push(IoLogic {
             logic_id: index as u16,
             controllable: attribute == 1,
@@ -429,6 +430,15 @@ fn refresh_table() {
     if TABLE_GENERATION.load(Ordering::Acquire) == generation {
         return;
     }
+    // TCP/RTU/BLE may all reach this function. Serialize a refresh and recheck
+    // after acquiring the lock so a slow parser cannot republish an older table.
+    let _guard = TABLE_REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = CONFIG_GENERATION.load(Ordering::Acquire);
+    if TABLE_GENERATION.load(Ordering::Acquire) == generation {
+        return;
+    }
     let table = storage_read()
         .map(|s| parse_table(&s.holding_buf))
         .unwrap_or_default();
@@ -438,7 +448,9 @@ fn refresh_table() {
 }
 
 fn publish_analog_ranges(channels: &[AnalogChannel]) {
-    ANALOG_VERSION.fetch_add(1, Ordering::AcqRel);
+    let _guard = ANALOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for value in &ANALOG_VALUES {
         value.store(0, Ordering::Release);
     }
@@ -457,14 +469,15 @@ fn publish_analog_ranges(channels: &[AnalogChannel]) {
     for (target, mask) in ANALOG_VALID.iter().zip(masks) {
         target.store(mask, Ordering::Release);
     }
-    ANALOG_VERSION.fetch_add(1, Ordering::Release);
 }
 
 fn update_analog_results(table: &LogicTable) {
     if table.analog_channels.is_empty() {
         return;
     }
-    ANALOG_VERSION.fetch_add(1, Ordering::AcqRel);
+    let _guard = ANALOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for channel in &table.analog_channels {
         let raw = IO.ai.get_scaled(channel.source as usize);
         let (words, count) = channel.encode(raw);
@@ -473,7 +486,6 @@ fn update_analog_results(table: &LogicTable) {
             ANALOG_VALUES[start + offset].store(value, Ordering::Release);
         }
     }
-    ANALOG_VERSION.fetch_add(1, Ordering::Release);
 }
 
 pub fn analog_result_word(address: u16) -> Option<u16> {
@@ -485,9 +497,24 @@ pub fn analog_result_word(address: u16) -> Option<u16> {
     Some(ANALOG_VALUES[index].load(Ordering::Acquire))
 }
 
-#[inline]
-pub fn analog_result_version() -> u32 {
-    ANALOG_VERSION.load(Ordering::Acquire)
+pub(crate) fn snapshot_results(
+    addr: u16,
+    count: u16,
+) -> crate::bus::register_snapshot::RegisterSnapshot {
+    use crate::bus::register_snapshot::{RegisterSnapshot, overlaps_results};
+    if !overlaps_results(
+        addr,
+        count,
+        MONITOR_RESULT_COUNT as u16,
+        USER_RESULT_BASE,
+        USER_RESULT_COUNT as u16,
+    ) {
+        return RegisterSnapshot::empty(addr);
+    }
+    let _guard = ANALOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RegisterSnapshot::capture(addr, count, analog_result_word)
 }
 
 fn point_scope(points: &[u8]) -> u64 {
@@ -588,13 +615,23 @@ pub fn tick() {
     refresh_table();
     let now = now_ms();
     let last = LAST_ANALOG_UPDATE_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(u64::from(last)) >= 100 {
+    if analog_update_due(now as u32, last) {
         let _ = TABLE.read_with(update_analog_results);
         LAST_ANALOG_UPDATE_MS.store(now as u32, Ordering::Relaxed);
     }
-    while let Some(command) = COMMANDS.dequeue() {
+    // A continuously refilled queue must not monopolize the 5ms main loop.
+    for _ in 0..8 {
+        let Some(command) = COMMANDS.dequeue() else {
+            break;
+        };
         let due = now_ms().saturating_add(u64::from(command.delay_ms));
         let _ = SCHEDULED.with_mut(|scheduled| {
+            let replaced = scheduled.iter().filter(|item| item.logic_id == command.logic_id).count();
+            let required = if command.pulse_ms > 0 { 2 } else { 1 };
+            if !schedule_fits(scheduled.len(), replaced, required) {
+                log::warn!("[control] schedule full; rejected logic={} without cancelling existing actions", command.logic_id);
+                return;
+            }
             scheduled.retain(|item| item.logic_id != command.logic_id);
             if scheduled.len() < MAX_SCHEDULED {
                 scheduled.push(Scheduled {
@@ -630,9 +667,41 @@ pub fn tick() {
     });
 }
 
+fn analog_update_due(now: u32, last: u32) -> bool {
+    now.wrapping_sub(last) >= 100
+}
+
+fn seconds_to_millis(seconds: u16) -> u32 {
+    u32::from(seconds) * 1_000
+}
+
+fn schedule_fits(current: usize, replaced: usize, required: usize) -> bool {
+    current.saturating_sub(replaced).saturating_add(required) <= MAX_SCHEDULED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_analog_period_survives_millisecond_wrap() {
+        assert!(!analog_update_due(99, 0));
+        assert!(analog_update_due(100, 0));
+        assert!(!analog_update_due(49, u32::MAX - 49));
+        assert!(analog_update_due(50, u32::MAX - 49));
+        assert!(!analog_update_due(105, 100));
+    }
+    #[test]
+    fn test_configured_seconds_are_not_saturated_to_65_seconds() {
+        assert_eq!(seconds_to_millis(66), 66_000);
+        assert_eq!(seconds_to_millis(u16::MAX), 65_535_000);
+    }
+    #[test]
+    fn test_pulse_requires_capacity_for_both_edges() {
+        assert!(schedule_fits(62, 0, 2));
+        assert!(!schedule_fits(63, 0, 2));
+        assert!(schedule_fits(64, 2, 2));
+        assert!(!schedule_fits(64, 1, 2));
+    }
     #[test]
     fn protocol_bit_words_are_decoded_little_bit_big_word() {
         assert_eq!(bit_words(&[0x0001, 0x0000, 0x8000], 0, 3), 0x8000_0000_0001);

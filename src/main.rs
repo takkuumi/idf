@@ -1,9 +1,9 @@
 //! ESP32-S3R2 嵌入式网关主入口
 //!
 //! 系统组成：
-//! - 以太网 (W5500 over SPI2) + 应用层简单冗余
+//! - 以太网 (W5500 over SPI3)；双光口硬件转发及冗余需独立验收
 //! - BLE GATT 配置/手持机协议；BLE Mesh 配网不在当前默认业务路径
-//! - 8 路 DI / 8 路 DO
+//! - DI/DO 通道数由 config::hw_version 决定（默认 F16 为 16/16）
 //! - 6 路 AI (ADC1) / 4 路 AO (LEDC PWM)
 //! - 2 路 RS485 (UART1/UART2)
 //! - Modbus RTU Master + Slave + TCP Server
@@ -377,6 +377,7 @@ fn main_loop(
     let mut max_work_us = 0u64;
     let mut deadline_miss_count = 0u32;
     let mut perf = MainLoopPerf::new();
+    let mut port_led_warn_at: Option<std::time::Instant> = None;
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
     // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
@@ -401,6 +402,19 @@ fn main_loop(
                 crate::channel::ai::tick_ai_sample(&hal);
                 crate::channel::ao::tick_ao_output(&hal);
             });
+            // Publish RS485 activity and active-low fiber detection together.
+            // Keep status LED I2C in the main task and preserve the BT bits.
+            {
+                let stats = &crate::modbus::shared::RS485_STATS;
+                if let Err(error) = hal.set_port_leds(
+                    [stats.port_active(0), stats.port_active(1)],
+                    crate::hal::fiber_status(),
+                ) && port_led_warn_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+                {
+                    port_led_warn_at = Some(std::time::Instant::now());
+                    log::warn!("[hal] 端口指示灯更新失败，将重试: {error}");
+                }
+            }
         }
 
         // DI 仍按 20ms 去抖，避免网络提速后把 I2C 轮询负载放大 4 倍。
@@ -418,12 +432,7 @@ fn main_loop(
         // Modbus, TCP, BLE, or the watchdog.
         control_logic::tick();
 
-        // LOOP13: DO NVS 持久化 (1s 节流 + 值去重), 重启后继电器恢复
-        #[cfg(feature = "io-di-do")]
-        perf.measure(4, || {
-            let now_ms = unsafe { esp_idf_sys::esp_timer_get_time() } as u64 / 1000;
-            crate::device::persist_do_bits_throttled(now_ms as u32);
-        });
+        // DO 的 1s 节流/去重持久化由 DeviceActor 执行，主循环不等待 Flash。
 
         // ETH 心跳 5s，取消独立 pthread。
         if tick.is_multiple_of(5000 / MAIN_LOOP_PERIOD_MS as u32) {
@@ -502,12 +511,20 @@ fn main_loop(
             if reset_request == 0 {
                 // No reset requested.
             } else if crate::bus::io_state::ResetSource::is_valid(reset_request) {
-                log::warn!(
-                    "[main] planned reset requested by {}",
-                    crate::bus::io_state::ResetSource::label(reset_request)
-                );
-                std::thread::sleep(Duration::from_millis(100));
-                unsafe { esp_idf_sys::esp_restart() };
+                if let Err(error) = device::flush_pending_before_reset() {
+                    log::error!(
+                        "[main] planned reset cancelled: pending configuration could not be saved: {error}"
+                    );
+                    // Dirty flags remain set and DeviceActor retries normally.
+                    // Do not restart with an acknowledged but uncommitted image.
+                } else {
+                    log::warn!(
+                        "[main] planned reset requested by {}",
+                        crate::bus::io_state::ResetSource::label(reset_request)
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    unsafe { esp_idf_sys::esp_restart() };
+                }
             } else {
                 log::error!(
                     "[main] ignored invalid reset request marker 0x{reset_request:02X}; possible state corruption"

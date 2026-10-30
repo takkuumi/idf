@@ -1,6 +1,7 @@
 # ESP32-S3R2 任务与内存架构
 
-> 更新：2026-08-13。容量数字来自最终 `cargo build` 生成的 sdkconfig 和 linker map。
+> 任务预算更新：2026-10-30，以 `src/safety/stack_budget.rs` 为准。
+> 标有旧日期的 linker map/镜像数字为历史快照，不代表当前产物。
 
 ## 硬件容量边界
 
@@ -36,20 +37,20 @@
 | 用户任务 | 栈 | 数量 | 调度职责 |
 |---|---:|---:|---|
 | main | 32KB | 1 | 5ms TCP/DO、10ms BLE、20ms DI、100ms AI/AO、健康监控 |
-| DeviceActor | 16KB | 1 | NVS 串行持久化；3010B blob 已移至 PSRAM 缓冲 |
-| mb-rtu-master | 8KB | 1 | RS485 主站 |
-| mb-rtu-slave | 8KB | 1 | RS485 从站 |
-| udp-mcast | 6KB | 1 | UDP 组播接收 |
-| nfc-st25 | 8KB | 1 | NFC 备份/恢复 |
-| http-srv | 12KB | 1 | Web 配置与流式 OTA |
-| **默认用户任务合计** | **90KB** | **7** | 固定，不随 TCP 连接数变化 |
+| DeviceActor | 12KB | 1 | NVS/DO 保存及 Web 完成确认；有界消息批次 |
+| mb-rtu-port0 | 8KB | 1 | 第一 UART 独占，按配置运行主站/从站 |
+| mb-rtu-port1 | 8KB | 1 | 第二 UART 独占，按配置运行主站/从站 |
+| udp-mcast | 4KB | 1 | UDP 接收、热重绑与新鲜度 |
+| nfc-st25 | 6KB | 1 | NFC 备份/恢复 |
+| http-srv | 10KB | 1 | Web/OTA；保存转交 Actor 并等待有界确认 |
+| **默认用户任务合计** | **80KB** | **7** | 固定，不随 TCP 连接数变化 |
 
-可选 RTU3 为 8KB，可选 Wi-Fi heartbeat 为 6KB；全部启用时用户任务上限 104KB，
+可选 RTU3 为 8KB，可选 Wi-Fi heartbeat 为 6KB；全部启用时用户任务上限 94KB，
 编译期断言限制为不超过 128KB。
 
 主要系统任务的保守配置合计约 48.5KB：BTC 8KB、BTU 8KB、LwIP 8KB、系统事件
 4KB、FreeRTOS timer 4KB、W5500 RX 4KB、BT controller 3.5KB、esp_timer 3.5KB、
-双核 IPC 2.5KB、双核 Idle 3KB。用户默认任务和这些系统任务合计约 138.5KB。
+双核 IPC 2.5KB、双核 Idle 3KB。用户默认任务和这些系统任务合计约 128.5KB。
 
 ## 固定连接状态机
 

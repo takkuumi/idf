@@ -32,6 +32,7 @@ struct DoState {
     /// 主循环 tick 计数器, 用于 10s 兜底定时
     tick_count: u32,
     consecutive_failures: u32,
+    retry_ticks: u32,
 }
 
 static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
@@ -43,6 +44,7 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
             last: u64::MAX,
             tick_count: 0,
             consecutive_failures: 0,
+            retry_ticks: 0,
         })
         .map_err(|_| crate::error::AppError::Io("DO state busy during init".into()))?;
     let _ = _hal;
@@ -57,6 +59,9 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
 /// main_loop 每 5ms 调用一次，dirty 标志提供事件驱动效果。
 pub fn tick_do_output(hal: &Hal) {
     let _ = DO_STATE.with_mut(|state| {
+        if retry_pending(&mut state.retry_ticks) {
+            return;
+        }
         let dirty = DO_DIRTY.swap(false, Ordering::Acquire);
         state.tick_count = state.tick_count.wrapping_add(1);
 
@@ -90,9 +95,29 @@ pub fn tick_do_output(hal: &Hal) {
                     // P0-4: 保持 last 不变，确保下次仍识别为未同步；
                     // 同时保持dirty标志以便100ms后重试
                     DO_DIRTY.store(true, Ordering::Release);
-                    state.tick_count = FALLBACK_TICKS.saturating_sub(RETRY_TICKS);
+                    state.retry_ticks = RETRY_TICKS;
                 }
             }
         }
     });
+}
+
+fn retry_pending(ticks: &mut u32) -> bool {
+    *ticks = ticks.saturating_sub(1);
+    *ticks != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_do_failure_waits_full_retry_interval_despite_dirty_flag() {
+        let mut ticks = RETRY_TICKS;
+        for tick in 1..RETRY_TICKS {
+            assert!(retry_pending(&mut ticks), "premature retry at tick {tick}");
+        }
+        assert!(!retry_pending(&mut ticks));
+        assert!(!retry_pending(&mut ticks));
+    }
 }

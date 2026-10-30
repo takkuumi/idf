@@ -10,8 +10,8 @@
 //! 本模块**手写 Modbus RTU 帧 + CRC16**, 不依赖 umodbus crate。
 //! (umodbus 0.1 API 在 embedded std 环境下不稳定)
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::modbus::rtu_master as cfg;
@@ -28,6 +28,9 @@ static TASK_HB: TaskHb = TaskHb::new_with_stall("mb-rtu-master", 30);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 const MAX_POLL_ITEMS: usize = 64;
+const FIRST_BYTE_TIMEOUT_MS: u64 = 250;
+const RETRY_BACKOFF_MS: u64 = 50;
+const POLL_ROUND_BUDGET_MS: u64 = 5_000;
 const MONITOR_RESULT_COUNT: usize = crate::config::regs::MONITOR_PLC_COUNT as usize;
 const USER_RESULT_BASE: u16 = crate::config::regs::HOLD_USER_BASE;
 const USER_RESULT_COUNT: usize = crate::config::regs::HOLD_USER_COUNT as usize;
@@ -42,8 +45,9 @@ const RESULT_MASK_WORDS: usize = RESULT_COUNT.div_ceil(RESULT_MASK_BITS);
 static RESULT_VALUES: [AtomicU16; RESULT_COUNT] = [const { AtomicU16::new(0) }; RESULT_COUNT];
 static RESULT_VALID: [AtomicU32; RESULT_MASK_WORDS] =
     [const { AtomicU32::new(0) }; RESULT_MASK_WORDS];
-static RESULT_VERSION: AtomicU32 = AtomicU32::new(0);
-static RESULT_WRITERS: AtomicU32 = AtomicU32::new(0);
+// Serialize short memory-only publication/capture sections. Do not hold this
+// across UART polling, parsing, logging, configuration or persistent writes.
+static RESULT_LOCK: Mutex<()> = Mutex::new(());
 
 /// 单条轮询任务
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,51 +79,44 @@ pub fn read_result_reg(addr: u16) -> Option<u16> {
     Some(RESULT_VALUES[index].load(Ordering::Acquire))
 }
 
-#[inline]
-pub fn result_version() -> u32 {
-    let writers = RESULT_WRITERS.load(Ordering::Acquire);
-    RESULT_VERSION.load(Ordering::Acquire) | u32::from(writers != 0)
-}
-
-fn begin_result_write() {
-    RESULT_WRITERS.fetch_add(1, Ordering::AcqRel);
-}
-
-fn end_result_write() {
-    RESULT_VERSION.fetch_add(2, Ordering::Release);
-    RESULT_WRITERS.fetch_sub(1, Ordering::Release);
+pub(crate) fn snapshot_results(
+    addr: u16,
+    count: u16,
+) -> crate::bus::register_snapshot::RegisterSnapshot {
+    use crate::bus::register_snapshot::{RegisterSnapshot, overlaps_results};
+    if !overlaps_results(
+        addr,
+        count,
+        MONITOR_RESULT_COUNT as u16,
+        USER_RESULT_BASE,
+        USER_RESULT_COUNT as u16,
+    ) {
+        return RegisterSnapshot::empty(addr);
+    }
+    let _guard = RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RegisterSnapshot::capture(addr, count, read_result_reg)
 }
 
 /// 批量编码主站镜像。`None` 表示起始地址不属于镜像区，`Some(false)` 表示
-/// 地址属于镜像区但有未配置字或写入并发过于频繁。
+/// 地址属于镜像区但有未配置字或请求范围非法。
 pub fn encode_result_regs_be(addr: u16, count: u16, out: &mut [u8]) -> Option<bool> {
-    let start = result_index(addr)?;
+    result_index(addr)?;
     if count == 0 || out.len() != count as usize * 2 || !result_range_is_valid(addr, count) {
         return Some(false);
     }
-    for attempt in 0..4 {
-        let before = result_version();
-        if before & 1 != 0 {
-            if attempt < 3 {
-                std::hint::spin_loop();
-                continue;
-            }
+    let _guard = RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for offset in 0..count {
+        let Some(value) = read_result_reg(addr + offset) else {
             return Some(false);
-        }
-        for offset in 0..count as usize {
-            let index = start + offset;
-            let mask = RESULT_VALID[index / RESULT_MASK_BITS].load(Ordering::Acquire);
-            if mask & (1u32 << (index % RESULT_MASK_BITS)) == 0 {
-                return Some(false);
-            }
-            out[offset * 2..offset * 2 + 2]
-                .copy_from_slice(&RESULT_VALUES[index].load(Ordering::Acquire).to_be_bytes());
-        }
-        if result_version() == before {
-            return Some(true);
-        }
+        };
+        let offset = usize::from(offset) * 2;
+        out[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
     }
-    Some(false)
+    Some(true)
 }
 
 fn result_index(addr: u16) -> Option<usize> {
@@ -144,7 +141,9 @@ fn result_range_is_valid(start: u16, count: u16) -> bool {
 }
 
 pub(crate) fn publish_result_ranges(items: &[PollItem]) {
-    begin_result_write();
+    let _guard = RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for value in &RESULT_VALUES {
         value.store(0, Ordering::Release);
     }
@@ -158,11 +157,12 @@ pub(crate) fn publish_result_ranges(items: &[PollItem]) {
     for (target, mask) in RESULT_VALID.iter().zip(masks) {
         target.store(mask, Ordering::Release);
     }
-    end_result_write();
 }
 
 fn write_result(item: PollItem, values: &[u16]) {
-    begin_result_write();
+    let _guard = RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start = result_index(item.dest_reg).expect("validated poll result address");
     for (offset, value) in values.iter().copied().enumerate() {
         if offset >= item.count as usize {
@@ -170,16 +170,16 @@ fn write_result(item: PollItem, values: &[u16]) {
         }
         RESULT_VALUES[start + offset].store(value, Ordering::Release);
     }
-    end_result_write();
 }
 
 pub(crate) fn clear_result(item: PollItem) {
-    begin_result_write();
+    let _guard = RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start = result_index(item.dest_reg).expect("validated poll result address");
     for value in &RESULT_VALUES[start..start + item.count as usize] {
         value.store(0, Ordering::Release);
     }
-    end_result_write();
 }
 
 fn holding_word(words: &[u16], addr: u16) -> Option<u16> {
@@ -355,9 +355,9 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
         crate::bus::config_state::config_read_with(|state| {
             let saved = &state.cfg.rs485[0];
             (
-                saved.retry_count.min(5) as u32,
-                saved.timeout_ms.clamp(20, 5000) as u64,
-                saved.interval_ms.clamp(20, 5000) as u64,
+                saved.retry_count.min(2) as u32,
+                saved.timeout_ms.clamp(20, 2000) as u64,
+                saved.interval_ms.clamp(20, 1000) as u64,
             )
         })
         .unwrap_or((0, cfg::TIMEOUT_MS, cfg::POLL_INTERVAL_MS));
@@ -400,7 +400,16 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                     }
                     Err(_) => {}
                 }
+                let round_deadline =
+                    std::time::Instant::now() + Duration::from_millis(POLL_ROUND_BUDGET_MS);
                 for item in poll_table.iter().copied().filter(|item| item.port == 1) {
+                    if std::time::Instant::now() >= round_deadline {
+                        log::warn!(
+                            "[mb-rtu-master] poll round budget {}ms exhausted; deferring remaining items",
+                            POLL_ROUND_BUDGET_MS
+                        );
+                        break;
+                    }
                     TASK_HB.tick();
                     if let Err(e) = poll_with_retry(&mut port, item, max_retry, timeout_ms) {
                         // 对齐 C++ Modbus_Clear_Result：重试耗尽或异常响应后清零，
@@ -433,7 +442,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     Ok(())
 }
 
-/// 带重试的轮询: 失败重试 MAX_RETRY 次, 间隔 100ms
+/// 带重试的轮询：失败后按调用方上限重试，重试间隔固定 50ms。
 pub(crate) fn poll_with_retry(
     port: &mut Rs485Port,
     item: PollItem,
@@ -442,8 +451,8 @@ pub(crate) fn poll_with_retry(
 ) -> AppResult<()> {
     let mut last_err: Option<crate::error::AppError> = None;
     for attempt in 0..=max_retry {
-        // 单次超时最多 5s，最多 6 次尝试。每次尝试前喂狗，断线重试不能累积成
-        // 30s 无喂狗窗口并造成非计划重启。
+        // 每次尝试前喂狗；运行时已将超时限制在 2s、重试限制在 2 次，
+        // 断线重试不会累积成过长的无喂狗窗口并造成非计划重启。
         crate::health::feed_wdt();
         match poll_once(port, item, timeout_ms) {
             Ok(()) => return Ok(()),
@@ -451,7 +460,7 @@ pub(crate) fn poll_with_retry(
                 log::debug!("[mb-rtu-master] attempt {} failed: {}", attempt + 1, e);
                 last_err = Some(e);
                 if attempt < max_retry {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
                 }
             }
         }
@@ -462,14 +471,19 @@ pub(crate) fn poll_with_retry(
 fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult<()> {
     let stats_port = usize::from(item.port.saturating_sub(1));
     let req = build_request(item);
-    let resp = match port.send_recv(&req, timeout_ms) {
-        Ok(r) => r,
-        Err(_) => {
-            // LOOP14: 主站通信错误 (超时) → 置 RS485_1_COMERR=0x04
-            crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
-            return Err(crate::error::AppError::Modbus("timeout".into()));
-        }
-    };
+    let response_len = expected_response_len(item);
+    let frame_timeout_ms = port.transaction_timeout_ms(req.len(), response_len, timeout_ms);
+    let first_byte_timeout_ms = timeout_ms.clamp(1, FIRST_BYTE_TIMEOUT_MS);
+    let resp =
+        match port.send_recv_with_first_byte_timeout(&req, first_byte_timeout_ms, frame_timeout_ms)
+        {
+            Ok(r) => r,
+            Err(_) => {
+                // LOOP14: 主站通信错误 (超时) → 置 RS485_1_COMERR=0x04
+                crate::modbus::shared::RS485_STATS.inc_port_comerr(stats_port);
+                return Err(crate::error::AppError::Modbus("timeout".into()));
+            }
+        };
 
     if resp.is_empty() {
         // send_recv 返回空帧表示在 deadline 内没有收到首字节，语义是超时而非
@@ -579,6 +593,16 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     crate::modbus::shared::RS485_STATS.mark_port_ok(stats_port);
 
     Ok(())
+}
+
+fn expected_response_len(item: PollItem) -> usize {
+    let payload = if item.func <= 2 {
+        (item.count as usize).div_ceil(8)
+    } else {
+        item.count as usize * 2
+    };
+    // slave + func + byte-count + payload + CRC
+    payload.saturating_add(5)
 }
 
 fn register_data(resp: &[u8], item: PollItem) -> AppResult<&[u8]> {
@@ -723,6 +747,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_expected_response_length_matches_modbus_shape() {
+        assert_eq!(
+            expected_response_len(PollItem {
+                count: 2,
+                func: 3,
+                ..ITEM
+            }),
+            9
+        );
+        assert_eq!(
+            expected_response_len(PollItem {
+                count: 16,
+                func: 4,
+                ..ITEM
+            }),
+            37
+        );
+        assert_eq!(
+            expected_response_len(PollItem {
+                count: 16,
+                func: 1,
+                ..ITEM
+            }),
+            7
+        );
+    }
+
+    #[test]
+    fn test_no_device_first_byte_budget_is_shorter_than_frame_budget() {
+        assert!(FIRST_BYTE_TIMEOUT_MS < POLL_ROUND_BUDGET_MS);
+        assert_eq!(RETRY_BACKOFF_MS, 50);
     }
 
     #[test]

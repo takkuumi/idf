@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::config_state::{CONFIG, ConfigSnapshot, config_read, config_read_with};
 use super::io_global::IO;
+use super::register_snapshot::RegisterSnapshot;
 use super::storage_state::{
     STORAGE, StorageSnapshot, proto_status, storage_read, storage_read_with,
 };
@@ -173,13 +174,20 @@ pub fn read_disc(addr: u16) -> Option<bool> {
 
 /// 读输入寄存器 (AI + 系统状态 + 故障统计, FC=04). 地址语义同 `Bus::read_input_reg`.
 pub fn read_input_reg(addr: u16) -> Option<u16> {
-    if let Some(value) = crate::control_logic::analog_result_word(addr) {
+    read_input_reg_from_runtime(addr, None)
+}
+
+fn read_input_reg_from_runtime(
+    addr: u16,
+    runtime: Option<&RuntimeRegisterSnapshot>,
+) -> Option<u16> {
+    if let Some(value) = analog_word(addr, runtime) {
         return Some(value);
     }
     // RS485 主站结果由组态中的 master_addr 指定。上位机历史业务固定用
     // FC04 读取 4000+ 镜像；值由独立原子区发布，不能误读 0x4000 协议存储。
     #[cfg(feature = "modbus-rtu")]
-    if let Some(value) = crate::modbus::rtu_master::read_result_reg(addr) {
+    if let Some(value) = rs485_word(addr, runtime) {
         return Some(value);
     }
     // 4000..4223 is a continuous RS485 result window. Only configured ranges
@@ -381,7 +389,45 @@ pub fn read_input_reg(addr: u16) -> Option<u16> {
 pub fn read_hold_reg(addr: u16) -> Option<u16> {
     let config = CONFIG.read()?;
     let storage = STORAGE.read()?;
-    read_hold_reg_from_snapshots(addr, &config, &storage)
+    read_hold_reg_from_snapshots(addr, &config, &storage, None)
+}
+
+struct RuntimeRegisterSnapshot {
+    analog: RegisterSnapshot,
+    #[cfg(feature = "modbus-rtu")]
+    rs485: RegisterSnapshot,
+}
+
+impl RuntimeRegisterSnapshot {
+    fn capture(addr: u16, count: u16, holding: bool) -> Self {
+        // FC03 0..299 are control words, not FC04 monitoring results.
+        let count =
+            if holding && u32::from(addr) + u32::from(count) <= u32::from(regs::HOLD_USER_BASE) {
+                0
+            } else {
+                count
+            };
+        Self {
+            analog: crate::control_logic::snapshot_results(addr, count),
+            #[cfg(feature = "modbus-rtu")]
+            rs485: crate::modbus::rtu_master::snapshot_results(addr, count),
+        }
+    }
+}
+
+fn analog_word(addr: u16, runtime: Option<&RuntimeRegisterSnapshot>) -> Option<u16> {
+    match runtime {
+        Some(snapshot) => snapshot.analog.get(addr),
+        None => crate::control_logic::analog_result_word(addr),
+    }
+}
+
+#[cfg(feature = "modbus-rtu")]
+fn rs485_word(addr: u16, runtime: Option<&RuntimeRegisterSnapshot>) -> Option<u16> {
+    match runtime {
+        Some(snapshot) => snapshot.rs485.get(addr),
+        None => crate::modbus::rtu_master::read_result_reg(addr),
+    }
 }
 
 /// 批量读保持寄存器，整个 FC03 请求只登记一次 CONFIG/STORAGE RCU 读者。
@@ -390,7 +436,10 @@ pub fn read_hold_reg(addr: u16) -> Option<u16> {
 /// RCU epoch，125 words 最多产生 250 组原子登记/退出。保持同一快照
 /// 同时提升吞吐和响应数据的一致性。
 pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
-    if count == 0 || out.len() != count as usize * 2 {
+    if count == 0
+        || usize::from(count) > crate::modbus::shared::MAX_REGS_PER_READ
+        || out.len() != count as usize * 2
+    {
         return false;
     }
     if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
@@ -402,87 +451,49 @@ pub fn encode_hold_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
     let Some(storage) = STORAGE.read() else {
         return false;
     };
-    for _ in 0..4 {
-        let analog_before = crate::control_logic::analog_result_version();
-        if analog_before & 1 != 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-        #[cfg(feature = "modbus-rtu")]
-        let before = crate::modbus::rtu_master::result_version();
-        #[cfg(feature = "modbus-rtu")]
-        if before & 1 != 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-        for offset in 0..count {
-            let Some(value) =
-                read_hold_reg_from_snapshots(addr.wrapping_add(offset), &config, &storage)
-            else {
-                return false;
-            };
-            let byte_offset = offset as usize * 2;
-            out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
-        }
-        if crate::control_logic::analog_result_version() != analog_before {
-            continue;
-        }
-        #[cfg(feature = "modbus-rtu")]
-        if crate::modbus::rtu_master::result_version() != before {
-            continue;
-        }
-        return true;
+    let runtime = RuntimeRegisterSnapshot::capture(addr, count, true);
+    for offset in 0..count {
+        let Some(value) =
+            read_hold_reg_from_snapshots(addr + offset, &config, &storage, Some(&runtime))
+        else {
+            return false;
+        };
+        let byte_offset = offset as usize * 2;
+        out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
     }
-    false
+    true
 }
 
-/// 批量读输入寄存器。RS485 多字镜像通过版本校验保证同一响应来自同一轮询结果。
+/// 批量读输入寄存器。先复制短锁保护的结果镜像，编码期间不持有结果锁。
 pub fn encode_input_regs_be(addr: u16, count: u16, out: &mut [u8]) -> bool {
-    if count == 0 || out.len() != count as usize * 2 {
+    if count == 0
+        || usize::from(count) > crate::modbus::shared::MAX_REGS_PER_READ
+        || out.len() != count as usize * 2
+    {
         return false;
     }
     if (addr as u32) + (count as u32) - 1 > u16::MAX as u32 {
         return false;
     }
-    for _ in 0..4 {
-        let analog_before = crate::control_logic::analog_result_version();
-        if analog_before & 1 != 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-        #[cfg(feature = "modbus-rtu")]
-        let before = crate::modbus::rtu_master::result_version();
-        #[cfg(feature = "modbus-rtu")]
-        if before & 1 != 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-        for offset in 0..count {
-            let Some(value) = read_input_reg(addr + offset) else {
-                return false;
-            };
-            let byte_offset = offset as usize * 2;
-            out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
-        }
-        if crate::control_logic::analog_result_version() != analog_before {
-            continue;
-        }
-        #[cfg(feature = "modbus-rtu")]
-        if crate::modbus::rtu_master::result_version() != before {
-            continue;
-        }
-        return true;
+    let runtime = RuntimeRegisterSnapshot::capture(addr, count, false);
+    for offset in 0..count {
+        let Some(value) = read_input_reg_from_runtime(addr + offset, Some(&runtime)) else {
+            return false;
+        };
+        let byte_offset = offset as usize * 2;
+        out[byte_offset..byte_offset + 2].copy_from_slice(&value.to_be_bytes());
     }
-    false
+    true
 }
 
 fn read_hold_reg_from_snapshots(
     addr: u16,
     config: &ConfigSnapshot,
     storage: &StorageSnapshot,
+    runtime: Option<&RuntimeRegisterSnapshot>,
 ) -> Option<u16> {
     if addr >= crate::config::regs::HOLD_USER_BASE
-        && let Some(value) = crate::control_logic::analog_result_word(addr)
+        && let Some(value) = analog_word(addr, runtime)
     {
         return Some(value);
     }
@@ -523,7 +534,7 @@ fn read_hold_reg_from_snapshots(
     // 原 C++ 把主站响应写入同一个 PRegBuf，因此 FC03 也能读到结果。
     // IDF 用原子镜像隔离高频运行时值与 NVS 配置，但保持完全相同的外部行为。
     #[cfg(feature = "modbus-rtu")]
-    if let Some(value) = crate::modbus::rtu_master::read_result_reg(addr) {
+    if let Some(value) = rs485_word(addr, runtime) {
         return Some(value);
     }
     // 2. CFG / PRegBuf (0x0880..=0x107F)
@@ -589,6 +600,21 @@ fn read_hold_reg_from_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_tcp_port_batch_validates_final_array_before_publishing() {
+        let original = config_read().unwrap().cfg.tcp_ports;
+        assert!(!write_hold_reg(regs::HOLD_TCP_COM_BASE, original[1]));
+        assert_eq!(config_read().unwrap().cfg.tcp_ports, original);
+        assert!(!write_hold_regs(
+            regs::HOLD_TCP_COM_BASE,
+            &[80, 1503, 1504, 1505]
+        ));
+        assert_eq!(config_read().unwrap().cfg.tcp_ports, original);
+        let swapped = [original[1], original[0], original[2], original[3]];
+        assert!(write_hold_regs(regs::HOLD_TCP_COM_BASE, &swapped));
+        assert_eq!(config_read().unwrap().cfg.tcp_ports, swapped);
+        assert!(write_hold_regs(regs::HOLD_TCP_COM_BASE, &original));
+    }
 
     #[test]
     fn read_coil_out_of_range() {
@@ -1039,6 +1065,11 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 }
             }
 
+            // Validate the completed batch, not each temporary intermediate
+            // array: a single FC16 may legally swap two existing ports.
+            if config_changed && !crate::device::system_config::valid_tcp_ports(&cs.cfg.tcp_ports) {
+                return false;
+            }
             if ble_name_changed {
                 // D98..D101 are also part of the legacy raw holding image.
                 // Publish the same bytes there in this transaction so FC03,
@@ -1172,7 +1203,11 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
     // - NotFound : 地址不在本配置区, 落 holding_buf 兜底
     if (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr) {
         let mut cs = config_clone();
-        match cs.cfg.write_reg(addr, value) {
+        let result = cs.cfg.write_reg(addr, value);
+        if !crate::device::system_config::valid_tcp_ports(&cs.cfg.tcp_ports) {
+            return false;
+        }
+        match result {
             WriteResult::Ok => {
                 super::config_state::CONFIG.write(cs);
                 return true;

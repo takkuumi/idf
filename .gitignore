@@ -3,7 +3,8 @@
 /release/
 **/*.rs.bk
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 
 # ESP-IDF 构建产物
 /build

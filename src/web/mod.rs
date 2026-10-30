@@ -179,6 +179,7 @@ fn load_web_system_info_from_nvs() -> WebSystemInfo {
 static WEB_SYSTEM_INFO_CACHE: std::sync::LazyLock<Mutex<WebSystemInfo>> =
     std::sync::LazyLock::new(|| Mutex::new(load_web_system_info_from_nvs()));
 static WEB_SYSTEM_INFO_DIRTY: AtomicBool = AtomicBool::new(false);
+static WEB_SYSTEM_INFO_PERSIST_LOCK: Mutex<()> = Mutex::new(());
 
 fn load_web_system_info() -> WebSystemInfo {
     WEB_SYSTEM_INFO_CACHE
@@ -200,8 +201,11 @@ fn save_web_system_info(info: &WebSystemInfo) -> bool {
     true
 }
 
-/// DeviceActor 独占调用的 Web 系统信息落盘路径。
+/// Web 保存和 DeviceActor 重试共用的串行落盘路径。
 pub fn persist_pending_system_info() -> Result<bool, String> {
+    let _guard = WEB_SYSTEM_INFO_PERSIST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // 写入前消费 dirty。若 NVS 写入期间又有保存请求，写者会重新置 true，
     // 成功路径不得再无条件清零，否则最新值可能永久只留在 RAM。
     if !WEB_SYSTEM_INFO_DIRTY.swap(false, Ordering::AcqRel) {
@@ -220,7 +224,15 @@ pub fn persist_pending_system_info() -> Result<bool, String> {
     };
     let result = crate::device::try_with_nvs_mut(|nvs| {
         nvs.set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
-            .map_err(|e| format!("{e:?}"))
+            .map_err(|e| format!("{e:?}"))?;
+        let mut verify = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
+        match nvs
+            .get_blob(NVS_KEY_WEB_SYSTEM_INFO, &mut verify)
+            .map_err(|e| format!("{e:?}"))?
+        {
+            Some(saved) if saved == blob => Ok(()),
+            _ => Err("web system info read-back mismatch".to_string()),
+        }
     });
     match result {
         Some(Ok(())) => Ok(true),
@@ -1035,6 +1047,13 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
         });
         crate::device::request_persist_config();
     }
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(
+            stream,
+            503,
+            &json_response("updatesysteminfoconfig", "0x01000005"),
+        );
+    }
     send_json(stream, 200, &json_response("updatesysteminfoconfig", "0"))
 }
 
@@ -1263,6 +1282,13 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         #[cfg(feature = "ble-at")]
         crate::ble_at::notify_ble_name_changed();
     }
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(
+            stream,
+            503,
+            &json_response("updatenetworkconfig", "0x01000005"),
+        );
+    }
     send_json(stream, 200, &json_response("updatenetworkconfig", "0"))
 }
 
@@ -1457,6 +1483,13 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
     );
 
     crate::device::request_persist_config();
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(
+            stream,
+            503,
+            &json_response("updateportconfig", "0x01000005"),
+        );
+    }
     send_json(stream, 200, &json_response("updateportconfig", "0"))
 }
 
@@ -1588,6 +1621,7 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
             false
         }
     };
+    let fiber = crate::hal::fiber_status();
     // 与原 MCA `states_led[0..7]` 字段保持相同的顺序: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2.
     // 485 状态与原 MCA 一样表示最近一次有效通信脉冲；累计错误只在诊断页显示。
     let state_data = format!(
@@ -1597,12 +1631,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         ethernet_link as u8,
         crate::modbus::shared::RS485_STATS.master_active() as u8,
         crate::modbus::shared::RS485_STATS.slave_active() as u8,
-        (unsafe {
-            esp_idf_sys::gpio_get_level(crate::config::pins::FIB1_PIN as esp_idf_sys::gpio_num_t)
-        } == 0) as u8,
-        (unsafe {
-            esp_idf_sys::gpio_get_level(crate::config::pins::FIB2_PIN as esp_idf_sys::gpio_num_t)
-        } == 0) as u8,
+        fiber[0] as u8,
+        fiber[1] as u8,
     );
 
     // DI/DO 状态数组 (对齐参考固件: di_addr_0..15, do_addr_0..15)
@@ -1661,15 +1691,13 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
         return send_json(stream, 405, &json_response("iocontrol", "405"));
     }
 
-    let addr: u16 = req
-        .form_field("addr")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let value: bool = req
-        .form_field("value")
-        .and_then(|s| s.parse::<u8>().ok())
-        .map(|v| v != 0)
-        .unwrap_or(false);
+    let addr_field = req.form_field("addr");
+    let value_field = req.form_field("value");
+    let Some((addr, value)) =
+        parse_io_control_fields(addr_field.as_deref(), value_field.as_deref())
+    else {
+        return send_json(stream, 200, &json_response("iocontrol", "0x01000003"));
+    };
 
     // LOOP13: 校验 addr 范围, 越界返回错误码 (0x01000003 = addr 超限)
     if addr >= crate::config::hw_version::DO_COUNT as u16 {
@@ -1679,10 +1707,18 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
     // 通过 Modbus coil 写入接口控制 DO (addr 为 DO 编号 0..N)
     // LOOP13: write_coil 内部已内化 notify(), 不需要在此显式调用
     let coil_addr = regs::COIL_DO_BASE + addr;
-    let _ = crate::bus::backends::write_coil(coil_addr, value);
+    if !crate::bus::backends::write_coil(coil_addr, value) {
+        return send_json(stream, 200, &json_response("iocontrol", "0x01000005"));
+    }
 
     log::info!("[http] IO control: addr={} value={}", addr, value);
     send_json(stream, 200, &json_response("iocontrol", "0"))
+}
+
+fn parse_io_control_fields(addr: Option<&str>, value: Option<&str>) -> Option<(u16, bool)> {
+    let addr = addr?.parse().ok()?;
+    let value = value?.parse::<u8>().ok()?;
+    (value <= 1).then_some((addr, value == 1))
 }
 
 /// GET /getbleconfig — BLE 名称 + MAC (现场识别用)
@@ -1721,9 +1757,11 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
     if req.method != "POST" {
         return send_json(stream, 405, &json_response("updatebleconfig", "405"));
     }
-    let name = req.form_field("blename").unwrap_or_default();
+    let Some(name) = req.form_field("blename") else {
+        return send_json(stream, 200, &json_response("updatebleconfig", "0x01000003"));
+    };
     let name_bytes = name.as_bytes();
-    if name_bytes.len() > 8 {
+    if name_bytes.len() > 8 || name_bytes.contains(&0) {
         return send_json(stream, 200, &json_response("updatebleconfig", "0x01000004"));
     }
     crate::bus::backends::config_modify(|cfg| {
@@ -1741,6 +1779,9 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
     // GAP 名称立即更新；配置快照由 DeviceActor 合并落盘。
     #[cfg(feature = "ble-at")]
     crate::ble_at::notify_ble_name_changed();
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(stream, 503, &json_response("updatebleconfig", "0x01000005"));
+    }
     send_json(stream, 200, &json_response("updatebleconfig", "0"))
 }
 
@@ -1787,18 +1828,22 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
     if req.method != "POST" {
         return send_json(stream, 405, &json_response("updatesensorconfig", "405"));
     }
-    let ch: usize = req
-        .form_field("ch")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let min_v: u16 = req
-        .form_field("min")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let max_v: u16 = req
-        .form_field("max")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let fields = (
+        req.form_field("ch"),
+        req.form_field("min"),
+        req.form_field("max"),
+    );
+    let Some((ch, min_v, max_v)) = parse_sensor_fields(
+        fields.0.as_deref(),
+        fields.1.as_deref(),
+        fields.2.as_deref(),
+    ) else {
+        return send_json(
+            stream,
+            200,
+            &json_response("updatesensorconfig", "0x01000003"),
+        );
+    };
     let ai_count = crate::config::hw_version::AI_COUNT as usize;
     if ch >= ai_count {
         return send_json(
@@ -1821,14 +1866,37 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
         }
     });
     crate::device::request_persist_holding();
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(
+            stream,
+            503,
+            &json_response("updatesensorconfig", "0x01000005"),
+        );
+    }
     log::info!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);
     send_json(stream, 200, &json_response("updatesensorconfig", "0"))
+}
+
+fn parse_sensor_fields(
+    ch: Option<&str>,
+    min: Option<&str>,
+    max: Option<&str>,
+) -> Option<(usize, u16, u16)> {
+    let ch = ch?.parse().ok()?;
+    let min = min?.parse::<u16>().ok()?;
+    let max = max?.parse::<u16>().ok()?;
+    // Zero selects the existing uncalibrated fallback. Nonzero endpoints may
+    // be reversed (legacy polarity), but must fit the 12-bit ADC and differ.
+    (min <= 4095 && max <= 4095 && (min == 0 || max == 0 || min != max)).then_some((ch, min, max))
 }
 
 /// POST /reboot — Web UI 触发设备重启 (Apply 配置后需要)
 fn handle_reboot(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Result<()> {
     if req.method != "POST" {
         return send_json(stream, 405, &json_response("reboot", "405"));
+    }
+    if crate::device::await_pending_persistence().is_err() {
+        return send_json(stream, 503, &json_response("reboot", "0x01000005"));
     }
     if req.form_field("after_config_save").as_deref() == Some("1") {
         if !crate::device::request_persist_config_and_reset() {
@@ -1850,6 +1918,9 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
 
     let old_pwd = req.form_field("opwd").unwrap_or_default();
     let new_pwd = req.form_field("npwd").unwrap_or_default();
+    if !valid_web_password(new_pwd.as_str()) {
+        return send_json(stream, 200, &json_response("updatepwd", "0x01000003"));
+    }
 
     let actual_pwd = load_web_password();
 
@@ -1865,13 +1936,19 @@ fn handle_update_password(stream: &mut TcpStream, req: &HttpRequest) -> std::io:
             .map_err(|e| format!("{:?}", e))?;
         Ok(())
     }) {
-        log::info!("[http] web password updated");
+        destroy_session();
+        log::info!("[http] web password updated; previous session invalidated");
     } else {
         log::warn!("[http] password save failed (NVS unavailable)");
         return send_json(stream, 500, &json_response("updatepwd", "0x01000003"));
     }
 
     send_json(stream, 200, &json_response("updatepwd", "0"))
+}
+
+fn valid_web_password(value: &str) -> bool {
+    // load_web_password uses a 64-byte buffer including the NUL terminator.
+    !value.is_empty() && value.len() <= 63 && !value.as_bytes().contains(&0)
 }
 
 /// POST /updateota (OTA 固件上传 — 流式, 不缓存整 body)
@@ -2067,6 +2144,53 @@ fn login_page_html() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_malformed_io_fields_cannot_default_to_output_zero() {
+        for (addr, value) in [
+            (None, None),
+            (Some("oops"), Some("1")),
+            (Some("0"), None),
+            (Some("0"), Some("2")),
+        ] {
+            assert_eq!(parse_io_control_fields(addr, value), None);
+        }
+        assert_eq!(
+            parse_io_control_fields(Some("0"), Some("0")),
+            Some((0, false))
+        );
+        assert_eq!(
+            parse_io_control_fields(Some("15"), Some("1")),
+            Some((15, true))
+        );
+    }
+    #[test]
+    fn test_sensor_fields_require_explicit_valid_calibration() {
+        assert_eq!(parse_sensor_fields(None, Some("605"), Some("3016")), None);
+        assert_eq!(
+            parse_sensor_fields(Some("x"), Some("605"), Some("3016")),
+            None
+        );
+        assert_eq!(
+            parse_sensor_fields(Some("0"), Some("4096"), Some("0")),
+            None
+        );
+        assert_eq!(parse_sensor_fields(Some("0"), Some("1"), Some("1")), None);
+        assert_eq!(
+            parse_sensor_fields(Some("0"), Some("0"), Some("0")),
+            Some((0, 0, 0))
+        );
+        assert_eq!(
+            parse_sensor_fields(Some("1"), Some("3016"), Some("605")),
+            Some((1, 3016, 605))
+        );
+    }
+    #[test]
+    fn test_web_password_must_fit_reload_buffer() {
+        assert!(!valid_web_password(""));
+        assert!(!valid_web_password("bad\0pwd"));
+        assert!(valid_web_password(&"a".repeat(63)));
+        assert!(!valid_web_password(&"a".repeat(64)));
+    }
 
     fn slow_tcp_pair(
         bytes: &'static [u8],

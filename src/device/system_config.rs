@@ -432,6 +432,11 @@ impl SystemConfig {
     /// prevents a malformed Modbus/AT register sequence from replacing a
     /// known-good persistent configuration.
     pub fn validate_for_persistence(&self) -> AppResult<()> {
+        if !valid_tcp_ports(&self.tcp_ports) {
+            return Err(AppError::Config(
+                "invalid, duplicate or reserved Modbus TCP ports".into(),
+            ));
+        }
         if self.dhcp {
             return Ok(());
         }
@@ -716,7 +721,7 @@ impl SystemConfig {
             .contains(&addr)
         {
             if value == 0 {
-                return WriteResult::NotFound;
+                return WriteResult::InvalidValue;
             }
             let idx = (addr - regs::HOLD_TCP_COM_BASE) as usize;
             self.tcp_ports[idx] = value;
@@ -829,6 +834,13 @@ pub(crate) fn is_ipv4_netmask(value: &[u8; 4]) -> bool {
     true
 }
 
+pub(crate) fn valid_tcp_ports(ports: &[u16; 4]) -> bool {
+    ports
+        .iter()
+        .enumerate()
+        .all(|(index, port)| *port != 0 && *port != 80 && !ports[..index].contains(port))
+}
+
 // ----------------------------------------------------------------------------
 // 字段编解码辅助
 // ----------------------------------------------------------------------------
@@ -901,6 +913,15 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_tcp_ports_reject_duplicate_zero_and_web_conflicts() {
+        assert!(valid_tcp_ports(&[502, 503, 504, 5002]));
+        assert!(valid_tcp_ports(&[503, 502, 504, 5002]));
+        assert!(!valid_tcp_ports(&[502, 502, 504, 5002]));
+        assert!(!valid_tcp_ports(&[0, 503, 504, 5002]));
+        assert!(!valid_tcp_ports(&[80, 503, 504, 5002]));
+        assert!(valid_tcp_ports(&[65535, 65534, 65533, 65532]));
+    }
 
     #[test]
     fn test_default_config() {

@@ -31,7 +31,11 @@ def read_registers(sock: socket.socket, unit: int, function: int, address: int, 
             raise ConnectionError("peer closed during PDU")
         body.extend(part)
     if body[0] == function | 0x80:
-        raise ValueError(f"Modbus exception 0x{body[1]:02X}")
+        if len(body) != 2:
+            raise ValueError(f"invalid exception PDU {body.hex()}")
+        raise ValueError(
+            f"Modbus exception 0x{body[1]:02X} fc={function} address={address} count={count}"
+        )
     if len(body) != count * 2 + 2 or body[0] != function or body[1] != count * 2:
         raise ValueError(f"invalid response PDU {body.hex()}")
     return list(struct.unpack(f">{count}H", body[2:]))

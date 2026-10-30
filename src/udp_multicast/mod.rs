@@ -22,9 +22,9 @@
 //! - 配置每秒检查，变更后自动重建 socket，无需重启
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::bus::config_state::config_read_with;
 use crate::bus::storage_state::storage_read_with;
@@ -44,6 +44,10 @@ static RECV_BUF: LazyLock<Spin<[u8; regs::MULTICAST_BUF_SIZE]>> =
 
 /// 最近一次接收的字节数 (0 = 尚未收到)
 static RECV_LEN: AtomicU16 = AtomicU16::new(0);
+static LAST_RECV_AT: Mutex<Option<Instant>> = Mutex::new(None);
+// The legacy status sender updates once per second. Five missed intervals
+// mark reception stale; register data remains the explicitly last-known image.
+const STATUS_FRESHNESS: Duration = Duration::from_secs(5);
 
 /// 默认组播地址 (参考固件未配置时的回退值: 239.0.0.1)
 const DEFAULT_MCAST_ADDR: [u8; 4] = [239, 0, 0, 1];
@@ -121,7 +125,7 @@ fn decode_multicast_config(
 struct MulticastConfig {
     group: [u8; 4],
     port: u16,
-    /// 源 IP 过滤 (None = 接受任意源, 对齐参考固件 SWITCH_IP=0 时不接收)
+    /// 源 IP 过滤 (None = 未配置，拒绝所有来源)
     switch_ip: Option<[u8; 4]>,
 }
 
@@ -181,6 +185,13 @@ fn recv_loop() {
 
 /// 绑定组播 socket 并持续接收
 fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
+    // A different group/source or a failed socket must not retain "receiving"
+    // from the previous session or expose its data as the new source's image.
+    RECV_LEN.store(0, Ordering::Release);
+    *LAST_RECV_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    RECV_BUF.lock().fill(0);
     // 1. 绑定本地端口 (INADDR_ANY)
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cfg.port);
     let sock = UdpSocket::bind(bind_addr).map_err(|e| format!("bind {bind_addr}: {e}"))?;
@@ -220,6 +231,13 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
         TASK_HB.tick();
         health::feed_wdt();
 
+        // 必须在 recv_from 前检查。被过滤的包会走 continue；若只在循环尾
+        // 检查，持续的无关 UDP 流量就能让新配置永远无法生效。
+        if read_multicast_config() != *cfg {
+            log::info!("[udp-mcast] configuration changed, rebuilding socket");
+            return Ok(());
+        }
+
         match sock.recv_from(&mut buf) {
             Ok((len, src)) => {
                 // 源 IP 过滤 (对齐参考固件: 仅接受来自 SWITCH_IP 的包)
@@ -241,6 +259,9 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
                     }
                 }
                 RECV_LEN.store(n as u16, Ordering::Release);
+                *LAST_RECV_AT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
                 log::debug!(
                     "[udp-mcast] received {} bytes from {} (stored {})",
                     len,
@@ -257,10 +278,6 @@ fn bind_and_recv(cfg: &MulticastConfig) -> Result<(), String> {
                     return Err(format!("recv_from: {e}"));
                 }
             }
-        }
-        if read_multicast_config() != *cfg {
-            log::info!("[udp-mcast] configuration changed, rebuilding socket");
-            return Ok(());
         }
     }
 }
@@ -372,7 +389,15 @@ fn ipv4_s_addr(octets: [u8; 4]) -> u32 {
 
 /// 当前组播接收状态 (用于 Web/诊断页面).
 pub fn is_receiving() -> bool {
-    RECV_LEN.load(Ordering::Acquire) != 0
+    let last = *LAST_RECV_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RECV_LEN.load(Ordering::Acquire) != 0 && packet_is_fresh(last, Instant::now())
+}
+
+fn packet_is_fresh(last: Option<Instant>, now: Instant) -> bool {
+    last.and_then(|received| now.checked_duration_since(received))
+        .is_some_and(|age| age <= STATUS_FRESHNESS)
 }
 
 /// 当前组播接收字节数.
@@ -407,6 +432,17 @@ pub fn recv_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_receiving_status_expires_and_does_not_accept_future_time() {
+        let now = Instant::now();
+        assert!(!packet_is_fresh(None, now));
+        assert!(packet_is_fresh(Some(now - Duration::from_secs(5)), now));
+        assert!(!packet_is_fresh(
+            Some(now - Duration::from_millis(5_001)),
+            now
+        ));
+        assert!(!packet_is_fresh(Some(now + Duration::from_secs(1)), now));
+    }
 
     #[test]
     fn test_ipv4_s_addr_preserves_network_octets_in_memory() {

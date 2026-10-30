@@ -45,10 +45,15 @@ ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)，其中：
 | | GPIO36 | I2C_SCL | IO 总线时钟线 |
 | | GPIO38 | LED_SDA | LED 板 I2C SDA |
 | | GPIO37 | LED_SCL | LED 板 I2C SCL |
-| **光纤检测** | GPIO39 | FIB1 | 光纤输入 1 |
-| | GPIO40 | FIB2 | 光纤输入 2 |
+| **光纤检测** | GPIO39 | FIB1 | 光纤检测输入 1，低电平有效 |
+| | GPIO40 | FIB2 | 光纤检测输入 2，低电平有效 |
 | **AI (6 路, ADC1)** | GPIO1~6 | AI0~AI5 | 12-bit SAR ADC |
 | **AO (4 路, LEDC PWM)** | GPIO15/16/17/18 | AO0~AO3 | 5kHz, 12-bit |
+
+F16/PCA9555 灯板的 FIB1、FIB2 指示灯由 LED 总线地址 `0x44` 的输出寄存器
+`0x02` 控制，低有效掩码分别为 `0xEF`（bit4）与 `0x7F`（bit7）。主循环每
+100ms 根据 GPIO39/40 检测输入同步实体灯，Web 使用相同的输入极性。它们表示
+硬件检测信号，不使用 RS485 的一秒通信时间窗，也不能单独证明环网冗余或业务转发正常。
 
 ### DI/DO 通道 (通过 PCA9555 I2C 扩展)
 

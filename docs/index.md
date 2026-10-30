@@ -8,7 +8,9 @@
 - [烧录与 OTA](FLASH.md)
 - [用户手册](user-manual.md)
 - [引脚映射](pinmap.md) · [内存布局](MEMORY_LAYOUT.md)
+- [双光纤调查与验收边界](hardware/fiber-analysis.md)
 - [验证说明](verification.md) · [持续集成记录](LOOP.md)
+- [2026-10-30 生产核查](testing/production-audit-2026-10-30.md)
 - [当前待办](todo.md)
 
 ## 按主题分类

@@ -128,6 +128,19 @@ impl Rs485Port {
         request: &[u8],
         timeout_ms: u64,
     ) -> AppResult<heapless::Vec<u8, 256>> {
+        self.send_recv_with_first_byte_timeout(request, timeout_ms, timeout_ms)
+    }
+
+    /// 发送并等待应答，同时把“等待首字节”和“接收完整帧”分开计时。
+    ///
+    /// 现场没有从站时，首字节等待是主站最主要的阻塞来源；收到首字节后，
+    /// 再按完整帧预算等待剩余字节，避免低波特率或长响应被过早截断。
+    pub fn send_recv_with_first_byte_timeout(
+        &mut self,
+        request: &[u8],
+        first_byte_timeout_ms: u64,
+        frame_timeout_ms: u64,
+    ) -> AppResult<heapless::Vec<u8, 256>> {
         // 上一轮超时后可能有迟到的响应残留在 RX ring。Modbus 主站在发出新请求前
         // 没有合法的未消费数据，清空可避免旧帧被误配给本轮事务。
         check(
@@ -136,7 +149,8 @@ impl Rs485Port {
         )?;
         self.write(request)?;
         let mut buf = [0u8; 256];
-        let n = self.read(&mut buf, timeout_ms)?;
+        let n =
+            self.read_with_first_byte_timeout(&mut buf, first_byte_timeout_ms, frame_timeout_ms)?;
         let mut out = heapless::Vec::new();
         out.extend_from_slice(&buf[..n])
             .map_err(|_| AppError::Rs485("response too long".into()))?;
@@ -169,7 +183,7 @@ impl Rs485Port {
     /// 仅读取 (从站监听用)
     ///
     /// 采用两阶段读取策略, 符合 Modbus RTU 帧结束判定:
-    /// 1. 第一阶段: 等待首字节 (长超时, 用于从站空闲监听)
+    /// 1. 第一阶段: 等待首字节 (由调用方传入，用于从站空闲监听)
     /// 2. 第二阶段: 帧间静默判断 (3.5 字符时间, 标准帧结束)
     ///
     /// 静默阈值: 11 bits/char * 3.5 char = 38.5 bits
@@ -177,13 +191,24 @@ impl Rs485Port {
     ///   - 19200bps:  ≈ 2.0ms
     ///   - 115200bps: ≈ 0.33ms (最小限制 1ms, 保证实际可行)
     pub fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> AppResult<usize> {
+        self.read_with_first_byte_timeout(buf, timeout_ms, timeout_ms)
+    }
+
+    /// 先快速等待首字节，收到后再开启完整帧超时预算。
+    pub fn read_with_first_byte_timeout(
+        &mut self,
+        buf: &mut [u8],
+        first_byte_timeout_ms: u64,
+        frame_timeout_ms: u64,
+    ) -> AppResult<usize> {
         let port = self.cfg.uart_port as uart_port_t;
         let mut total = 0usize;
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let first_deadline =
+            std::time::Instant::now() + Duration::from_millis(first_byte_timeout_ms.max(1));
 
-        // 第一阶段: 等待首字节 (长超时, 利用硬件 RX 帧间隔检测尽早返回)
-        while total == 0 && std::time::Instant::now() < deadline {
-            let remaining_ms = deadline
+        // 第一阶段: 等待首字节 (利用硬件 RX 帧间隔检测尽早返回)
+        while total == 0 && std::time::Instant::now() < first_deadline {
+            let remaining_ms = first_deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
                 .max(1)
@@ -208,13 +233,18 @@ impl Rs485Port {
             return Ok(0); // 超时无数据
         }
 
+        // 收到首字节后，重新开始完整帧预算。这样 1200/2400bps 的合法长响应
+        // 不会被“首字节快速失败”策略截断。
+        let frame_deadline =
+            std::time::Instant::now() + Duration::from_millis(frame_timeout_ms.max(1));
+
         // 第二阶段: 帧间静默判断
         // 3.5 字符时间 = 38.5 bits / 波特率, 最小 1ms 保证实时性
         let silence_us = rtu_silence_us(self.cfg.baud);
         let silence_ms: u64 = std::cmp::max(silence_us / 1000, 1) as u64;
         let silence_dur = Duration::from_millis(silence_ms);
 
-        while total < buf.len() && std::time::Instant::now() < deadline {
+        while total < buf.len() && std::time::Instant::now() < frame_deadline {
             // 短暂静默等待 (模拟 3.5 字符时间间隔)
             std::thread::sleep(silence_dur);
 
@@ -255,6 +285,28 @@ impl Rs485Port {
     pub fn port(&self) -> u8 {
         self.cfg.uart_port
     }
+
+    /// 根据请求/响应长度估算一笔 RTU 事务所需的完整帧时间。
+    ///
+    /// 该值只用于“收到首字节之后”的帧接收预算；没有从站时仍由首字节
+    /// 快速超时控制等待时间。保留调用方配置的更大超时，兼容慢速仪表。
+    pub fn transaction_timeout_ms(
+        &self,
+        request_len: usize,
+        response_len: usize,
+        configured_timeout_ms: u64,
+    ) -> u64 {
+        let parity_bits = u64::from(self.cfg.parity != 'N');
+        let bits_per_char = 1 + self.cfg.data_bits as u64 + parity_bits + self.cfg.stop_bits as u64;
+        let wire_bits = (request_len + response_len) as u64 * bits_per_char;
+        let wire_ms = wire_bits
+            .saturating_mul(1000)
+            .div_ceil(self.cfg.baud.max(1) as u64);
+        let silence_ms = u64::from((rtu_silence_us(self.cfg.baud) / 1000).max(1));
+        configured_timeout_ms
+            .max(wire_ms.saturating_add(silence_ms).saturating_add(30))
+            .clamp(20, 2000)
+    }
 }
 
 impl Drop for Rs485Port {
@@ -289,5 +341,24 @@ mod tests {
     fn test_tick_conversion_never_returns_zero() {
         assert_eq!(ms_to_ticks(0), 1);
         assert!(ms_to_ticks(100) >= 1);
+    }
+
+    #[test]
+    fn test_transaction_timeout_is_bounded_and_frame_aware() {
+        let port = Rs485Port {
+            cfg: Rs485Config {
+                baud: 9_600,
+                data_bits: 8,
+                parity: 'N',
+                stop_bits: 1,
+                ..Rs485Config::default()
+            },
+        };
+        let timeout = port.transaction_timeout_ms(8, 255, 100);
+        assert!(timeout >= 100);
+        assert!(timeout < 5000);
+        assert_eq!(port.transaction_timeout_ms(8, 5, 60_000), 2000);
+        // This unit test does not open a driver; avoid Drop touching UART0.
+        std::mem::forget(port);
     }
 }

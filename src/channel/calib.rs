@@ -50,7 +50,7 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
 
     let mut cal_ch: Option<usize> = None;
 
-    for ch in 0..SENSOR_CHANNELS {
+    for ch in 0..calibration_channel_count(crate::config::hw_version::AI_COUNT) {
         let min_idx = (crate::config::regs::HOLD_SENSOR_MIN_BASE as usize)
             .checked_sub(crate::config::regs::HOLD_CFG_BASE as usize);
         let max_idx = (crate::config::regs::HOLD_SENSOR_MAX_BASE as usize)
@@ -175,4 +175,21 @@ pub fn run_auto_calibration(hal: &Hal) -> AppResult<()> {
 
     finish_calib();
     Ok(())
+}
+
+fn calibration_channel_count(configured_channels: u16) -> usize {
+    usize::from(configured_channels).min(SENSOR_CHANNELS)
+}
+
+#[cfg(test)]
+mod channel_count_tests {
+    use super::*;
+    #[test]
+    fn test_calibration_ignores_legacy_slots_without_physical_channels() {
+        assert_eq!(calibration_channel_count(0), 0);
+        assert_eq!(calibration_channel_count(4), 4);
+        assert_eq!(calibration_channel_count(6), 6);
+        assert_eq!(calibration_channel_count(8), 8);
+        assert_eq!(calibration_channel_count(9), 8);
+    }
 }

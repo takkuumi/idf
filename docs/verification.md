@@ -1,197 +1,74 @@
-# 验证清单
+# 生产验收清单
 
-> 首次烧录后建议按顺序逐项验证
+更新：2026-10-30。实际结果见 [本轮生产核查](testing/production-audit-2026-10-30.md)。
+清单不是通过证明；设备测试的 `--no-run` 仅编译，短时联网不替代连续长测。
 
-## 启动验证
+## 构建与产物
 
-- [ ] 串口能看到 ESP32-S3R8 启动 banner
-- [ ] 串口能看到 `esp32s3-iot-gateway v0.1.0` 日志
-- [ ] 串口能看到 `[main] starting ethernet/ble mesh/io scan/ai-ao/modbus rtu/tcp`
-- [ ] 串口能看到 `[main] entering main loop`
-- [ ] `[main] uptime=1s tick=10` 每秒打印一次
-- [ ] 无连续 panic / backtrace
+- [ ] fmt、diff 检查通过，Clippy `-D warnings` 通过。
+- [ ] `python3 tests/host/run_production_core.py` 实际执行核心主机测试。
+- [ ] `cargo test --locked --bin gateway --no-run` 编译通过；禁止烧入测试 ELF。
+- [ ] 默认、F3、F4、TCP-only 分别编译，按实物选择变体。
+- [ ] Release 构建成功，记录 ELF/app SHA-256；app 小于 `0x240000`。
+- [ ] 正式发布固定版本、干净提交和发布清单；候选产物不冒充正式发布。
 
-## 以太网验证
+## 启动与数据语义
 
-- [ ] W5500 复位正常（GPIO15 输出低脉冲 50ms，由 `hal.gpio.eth_reset()` 控制）
-- [ ] 网线插入后 DHCP 获取 IP（log 输出 `[eth] got IP: x.x.x.x / x.x.x.x gw x.x.x.x`）
-- [ ] 拔插网线能重新获取 IP
-- [ ] `ping <设备IP>` 能通
-- [ ] 心跳任务每 5s 执行一次（debug 级日志）
-- [ ] 拔网线 15s 后设备自动复位（连续 3 次心跳失败）
+- [ ] 带 `--no-skip`、显式 bootloader/partitions/factory 完整烧录，保留 NVS/holding。
+- [ ] 核对启动、配置 A/B 加载、BLE 广播、HTTP/Modbus 监听、reset reason/count。
+- [ ] 保留 W5500 PHY/IP 事件时间，另测业务可达时间；不把 PHY 速率解释为光口速率。
 
-## BLE Mesh 验证
+| 数据 | 实际协议地址 | 注意事项 |
+| --- | --- | --- |
+| 版本/日期 | FC04 `0x087E/0x087F` | 应与候选镜像一致 |
+| IP/掩码/网关 | FC03 `2247..2258` | 12 octet，IP → 掩码 → 网关 |
+| AI | FC04 `0x0080` 起 | 默认/F3 报告 4 路；数值不是 mA 工程量 |
+| AI 状态 | FC04 `0x0088` 起 | 状态位，不能作 AI 数值 |
+| 组态 | FC03 `2300+` | 按实际变长表及提交闸门语义操作 |
+| RS485 结果 | FC04，组态指定的目标地址 | RAM 实时值；FC03 低地址是控制字 |
+| UDP 状态 | FC04 `0x0090..0x009F` | LE 镜像；读取历史镜像须结合接收新鲜度 |
 
-使用 ESP-BLE-Mesh App (iOS/Android) 或 [nRF Mesh](https://www.nordicsemi.com/Products/Development-tools/nrf-mesh) 测试：
+不得凭通用 3xxxx/4xxxx 惯例自行改偏移；本工程有实际数值为 30001/40001 的兼容别名。
+旧清单中 `0x0103=重启`、`FC03 0=AO`、8DI/8DO 和 BLE Mesh 等描述已过期。
 
-- [ ] 扫描能发现设备 `ESP32S3-GW`
-- [ ] 能成功配网 (Provisioning)
-- [ ] 配网后设备加入 mesh 网络
-- [ ] Generic OnOff Client 能控制设备 DO0
-- [ ] 设备能作为 Proxy 节点（手机远离 mesh 时通过设备转发）
-- [ ] 心跳上报每 60s 一次
+## 参数保存
 
-## Modbus TCP Server 验证
+- [ ] Web 保存成功有 DeviceActor 完成确认；忙、队列满、失败、超时返回失败。
+- [ ] 缺失/非法参数不能误改 DO0、AI0 或清空 BLE 名称。
+- [ ] 网络、端口、BLE 名称、AI 校准、系统信息、holding、设备文本分别复读。
+- [ ] 保存后立即软件重启再复读；再独立做真实断电试验。
+- [ ] 保存失败及并发新写保留 dirty；运行时 AI/RS485 采样不写 Flash。
+- [ ] 测试参数有备份并最终恢复，不能把测试标记带入交付。
 
-用 [Modbus Poll](https://www.modbustools.com/modbus_poll.html) 或 [pymodbus](https://pypi.org/project/pymodbus/) 测试：
-
-```bash
-pip install pymodbus
-python -c "
-from pymodbus.client import ModbusTcpClient
-c = ModbusTcpClient('192.168.1.100', port=502)
-print(c.connect())
-# 读固件版本 (0x0100)
-r = c.read_holding_registers(address=0x0100, count=1)
-print(hex(r.registers[0]))  # 应输出 0x100 (v1.00)
-# 读运行时长
-r = c.read_holding_registers(address=0x0101, count=1)
-print('uptime:', r.registers[0], 's')
-"
-```
-
-- [ ] TCP 能连接到设备 502 端口
-- [ ] 读保持寄存器 0x0100 返回固件版本 (0x0100)
-- [ ] 读保持寄存器 0x0101 返回 uptime（每秒自增）
-- [ ] 写线圈 0x0000 (DO0) → DO0 GPIO 输出变化
-- [ ] 读离散输入 0x0000 (DI0) → 反映 DI0 实际电平
-- [ ] 读输入寄存器 0x0000 (AI0 raw) → 返回 ADC 原始值
-- [ ] 读输入寄存器 0x0010 (AI0 scaled) → 返回工程量
-- [ ] 写保持寄存器 0x0000 (AO0) → AO0 PWM 输出变化
-- [ ] 写保持寄存器 0x0103 = 0xA5A5 → 设备复位
-- [ ] 多连接（同时 4 个客户端）正常
-- [ ] 第 5 个客户端连接被拒绝
-
-## Modbus RTU Slave 验证
-
-用 [Modbus Poll](https://www.modbustools.com/modbus_poll.html) 或 USB-RS485 转换器测试：
-
-- [ ] 主站设备能访问从站地址 1
-- [ ] 各功能码 (01/02/03/04/05/06/0F/10) 正常响应
-- [ ] 非法地址返回异常码 0x02
-- [ ] 非法数据值返回异常码 0x03
-- [ ] 广播地址 0 不返回响应但执行操作
-- [ ] CRC 错误的帧被丢弃（无响应）
-
-## Modbus RTU Master 验证
-
-- [ ] 能成功轮询从站 1 (FC=03, addr=0, count=8)
-- [ ] 从站不存在时超时返回 (TIMEOUT_MS=500ms)
-- [ ] CRC 校验失败的响应被丢弃
-- [ ] 异常响应被正确处理并打日志
-
-## IO 验证
-
-### DI 数字输入
-- [ ] DI0~DI7 电平变化能在 1ms+去抖后反映到总线
-- [ ] 上升沿/下降沿日志正常
-- [ ] 通过 Modbus 读离散输入能获取最新状态
-
-### DO 数字输出
-- [ ] DO0~DO7 通过 Modbus 写线圈能切换
-- [ ] BLE Mesh OnOff Set 能控制 DO0
-- [ ] DO 输出电流符合硬件设计（开漏 100mA）
-
-### 联动测试
-- [ ] DO0 输出 → DI0 检测（硬件回环）状态一致
-- [ ] DO0 通过 Modbus 写 → DI0 通过 Modbus 读，状态一致
-- [ ] DO0 通过 BLE Mesh 写 → DI0 通过 Modbus 读，状态一致
-
-## AI/AO 验证
-
-### AI 模拟输入
-- [ ] ADC 0-3.3V 输入对应 raw 0-4095
-- [ ] 滑动平均生效（连续 8 个采样后才稳定）
-- [ ] 4-20mA 标定正确（4mA → scaled=4000, 20mA → scaled=20000）
-
-### AO 模拟输出
-- [ ] 写保持寄存器 0x0000 = 0 → PWM duty = 0
-- [ ] 写保持寄存器 0x0000 = 10000 → PWM duty = 4095
-- [ ] AO 经 RC 滤波后电压与 scaled 线性相关
-
-### 联动测试
-- [ ] AO0 输出 PWM → 用万用表测量电压
-- [ ] AO0 输出 → 经外部电路 → AI0 采集，闭环测试
-
-## 稳定性测试
-
-- [ ] 24 小时连续运行无 panic
-- [ ] 24 小时 Modbus TCP 持续轮询无丢包
-- [ ] 网线插拔 100 次能正常恢复
-- [ ] BLE Mesh 配网/断网 10 次能正常工作
-- [ ] 内存占用稳定（不持续增长）
-- [ ] 任务堆栈无溢出（`CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y`）
-
-## 性能基准
-
-- [ ] Modbus TCP 响应延迟 < 50ms
-- [ ] Modbus RTU 响应延迟 < 100ms (9600bps)
-- [ ] DI 变化到总线更新延迟 < 5ms (1ms 扫描 + 3 次去抖)
-- [ ] DO 写到 GPIO 输出延迟 < 20ms (10ms 周期)
-- [ ] AI 采样到总线更新延迟 < 100ms
-- [ ] BLE Mesh OnOff Set 到 DO 输出延迟 < 200ms (心跳周期)
-
-## BLE 验证 (新)
-
-### 启动日志检查
-- [ ] `[ble_at] service starting (uuid=4fafc201-...)` 应在初始化时打印
-- [ ] `[ble_at] controller config magic=0x...` 显示 magic 正确
-- [ ] `[ble_at] Classic BT memory release returned 0x...` (S3 上是 NOT_FOUND, 正常)
-- [ ] `[ble_at] BLE device name set to 'GW-XXXXXX'` 显示 BLE 名称
-- [ ] `[ble_at] BLE MAC = XX:XX:XX:XX:XX:XX` 显示蓝牙 MAC
-- [ ] `[ble_at] ETH MAC = XX:XX:XX:XX:XX:XX` 显示以太网 MAC
-- [ ] `[ble_at] local MTU set to 247` MTU 设置成功
-- [ ] `[ble_at] GATT app registered` GATT 应用注册
-- [ ] `[ble_at] GOT CREAT_ATTR_TAB_EVT` 属性表创建事件
-- [ ] `[ble_at] GATT service started` 服务启动
-- [ ] `[ble_at] ADV_DATA configured` 广播数据配置
-- [ ] `[ble_at] SCAN_RSP configured` 扫描响应配置 (含 name + txpower)
-- [ ] `[ble_at] SCAN_RSP configured; starting advertising...` 启动广播
-- [ ] `[ble_at] BLE advertising active (svc=4fafc201-...)` 广播已激活
-
-### 移动端扫描测试
-- [ ] 打开 nRF Connect 或 手持机 APP
-- [ ] 扫描 BLE 设备, 应该看到 "GW-XXXXXX" (后 3 字节是 MAC 地址)
-- [ ] 点击连接, 应能成功连接
-- [ ] MTU 协商 = 247 (查看 nRF Connect 详情)
-- [ ] 服务列表中应显示 4fafc201-1fb5-459e-8fcc-c5c9c331914b
-- [ ] 特征 b/eb5483e-36e1-4688-b7f5-ea07361b26a8 应显示 Read/Write/Notify 属性
-- [ ] Subscribe Notify 应能成功
-- [ ] 写入 "AT\r\n" 到 characteristic, 设备应通过 Notify 返回 "OK\r\n"
-
-## 单元测试运行
+台架测试会改少量参数及原始字，禁止直接用于已接生产控制回路的设备：
 
 ```bash
-# 这些测试是 #[cfg(test)] mod tests, 嵌入在源码中
-# 由于项目链接 esp-idf-sys, 标准的 cargo test 无法运行
-# 但可通过文档测试或 device 上运行的集成测试验证
-
-# 验证代码结构正确:
-cargo check              # 默认 features
-cargo check --features f3 # F3 版本 (16 DI + 16 DO)
-cargo check --features f4 # F4 版本 (48 DI, 无 DO)
+GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/configuration_acceptance.py \
+  192.168.51.226 --apply --backup log/hardware/config-original.json
+GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/test_udp_reconfiguration.py \
+  192.168.51.226 --apply
 ```
 
-## F3/F4 版本特定测试
+## 通信与物理功能
 
-### F3 (16 DI + 16 DO)
-- [ ] 编译时启用: `cargo build --features f3`
-- [ ] `cfg::hw_version::NAME` == "F3"
-- [ ] `cfg::hw_version::DI_COUNT` == 16
-- [ ] `cfg::hw_version::DO_COUNT` == 16
-- [ ] 3 片 MCP23017 在 I2C 总线 (DI@0x20, DO@0x21)
-- [ ] 读 DI 0..15 正确
-- [ ] 写 DO 0..15 正确
+- [ ] 四端口 FC03/04、125-word 响应、分片、流水、非法 PDU、Web 参数和认证检查通过。
+- [ ] 真实 RS485 数据持续写入配置目标；慢帧、错 CRC、离线、多端口分别验证。
+- [ ] UDP 被过滤流量持续到达时仍可热重绑，停包后新鲜度失效。
+- [ ] 真实手持机 BLE 读写、重连、组态和网络断电恢复通过。
+- [ ] NFC 实际标签、DI/DO 负载、AI 标准源/AO 测量、双光口和环网分别验收。
+- [ ] HTTP 慢滴送、TCP 半帧/背压、断线恢复不饿死其它任务。
 
-### F4 (48 DI + 48 DO)
-- [ ] 编译时启用: `cargo build --features f4`
-- [ ] `cfg::hw_version::NAME` == "F4"
-- [ ] `cfg::hw_version::DI_COUNT` == 48
-- [ ] `cfg::hw_version::DO_COUNT` == 48
-- [ ] `cfg::hw_version::DO_EXT_CHIPS` == 3
-- [ ] 6 片 MCP23017 在 I2C 总线
-  - DI: 0x20 / 0x21 / 0x22 (各 16 路)
-  - DO: 0x23 / 0x24 / 0x25 (各 16 路)
-- [ ] 读 DI 0..47 正确
-- [ ] 写 DO 0..47 正确 (一次 I2C 写 3 片, 约 600μs)
-- [ ] 读 DO 缓存正确
+```bash
+GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/production_acceptance.py \
+  192.168.51.226 --duration 600 --expected-version 0x00E4
+```
+
+## 7×24 放行门槛
+
+- [ ] 同一 SHA 连续 72 小时 Web/Modbus/真实负载和串口记录；刷机或复位后重新计时。
+- [ ] 无非计划重启、panic、WDT、低栈、堆损坏或持续内存下降。
+- [ ] 记录请求量、错误、P95/P99/最长延迟、内部 SRAM、任务最小栈和主循环 miss。
+- [ ] 完成物理断电、Flash 写入中断、从站离线、OTA 升级/回滚和传输中断测试。
+- [ ] 每项承诺交付功能都有实测证据；缺少硬件的测试不得标为通过。
+
+放行结论必须限定镜像、硬件、配置、负载和测试时长，不承诺“100% 永不故障”。

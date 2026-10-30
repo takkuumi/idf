@@ -270,6 +270,10 @@ pub fn end() -> AppResult<()> {
 
     let handle = sess.handle;
     let written = sess.written;
+    // Do not select a new boot partition while recently acknowledged business
+    // configuration is still only in RAM. On failure keep the active OTA
+    // handle so the caller can retry END or explicitly ABORT.
+    crate::device::await_pending_persistence()?;
     let r = unsafe { esp_idf_sys::esp_ota_end(handle) };
     // ESP-IDF 明确规定：esp_ota_end 无论返回值如何，handle 都已释放。
     sess.handle_active = false;
