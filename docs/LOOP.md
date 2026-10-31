@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-10-31 (SDKCONFIG 与持久化性能核查)
+> 最后更新: 2026-10-31 (2.3.1 发布准备与 NVS 优化归档)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -12,12 +12,27 @@
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
+## 2.3.1 发布（2026-10-31）
+
+- 将 Cargo、lockfile 和 IDF app 描述版本统一为 2.3.1（Modbus 231 / 0x00E7）。
+- 纳入已完成主机、IDF engine 仿真及 F3 实机验证的 NVS blob 优化；硬件型号映射、分区、保存节流和 Q 点逻辑保持原实现。
+- 按既有发布脚本干净构建 DEFAULT/MCP23017、F3/PCA9555、F4/PCA9555，生成逐文件 SHA-256、manifest 和烧录段。
+- 本轮设备操作限定为 F3 发布固件烧录和只读 UART/Modbus 复核；不登录 Web、不执行 Q 点写入、参数修改或额外重启验收。
+- 发布/设备结果记录在 `log/hardware/release-v2.3.1-2026-10-31.md`，原 2.3.0 产物保留。
+
 ## SDKCONFIG 与持久化核查（2026-10-31）
 
 - 核对 DEFAULT/F3/F4 生成配置和 IDF v5.5.4 源码：NVS cache 已在内部 RAM，Flash 函数已在 IRAM，写块已为 8192 字节。
 - 删除不生效的 `SPI_FLASH_USE_4BLOCK_ERASE`，显式固定现有 Flash 调度值；将 NVS 特定断言检查改为错误码，保留常规安全检查与业务校验。
 - 确认 holding 实际使用 raw A/B 分区；其 2 秒静默条件和 Actor/节流调度才是延迟来源之一，NVS commit 在本版 IDF 中不做后台 flush。未改保存周期或宣称未经测量的性能提升。
 - 新增实际生成配置核验脚本；构建验收与证据见 `docs/testing/sdkconfig-storage-audit-2026-10-31.md`。未刷机，已有发布包不变。
+
+## NVS 写入路径优化（2026-10-31）
+
+- 发现 `esp-idf-svc 0.53.0::set_blob` 的 delete-before-set 会在 IDF 已具备原位替换和相同内容去重的情况下增加一次删除操作。
+- 新增 `src/device/nvs_store.rs`，项目自有 blob 统一使用 `nvs_set_blob` 原生替换，保留逐 key commit、错误返回、dirty 重试、A/B、CRC 和回读校验。
+- SystemConfig、协议 blob、设备文本、Web 信息、DO 位图和 device_config 均接入；未改 key、分区、格式和保存节流。
+- host 适配层 10 项、真实 IDF NVS engine 的相同值/GC/113 个操作中断点和空间耗尽检查通过；核心生产测试 25 项、默认/F3/F4 Clippy、设备测试目标编译和格式检查通过。优化 F3 镜像已刷入：相同值保存中位数 106.6ms→95.3ms（小样本）；45 秒 1,640 次 Modbus 和 9 次 Web 均通过。现场两次 SOFTWARE 为测试主动 Web 重启，计数止于 79；用户操作期间已停止所有测试/登录。详见 `docs/testing/nvs-performance-optimization-2026-10-31.md`。
 
 ## LOOP47 生产核查与长期运行修复（2026-10-30）
 

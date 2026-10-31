@@ -223,7 +223,7 @@ pub fn persist_pending_system_info() -> Result<bool, String> {
         return Err("invalid web system info".to_string());
     };
     let result = crate::device::try_with_nvs_mut(|nvs| {
-        nvs.set_blob(NVS_KEY_WEB_SYSTEM_INFO, &blob)
+        crate::device::nvs_store::set_blob(nvs, NVS_KEY_WEB_SYSTEM_INFO, &blob)
             .map_err(|e| format!("{e:?}"))?;
         let mut verify = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
         match nvs

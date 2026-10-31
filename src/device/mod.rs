@@ -28,6 +28,7 @@
 //! - 兼容旧格式: 若 `proto_act` 不存在但 `proto_data` 存在, 迁移到 A
 
 pub mod holding_store;
+pub(crate) mod nvs_store;
 mod pending_save;
 pub mod system_config;
 
@@ -808,7 +809,7 @@ pub fn nvs_write(key: &str, data: &[u8]) -> AppResult<()> {
     let nvs = guard
         .as_ref()
         .ok_or_else(|| AppError::Config("NVS not available".into()))?;
-    nvs.set_blob(key, data)
+    nvs_store::set_blob(nvs, key, data)
         .map_err(|e| AppError::Config(format!("nvs set_blob {key}: {e:?}")))
 }
 
@@ -1008,7 +1009,7 @@ fn commit() -> AppResult<()> {
         let crc_data = crc32(&blob[BLOB_HEADER_BYTES..BLOB_TOTAL_BYTES]);
         blob[6..10].copy_from_slice(&crc.wrapping_add(crc_data).to_le_bytes());
 
-        nvs.set_blob(write_key, &blob[..BLOB_TOTAL_BYTES])
+        nvs_store::set_blob(nvs, write_key, &blob[..BLOB_TOTAL_BYTES])
             .map_err(|e| AppError::Config(format!("nvs set_blob {write_key}: {e:?}")))?;
         nvs.set_u8(NVS_KEY_ACTIVE, new_active)
             .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
@@ -1261,8 +1262,8 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
         )));
     }
     if let Some(result) = try_with_nvs_mut(|nvs| -> AppResult<()> {
-        // 先比较现有内容。文本分片会反复触发 dirty，但内容没变化时绝不能
-        // 再次调用 set_blob；EspNvs::set_blob 会先擦除旧 key，失败时会留下空 key。
+        // 文本分片会反复触发 dirty；保留预比较，避免重复扫描 4000 字节。
+        // 共享写入层使用 IDF 的原位替换 API，不预先删除旧 key。
         let mut verify = DEVICE_TEXT_VERIFY_BUFFER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1283,9 +1284,9 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
             }
         };
         if !unchanged {
-            // 保持 MCA 的单 blob 格式：擦除并重写 4000 字节文本，再写兼容 magic。
+            // 保持 MCA 的单 blob 格式：提交 4000 字节文本，再写兼容 magic。
             // FC16 批量写只调用一次；FC06 分片由 DeviceActor 合并后写一次。
-            nvs.set_blob(NVS_KEY_DEV_TEXT, blob)
+            nvs_store::set_blob(nvs, NVS_KEY_DEV_TEXT, blob)
                 .map_err(|e| AppError::Config(format!("nvs set dev_text: {e:?}")))?;
         }
         nvs.set_u16(NVS_KEY_DEV_TEXT_MAGIC, DEV_TEXT_MAGIC)
@@ -1363,7 +1364,7 @@ fn load_do_bits_from_nvs(nvs: &EspDefaultNvs) -> u64 {
 pub fn save_do_bits_to_nvs(bits: u64) -> AppResult<()> {
     let bytes = bits.to_le_bytes();
     crate::device::try_with_nvs_mut(|nvs| -> AppResult<()> {
-        nvs.set_blob(NVS_KEY_DO_BITS, &bytes)
+        nvs_store::set_blob(nvs, NVS_KEY_DO_BITS, &bytes)
             .map_err(|e| AppError::Config(format!("nvs set do_bits: {e:?}")))?;
         nvs.set_u16(NVS_KEY_DO_MAGIC, DO_NVS_MAGIC)
             .map_err(|e| AppError::Config(format!("nvs set do_magic: {e:?}")))?;

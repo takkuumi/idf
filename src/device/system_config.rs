@@ -418,7 +418,7 @@ impl SystemConfig {
     pub fn save_to_nvs(&self, nvs: &mut EspDefaultNvs) -> AppResult<()> {
         self.validate_for_persistence()?;
         let buf = self.encode();
-        nvs.set_blob(NVS_KEY_BLOB, &buf)
+        crate::device::nvs_store::set_blob(nvs, NVS_KEY_BLOB, &buf)
             .map_err(|e| AppError::Config(format!("nvs set blob: {e:?}")))?;
         nvs.set_u32(NVS_KEY_MAGIC, NVS_MAGIC)
             .map_err(|e| AppError::Config(format!("nvs set magic: {e:?}")))?;

@@ -82,6 +82,20 @@ python3 tests/manual/serial_soak.py --port /dev/cu.usbserial-1430 --baud 115200 
 脚本只读 UART，并在端口暂时不可用时退避重连。用串口 monitor 或烧录工具前应先停止该采集器，
 因为一个串口不能同时由多个进程读取。
 
+## NVS 保存时延基准
+
+```bash
+GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/nvs_save_benchmark.py \
+  192.168.51.226 --apply --backup log/hardware/nvs-original-config.json
+```
+
+脚本只临时修改设备显示名称和相同的地址备注，不改 IP、RS485、BLE、校准或输出；结束时
+自动恢复并逐项复读。备份路径必须不存在。结果是 Web 保存确认时延，包含 HTTP 和
+DeviceActor 调度，不代表纯 Flash 时延或擦除次数。
+
+必须在独占台架窗口执行：设备 Web 为单会话，脚本登录会使人工浏览器会话失效。
+`--reboot-check` 会主动重启设备两次，不得与人工 Q 点操作或现场控制并发执行。
+
 ## Modbus TCP 网络配置读取
 
 ```bash
