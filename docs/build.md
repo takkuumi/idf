@@ -305,8 +305,8 @@ ESPFLASH_BEFORE=no_reset just release-flash f3
 串口、波特率和复位方式可通过 `ESPFLASH_PORT`、`ESPFLASH_BAUD`、
 `ESPFLASH_BEFORE`、`ESPFLASH_AFTER` 覆盖。没有设备时可用
 `RELEASE_FLASH_DRY_RUN=1 just release-flash f3` 验证构建、清单和最终命令。
-F3/F4/Default 是编译期硬件型号，必须与实际主板匹配；例如 F16 主板不能刷 F3，
-否则 MCP23017 初始化会失败且网口不会启动。当前脚本无法仅凭 ESP32 芯片 MAC
+F3/F4/Default 是编译期硬件型号，必须与实际主板匹配；Default 主板不能刷 F3，
+否则 PCA9555 初始化会失败且网口不会启动。当前脚本无法仅凭 ESP32 芯片 MAC
 自动识别扩展板型号，刷写前必须确认型号。
 刷入脚本默认只接受当前 Git 提交且工作区干净的发布包；仅在明确确认时，才使用
 `ALLOW_STALE_RELEASE=1` 或 `ALLOW_DIRTY_RELEASE=1` 放宽对应保护。
@@ -329,10 +329,10 @@ cargo build --release
 cargo build --release --no-default-features \
     --features "ble-mesh,ethernet-w5500,modbus-rtu,modbus-tcp,ai-ao,io-di-do"
 
-# F3 硬件版本 (16 DI + 16 DO, I2C MCP23017 扩展)
+# F3 硬件版本 (16 DI + 16 DO, PCA9555 扩展)
 cargo build --release --features f3
 
-# F4 硬件版本 (48 DI + 16 DO, I2C MCP23017 扩展)
+# F4 硬件版本 (48 DI + 48 DO, 多片 PCA9555 扩展)
 cargo build --release --features f4
 ```
 

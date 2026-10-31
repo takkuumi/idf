@@ -107,11 +107,11 @@ espflash --version             # 应可用
 
 | 版本 | 命令 | DI | DO | IO 方式 |
 |------|------|----|----|---------|
-| Default | `cargo build` | 8 | 8 | GPIO 直驱 |
-| F3 | `cargo build --features f3` | 16 | 16 | I2C MCP23017（2 片） |
-| F4 | `cargo build --features f4` | 48 | 16 | I2C MCP23017（4 片） |
+| Default | `cargo build` | 16 | 16 | MCP23017（2 片） |
+| F3 | `cargo build --features f3` | 16 | 16 | PCA9555（单组） |
+| F4 | `cargo build --features f4` | 48 | 48 | PCA9555（多组） |
 
-F3/F4 互斥由 `build.rs::check_feature_compatibility()` 强制校验，同时启用会 panic 中断编译。启用 `f3`/`f4` 后，`io-di-do` 自动启用，I2C 总线占用 GPIO21(SDA)/GPIO33(SCL)。
+F3/F4 互斥由 `build.rs::check_feature_compatibility()` 强制校验，同时启用会 panic 中断编译。启用 `f3`/`f4` 后，`io-di-do` 自动启用，PCA9555 软件 I2C 占用 GPIO35/36 与 GPIO38/37；Default 使用 MCP23017 硬件 I2C GPIO21/33。
 
 ### 2.2 功能 feature
 
@@ -149,13 +149,13 @@ cargo build
 # Release 构建（opt-level=3 + fat LTO + panic=abort，体积最小）
 cargo build --release
 
-# Default 硬件版本（8 DI + 8 DO）
+# Default 硬件版本（16 DI + 16 DO，MCP23017）
 cargo build --release
 
 # F3 硬件版本（16 DI + 16 DO，I2C 扩展）
 cargo build --release --features f3
 
-# F4 硬件版本（48 DI + 16 DO，I2C 扩展）
+# F4 硬件版本（48 DI + 48 DO，PCA9555 多芯片）
 cargo build --release --features f4
 
 # 自定义 feature 组合（禁用默认，显式启用）

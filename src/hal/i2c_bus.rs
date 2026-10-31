@@ -1,4 +1,4 @@
-//! I2C 总线封装 (用于 MCP23017 IO 扩展, 仅 F3/F4 版本)
+//! I2C 总线封装 (用于默认构建的 MCP23017 IO 扩展)
 
 use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};

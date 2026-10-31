@@ -1,6 +1,7 @@
 //! PCA9555 (NCA9555 compatible) driver — matching reference firmware nca9555.cpp.
 //!
-//! Hardware model: **F16** (16 DI + 16 DO), same as `#define NCA9555F16`.
+//! Hardware models: **F3** (16 DI + 16 DO) and **F4** (48 DI + 48 DO),
+//! matching the reference NCA9555 F16/F48 address banks.
 //!
 //! ## IO Bus (SDA=GPIO35, SCL=GPIO36)
 //! | Chip | Addr | Purpose |
@@ -20,8 +21,6 @@
 //! - DO LED: `!byte` — inverted (low-active)
 //! - DI read: `!raw` — inverted (active-low input)
 //! - DI LED: `raw` — direct (low-active LED, 0=input-active=LED-ON)
-
-use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::error::{AppError, AppResult};
 use crate::sync::Spin;
@@ -44,7 +43,7 @@ const ADDR_DI_LED: u8 = 0x40;
 const ADDR_STATUS_LED: u8 = 0x44;
 const ADDR_DO_LED: u8 = 0x48;
 
-// F16 status LEDs are active-low. These masks match nca9555.h in the
+// Status LEDs are active-low. These masks match nca9555.h in the
 // production MCA firmware; clearing a bit turns the corresponding LED on.
 const STATUS_LED_BT: u8 = 0xFD;
 const STATUS_LED_RS485: [u8; 2] = [0xFB, 0xF7];
@@ -206,237 +205,299 @@ impl BusI2c {
 }
 
 // ============================================================================
-// Pca9555Duo — F16 DO+DI+LED driver implementing DigitalIo
+// Pca9555Duo — F3/F4 PCA9555 banks implementing DigitalIo
 // ============================================================================
+const MAX_CHIPS: usize = 3;
+
+#[cfg(feature = "f4")]
+const DI_IO_ADDRS: &[u8] = &[0x40, 0x44, 0x42];
+#[cfg(not(feature = "f4"))]
+const DI_IO_ADDRS: &[u8] = &[ADDR_DI_IO];
+#[cfg(feature = "f4")]
+const DO_IO_ADDRS: &[u8] = &[0x48, 0x4C, 0x4E];
+#[cfg(not(feature = "f4"))]
+const DO_IO_ADDRS: &[u8] = &[ADDR_DO_IO];
+#[cfg(feature = "f4")]
+const DI_LED_ADDRS: &[u8] = &[0x40, 0x44, 0x42];
+#[cfg(not(feature = "f4"))]
+const DI_LED_ADDRS: &[u8] = &[ADDR_DI_LED];
+#[cfg(feature = "f4")]
+const DO_LED_ADDRS: &[u8] = &[0x48, 0x4C, 0x4E];
+#[cfg(not(feature = "f4"))]
+const DO_LED_ADDRS: &[u8] = &[ADDR_DO_LED];
+#[cfg(feature = "f4")]
+const STATUS_LED_ADDR: u8 = 0x46;
+#[cfg(not(feature = "f4"))]
+const STATUS_LED_ADDR: u8 = ADDR_STATUS_LED;
+
+#[cfg(feature = "f4")]
+const STATUS_LED_RS485_F4: [u8; 2] = [0xDF, 0xFB];
+#[cfg(feature = "f4")]
+const STATUS_LED_FIBER_F4: [u8; 2] = [0xF7, 0x7F];
+#[cfg(feature = "f4")]
+const STATUS_LED_BT_F4: u8 = 0xEF;
+
 pub struct Pca9555Duo {
     io_bus: BusI2c,
     led_bus: BusI2c,
-    do_cache: AtomicU16,
-    /// Last written IO port values (bit-reversed), for incremental write
-    last_io: Spin<(u8, u8)>,
-    /// Last written LED port values (inverted), for incremental write
-    last_led: Spin<(u8, u8)>,
-    /// Last raw DI values mirrored to the DI LED expander.
-    last_di_led: Spin<(u8, u8)>,
+    do_cache: crate::sync::AtomicBits64,
+    /// Last written IO port values (bit-reversed), indexed by DO chip.
+    last_io: Spin<[(u8, u8); MAX_CHIPS]>,
+    /// Last written LED port values (inverted), indexed by DO LED chip.
+    last_led: Spin<[(u8, u8); MAX_CHIPS]>,
+    /// Last raw DI values mirrored to DI LED chips.
+    last_di_led: Spin<[(u8, u8); MAX_CHIPS]>,
+    #[cfg(feature = "f4")]
+    status_led: Spin<(u8, u8)>,
+    #[cfg(not(feature = "f4"))]
     status_led: Spin<u8>,
 }
 
 impl Pca9555Duo {
     pub fn init(io_sda: i32, io_scl: i32, led_sda: i32, led_scl: i32) -> AppResult<Self> {
-        // Power sequence matching reference: init chips with power OFF,
-        // then power ON after init.
-        // Note: GPIO21/33 are already set HIGH by hal::init before this call,
-        // which is opposite of reference. This is OK for F16 — boards get power
-        // before I2C init without issue.
+        let io_bus = BusI2c::new(SwI2c::init(io_sda, io_scl)?);
+        let led_bus = BusI2c::new(SwI2c::init(led_sda, led_scl)?);
 
-        let io_i2c = SwI2c::init(io_sda, io_scl)?;
-        let led_i2c = SwI2c::init(led_sda, led_scl)?;
-        let io_bus = BusI2c::new(io_i2c);
-        let led_bus = BusI2c::new(led_i2c);
-
-        // ---- IO Bus init (matching nca9555_init for NCA9555F16) ----
-        // Clear DO chip outputs first
-        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_0, 0x00)?;
-        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_1, 0x00)?;
-        // DI chip: all inputs
-        io_bus.write_reg(ADDR_DI_IO, REG_CONFIG_0, 0xFF)?;
-        io_bus.write_reg(ADDR_DI_IO, REG_CONFIG_1, 0xFF)?;
-        // Set safe output latches BEFORE enabling the outputs. PCA9555 reset
-        // output latches are high; cached zeroes must match real hardware.
-        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_0, 0x00)?;
-        io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_1, 0x00)?;
-        // DO chip: all outputs
-        io_bus.write_reg(ADDR_DO_IO, REG_CONFIG_0, 0x00)?;
-        io_bus.write_reg(ADDR_DO_IO, REG_CONFIG_1, 0x00)?;
-        log::info!("[pca9555] io bus: DI@0x40(input) DO@0x42(output)");
-
-        // ---- LED Bus init (all outputs, all LEDs OFF) ----
-        for &(addr, _name) in &[
-            (ADDR_DI_LED, "DI_LED@0x40"),
-            (ADDR_STATUS_LED, "STATUS@0x44"),
-            (ADDR_DO_LED, "DO_LED@0x48"),
-        ] {
-            led_bus.write_reg(addr, REG_CONFIG_0, 0x00)?;
-            led_bus.write_reg(addr, REG_CONFIG_1, 0x00)?;
-            led_bus.write_reg(addr, REG_OUTPUT_0, 0xFF)?;
-            led_bus.write_reg(addr, REG_OUTPUT_1, 0xFF)?;
+        // Inputs are high-impedance with the board's external pull-ups.
+        for &addr in DI_IO_ADDRS {
+            io_bus.write_reg(addr, REG_CONFIG_0, 0xFF)?;
+            io_bus.write_reg(addr, REG_CONFIG_1, 0xFF)?;
+        }
+        // Set safe output latches before enabling outputs.
+        for &addr in DO_IO_ADDRS {
+            io_bus.write_regs2(addr, REG_OUTPUT_0, [0x00, 0x00])?;
+            io_bus.write_regs2(addr, REG_CONFIG_0, [0x00, 0x00])?;
+        }
+        // DI/DO mirrors and status LEDs are all active-low outputs.
+        for &addr in DI_LED_ADDRS
+            .iter()
+            .chain(DO_LED_ADDRS)
+            .chain([STATUS_LED_ADDR].iter())
+        {
+            led_bus.write_regs2(addr, REG_CONFIG_0, [0x00, 0x00])?;
+            led_bus.write_regs2(addr, REG_OUTPUT_0, [0xFF, 0xFF])?;
         }
 
-        // Status LEDs: PWR+RUN ON (matching reference: gucOtherLedState = 0xFF & PWRLED & RUNLED)
-        // PWRLED=0xFE, RUNLED=0xDF → gucOtherLedState = 0xDE (bits for PWR+RUN cleared = ON)
-        let other_led: u8 = 0xFE & 0xDF; // = 0xDE
-        led_bus.write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, other_led)?;
-        log::info!("[pca9555] status LEDs: PWR+RUN on (0x{other_led:02X})");
+        #[cfg(feature = "f4")]
+        let status_led = (0xFC, 0xFF); // PWR=ON, RUN=ON; other indicators OFF
+        #[cfg(not(feature = "f4"))]
+        let status_led = 0xDE; // F3/F16-compatible PWR+RUN state
+        #[cfg(feature = "f4")]
+        led_bus.write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [status_led.0, status_led.1])?;
+        #[cfg(not(feature = "f4"))]
+        led_bus.write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, status_led)?;
 
-        log::info!("[pca9555] led bus: all chips ready, all LEDs off except PWR/RUN");
-        log::info!("[pca9555] F16 (16DI+16DO) init complete");
-
+        log::info!(
+            "[pca9555] initialized: DI={:?} DO={:?} ({}DI/{}DO)",
+            DI_IO_ADDRS,
+            DO_IO_ADDRS,
+            crate::config::hw_version::DI_COUNT,
+            crate::config::hw_version::DO_COUNT
+        );
         Ok(Self {
             io_bus,
             led_bus,
-            do_cache: AtomicU16::new(0x0000),
-            last_io: Spin::new((0x00, 0x00)),
-            last_led: Spin::new((0xFF, 0xFF)), // init=off matches LED init above
-            last_di_led: Spin::new((0xFF, 0xFF)),
-            status_led: Spin::new(other_led),
+            do_cache: crate::sync::AtomicBits64::new(0),
+            last_io: Spin::new([(0, 0); MAX_CHIPS]),
+            last_led: Spin::new([(0xFF, 0xFF); MAX_CHIPS]),
+            last_di_led: Spin::new([(0xFF, 0xFF); MAX_CHIPS]),
+            status_led: Spin::new(status_led),
         })
     }
 
-    /// Write DO to IO bus (bit-reversed) + LED bus (inverted).
-    /// Only writes ports that actually changed (incremental update).
-    fn apply_do(&self, val: u16) -> AppResult<()> {
-        let lo = (val & 0xFF) as u8;
-        let hi = ((val >> 8) & 0xFF) as u8;
-        let io_lo = bit_reverse(lo);
-        let io_hi = bit_reverse(hi);
-        let led_lo = !lo;
-        let led_hi = !bit_reverse(hi);
-
-        // IO bus: only write changed ports
-        {
-            let mut last = self.last_io.lock();
-            if last.0 != io_lo {
-                self.io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_0, io_lo)?;
-                last.0 = io_lo;
+    fn apply_do(&self, value: u64) -> AppResult<()> {
+        let mut last_io = self.last_io.lock();
+        let mut last_led = self.last_led.lock();
+        for (index, (&io_addr, &led_addr)) in DO_IO_ADDRS.iter().zip(DO_LED_ADDRS).enumerate() {
+            let raw = ((value >> (index * 16)) & 0xFFFF) as u16;
+            let lo = raw as u8;
+            let hi = (raw >> 8) as u8;
+            let io = [bit_reverse(lo), bit_reverse(hi)];
+            let led = [!lo, !bit_reverse(hi)];
+            if last_io[index] != (io[0], io[1]) {
+                self.io_bus.write_regs2(io_addr, REG_OUTPUT_0, io)?;
+                last_io[index] = (io[0], io[1]);
             }
-            if last.1 != io_hi {
-                self.io_bus.write_reg(ADDR_DO_IO, REG_OUTPUT_1, io_hi)?;
-                last.1 = io_hi;
+            if last_led[index] != (led[0], led[1]) {
+                self.led_bus.write_regs2(led_addr, REG_OUTPUT_0, led)?;
+                last_led[index] = (led[0], led[1]);
             }
         }
-
-        // LED bus: only write changed ports
-        {
-            let mut last = self.last_led.lock();
-            if last.0 != led_lo {
-                self.led_bus.write_reg(ADDR_DO_LED, REG_OUTPUT_0, led_lo)?;
-                last.0 = led_lo;
-            }
-            if last.1 != led_hi {
-                self.led_bus.write_reg(ADDR_DO_LED, REG_OUTPUT_1, led_hi)?;
-                last.1 = led_hi;
-            }
-        }
-
         Ok(())
     }
 
-    /// Update DI LEDs from raw input values.
-    fn update_di_leds(&self, port0: u8, port1: u8) -> AppResult<()> {
+    fn update_di_leds(&self, index: usize, addr: u8, raw: [u8; 2]) -> AppResult<()> {
         let mut last = self.last_di_led.lock();
-        if *last == (port0, port1) {
+        if last[index] == (raw[0], raw[1]) {
             return Ok(());
         }
-        self.led_bus
-            .write_regs2(ADDR_DI_LED, REG_OUTPUT_0, [port0, port1])?;
-        *last = (port0, port1);
+        self.led_bus.write_regs2(addr, REG_OUTPUT_0, raw)?;
+        last[index] = (raw[0], raw[1]);
         Ok(())
     }
 
-    /// Keep the physical BT indicator aligned with the GATT connection state.
-    /// This is called from the main task, never from a Bluedroid callback.
     pub fn set_bt_led(&self, connected: bool) -> AppResult<()> {
-        let mut current = self.status_led.lock();
-        let next = with_status_led(*current, STATUS_LED_BT, connected);
-        if next == *current {
-            return Ok(());
+        #[cfg(feature = "f4")]
+        {
+            let mut current = self.status_led.lock();
+            let next = if connected {
+                (current.0 & STATUS_LED_BT_F4, current.1)
+            } else {
+                (current.0 | !STATUS_LED_BT_F4, current.1)
+            };
+            if next != *current {
+                self.led_bus
+                    .write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [next.0, next.1])?;
+                *current = next;
+            }
+            Ok(())
         }
-        self.led_bus
-            .write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, next)?;
-        *current = next;
-        Ok(())
+        #[cfg(not(feature = "f4"))]
+        {
+            let mut current = self.status_led.lock();
+            let next = with_status_led(*current, STATUS_LED_BT, connected);
+            if next != *current {
+                self.led_bus
+                    .write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, next)?;
+                *current = next;
+            }
+            Ok(())
+        }
     }
 
-    /// Update F16 RS485 activity and fiber input indicators in one I2C write.
-    /// The main task owns this work; BT/PWR/RUN/ERR bits are preserved.
     pub fn set_port_leds(&self, rs485: [bool; 2], fiber: [bool; 2]) -> AppResult<()> {
-        let mut current = self.status_led.lock();
-        let next = with_fiber_leds(with_rs485_leds(*current, rs485), fiber);
-        if next == *current {
-            return Ok(());
+        #[cfg(feature = "f4")]
+        {
+            let mut current = self.status_led.lock();
+            let mut next = *current;
+            for (i, &active) in rs485.iter().enumerate() {
+                next.0 = if active {
+                    next.0 & STATUS_LED_RS485_F4[i]
+                } else {
+                    next.0 | !STATUS_LED_RS485_F4[i]
+                };
+            }
+            next.0 = if fiber[0] {
+                next.0 & STATUS_LED_FIBER_F4[0]
+            } else {
+                next.0 | !STATUS_LED_FIBER_F4[0]
+            };
+            next.1 = if fiber[1] {
+                next.1 & STATUS_LED_FIBER_F4[1]
+            } else {
+                next.1 | !STATUS_LED_FIBER_F4[1]
+            };
+            if next != *current {
+                self.led_bus
+                    .write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [next.0, next.1])?;
+                *current = next;
+            }
+            Ok(())
         }
-        self.led_bus
-            .write_reg(ADDR_STATUS_LED, REG_OUTPUT_0, next)?;
-        *current = next;
-        log::info!(
-            "[pca9555] 端口指示灯已写入: rs485={rs485:?} fiber={fiber:?} output=0x{next:02X}"
-        );
-        Ok(())
+        #[cfg(not(feature = "f4"))]
+        {
+            let mut current = self.status_led.lock();
+            let next = with_fiber_leds(with_rs485_leds(*current, rs485), fiber);
+            if next != *current {
+                self.led_bus
+                    .write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, next)?;
+                *current = next;
+            }
+            Ok(())
+        }
     }
 }
 
 impl DigitalIo for Pca9555Duo {
     fn di_count(&self) -> usize {
-        16
+        crate::config::hw_version::DI_COUNT
     }
     fn do_count(&self) -> usize {
-        16
+        crate::config::hw_version::DO_COUNT
     }
 
     fn read_di_all(&self) -> AppResult<u64> {
-        let [raw0, raw1] = self.io_bus.read_regs2(ADDR_DI_IO, REG_INPUT_0)?;
-
-        // Update DI LEDs with raw value (matching reference: savedata = backdata)
-        let _ = self.update_di_leds(raw0, raw1);
-
-        // Invert: input is active-low (pull-up → LOW=active → 1 in Modbus)
-        let di0 = (!raw0) as u64;
-        // Reference bit-reverses port1: EXchg_ByteHl then invert
-        let di1_rev = bit_reverse(raw1) as u64;
-        Ok(((di1_rev ^ 0xFF) << 8) | di0)
+        let mut result = 0u64;
+        for (index, (&io_addr, &led_addr)) in DI_IO_ADDRS.iter().zip(DI_LED_ADDRS).enumerate() {
+            let raw = self.io_bus.read_regs2(io_addr, REG_INPUT_0)?;
+            let _ = self.update_di_leds(index, led_addr, raw);
+            let bits = (!raw[0] as u64) | ((bit_reverse(raw[1]) ^ 0xFF) as u64) << 8;
+            result |= bits << (index * 16);
+        }
+        Ok(result)
     }
 
     fn read_di(&self, idx: usize) -> AppResult<bool> {
-        if idx >= 16 {
+        if idx >= self.di_count() {
             return Err(AppError::Io(format!("di idx {idx} out of range")));
         }
-        let all = self.read_di_all()?;
-        Ok(all & (1u64 << idx) != 0)
+        Ok(self.read_di_all()? & (1u64 << idx) != 0)
     }
 
     fn write_do_all(&self, value: u64) -> AppResult<()> {
-        let bits = (value & 0xFFFF) as u16;
-        if self.do_cache.load(Ordering::Acquire) == bits {
+        let mask = if self.do_count() >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.do_count()) - 1
+        };
+        let value = value & mask;
+        if self.do_cache.load_bits() == value {
             return Ok(());
         }
-        self.apply_do(bits)?;
-        // 缓存表示已确认的硬件状态，不能在 I2C 写入成功前发布。
-        self.do_cache.store(bits, Ordering::Release);
+        self.apply_do(value)?;
+        self.do_cache.store_bits(value);
         Ok(())
     }
 
     fn write_do(&self, idx: usize, on: bool) -> AppResult<()> {
-        if idx >= 16 {
+        if idx >= self.do_count() {
             return Err(AppError::Io(format!("do idx {idx} out of range")));
         }
-        let mask = 1u16 << idx;
-        let current = self.do_cache.load(Ordering::Acquire);
-        let bits = if on { current | mask } else { current & !mask };
-        if current == bits {
-            return Ok(());
-        }
-        self.apply_do(bits)?;
-        self.do_cache.store(bits, Ordering::Release);
-        Ok(())
+        let current = self.do_cache.load_bits();
+        let value = if on {
+            current | (1u64 << idx)
+        } else {
+            current & !(1u64 << idx)
+        };
+        self.write_do_all(value)
     }
 
     fn read_do_cached(&self) -> u64 {
-        self.do_cache.load(Ordering::Acquire) as u64
+        self.do_cache.load_bits()
     }
 
     fn read_do_actual(&self) -> AppResult<u64> {
-        let lo = self.io_bus.read_reg(ADDR_DO_IO, REG_OUTPUT_0)?;
-        let hi = self.io_bus.read_reg(ADDR_DO_IO, REG_OUTPUT_1)?;
-        // Reverse the bit-reversal
-        let d0 = bit_reverse(lo) as u64;
-        let d1 = bit_reverse(hi) as u64;
-        Ok(d0 | (d1 << 8))
+        let mut result = 0u64;
+        for (index, &addr) in DO_IO_ADDRS.iter().enumerate() {
+            let raw = self.io_bus.read_regs2(addr, REG_OUTPUT_0)?;
+            result |= (bit_reverse(raw[0]) as u64) << (index * 16);
+            result |= (bit_reverse(raw[1]) as u64) << (index * 16 + 8);
+        }
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "f3")]
+    fn test_f3_pca_bank_layout() {
+        assert_eq!(DI_IO_ADDRS, &[0x40]);
+        assert_eq!(DO_IO_ADDRS, &[0x42]);
+        assert_eq!(crate::config::hw_version::DI_COUNT, 16);
+        assert_eq!(crate::config::hw_version::DO_COUNT, 16);
+    }
+
+    #[test]
+    #[cfg(feature = "f4")]
+    fn test_f4_pca_bank_layout() {
+        assert_eq!(DI_IO_ADDRS, &[0x40, 0x44, 0x42]);
+        assert_eq!(DO_IO_ADDRS, &[0x48, 0x4C, 0x4E]);
+        assert_eq!(crate::config::hw_version::DI_COUNT, 48);
+        assert_eq!(crate::config::hw_version::DO_COUNT, 48);
+    }
 
     #[test]
     fn test_rs485_leds_are_active_low_and_independent() {

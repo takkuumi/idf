@@ -8,8 +8,8 @@
 //!
 //! # 数字 IO (DI/DO) 归属
 //!
-//! 默认版本 (8 DI + 8 DO): 由 [`crate::hal::pca9555`] 通过软件 I2C 管理
-//! F3/F4 版本 (16/48 DI + 16 DO): 由 [`crate::hal::io_ext`] 通过硬件 I2C + MCP23017 管理
+//! 默认版本 DI/DO 由 [`crate::hal::io_ext`] 通过硬件 I2C + MCP23017 管理。
+//! F3/F4 版本由 [`crate::hal::pca9555`] 通过软件 I2C PCA9555 组管理。
 //!
 //! 上层通过 `crate::hal::Hal::dio()` trait object 统一访问, 无需关心底层硬件。
 //!

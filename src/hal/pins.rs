@@ -69,7 +69,7 @@ pub struct HalPins {
     /// RS485 #0 / #1 的 DE 引脚
     pub rs485_de: [u8; 2],
 
-    // ---- DI / DO 引脚号 (仅 io-di-do 版本, F3/F4 用 I2C 扩展) ----
+    // ---- 兼容 DI / DO 引脚号（当前硬件变体均由 I2C 扩展管理） ----
     #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
     pub di: [u8; 8],
     #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
@@ -121,5 +121,5 @@ impl HalPins {
     }
 }
 
-// 注: F3/F4 版本下 HalPins 不包含 di/do_ 字段 (用 IoExtender 经 MCP23017 扩展),
+// 注: 当前变体下 HalPins 不包含 di/do_ 字段（由 I2C 扩展驱动），
 // split 也不设置 di/do_, 不引用 cfg::DI_PINS/DO_PINS。

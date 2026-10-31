@@ -1,23 +1,19 @@
-//! IO 扩展聚合器 (I2C 总线 + 多片 MCP23017)
+//! IO 扩展聚合器 (I2C 总线 + MCP23017)
 //!
-//! 仅 F3/F4 版本启用, 提供 DI/DO 的统一访问接口。
+//! 仅默认构建启用, 提供 DI/DO 的统一访问接口。
 //!
 //! # 通道分配
 //!
 //! DI:
-//! - F3 (16 DI): 1 片 MCP23017 (地址 0x20), bit0-15
-//! - F4 (48 DI): 3 片 MCP23017 (地址 0x20/0x21/0x22), bit0-15 / bit16-31 / bit32-47
+//! - 默认 (16 DI): 1 片 MCP23017 (地址 0x20), bit0-15
 //!
 //! DO:
-//! - F3 (16 DO): 1 片 MCP23017 (地址 0x21), bit0-15
-//! - F4 (16 DO): 1 片 MCP23017 (地址 0x23), bit0-15
+//! - 默认 (16 DO): 1 片 MCP23017 (地址 0x21), bit0-15
 //!
 //! # 位序约定
 //!
 //! `read_di()` 返回 `u64`, bit i 对应 DI i:
-//! - DI 0-15: 第一片 MCP23017 (地址 0x20)
-//! - DI 16-31: 第二片 (地址 0x21, 仅 F4)
-//! - DI 32-47: 第三片 (地址 0x22, 仅 F4)
+//! - DI 0-15: MCP23017 (地址 0x20)
 //!
 //! MCP23017 内部: bit0-7 = PORTA, bit8-15 = PORTB
 
@@ -29,9 +25,9 @@ use crate::error::{AppError, AppResult};
 use crate::hal::i2c_bus::I2cBus;
 use crate::hal::mcp23017::Mcp23017;
 
-/// 最大 DI 扩展芯片数 (F4 = 3 片)
+/// 最大 DI 扩展芯片数
 const MAX_DI_CHIPS: usize = 3;
-/// 最大 DO 扩展芯片数 (F4 = 3 片, 每片 16 DO → 48 DO)
+/// 最大 DO 扩展芯片数
 const MAX_DO_CHIPS: usize = 3;
 
 /// IO 扩展聚合器
@@ -42,7 +38,7 @@ pub struct IoExtender {
     bus: Spin<I2cBus>,
     di_chips: [Mcp23017; MAX_DI_CHIPS],
     di_chip_count: usize,
-    /// DO 扩展芯片数组 (F3: 1 片; F4: 3 片)
+    /// DO 扩展芯片数组
     do_chips: [Mcp23017; MAX_DO_CHIPS],
     do_chip_count: usize,
     /// DO 输出缓存 (避免每次读取 MCP23017); 真无锁 (AtomicBits64)
@@ -105,7 +101,7 @@ impl IoExtender {
 
     /// 读取所有 DI 通道, 返回 bit i = DI i 状态
     ///
-    /// F3: 16 bit, F4: 48 bit
+    /// 默认: 16 bit
     #[inline]
     pub fn read_di(&self) -> AppResult<u64> {
         let mut bus = self.bus.lock();
@@ -129,8 +125,7 @@ impl IoExtender {
 
     /// 写入所有 DO 通道, bit i = DO i 目标状态
     ///
-    /// F3: 16 bit (单芯片 16 DO)
-    /// F4: 48 bit (3 片 MCP23017, 每片写 16 bit)
+    /// 默认: 16 bit
     #[inline]
     pub fn write_do(&self, value: u64) -> AppResult<()> {
         // 限制为 DO_COUNT 位 (超出 bit 忽略)
@@ -178,7 +173,7 @@ impl IoExtender {
         self.do_cache.load_bits()
     }
 
-    /// 读取当前 DO 输出状态 (从所有 MCP23017 读取, F4 需 3 次 I2C 读)
+    /// 读取当前 DO 输出状态 (从 MCP23017 读取)
     pub fn read_do_actual(&self) -> AppResult<u64> {
         let mut bus = self.bus.lock();
         let mut result: u64 = 0;
@@ -196,7 +191,7 @@ impl IoExtender {
 }
 
 // ============================================================================
-// DigitalIo trait 实现 (F3/F4 版本, I2C MCP23017 扩展)
+// DigitalIo trait 实现 (默认版本, I2C MCP23017 扩展)
 // ============================================================================
 // IoExtender 已有的方法签名与 DigitalIo trait 高度一致,
 // 这里直接委托, 无额外逻辑。
@@ -251,8 +246,6 @@ impl crate::hal::digital_io::DigitalIo for IoExtender {
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use crate::config::hw_version;
-
     #[test]
     #[cfg(feature = "f3")]
     fn test_f3_channel_count() {

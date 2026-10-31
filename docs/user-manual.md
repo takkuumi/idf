@@ -78,29 +78,30 @@
 | 项目 | Default | F3 | F4 |
 |------|---------|----|----|
 | **编译命令** | `cargo build` | `cargo build --features f3` | `cargo build --features f4` |
-| **DI 通道数** | 8（GPIO 直驱） | 16（I2C 扩展） | 48（I2C 扩展） |
-| **DO 通道数** | 8（GPIO 直驱） | 16（I2C 扩展） | 16（I2C 扩展） |
+| **DI 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
+| **DO 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
 | **AI 通道数** | 6 | 6 | 6 |
 | **AO 通道数** | 4 | 4 | 4 |
-| **MCP23017 数量** | 0 | 2 片 | 4 片 |
-| **I2C 总线** | 不启用 | 启用（GPIO21/33） | 启用（GPIO21/33） |
+| **MCP23017 数量** | 2 片 | 0 | 0 |
+| **PCA9555 数量** | 0 | 单组 | 多组 |
+| **I2C 总线** | 启用（GPIO21/33） | 软件 I2C（GPIO35/36、38/37） | 软件 I2C（GPIO35/36、38/37） |
 | **DI 寄存器范围** | 0x0000-0x0007 | 0x0000-0x000F | 0x0000-0x002F |
-| **DO 寄存器范围** | 0x0000-0x0007 | 0x0000-0x000F | 0x0000-0x000F |
+| **DO 寄存器范围** | 0x0000-0x000F | 0x0000-0x000F | 0x0000-0x002F |
 
 > **注意**：AO 通道与 DO0~DO3 共用 GPIO（GPIO8/9/16/38），硬件互斥，由硬件跳线或硬件版本决定使用模式。
 
-### 2.2 F3/F4 MCP23017 I2C 地址分配
+### 2.2 Default/F3/F4 IO 扩展地址分配
 
 | 版本 | 芯片 | I2C 地址 | A2/A1/A0 | 用途 |
 |------|------|---------|----------|------|
-| F3 | U1 | 0x20 | 0/0/0 | DI 0-15（PORTA=DI0-7，PORTB=DI8-15） |
-| F3 | U2 | 0x21 | 0/0/1 | DO 0-15（PORTA=DO0-7，PORTB=DO8-15） |
-| F4 | U1 | 0x20 | 0/0/0 | DI 0-15 |
-| F4 | U2 | 0x21 | 0/0/1 | DI 16-31 |
-| F4 | U3 | 0x22 | 0/1/0 | DI 32-47 |
-| F4 | U4 | 0x23 | 0/1/1 | DO 0-15 |
+| Default | MCP23017 | 0x20 | 0/0/0 | DI 0-15 |
+| Default | MCP23017 | 0x21 | 0/0/1 | DO 0-15 |
+| F3 | PCA9555 | 0x40/0x42 | — | DI/DO 0-15 |
+| F4 | PCA9555 | 0x40/0x44/0x42 | — | DI 0-47 |
+| F4 | PCA9555 | 0x48/0x4C/0x4E | — | DO 0-47 |
 
-I2C 总线参数：I2C0 端口，SDA=GPIO21，SCL=GPIO33，400kHz Fast Mode，MCP23017 内部上拉使能。
+
+Default MCP23017 总线参数：I2C0，SDA=GPIO21，SCL=GPIO33，400kHz。F3/F4 PCA9555 使用软件 I2C：IO SDA/SCL=GPIO35/36，LED SDA/SCL=GPIO38/37。
 
 ---
 
@@ -128,8 +129,8 @@ I2C 总线参数：I2C0 端口，SDA=GPIO21，SCL=GPIO33，400kHz Fast Mode，MC
 | **DO (默认版本 8 路)** | GPIO8/9/16/38/39/45/46/48 | DO0~DO7 | OC 输出 |
 | **AI (6 路, ADC1)** | GPIO1/2/3/4/5/6 | AI0~AI5 | 12-bit SAR ADC，对应 ADC1_CH0~CH5 |
 | **AO (4 路, LEDC)** | GPIO8/9/16/38 | AO0~AO3 | 与 DO0~DO3 共用引脚（硬件互斥） |
-| **I2C (仅 F3/F4)** | GPIO21 | SDA | MCP23017 数据线（默认版本作 DI2） |
-| | GPIO33 | SCL | MCP23017 时钟线（默认版本作 DI3） |
+| **I2C (仅 Default)** | GPIO21 | SDA | MCP23017 数据线 |
+| | GPIO33 | SCL | MCP23017 时钟线 |
 
 ### 3.2 ADC1 通道映射
 
@@ -189,7 +190,7 @@ GPIO7  (DE/RE) ─────────── DE + /RE
 
 > **注意**：ESP-IDF UART RS485 模式自动控制 DE/RE 时序，无需外部方向切换电路。
 
-### 3.5 I2C 扩展接线（仅 F3/F4）
+### 3.5 I2C 扩展接线（Default MCP23017 / F3-F4 PCA9555）
 
 ```
 ESP32-S3R2                MCP23017 (U1, 0x20)
@@ -1115,7 +1116,7 @@ print('OTA upgrade done, device rebooting')
 2. 查看串口日志中的 `[health] task stalled: <name>` 警告
 3. 检查任务是否被阻塞（如 I2C 总线死锁、UART 缓冲区满）
 
-#### 8.1.8 I2C MCP23017 通信失败（仅 F3/F4）
+#### 8.1.8 I2C 扩展通信失败（按硬件变体）
 
 **现象**：DI 全部读回 0 或 0xFFFF，DO 输出无效。
 

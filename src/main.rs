@@ -3,7 +3,7 @@
 //! 系统组成：
 //! - 以太网 (W5500 over SPI3)；双光口硬件转发及冗余需独立验收
 //! - BLE GATT 配置/手持机协议；BLE Mesh 配网不在当前默认业务路径
-//! - DI/DO 通道数由 config::hw_version 决定（默认 F16 为 16/16）
+//! - DI/DO 通道数由 config::hw_version 决定（默认/F3 为 16/16，F4 为 48/48）
 //! - 6 路 AI (ADC1) / 4 路 AO (LEDC PWM)
 //! - 2 路 RS485 (UART1/UART2)
 //! - Modbus RTU Master + Slave + TCP Server
