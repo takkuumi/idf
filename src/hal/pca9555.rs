@@ -717,10 +717,12 @@ impl DigitalIo for Pca9555Duo {
     }
 
     fn read_di_all(&self) -> AppResult<u64> {
-        self.read_di_sample().map(|(bits, _)| bits)
+        self.read_di_sample()?
+            .map(|(bits, _)| bits)
+            .ok_or_else(|| AppError::Io("DI publication busy".into()))
     }
 
-    fn read_di_sample(&self) -> AppResult<(u64, Option<u32>)> {
+    fn read_di_sample(&self) -> AppResult<Option<(u64, Option<u32>)>> {
         self.worker_alive()?;
         for _ in 0..4 {
             let generation = self.worker.di_generation.load(Ordering::SeqCst);
@@ -736,15 +738,13 @@ impl DigitalIo for Pca9555Duo {
                 continue;
             }
             if sample_is_fresh(true, now_ms(), sampled, failures) {
-                return Ok((bits, Some(generation)));
+                return Ok(Some((bits, Some(generation))));
             }
             return Err(AppError::Io(
                 "DI sample stale or hardware read failed".into(),
             ));
         }
-        Err(AppError::Io(
-            "DI sample not ready or publication busy".into(),
-        ))
+        Ok(None)
     }
 
     fn read_di(&self, idx: usize) -> AppResult<bool> {

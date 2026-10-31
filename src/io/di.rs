@@ -24,6 +24,7 @@ struct DiState {
     candidate_count: u8,
     last_generation: Option<u32>,
     read_failures: u32,
+    last_warn: Option<std::time::Instant>,
 }
 
 static DI_STATE: MainLoopCell<DiState> = MainLoopCell::new();
@@ -37,6 +38,7 @@ pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
             candidate_count: 0,
             last_generation: None,
             read_failures: 0,
+            last_warn: None,
         })
         .map_err(|_| crate::error::AppError::Io("DI state busy during init".into()))?;
     let _ = _hal;
@@ -52,13 +54,18 @@ pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
 pub fn tick_di_scan(hal: &Hal) {
     let _ = DI_STATE.with_mut(|state| {
         let (bits, generation) = match hal.dio().read_di_sample() {
-            Ok(v) => v,
+            Ok(Some(v)) => v,
+            Ok(None) => return,
             Err(e) => {
                 // LOOP9: 读取失败时不应推进去抖计数 (旧实现用 state.candidate 作为 bits,
                 // 导致 bits==candidate 恒成立, 错误 candidate 被快速确认为 stable, 误报 DI 变化)
                 state.candidate_count = 0;
                 state.read_failures = state.read_failures.saturating_add(1);
-                if state.read_failures == 1 || state.read_failures.is_multiple_of(500) {
+                if state
+                    .last_warn
+                    .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(10))
+                {
+                    state.last_warn = Some(std::time::Instant::now());
                     log::warn!("[di] 采样失效，保留最后状态，不推进去抖: {}", e);
                 }
                 return;

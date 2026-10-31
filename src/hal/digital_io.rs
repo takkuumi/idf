@@ -41,9 +41,9 @@ pub trait DigitalIo: Send + Sync {
     fn read_di_all(&self) -> AppResult<u64>;
 
     /// 返回采样序号；异步驱动用来避免把同一缓存误计为多次去抖采样。
-    /// 同步驱动每次读取都是新样本，因此序号为 None。
-    fn read_di_sample(&self) -> AppResult<(u64, Option<u32>)> {
-        self.read_di_all().map(|bits| (bits, None))
+    /// 同步驱动每次读取都是新样本，因此序号为 None。外层 None 表示发布中，稍后再读。
+    fn read_di_sample(&self) -> AppResult<Option<(u64, Option<u32>)>> {
+        self.read_di_all().map(|bits| Some((bits, None)))
     }
 
     /// 读取单个 DI 通道 (idx 从 0 开始)
