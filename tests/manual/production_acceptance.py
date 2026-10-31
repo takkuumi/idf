@@ -172,6 +172,7 @@ def main() -> None:
     parser.add_argument("--destination", type=int, default=1)
     parser.add_argument("--count", type=int, default=2)
     parser.add_argument("--expected-version", type=lambda text: int(text, 0), default=0x00E5)
+    parser.add_argument("--reauth-on-session-replacement", action="store_true", help="record login replacement and reauthenticate; default remains strict")
     args = parser.parse_args()
     if args.duration <= 0 or args.interval < 0 or not 1 <= args.count <= 125 or not 0 <= args.destination <= 65536 - args.count:
         parser.error("invalid duration, interval or result window")
@@ -185,9 +186,24 @@ def main() -> None:
     with opener.open(login, timeout=5) as response:
         response.read()
 
+    session_replacements = 0
+
     def api(path: str) -> dict:
+        nonlocal session_replacements
         with opener.open(f"http://{args.host}/{path}", timeout=5) as response:
-            envelope = json.load(response)
+            content_type = response.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                if args.reauth_on_session_replacement and response.url.endswith("/login"):
+                    session_replacements += 1
+                    emit("session_replaced", endpoint=path)
+                    with opener.open(login, timeout=5) as relogin:
+                        relogin.read()
+                    with opener.open(f"http://{args.host}/{path}", timeout=5) as retry:
+                        envelope = json.load(retry)
+                else:
+                    raise ValueError(f"{path}: expected JSON, final_url={response.url}, content_type={content_type}; check session replacement")
+            else:
+                envelope = json.load(response)
         if envelope.get("type") != path or str(envelope.get("code")) != "0":
             raise ValueError(f"invalid {path} response")
         return envelope["data"]
@@ -224,7 +240,7 @@ def main() -> None:
                 if api("getnetworkconfig") != before["getnetworkconfig"] or api("getportconfig") != before["getportconfig"]:
                     raise ValueError("network/port configuration changed")
                 io = api("getiodata")
-                emit("web_health", state=state, fiber=[io["state_data"][f"state_addr_{i}"] for i in (6, 7)])
+                emit("web_health", state=state, diagnostics=io.get("diagnostics"), fiber=[io["state_data"][f"state_addr_{i}"] for i in (6, 7)])
             except Exception as error:
                 web_errors += 1
                 emit("web_error", error=str(error))
@@ -234,7 +250,7 @@ def main() -> None:
     errors = web_errors + sum(result["errors"] for result in results)
     emit("end", duration=duration, requests=sum(result["requests"] for result in results),
          requests_per_second=sum(result["successes"] for result in results) / duration,
-         web_samples=web_samples, web_errors=web_errors, minimum_heap=minimum_heap, errors=errors)
+         web_samples=web_samples, web_errors=web_errors, session_replacements=session_replacements, minimum_heap=minimum_heap, errors=errors)
     if errors:
         raise SystemExit(1)
 

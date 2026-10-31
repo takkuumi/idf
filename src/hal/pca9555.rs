@@ -306,7 +306,7 @@ pub fn diagnostics_json() -> String {
     format!(
         r#"{{"worker_age_ms":{},"di_valid":{},"di_age_ms":{},"di_generation":{},"di_failures":{},"output_queue":{},"do_readback_valid":{},"do_readback_bits":{},"do_readback_age_ms":{},"do_failures":{},"do_confirmed_generation":{},"led_errors":{},"loop_max_us":{}}}"#,
         now.wrapping_sub(state.heartbeat_ms.load(Ordering::Acquire)),
-        generation != 0 && generation & 1 == 0 && sample_is_fresh(true, now, sampled, failures),
+        generation >= 2 && sample_is_fresh(true, now, sampled, failures),
         if generation == 0 {
             "null".into()
         } else {
