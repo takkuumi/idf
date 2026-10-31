@@ -17,6 +17,7 @@
 - RCU 快照改为原子指针 + reader guard；PCA9555 bit-bang I2C 改为 6KB 独立 worker，DI/DO/LED 通过原子缓存交接；RS485 TX_DONE 余量按波特率动态计算。
 - DEFAULT/F3/F4 Clippy、目标测试编译、RCU host 5/5 和核心 host 25/25 通过。F3 真机 build id `14ee09d3cc1f` 启动后，四个 Modbus TCP 端口只读测试 60.2 秒 224/224 成功；测试窗口内无 Modbus 错误。先前两次短测出现成段连接拒绝/超时，之后服务恢复；原因未由对应串口窗口证实，不能视为已解释。
 - F3 真机 UART 启动记录确认 `pca9555-i2c` worker 注册、配置 IP `192.168.51.227`、reset count 98 / POWERON，未见 panic、WDT 或栈错误。I2C 故障注入、F4 多芯片与真实 PLC 高频 RS485 仍未覆盖。
+- 生产刷机后发现并修复高负载 `TASK_WDT`：PCA9555 worker 改绑 CPU1，`AtomicBits64` seqlock 自旋增加协作让出。修复提交 `86cf0b6`，F3 四段刷写读回校验通过；四端口 120.2 秒 956/956 成功，30 秒极限吞吐 5,770 请求零错误，设备持续至 uptime 300 秒无 WDT。完整量化记录见 `docs/testing/v2.4.0-f3-full-flash-acceptance-2026-11-01.md`。
 
 - 事件总线将 DI/AI/AO/DO 改为原子合并标志；IP/链路/复位使用关键状态单槽，避免普通采样事件覆盖关键网络状态。
 - BLE DI 状态上报降为 DEBUG，生产 INFO 不再随输入抖动刷串口；日志文档同步当前实现。
