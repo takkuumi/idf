@@ -2299,7 +2299,7 @@ fn handle_ble_android_read_command(
                     let _ = d.push((fw & 0xFF) as u8);
                     let _ = d.push((dt >> 8) as u8);
                     let _ = d.push((dt & 0xFF) as u8);
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
                         fw,
                         fw / 100,
@@ -2330,7 +2330,7 @@ fn handle_ble_android_read_command(
                     let gw = cfg.gateway;
                     let mask = cfg.mask;
                     let d = encode_android_ip_read_response(&ip, &mask, &gw);
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_IP: {}.{}.{}.{} / {}.{}.{}.{} gw {}.{}.{}.{}",
                         ip[0],
                         ip[1],
@@ -2359,7 +2359,7 @@ fn handle_ble_android_read_command(
                         let _ = d.push(0);
                         let _ = d.push(b);
                     }
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                         mac[0],
                         mac[1],
@@ -2380,7 +2380,7 @@ fn handle_ble_android_read_command(
                 (0x08E2, 4) => {
                     let d = encode_ble_name_read_response(&cfg.ble_name);
                     let name_len = cfg.ble_name.iter().position(|&b| b == 0).unwrap_or(8);
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_BLE_ID: {:?}",
                         core::str::from_utf8(&cfg.ble_name[..name_len]).unwrap_or("<bin>")
                     );
@@ -2395,7 +2395,7 @@ fn handle_ble_android_read_command(
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(take as u8);
                     let _ = d.extend_from_slice(&bytes[..take]);
-                    log::info!("[ble_at] READ_SN: {} bytes", take);
+                    log::debug!("[ble_at] READ_SN: {} bytes", take);
                     Some(d)
                 }
                 // READ_LOCATION (0x089D, 0x0008): 同 SN 格式, [length][location bytes]
@@ -2406,7 +2406,7 @@ fn handle_ble_android_read_command(
                     let mut d: heapless::Vec<u8, BLE_RESPONSE_DATA_MAX> = heapless::Vec::new();
                     let _ = d.push(take as u8);
                     let _ = d.extend_from_slice(&bytes[..take]);
-                    log::info!("[ble_at] READ_LOCATION: {} bytes", take);
+                    log::debug!("[ble_at] READ_LOCATION: {} bytes", take);
                     Some(d)
                 }
                 // READ_RS485_INDEX_CONFIG (0x08A6/0x08AB/0x08B0, 5): metuory 期望 packed 10-byte struct
@@ -2439,7 +2439,7 @@ fn handle_ble_android_read_command(
                     let _ = d.push((r.timeout_ms & 0xFF) as u8);
                     let _ = d.push((r.interval_ms >> 8) as u8);
                     let _ = d.push((r.interval_ms & 0xFF) as u8);
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_RS485_CONFIG: port={} baud={} parity={} stop={} data={} mode={} slave={} retry={} timeout={} interval={}",
                         port,
                         r.baudrate,
@@ -2468,7 +2468,7 @@ fn handle_ble_android_read_command(
                         let _ = d.push((v >> 8) as u8);
                         let _ = d.push((v & 0xFF) as u8);
                     }
-                    log::info!("[ble_at] READ_ADC: {} channels", n);
+                    log::debug!("[ble_at] READ_ADC: {} channels", n);
                     Some(d)
                 }
                 // READ_COM_INPUT_IO_STATUS (0x0000, count): Android 期望 [N bytes][N bytes of packed I/O bits]
@@ -2500,7 +2500,7 @@ fn handle_ble_android_read_command(
                         }
                         let _ = d.push(acc);
                     }
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_COM_IO: addr=0x{:04X} cnt={}",
                         reg_addr,
                         reg_cnt
@@ -2525,7 +2525,7 @@ fn handle_ble_android_read_command(
                         let _ = d.push((v >> 8) as u8);
                         let _ = d.push((v & 0xFF) as u8);
                     }
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_RS485_VALUE: addr=0x{:04X} cnt={}",
                         reg_addr,
                         reg_cnt
@@ -2545,7 +2545,7 @@ fn handle_ble_android_read_command(
                         let _ = d.push((v >> 8) as u8);
                         let _ = d.push((v & 0xFF) as u8);
                     }
-                    log::info!(
+                    log::debug!(
                         "[ble_at] READ_RS485_CUSTOM: addr=0x{:04X} cnt={}",
                         reg_addr,
                         reg_cnt
@@ -3413,7 +3413,7 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
         return;
     };
     let length = pdu_data.len() as u16;
-    log::info!(
+    log::debug!(
         "[ble_at] BLE frame: tx_id={:#06X} proto={:#06X} len={} data_len={}",
         tx_id,
         proto_id,
