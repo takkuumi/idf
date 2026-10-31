@@ -24,12 +24,13 @@
 
 use crate::error::{AppError, AppResult};
 use crate::sync::{AtomicBits64, Spin};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::digital_io::DigitalIo;
+use super::io_worker_state::{OutputQueue, sample_is_fresh};
 use super::sw_i2c::SwI2c;
 
 static PCA9555_TASK_HB: crate::health::TaskHb =
@@ -248,15 +249,81 @@ pub struct Pca9555Duo {
     worker: Arc<Pca9555WorkerState>,
 }
 
+static WORKER_DIAGNOSTICS: OnceLock<Arc<Pca9555WorkerState>> = OnceLock::new();
+
+fn now_ms() -> u32 {
+    (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u32
+}
+
 struct Pca9555WorkerState {
     alive: AtomicBool,
+    heartbeat_ms: AtomicU32,
     di_bits: AtomicBits64,
+    di_generation: AtomicU32,
+    di_sampled_ms: AtomicU32,
+    di_failures: AtomicU32,
     do_desired: AtomicBits64,
     do_hardware: AtomicBits64,
-    #[cfg(feature = "f4")]
+    do_readback_valid: AtomicBool,
+    do_readback_ms: AtomicU32,
+    do_failures: AtomicU32,
+    do_confirmed_generation: AtomicU32,
+    outputs: Mutex<OutputQueue>,
+    led_errors: AtomicU32,
+    loop_max_us: AtomicU32,
     status_led: AtomicU16,
-    #[cfg(not(feature = "f4"))]
-    status_led: AtomicU16,
+}
+
+/// 诊断为近似时点快照；null 表示尚未初始化或正在争用，不伪造正常值。
+pub fn diagnostics_json() -> String {
+    let Some(state) = WORKER_DIAGNOSTICS.get() else {
+        return "null".into();
+    };
+    let now = now_ms();
+    let generation = state.di_generation.load(Ordering::SeqCst);
+    let sampled = state.di_sampled_ms.load(Ordering::SeqCst);
+    let failures = state.di_failures.load(Ordering::SeqCst);
+    let queue = state
+        .outputs
+        .try_lock()
+        .ok()
+        .map(|q| {
+            format!(
+                r#"{{"depth":{},"high_water":{},"rejected":{},"canceled_after_fault":{},"requested_generation":{}}}"#,
+                q.len(),
+                q.high_water,
+                q.rejected,
+                q.canceled_after_fault,
+                q.latest().generation
+            )
+        })
+        .unwrap_or_else(|| "null".into());
+    let bits = state
+        .do_hardware
+        .try_load_bits(4)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".into());
+    format!(
+        r#"{{"worker_age_ms":{},"di_valid":{},"di_age_ms":{},"di_generation":{},"di_failures":{},"output_queue":{},"do_readback_valid":{},"do_readback_bits":{},"do_readback_age_ms":{},"do_failures":{},"do_confirmed_generation":{},"led_errors":{},"loop_max_us":{}}}"#,
+        now.wrapping_sub(state.heartbeat_ms.load(Ordering::Acquire)),
+        generation != 0 && generation & 1 == 0 && sample_is_fresh(true, now, sampled, failures),
+        if generation == 0 {
+            "null".into()
+        } else {
+            now.wrapping_sub(sampled).to_string()
+        },
+        generation,
+        failures,
+        queue,
+        state.do_readback_valid.load(Ordering::Acquire)
+            && now.wrapping_sub(state.do_readback_ms.load(Ordering::Acquire)) <= 250,
+        bits,
+        now.wrapping_sub(state.do_readback_ms.load(Ordering::Acquire)),
+        state.do_failures.load(Ordering::Acquire),
+        state.do_confirmed_generation.load(Ordering::Acquire),
+        state.led_errors.load(Ordering::Relaxed),
+        state.loop_max_us.load(Ordering::Relaxed)
+    )
 }
 
 #[cfg(feature = "f4")]
@@ -279,109 +346,202 @@ fn unpack_status_led(value: u16) -> u8 {
     value as u8
 }
 
-fn pca9555_worker(mut io_bus: BusI2c, mut led_bus: BusI2c, state: Arc<Pca9555WorkerState>) {
+fn pca9555_worker(io_bus: BusI2c, led_bus: BusI2c, state: Arc<Pca9555WorkerState>) {
     crate::health::subscribe_wdt();
-    let mut last_io = [(0xFF, 0xFF); MAX_CHIPS];
-    let mut last_led = [(0xFF, 0xFF); MAX_CHIPS];
-    let mut last_di_led = [(0xFF, 0xFF); MAX_CHIPS];
-    let mut last_do = u64::MAX;
-    let mut last_status = u16::MAX;
     let mut last_warn = Instant::now() - Duration::from_secs(10);
-
+    let mut last_do_check = Instant::now() - Duration::from_millis(100);
+    let mut retry_at = Instant::now();
+    let mut di_led = [[0xFF; 2]; MAX_CHIPS];
+    let mut do_led = [[0xFF; 2]; MAX_CHIPS];
+    let mut last_status = u16::MAX;
     loop {
+        let started = Instant::now();
+        state.heartbeat_ms.store(now_ms(), Ordering::Release);
         PCA9555_TASK_HB.tick();
         crate::health::feed_wdt();
 
-        if let Err(error) = worker_sample_di(&io_bus, &mut led_bus, &mut last_di_led, &state)
-            && last_warn.elapsed() >= Duration::from_secs(10)
+        // 输入读取和发布独立于灯总线；LED NACK 不得阻止有效 DI 更新。
+        match worker_sample_di(&io_bus) {
+            Ok((bits, raw)) => {
+                state.di_generation.fetch_add(1, Ordering::SeqCst);
+                state.di_bits.store_bits(bits);
+                state.di_sampled_ms.store(now_ms(), Ordering::SeqCst);
+                state.di_failures.store(0, Ordering::SeqCst);
+                state.di_generation.fetch_add(1, Ordering::SeqCst);
+                for (i, &addr) in DI_LED_ADDRS.iter().enumerate() {
+                    if di_led[i] != raw[i] {
+                        match led_bus.write_regs2(addr, REG_OUTPUT_0, raw[i]) {
+                            Ok(()) => di_led[i] = raw[i],
+                            Err(_) => {
+                                state.led_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                state.di_failures.fetch_add(1, Ordering::SeqCst);
+                warn_worker(&mut last_warn, "DI", &error);
+            }
+        }
+
+        // 一轮最多应用一个输出边沿，保留至少一个 worker 调度间隔；
+        // 失败保留队首，按 100ms 重试，禁止 LED 故障阻塞输出确认。
+        let command = {
+            let mut queue = state.outputs.lock().unwrap_or_else(|e| e.into_inner());
+            if state.do_failures.load(Ordering::Acquire) != 0 {
+                queue.retain_latest_after_fault();
+            }
+            queue.front()
+        };
+        if let Some(command) = command
+            && Instant::now() >= retry_at
         {
-            log::warn!("[pca9555] worker DI transaction failed: {error}");
-            last_warn = Instant::now();
-        }
-
-        let desired_do = state.do_desired.load_bits();
-        if desired_do != last_do {
-            match worker_apply_do(
-                &mut io_bus,
-                &mut led_bus,
-                desired_do,
-                &mut last_io,
-                &mut last_led,
-            ) {
-                Ok(()) => {
-                    last_do = desired_do;
-                    state.do_hardware.store_bits(desired_do);
+            let outcome = worker_write_do(&io_bus, command.bits)
+                .and_then(|()| worker_read_do(&io_bus))
+                .and_then(|actual| {
+                    if actual == command.bits {
+                        Ok(actual)
+                    } else {
+                        Err(AppError::Io("DO output register readback mismatch".into()))
+                    }
+                });
+            match outcome {
+                Ok(actual) => {
+                    publish_do_readback(&state, actual);
+                    state.do_failures.store(0, Ordering::Release);
+                    state
+                        .do_confirmed_generation
+                        .store(command.generation, Ordering::Release);
+                    state
+                        .outputs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .confirm(command);
+                    last_do_check = Instant::now();
                 }
-                Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
-                    log::warn!("[pca9555] worker DO transaction failed: {error}");
-                    last_warn = Instant::now();
+                Err(error) => {
+                    state.do_readback_valid.store(false, Ordering::Release);
+                    state.do_failures.fetch_add(1, Ordering::AcqRel);
+                    retry_at = Instant::now() + Duration::from_millis(100);
+                    warn_worker(&mut last_warn, "DO", &error);
                 }
-                Err(_) => {}
+            }
+        } else if command.is_none() && last_do_check.elapsed() >= Duration::from_millis(100) {
+            last_do_check = Instant::now();
+            let target = state
+                .outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .latest()
+                .bits;
+            match worker_read_do(&io_bus).and_then(|actual| {
+                if actual == target {
+                    Ok(actual)
+                } else {
+                    // Expander brownout/reset: rewrite and verify instead of trusting a cache.
+                    worker_write_do(&io_bus, target)?;
+                    let actual = worker_read_do(&io_bus)?;
+                    if actual == target {
+                        Ok(actual)
+                    } else {
+                        Err(AppError::Io("DO recovery readback mismatch".into()))
+                    }
+                }
+            }) {
+                Ok(actual) => {
+                    publish_do_readback(&state, actual);
+                    state.do_failures.store(0, Ordering::Release);
+                }
+                Err(error) => {
+                    state.do_readback_valid.store(false, Ordering::Release);
+                    state.do_failures.fetch_add(1, Ordering::AcqRel);
+                    warn_worker(&mut last_warn, "DO readback", &error);
+                }
             }
         }
-
-        let desired_status = state.status_led.load(Ordering::Acquire);
-        if desired_status != last_status {
-            match worker_apply_status(&mut led_bus, desired_status) {
-                Ok(()) => last_status = desired_status,
-                Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
-                    log::warn!("[pca9555] worker status LED transaction failed: {error}");
-                    last_warn = Instant::now();
+        if state.do_readback_valid.load(Ordering::Acquire) {
+            let actual = state.do_hardware.load_bits();
+            for (i, &addr) in DO_LED_ADDRS.iter().enumerate() {
+                let raw = (actual >> (i * 16)) as u16;
+                let led = [!(raw as u8), !bit_reverse((raw >> 8) as u8)];
+                if do_led[i] != led {
+                    match led_bus.write_regs2(addr, REG_OUTPUT_0, led) {
+                        Ok(()) => do_led[i] = led,
+                        Err(_) => {
+                            state.led_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
-                Err(_) => {}
             }
         }
-
+        let status = state.status_led.load(Ordering::Acquire);
+        if status != last_status {
+            match worker_apply_status(&led_bus, status) {
+                Ok(()) => last_status = status,
+                Err(error) => {
+                    state.led_errors.fetch_add(1, Ordering::Relaxed);
+                    warn_worker(&mut last_warn, "LED", &error);
+                }
+            }
+        }
+        let elapsed = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        // Single writer (this worker); keep atomic loads for external readers.
+        let maximum = state.loop_max_us.load(Ordering::Relaxed).max(elapsed);
+        state.loop_max_us.store(maximum, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn worker_sample_di(
-    io_bus: &BusI2c,
-    led_bus: &mut BusI2c,
-    last_di_led: &mut [(u8, u8); MAX_CHIPS],
-    state: &Pca9555WorkerState,
-) -> AppResult<()> {
+fn warn_worker(last_warn: &mut Instant, phase: &str, error: &AppError) {
+    if last_warn.elapsed() >= Duration::from_secs(10) {
+        log::warn!("[pca9555] {phase} transaction failed: {error}");
+        *last_warn = Instant::now();
+    }
+}
+
+fn publish_do_readback(state: &Pca9555WorkerState, bits: u64) {
+    state.do_readback_valid.store(false, Ordering::SeqCst);
+    state.do_hardware.store_bits(bits);
+    state.do_readback_ms.store(now_ms(), Ordering::Release);
+    state.do_readback_valid.store(true, Ordering::SeqCst);
+}
+
+fn worker_sample_di(io_bus: &BusI2c) -> AppResult<(u64, [[u8; 2]; MAX_CHIPS])> {
     let mut result = 0u64;
-    for (index, (&io_addr, &led_addr)) in DI_IO_ADDRS.iter().zip(DI_LED_ADDRS).enumerate() {
-        let raw = io_bus.read_regs2(io_addr, REG_INPUT_0)?;
-        if last_di_led[index] != (raw[0], raw[1]) {
-            led_bus.write_regs2(led_addr, REG_OUTPUT_0, raw)?;
-            last_di_led[index] = (raw[0], raw[1]);
-        }
-        let bits = (!raw[0] as u64) | ((bit_reverse(raw[1]) ^ 0xFF) as u64) << 8;
+    let mut samples = [[0; 2]; MAX_CHIPS];
+    for (index, &addr) in DI_IO_ADDRS.iter().enumerate() {
+        let raw = io_bus.read_regs2(addr, REG_INPUT_0)?;
+        samples[index] = raw;
+        let bits = u64::from(!raw[0]) | (u64::from(bit_reverse(raw[1]) ^ 0xFF) << 8);
         result |= bits << (index * 16);
     }
-    state.di_bits.store_bits(result);
-    Ok(())
+    Ok((result, samples))
 }
 
-fn worker_apply_do(
-    io_bus: &mut BusI2c,
-    led_bus: &mut BusI2c,
-    value: u64,
-    last_io: &mut [(u8, u8); MAX_CHIPS],
-    last_led: &mut [(u8, u8); MAX_CHIPS],
-) -> AppResult<()> {
-    for (index, (&io_addr, &led_addr)) in DO_IO_ADDRS.iter().zip(DO_LED_ADDRS).enumerate() {
-        let raw = ((value >> (index * 16)) & 0xFFFF) as u16;
-        let lo = raw as u8;
-        let hi = (raw >> 8) as u8;
-        let io = [bit_reverse(lo), bit_reverse(hi)];
-        let led = [!lo, !bit_reverse(hi)];
-        if last_io[index] != (io[0], io[1]) {
-            io_bus.write_regs2(io_addr, REG_OUTPUT_0, io)?;
-            last_io[index] = (io[0], io[1]);
-        }
-        if last_led[index] != (led[0], led[1]) {
-            led_bus.write_regs2(led_addr, REG_OUTPUT_0, led)?;
-            last_led[index] = (led[0], led[1]);
-        }
+fn worker_write_do(io_bus: &BusI2c, value: u64) -> AppResult<()> {
+    for (i, &addr) in DO_IO_ADDRS.iter().enumerate() {
+        let raw = (value >> (i * 16)) as u16;
+        io_bus.write_regs2(
+            addr,
+            REG_OUTPUT_0,
+            [bit_reverse(raw as u8), bit_reverse((raw >> 8) as u8)],
+        )?;
     }
     Ok(())
 }
 
-fn worker_apply_status(led_bus: &mut BusI2c, packed: u16) -> AppResult<()> {
+fn worker_read_do(io_bus: &BusI2c) -> AppResult<u64> {
+    let mut result = 0u64;
+    for (i, &addr) in DO_IO_ADDRS.iter().enumerate() {
+        let raw = io_bus.read_regs2(addr, REG_OUTPUT_0)?;
+        result |= u64::from(bit_reverse(raw[0])) << (i * 16);
+        result |= u64::from(bit_reverse(raw[1])) << (i * 16 + 8);
+    }
+    Ok(result)
+}
+
+fn worker_apply_status(led_bus: &BusI2c, packed: u16) -> AppResult<()> {
     #[cfg(feature = "f4")]
     {
         let status = unpack_status_led(packed);
@@ -436,6 +596,17 @@ impl Pca9555Duo {
         );
         let worker = Arc::new(Pca9555WorkerState {
             alive: AtomicBool::new(true),
+            heartbeat_ms: AtomicU32::new(now_ms()),
+            di_generation: AtomicU32::new(0),
+            di_sampled_ms: AtomicU32::new(0),
+            di_failures: AtomicU32::new(0),
+            do_readback_valid: AtomicBool::new(false),
+            do_readback_ms: AtomicU32::new(0),
+            do_failures: AtomicU32::new(0),
+            do_confirmed_generation: AtomicU32::new(0),
+            outputs: Mutex::new(OutputQueue::new()),
+            led_errors: AtomicU32::new(0),
+            loop_max_us: AtomicU32::new(0),
             di_bits: AtomicBits64::new(0),
             do_desired: AtomicBits64::new(0),
             do_hardware: AtomicBits64::new(0),
@@ -459,6 +630,7 @@ impl Pca9555Duo {
             &PCA9555_TASK_HB,
             crate::safety::stack_budget::PCA9555_I2C,
         );
+        let _ = WORKER_DIAGNOSTICS.set(Arc::clone(&worker));
         Ok(Self { worker })
     }
 
@@ -545,8 +717,34 @@ impl DigitalIo for Pca9555Duo {
     }
 
     fn read_di_all(&self) -> AppResult<u64> {
+        self.read_di_sample().map(|(bits, _)| bits)
+    }
+
+    fn read_di_sample(&self) -> AppResult<(u64, Option<u32>)> {
         self.worker_alive()?;
-        Ok(self.worker.di_bits.load_bits())
+        for _ in 0..4 {
+            let generation = self.worker.di_generation.load(Ordering::SeqCst);
+            if generation == 0 || generation & 1 != 0 {
+                continue;
+            }
+            let Some(bits) = self.worker.di_bits.try_load_bits(4) else {
+                continue;
+            };
+            let sampled = self.worker.di_sampled_ms.load(Ordering::SeqCst);
+            let failures = self.worker.di_failures.load(Ordering::SeqCst);
+            if generation != self.worker.di_generation.load(Ordering::SeqCst) {
+                continue;
+            }
+            if sample_is_fresh(true, now_ms(), sampled, failures) {
+                return Ok((bits, Some(generation)));
+            }
+            return Err(AppError::Io(
+                "DI sample stale or hardware read failed".into(),
+            ));
+        }
+        Err(AppError::Io(
+            "DI sample not ready or publication busy".into(),
+        ))
     }
 
     fn read_di(&self, idx: usize) -> AppResult<bool> {
@@ -564,24 +762,21 @@ impl DigitalIo for Pca9555Duo {
         };
         let value = value & mask;
         self.worker_alive()?;
-        if self.worker.do_desired.load_bits() == value {
-            return Ok(());
-        }
-        self.worker.do_desired.store_bits(value);
-        Ok(())
+        self.submit_output(|_| value)
     }
 
     fn write_do(&self, idx: usize, on: bool) -> AppResult<()> {
         if idx >= self.do_count() {
             return Err(AppError::Io(format!("do idx {idx} out of range")));
         }
-        let current = self.worker.do_desired.load_bits();
-        let value = if on {
-            current | (1u64 << idx)
-        } else {
-            current & !(1u64 << idx)
-        };
-        self.write_do_all(value)
+        self.worker_alive()?;
+        self.submit_output(|current| {
+            if on {
+                current | (1 << idx)
+            } else {
+                current & !(1 << idx)
+            }
+        })
     }
 
     fn read_do_cached(&self) -> u64 {
@@ -590,13 +785,42 @@ impl DigitalIo for Pca9555Duo {
 
     fn read_do_actual(&self) -> AppResult<u64> {
         self.worker_alive()?;
-        Ok(self.worker.do_hardware.load_bits())
+        if !sample_is_fresh(
+            self.worker.do_readback_valid.load(Ordering::SeqCst),
+            now_ms(),
+            self.worker.do_readback_ms.load(Ordering::Acquire),
+            self.worker.do_failures.load(Ordering::Acquire),
+        ) {
+            return Err(AppError::Io(
+                "DO hardware readback unavailable or stale".into(),
+            ));
+        }
+        self.worker
+            .do_hardware
+            .try_load_bits(8)
+            .ok_or_else(|| AppError::Io("DO hardware readback busy".into()))
     }
 }
 
 impl Pca9555Duo {
+    fn submit_output(&self, update: impl FnOnce(u64) -> u64) -> AppResult<()> {
+        let mut queue = self
+            .worker
+            .outputs
+            .try_lock()
+            .map_err(|_| AppError::Io("DO queue busy, retry required".into()))?;
+        let value = update(queue.latest().bits);
+        if !queue.submit(value) {
+            return Err(AppError::Io("DO queue full, retry required".into()));
+        }
+        self.worker.do_desired.store_bits(value);
+        Ok(())
+    }
+
     fn worker_alive(&self) -> AppResult<()> {
-        if self.worker.alive.load(Ordering::Acquire) {
+        if self.worker.alive.load(Ordering::Acquire)
+            && now_ms().wrapping_sub(self.worker.heartbeat_ms.load(Ordering::Acquire)) <= 1000
+        {
             Ok(())
         } else {
             Err(AppError::Io("pca9555 worker stopped".into()))

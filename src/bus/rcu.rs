@@ -1,68 +1,99 @@
-//! 通用不可变快照容器。
+//! 不可变 Arc 快照：读端不获取 OS Mutex，写端串行发布并回收旧代。
 //!
-//! 读取路径使用原子指针 + reader guard，不获取 OS Mutex；写入路径先交换新快照，
-//! 再等待已经开始的读者退出后释放旧快照。读者在增加 guard 计数后才加载指针，
-//! 因此旧对象在 `Arc::increment_strong_count` 前始终由写者持有，避免 use-after-free。
-//!
-//! 这是一个适合“读多写少、读闭包短”的 RCU。写者会在读者长期占用快照时让出调度器，
-//! 不在主循环中持有大锁；不用于需要实时写入确认的外设事务。
+//! 所有 epoch / reader / pointer 操作用 SeqCst 建立共同的总序。读者必须先登记
+//! 并验证 epoch，再解引用指针；写者先交换指针、推进 epoch，之后等待旧代登记退出。
+//! 计数只覆盖 Arc 引用获取，业务闭包及外部 Arc 持有时间不在回收等待区间内。
+//! 新代读者不延长旧代回收。被暂停的旧代读者仍可能延迟写者，不能宣称 wait-free；
+//! 写者争用回收时按 RTOS tick 休眠，避免同核抢占造成永久自旋。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct Rcu<T> {
     ptr: AtomicPtr<T>,
-    readers: AtomicUsize,
+    epoch: AtomicUsize,
+    readers: [AtomicUsize; 2],
+    writer: Mutex<()>,
+    max_reclaim_wait_us: AtomicU32,
 }
 
 impl<T> Rcu<T> {
     pub const fn empty() -> Self {
         Self {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
-            readers: AtomicUsize::new(0),
+            epoch: AtomicUsize::new(0),
+            readers: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            writer: Mutex::new(()),
+            max_reclaim_wait_us: AtomicU32::new(0),
         }
     }
 
     pub fn new(initial: T) -> Self {
-        Self {
-            ptr: AtomicPtr::new(Arc::into_raw(Arc::new(initial)) as *mut T),
-            readers: AtomicUsize::new(0),
-        }
+        let value = Self::empty();
+        value
+            .ptr
+            .store(Arc::into_raw(Arc::new(initial)) as *mut T, Ordering::SeqCst);
+        value
     }
 
-    /// 发布新快照。旧快照只在所有已经开始的读者退出后释放。
     pub fn write(&self, new_value: T) {
-        let new_ptr = Arc::into_raw(Arc::new(new_value)) as *mut T;
-        let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
-        while self.readers.load(Ordering::Acquire) != 0 {
-            std::thread::yield_now();
+        let new_value = Arc::new(new_value);
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let old = self
+            .ptr
+            .swap(Arc::into_raw(new_value) as *mut T, Ordering::SeqCst);
+        let old_epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        while self.readers[old_epoch & 1].load(Ordering::SeqCst) != 0 {
+            // yield_now alone need not schedule a lower-priority owner on RTOS.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if !old_ptr.is_null() {
-            // SAFETY: old_ptr came from Arc::into_raw and no reader can still
-            // be between pointer load and Arc::increment_strong_count after the
-            // reader counter reached zero.
+        // writer Mutex already serializes this high-water update. Avoid
+        // AtomicU32::fetch_max: Xtensa LLVM 1.90 emits undefined branch labels
+        // for this RMW lowering. Readers still use an atomic load.
+        let elapsed = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        let maximum = self
+            .max_reclaim_wait_us
+            .load(Ordering::Relaxed)
+            .max(elapsed);
+        self.max_reclaim_wait_us.store(maximum, Ordering::Relaxed);
+        if !old.is_null() {
+            // SAFETY: writer serialization owns exactly this retired Arc. Any
+            // reader that could have observed old registered in old_epoch and
+            // has now acquired its own Arc (or rejected its stale registration).
             unsafe {
-                drop(Arc::from_raw(old_ptr));
+                drop(Arc::from_raw(old));
             }
         }
     }
 
-    /// 读取当前快照并转移一个安全的所有权句柄。
     pub fn read(&self) -> Option<Arc<T>> {
-        self.readers.fetch_add(1, Ordering::Acquire);
-        let ptr = self.ptr.load(Ordering::Acquire);
-        if ptr.is_null() {
-            self.readers.fetch_sub(1, Ordering::Release);
-            return None;
+        loop {
+            let epoch = self.epoch.load(Ordering::SeqCst);
+            let readers = &self.readers[epoch & 1];
+            readers.fetch_add(1, Ordering::SeqCst);
+            if epoch != self.epoch.load(Ordering::SeqCst) {
+                readers.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+            let ptr = self.ptr.load(Ordering::SeqCst);
+            if ptr.is_null() {
+                readers.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
+            // SAFETY: validated reader registration prevents the owning writer
+            // from releasing this pointer until the increment has completed.
+            unsafe {
+                Arc::increment_strong_count(ptr);
+            }
+            readers.fetch_sub(1, Ordering::SeqCst);
+            // SAFETY: increment_strong_count created this owned reference.
+            return Some(unsafe { Arc::from_raw(ptr) });
         }
-        // SAFETY: a writer cannot free the pointer while readers is non-zero;
-        // the writer that swapped this pointer still owns one Arc reference.
-        unsafe {
-            Arc::increment_strong_count(ptr);
-        }
-        self.readers.fetch_sub(1, Ordering::Release);
-        // SAFETY: the increment above created the owned Arc reference.
-        Some(unsafe { Arc::from_raw(ptr) })
+    }
+
+    pub fn max_reclaim_wait_us(&self) -> u32 {
+        self.max_reclaim_wait_us.load(Ordering::Relaxed)
     }
 
     pub fn read_cloned(&self) -> Option<T>
@@ -89,12 +120,10 @@ impl<T> Default for Rcu<T> {
 
 impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
-        while self.readers.load(Ordering::Acquire) != 0 {
-            std::thread::yield_now();
-        }
-        let ptr = self.ptr.load(Ordering::Acquire);
+        let ptr = *self.ptr.get_mut();
         if !ptr.is_null() {
-            // SAFETY: Drop has exclusive access to self and all readers exited.
+            // SAFETY: exclusive access to the container excludes acquisitions;
+            // Arc handles already returned own their independent references.
             unsafe {
                 drop(Arc::from_raw(ptr));
             }
@@ -102,6 +131,7 @@ impl<T> Drop for Rcu<T> {
     }
 }
 
+// SAFETY: immutable T is shared through Arc; mutations only publish owned values.
 unsafe impl<T: Send + Sync> Send for Rcu<T> {}
 unsafe impl<T: Send + Sync> Sync for Rcu<T> {}
 
@@ -178,5 +208,47 @@ mod tests {
             reader.join().expect("reader thread");
         }
         assert_eq!(*rcu.read().unwrap(), 10_000);
+    }
+    #[test]
+    fn test_multiple_writers_reclaim_every_published_value() {
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rcu = Arc::new(Rcu::new(Tracked(drops.clone())));
+        thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..500 {
+                        rcu.write(Tracked(drops.clone()));
+                    }
+                });
+            }
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        drop(rcu.read());
+                    }
+                });
+            }
+        });
+        drop(rcu);
+        assert_eq!(drops.load(Ordering::SeqCst), 1501);
+    }
+
+    #[test]
+    fn test_read_closure_can_publish_without_deadlock() {
+        let rcu = Rcu::new(1);
+        assert_eq!(
+            rcu.read_with(|old| {
+                rcu.write(2);
+                *old
+            }),
+            Some(1)
+        );
+        assert_eq!(rcu.read_cloned(), Some(2));
     }
 }

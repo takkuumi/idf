@@ -16,12 +16,14 @@ const DEBOUNCE_COUNT: u8 = 3;
 // 架构改造 Phase 2: DI 扫描合并到 main_loop
 // 原始: 独立 pthread 5ms 高频扫描
 // 改造后: main_loop 20ms tick 调用
-// 牺牲: 5ms → 20ms 响应延迟, 对工业 50Hz 信号仍足够 (20ms 周期采 1 次)
+// 这是机械触点去抖路径，不适用于 50Hz 计数或短脉冲捕获。
 
 struct DiState {
     stable: u64,
     candidate: u64,
     candidate_count: u8,
+    last_generation: Option<u32>,
+    read_failures: u32,
 }
 
 static DI_STATE: MainLoopCell<DiState> = MainLoopCell::new();
@@ -33,6 +35,8 @@ pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
             stable: 0,
             candidate: 0,
             candidate_count: 0,
+            last_generation: None,
+            read_failures: 0,
         })
         .map_err(|_| crate::error::AppError::Io("DI state busy during init".into()))?;
     let _ = _hal;
@@ -47,15 +51,25 @@ pub fn start_scan_task(_hal: Arc<Hal>) -> AppResult<()> {
 /// main_loop 每 20ms 调用一次
 pub fn tick_di_scan(hal: &Hal) {
     let _ = DI_STATE.with_mut(|state| {
-        let bits: u64 = match hal.dio().read_di_all() {
+        let (bits, generation) = match hal.dio().read_di_sample() {
             Ok(v) => v,
             Err(e) => {
                 // LOOP9: 读取失败时不应推进去抖计数 (旧实现用 state.candidate 作为 bits,
                 // 导致 bits==candidate 恒成立, 错误 candidate 被快速确认为 stable, 误报 DI 变化)
-                log::warn!("[di] read_di_all failed: {}", e);
+                state.candidate_count = 0;
+                state.read_failures = state.read_failures.saturating_add(1);
+                if state.read_failures == 1 || state.read_failures.is_multiple_of(500) {
+                    log::warn!("[di] 采样失效，保留最后状态，不推进去抖: {}", e);
+                }
                 return;
             }
         };
+
+        state.read_failures = 0;
+        if generation.is_some() && generation == state.last_generation {
+            return;
+        }
+        state.last_generation = generation;
 
         if bits == state.candidate {
             state.candidate_count = state.candidate_count.saturating_add(1);

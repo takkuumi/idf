@@ -42,6 +42,7 @@ mod protocol;
 mod rs485;
 mod safety;
 mod sync;
+mod telemetry;
 mod udp_multicast;
 mod web;
 #[cfg(feature = "wifi")]
@@ -62,62 +63,7 @@ use crate::hal::Hal;
 static MAIN_HB: health::TaskHb = health::TaskHb::new("main");
 const BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
 
-struct MainLoopPerf {
-    #[cfg(debug_assertions)]
-    phase_peaks_us: [u64; 9],
-}
-
-impl MainLoopPerf {
-    const fn new() -> Self {
-        Self {
-            #[cfg(debug_assertions)]
-            phase_peaks_us: [0; 9],
-        }
-    }
-
-    #[inline]
-    fn measure<F>(&mut self, phase: usize, operation: F)
-    where
-        F: FnOnce(),
-    {
-        #[cfg(debug_assertions)]
-        let started = std::time::Instant::now();
-        operation();
-        #[cfg(debug_assertions)]
-        {
-            let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            self.phase_peaks_us[phase] = self.phase_peaks_us[phase].max(elapsed);
-        }
-        #[cfg(not(debug_assertions))]
-        let _ = phase;
-    }
-
-    #[cfg(debug_assertions)]
-    fn record_elapsed(&mut self, phase: usize, started: std::time::Instant) {
-        let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.phase_peaks_us[phase] = self.phase_peaks_us[phase].max(elapsed);
-    }
-
-    fn log_and_reset(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            let p = &self.phase_peaks_us;
-            log::info!(
-                "[perf] phase_peak_us tcp={} ai_ao={} di={} do={} persist={} eth={} ble={} events={} housekeeping={}",
-                p[0],
-                p[1],
-                p[2],
-                p[3],
-                p[4],
-                p[5],
-                p[6],
-                p[7],
-                p[8]
-            );
-            self.phase_peaks_us.fill(0);
-        }
-    }
-}
+use crate::telemetry::MainLoopPerf;
 
 fn main() -> AppResult<()> {
     // 1. 初始化日志
@@ -279,20 +225,11 @@ fn main() -> AppResult<()> {
         channel::start(hal.clone(), timer_svc.clone())?;
     }
 
-    // 8.1 ADC 自动校准 (开机 8 秒窗口, 对齐参考固件)
-    // 在 IO 任务启动后立即执行, 校准期间阻塞主循环;
-    // 校准窗口结束前 IO/AO 任务使用默认标定值 (固定 4-20mA 范围).
-    // LOOP9: 校准期间 calib.rs 调用 feed_wdt(), 必须先订阅 WDT,
-    //        否则高频报 "task not found" 刷屏 (~150 条/8s)
+    // 校准注册后立即继续服务启动；采样在主循环中有界执行。
     health::subscribe_wdt();
     #[cfg(feature = "ai-ao")]
-    {
-        use crate::channel::calib;
-        if let Err(e) = calib::run_auto_calibration(&hal) {
-            log::warn!("[main] ADC auto-calibration failed: {}", e);
-            // LOOP9: 失败也标记完成, 避免心跳停滞触发强制重启
-            calib::mark_task_completed();
-        }
+    if let Err(error) = channel::calib::start_auto_calibration() {
+        log::warn!("[main] ADC calibration registration failed: {error}");
     }
 
     // 8.2 启动 UDP 组播接收 (MCA 一体机分布式资源)
@@ -397,7 +334,7 @@ fn main_loop(
     let mut port_led_warn_at: Option<std::time::Instant> = None;
 
     // 把 main 任务加入 ESP-IDF Task Watchdog (10s 超时)
-    // LOOP9: main() 中已订阅 (calib 前), 此处不再重复订阅 (避免 "task is already subscribed")
+    // main() 已订阅；主循环统一喂狗，包括校准 tick。
 
     loop {
         let loop_started = std::time::Instant::now();
@@ -412,6 +349,9 @@ fn main_loop(
         #[cfg(feature = "modbus-tcp")]
         perf.measure(0, crate::modbus::tcp_server::tick_tcp_server);
 
+        #[cfg(feature = "ai-ao")]
+        perf.measure(9, || crate::channel::calib::tick_auto_calibration(&hal));
+
         // 5ms 网络基准调度；AI/AO 分频保持 100ms 周期。
         if tick.is_multiple_of(100 / MAIN_LOOP_PERIOD_MS as u32) {
             #[cfg(feature = "ai-ao")]
@@ -420,7 +360,7 @@ fn main_loop(
                 crate::channel::ao::tick_ao_output(&hal);
             });
             // Publish RS485 activity and active-low fiber detection together.
-            // Keep status LED I2C in the main task and preserve the BT bits.
+            // F3/F4 only submit atomic LED targets here; the worker owns I2C.
             {
                 let stats = &crate::modbus::shared::RS485_STATS;
                 if let Err(error) = hal.set_port_leds(
@@ -441,13 +381,13 @@ fn main_loop(
         }
 
         // DO dirty 检查是单原子操作，每 5ms 运行；只有值变化才访问 I2C。
-        // 这使 TCP/RTU/BLE/Web 点位控制到物理输出的额外调度延迟不超过 5ms。
+        // 目标提交按 5ms 调度；F3/F4 实际执行及读回由 worker 异步确认。
         #[cfg(feature = "io-di-do")]
         perf.measure(3, || crate::io::do_::tick_do_output(&hal));
 
         // MCA control words are scheduled here so delay/pulse never block
         // Modbus, TCP, BLE, or the watchdog.
-        control_logic::tick();
+        perf.measure(4, control_logic::tick);
 
         // DO 的 1s 节流/去重持久化由 DeviceActor 执行，主循环不等待 Flash。
 
@@ -519,7 +459,6 @@ fn main_loop(
 
         // 每 1s 更新 uptime + 检查任务心跳
         if tick.is_multiple_of(1000 / MAIN_LOOP_PERIOD_MS as u32) {
-            #[cfg(debug_assertions)]
             let housekeeping_started = std::time::Instant::now();
             let uptime = start.elapsed().as_secs() as u32;
             // 阶段 A: uptime 写 + reset-request 读 全过 bus::IO.sys (原子), 无锁
@@ -665,15 +604,9 @@ fn main_loop(
             if tick.is_multiple_of(stack_report_period_ms / MAIN_LOOP_PERIOD_MS as u32) {
                 health::print_stack_watermarks();
             }
-            #[cfg(debug_assertions)]
             perf.record_elapsed(8, housekeeping_started);
         }
 
-        let work_us = loop_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        max_work_us = max_work_us.max(work_us);
-        if work_us > MAIN_LOOP_PERIOD_MS * 1_000 {
-            deadline_miss_count = deadline_miss_count.saturating_add(1);
-        }
         if tick.is_multiple_of(60_000 / MAIN_LOOP_PERIOD_MS as u32) {
             log::info!(
                 "[perf] main_loop period={}ms max_work={}us deadline_miss={}",
@@ -682,8 +615,20 @@ fn main_loop(
                 deadline_miss_count
             );
             perf.log_and_reset();
+            log::info!(
+                "[rcu] max_reclaim_wait_us config={} storage={}",
+                bus::config_state::CONFIG.max_reclaim_wait_us(),
+                bus::storage_state::STORAGE.max_reclaim_wait_us()
+            );
             max_work_us = 0;
             deadline_miss_count = 0;
+        }
+
+        let work_us = loop_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        max_work_us = max_work_us.max(work_us);
+        perf.record_work(work_us);
+        if work_us > MAIN_LOOP_PERIOD_MS * 1_000 {
+            deadline_miss_count = deadline_miss_count.saturating_add(1);
         }
 
         // 以绝对 deadline 调度，避免“业务耗时 + 固定 sleep”使 5ms 周期持续漂移。

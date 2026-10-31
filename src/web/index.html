@@ -113,11 +113,11 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     </div>
     <div class="card">
       <h2>数字输入 (DI)</h2>
-      <div class="di-list" id="di_list"></div>
+      <div class="di-list" id="di_list"></div><p id="di_quality" class="hint" role="status"></p>
     </div>
     <div class="card">
       <h2>数字输出 (DO)</h2>
-      <div class="do-list" id="do_list"></div>
+      <div class="do-list" id="do_list"></div><p id="do_quality" class="hint" role="status"></p>
     </div>
     <div class="card">
       <h2>模拟输入 (AI)</h2>
@@ -479,6 +479,15 @@ async function pollIO() {
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
+    const quality = d.diagnostics && d.diagnostics.io;
+    $('#di_quality').textContent = quality ? (quality.di_valid
+      ? '采样有效 · ' + quality.di_age_ms + ' ms'
+      : '采样失效：显示最后状态，请检查 IO 板与总线') : '';
+    const queued = quality && quality.output_queue;
+    $('#do_quality').textContent = quality ? (!quality.do_readback_valid
+      ? '输出寄存器读回失效，请检查 IO 板与总线'
+      : queued && queued.depth > 0 ? '命令待执行：' + queued.depth
+      : '输出寄存器已读回（不代表触点/负载反馈）') : '';
 
     // 原 MAC 页面固定显示 8 个状态灯: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2。
     const stateNames = ['PWR', 'RUN', 'BT', 'LAN', '485_1', '485_2', 'FIB1', 'FIB2'];
@@ -575,7 +584,7 @@ async function toggleDO(addr, val) {
     const r = await fetch('/iocontrol', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') { toast('控制失败: ' + j.code, false); }
-    else toast('输出已更新', true);
+    else { toast('控制指令已接收，请查看输出确认状态', true); await pollIO(); }
   } catch(e) { toast('控制失败: ' + e, false); }
 }
 

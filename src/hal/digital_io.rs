@@ -40,6 +40,12 @@ pub trait DigitalIo: Send + Sync {
     /// F3/F4 (PCA9555): 软件 I2C 多芯片读取
     fn read_di_all(&self) -> AppResult<u64>;
 
+    /// 返回采样序号；异步驱动用来避免把同一缓存误计为多次去抖采样。
+    /// 同步驱动每次读取都是新样本，因此序号为 None。
+    fn read_di_sample(&self) -> AppResult<(u64, Option<u32>)> {
+        self.read_di_all().map(|bits| (bits, None))
+    }
+
     /// 读取单个 DI 通道 (idx 从 0 开始)
     ///
     /// 返回 `true` = 高电平, `false` = 低电平。
@@ -65,9 +71,10 @@ pub trait DigitalIo: Send + Sync {
     /// F3/F4: 读 PCA9555 缓存
     fn read_do_cached(&self) -> u64;
 
-    /// 读取 DO 实际硬件状态 (慢, 用于诊断)
+    /// 读取输出寄存器状态；异步驱动返回有时效检查的最近硬件读回。
+    /// 这不是继电器触点或负载电流反馈。
     ///
     /// 默认版本: 读 MCP23017 OLAT
-    /// F3/F4: 读 PCA9555 OLAT 寄存器
+    /// F3/F4: worker 最近读取的 PCA9555 OUTPUT 寄存器
     fn read_do_actual(&self) -> AppResult<u64>;
 }

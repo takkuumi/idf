@@ -1,7 +1,7 @@
 //! 并发同步原语 — 无 parking_lot::Mutex, 无锁中毒
 //!
 //! ## 设计取向
-//! - 高频实时位图 (DI/DO 64 位) → [`AtomicBits64`] (wait-free 读 + CAS 单位写)
+//! - 高频实时位图 (DI/DO 64 位) → [`AtomicBits64`] (一致快照 + CAS 写者串行化)
 //! - 短临界区 (外设句柄 / legacy Bus / 环日志 / BLE 回调表) → [`Spin`]
 //!   - 无争用 CAS 快路径；持续争用时协作让出调度器，避免优先级反转
 //! - 多生产者-单消费者消息 (Actor mailbox / 事件总线) → [`MpscRing`]
@@ -9,9 +9,9 @@
 //!
 //! ## 为什么不用 parking_lot
 //! - parking_lot::Mutex 会把争用线程 park 到 OS (调度器介入, 微秒→毫秒级)
-//! - std::sync::Mutex 可中毒 (持锁线程 panic 时永久不可用)
+//! - std::sync::Mutex 可中毒；适用处显式处理 poisoned 状态。
 //! - 本模块: 所有锁都是短临界区 (≤ 微秒级), 以 CAS 为快路径
-//! - 工业实时路径 (I/O/Modbus) 永不睡眠
+//! - 争用路径可让出 RTOS 调度；有界实时调用应使用 try_* 接口。
 //!
 //! ## 完全去除 parking_lot::Mutex 之后的状态分类
 //! | 区域 | 旧锁 | 新方案 | 类别 |
@@ -28,7 +28,7 @@
 
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use heapless::spsc::Queue;
 
@@ -133,7 +133,7 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
 // ESP32-S3 (Xtensa LX7) 没有原生 64 位原子; `AtomicU64` 在 xtensa 上回退到 libatomic
 // (会引锁). 之前用 `Mutex<u64>` 保护 64 位 IO 位图, 在 IO 高频路径上加锁竞争明显.
 //
-// 本实现: 拆 4× AtomicU16 (xtensa 原生无锁), 配合单字节 seqlock:
+// 本实现: 拆 4× AtomicU16 (xtensa 原生无锁), 配合32 位 seqlock:
 // - 读 (`load_bits`): 序号前后比对 + 读 4 个 word; 不一致重试 (类 seqlock, 无限重试边界).
 // - 写: CAS 把偶数序号改成奇数以取得唯一写者资格，完成后发布下一个偶数序号。
 //
@@ -148,7 +148,7 @@ pub struct AtomicBits64 {
     /// 低 16 位 → 高 16 位 顺序排列
     words: [AtomicU16; 4],
     /// seqlock 序号 (写者进入+1, 出口+1; 序号偶 = 临界区空闲, 奇 = 写入中)
-    seq: AtomicU8,
+    seq: AtomicU32,
 }
 
 unsafe impl Sync for AtomicBits64 {}
@@ -164,44 +164,46 @@ impl AtomicBits64 {
                 AtomicU16::new((value >> 32) as u16),
                 AtomicU16::new((value >> 48) as u16),
             ],
-            seq: AtomicU8::new(0),
+            seq: AtomicU32::new(0),
         }
     }
 
-    /// 全量读取 (seqlock 重试, 真无锁).
+    /// 一致读取；争用时协作让出。无等待上限，不用于 ISR。
     pub fn load_bits(&self) -> u64 {
         let mut retries = 0u16;
         loop {
-            let v0 = self.seq.load(Ordering::Acquire);
-            if v0 & 1 != 0 {
-                // 写入者可能在同一 CPU 被抢占。短暂自旋后协作让出，
-                // 防止读者把 main loop 卡在 seqlock 上并饿死写者/WDT。
-                cooperative_yield_after(&mut retries);
-                continue;
+            if let Some(bits) = self.try_load_bits(8) {
+                return bits;
             }
-            let w0 = self.words[0].load(Ordering::Acquire);
-            let w1 = self.words[1].load(Ordering::Acquire);
-            let w2 = self.words[2].load(Ordering::Acquire);
-            let w3 = self.words[3].load(Ordering::Acquire);
-            let v1 = self.seq.load(Ordering::Acquire);
-            if v0 == v1 {
-                return (w0 as u64)
-                    | ((w1 as u64) << 16)
-                    | ((w2 as u64) << 32)
-                    | ((w3 as u64) << 48);
-            }
-            // 中途被写者改写: 重试
             cooperative_yield_after(&mut retries);
         }
+    }
+
+    /// 有界尝试；写者暂停或持续争用时返回 None，不把主循环卡在重试中。
+    pub fn try_load_bits(&self, attempts: usize) -> Option<u64> {
+        for _ in 0..attempts {
+            let before = self.seq.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                continue;
+            }
+            let mut value = 0u64;
+            for (i, word) in self.words.iter().enumerate() {
+                value |= u64::from(word.load(Ordering::SeqCst)) << (i * 16);
+            }
+            if before == self.seq.load(Ordering::SeqCst) {
+                return Some(value);
+            }
+        }
+        None
     }
 
     /// 全量替换 (多写者最后写入生效).
     pub fn store_bits(&self, value: u64) {
         let write_seq = self.begin_write();
-        self.words[0].store(value as u16, Ordering::Release);
-        self.words[1].store((value >> 16) as u16, Ordering::Release);
-        self.words[2].store((value >> 32) as u16, Ordering::Release);
-        self.words[3].store((value >> 48) as u16, Ordering::Release);
+        self.words[0].store(value as u16, Ordering::SeqCst);
+        self.words[1].store((value >> 16) as u16, Ordering::SeqCst);
+        self.words[2].store((value >> 32) as u16, Ordering::SeqCst);
+        self.words[3].store((value >> 48) as u16, Ordering::SeqCst);
         self.end_write(write_seq);
     }
 
@@ -210,7 +212,7 @@ impl AtomicBits64 {
         if ch >= 64 {
             return false;
         }
-        let w = self.words[ch >> 4].load(Ordering::Acquire);
+        let w = self.words[ch >> 4].load(Ordering::SeqCst);
         w & (1u16 << (ch & 0x0F)) != 0
     }
 
@@ -222,14 +224,14 @@ impl AtomicBits64 {
         let write_seq = self.begin_write();
         let idx = ch >> 4;
         let mask = 1u16 << (ch & 0x0F);
-        let cur = self.words[idx].load(Ordering::Relaxed);
+        let cur = self.words[idx].load(Ordering::SeqCst);
         let nv = if value { cur | mask } else { cur & !mask };
-        self.words[idx].store(nv, Ordering::Release);
+        self.words[idx].store(nv, Ordering::SeqCst);
         self.end_write(write_seq);
         true
     }
 
-    /// 用 (mask, value) 在 64 位范围内批量替换指定 bit. 多写者 best-effort.
+    /// 在同一个写临界区内批量替换指定 bit，不丢失并发修改。
     pub fn mask_replace(&self, mask: u64, value: u64) {
         let write_seq = self.begin_write();
         for i in 0..4usize {
@@ -238,30 +240,25 @@ impl AtomicBits64 {
                 continue;
             }
             let v = ((value >> (i * 16)) & 0xFFFF) as u16;
-            let cur = self.words[i].load(Ordering::Relaxed);
+            let cur = self.words[i].load(Ordering::SeqCst);
             let nv = (cur & !m) | (v & m);
-            self.words[i].store(nv, Ordering::Release);
+            self.words[i].store(nv, Ordering::SeqCst);
         }
         self.end_write(write_seq);
     }
 
     /// 取得唯一写者资格，返回取得时的偶数序号。
-    fn begin_write(&self) -> u8 {
+    fn begin_write(&self) -> u32 {
         let mut retries = 0u16;
         loop {
-            let seq = self.seq.load(Ordering::Acquire);
+            let seq = self.seq.load(Ordering::SeqCst);
             if seq & 1 != 0 {
                 cooperative_yield_after(&mut retries);
                 continue;
             }
             if self
                 .seq
-                .compare_exchange_weak(
-                    seq,
-                    seq.wrapping_add(1),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(seq, seq.wrapping_add(1), Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return seq;
@@ -270,8 +267,8 @@ impl AtomicBits64 {
         }
     }
 
-    fn end_write(&self, write_seq: u8) {
-        self.seq.store(write_seq.wrapping_add(2), Ordering::Release);
+    fn end_write(&self, write_seq: u32) {
+        self.seq.store(write_seq.wrapping_add(2), Ordering::SeqCst);
     }
 }
 
@@ -569,6 +566,25 @@ mod tests {
     }
 
     // --- AtomicBits64 ---
+    #[test]
+    fn test_bits_bounded_read_detects_preempted_writer() {
+        let bits = AtomicBits64::new(42);
+        let seq = bits.begin_write();
+        assert_eq!(bits.try_load_bits(32), None);
+        bits.end_write(seq);
+        assert_eq!(bits.try_load_bits(1), Some(42));
+    }
+
+    #[test]
+    fn test_bits_32bit_generation_survives_old_u8_wrap() {
+        let bits = AtomicBits64::new(0);
+        for value in 0..256 {
+            bits.store_bits(value);
+        }
+        assert_eq!(bits.seq.load(Ordering::SeqCst), 512);
+        assert_eq!(bits.try_load_bits(1), Some(255));
+    }
+
     #[test]
     fn test_bits_basic() {
         let b = AtomicBits64::new(0);

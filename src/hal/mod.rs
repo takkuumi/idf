@@ -27,6 +27,7 @@ pub mod gpio;
 pub mod i2c_bus;
 #[cfg(not(any(feature = "f3", feature = "f4")))]
 pub mod io_ext;
+pub mod io_worker_state;
 pub mod ledc;
 #[cfg(not(any(feature = "f3", feature = "f4")))]
 pub mod mcp23017;

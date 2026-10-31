@@ -12,6 +12,12 @@
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
 
+## 架构按优先级完善（2026-11-01）
+
+- 实施 DI 时效/唯一采样去抖、LED 故障隔离、DO FIFO 与 OUTPUT 寄存器读回确认；故障恢复只保留最新目标，状态与错误可在 Web 查询。
+- RCU 双代登记及 SeqCst 回收、AtomicBits64 32 位序号和有界读取；开机校准改为非阻塞状态机，生产路径增加固定容量分位桶与回收等待诊断。
+- 主机/模型与实机验证进展见 `docs/testing/architecture-priority-implementation-2026-11-01.md`。保持 2.4.0 版本、硬件映射和寄存器/NVS 格式。
+
 ## 2.4.0 架构性能改进（2026-10-31）
 
 - RCU 快照改为原子指针 + reader guard；PCA9555 bit-bang I2C 改为 6KB 独立 worker，DI/DO/LED 通过原子缓存交接；RS485 TX_DONE 余量按波特率动态计算。

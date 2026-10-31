@@ -1678,9 +1678,21 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         ai_min.push_str(&format!("\"ai_addr_min_{}\":{}", i, min_v));
     }
 
+    #[cfg(any(feature = "f3", feature = "f4"))]
+    let io_health = crate::hal::pca9555::diagnostics_json();
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    let io_health = "null";
+    let diagnostics = format!(
+        r#"{{"io":{},"calibration_status":{},"performance":{},"rcu_reclaim_max_us":{{"config":{},"storage":{}}}}}"#,
+        io_health,
+        crate::channel::calib::status_code(),
+        crate::telemetry::json(),
+        crate::bus::config_state::CONFIG.max_reclaim_wait_us(),
+        crate::bus::storage_state::STORAGE.max_reclaim_wait_us()
+    );
     let json = format!(
-        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}}}}}}"#,
-        state_data, di_data, do_data, ai_data, ai_max, ai_min,
+        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}},"diagnostics":{}}}}}"#,
+        state_data, di_data, do_data, ai_data, ai_max, ai_min, diagnostics,
     );
     send_json(stream, 200, &json)
 }

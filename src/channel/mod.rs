@@ -15,6 +15,7 @@ use crate::hal::Hal;
 pub mod ai;
 pub mod ao;
 pub mod calib;
+pub mod calibration_window;
 
 /// 启动 AI 采样 + AO 输出任务
 pub fn start(_hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppResult<()> {
