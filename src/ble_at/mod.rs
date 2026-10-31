@@ -691,7 +691,7 @@ unsafe extern "C" fn gatts_event_cb(
                     for &b in data.iter().take(20) {
                         let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
                     }
-                    log::info!("[ble_at] GATT write RX: {} bytes, hex={}", data.len(), hex);
+                    log::debug!("[ble_at] GATT write RX: {} bytes, hex={}", data.len(), hex);
                     if !try_feed_binary_protocol(data, p.conn_id, p.trans_id) {
                         feed_data(data);
                     }
@@ -1143,7 +1143,7 @@ pub fn process_tick(hal: &crate::hal::Hal) {
             let _ = rx.remove(0);
         }
         drop(rx);
-        log::info!("[ble_at] AT cmd: {}", line_str);
+        log::debug!("[ble_at] AT cmd: {}", line_str);
         at_response = Some(crate::ble_at::parser::process(&line_str));
     }
     if let Some(resp) = at_response {
@@ -1620,13 +1620,13 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
         for &b in data.iter().take(20) {
             let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
         }
-        log::info!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
+        log::debug!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
     } else {
         let mut hex = heapless::String::<64>::new();
         for &b in data.iter() {
             let _ = core::fmt::write(&mut hex, format_args!("{:02X} ", b));
         }
-        log::info!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
+        log::debug!("[ble_at] binary rx: {} bytes, hex={}", data.len(), hex);
     }
     // 最小帧: tx_id(2) + proto_id(2) + length(2) + unit(1) + func(1) + crc(2) = 10
     if data.len() < 10 {
@@ -1892,7 +1892,7 @@ fn handle_mca_custom_command(
     conn_id: u16,
     _unit: u8,
 ) -> bool {
-    log::info!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={data:02X?}",);
+    log::debug!("[ble_at] MCA custom cmd: func=0x{func:02X}, data={data:02X?}",);
     let Some(rsp) = build_mca_custom_response(func, data) else {
         log::warn!("[ble_at] MCA custom cmd 0x{func:02X} invalid or unsupported");
         return false;

@@ -370,7 +370,7 @@ pub fn handle_logic_config(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
     let sub = data[0];
     let payload = &data[1..];
 
-    log::info!(
+    log::debug!(
         "[logic_cfg] D0 LOGIC_CONFIG: sub=0x{:02X} ({}), payload={} bytes",
         sub,
         sub_name(sub),
@@ -405,7 +405,7 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
         return None;
     }
     let sub = data[0];
-    log::info!(
+    log::debug!(
         "[logic_cfg] D1 LOGIC_RETRIEVE: sub=0x{:02X} ({})",
         sub,
         sub_name(sub)
@@ -424,7 +424,7 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
             rsp.push(0xD1).ok()?;
             rsp.push(sub).ok()?;
             rsp.extend_from_slice(&cfg_data).ok()?;
-            log::info!(
+            log::debug!(
                 "[logic_cfg] D1: sub=0x{:02X} ({}) → {} bytes",
                 sub,
                 sub_name(sub),
@@ -433,7 +433,7 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
             Some(rsp)
         }
         None => {
-            log::info!(
+            log::debug!(
                 "[logic_cfg] D1: sub=0x{:02X} ({}) not configured",
                 sub,
                 sub_name(sub)
@@ -462,7 +462,7 @@ pub fn handle_delete_config() -> Option<heapless::Vec<u8, 256>> {
 /// 对齐参考固件 vConfigComReuest: 返回当前 DI/DO 位图.
 /// 返回两帧: 第一帧 DI 位图 (sub=0x27), 第二帧 DO 位图 (sub=0x28).
 pub fn handle_com_request() -> Option<heapless::Vec<u8, 256>> {
-    log::info!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
+    log::debug!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
 
     let [di, do_] = com_request_frames();
     let mut rsp: heapless::Vec<u8, 256> = heapless::Vec::new();
@@ -476,7 +476,7 @@ pub fn handle_com_request() -> Option<heapless::Vec<u8, 256>> {
 /// must therefore wrap and notify them separately instead of nesting both
 /// payloads in one outer frame.
 pub fn com_request_frames() -> [heapless::Vec<u8, 256>; 2] {
-    log::info!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
+    log::debug!("[logic_cfg] D3 COM_REQUEST: querying DI/DO status");
 
     // 读取当前 DI 状态 (离散输入位图)
     let di_bitmap = read_io_bitmap(true);

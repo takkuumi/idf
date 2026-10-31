@@ -66,7 +66,9 @@ impl SwI2c {
         this.scl_write(true);
         this.release_bus();
 
-        log::info!("[sw_i2c] init: sda={sda} scl={scl}");
+        // Optional NFC probing can repeat this successful initialization every
+        // few seconds when no board is connected; keep it out of production INFO.
+        log::debug!("[sw_i2c] init: sda={sda} scl={scl}");
         Ok(this)
     }
 

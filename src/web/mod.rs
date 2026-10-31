@@ -1711,7 +1711,7 @@ fn handle_io_control(stream: &mut TcpStream, req: &HttpRequest) -> std::io::Resu
         return send_json(stream, 200, &json_response("iocontrol", "0x01000005"));
     }
 
-    log::info!("[http] IO control: addr={} value={}", addr, value);
+    log::debug!("[http] IO control: addr={} value={}", addr, value);
     send_json(stream, 200, &json_response("iocontrol", "0"))
 }
 
@@ -1771,7 +1771,7 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
         let take = name_bytes.len().min(8);
         cfg.ble_name[..take].copy_from_slice(&name_bytes[..take]);
     });
-    log::info!("[http] update BLE name: {:?}", name);
+    log::debug!("[http] update BLE name: {:?}", name);
     // The legacy Modbus/PC window (D98..D101) is an externally visible alias
     // of SystemConfig::ble_name. Keep it synchronized for every Web write.
     crate::bus::backends::sync_ble_name_holding();
@@ -1873,7 +1873,7 @@ fn handle_update_sensor_config(stream: &mut TcpStream, req: &HttpRequest) -> std
             &json_response("updatesensorconfig", "0x01000005"),
         );
     }
-    log::info!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);
+    log::debug!("[http] update sensor AI{} min={} max={}", ch, min_v, max_v);
     send_json(stream, 200, &json_response("updatesensorconfig", "0"))
 }
 
