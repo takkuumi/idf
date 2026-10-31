@@ -1,55 +1,70 @@
 //! 通用不可变快照容器。
 //!
-//! 读写锁内只克隆或替换一个 `Arc`，实际读取、业务闭包和旧快照析构均在锁外。
-//! 这里不使用 `arc-swap`：其 debt/TLS 回收路径在 ESP-IDF pthread 环境中会破坏
-//! 相邻 BSS 状态。快照指针只在调度器互斥量内克隆/替换，避免高优先级 main
-//! 抢占低优先级持有者后永久自旋。
+//! 读取路径使用原子指针 + reader guard，不获取 OS Mutex；写入路径先交换新快照，
+//! 再等待已经开始的读者退出后释放旧快照。读者在增加 guard 计数后才加载指针，
+//! 因此旧对象在 `Arc::increment_strong_count` 前始终由写者持有，避免 use-after-free。
+//!
+//! 这是一个适合“读多写少、读闭包短”的 RCU。写者会在读者长期占用快照时让出调度器，
+//! 不在主循环中持有大锁；不用于需要实时写入确认的外设事务。
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-/// 多读多写安全的不可变快照容器。
 pub struct Rcu<T> {
-    value: Mutex<Option<Arc<T>>>,
+    ptr: AtomicPtr<T>,
+    readers: AtomicUsize,
 }
 
 impl<T> Rcu<T> {
-    /// 构造空容器，第一次读取返回 `None`。
     pub const fn empty() -> Self {
         Self {
-            value: Mutex::new(None),
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            readers: AtomicUsize::new(0),
         }
     }
 
-    /// 创建已初始化容器。
     pub fn new(initial: T) -> Self {
         Self {
-            value: Mutex::new(Some(Arc::new(initial))),
+            ptr: AtomicPtr::new(Arc::into_raw(Arc::new(initial)) as *mut T),
+            readers: AtomicUsize::new(0),
         }
     }
 
-    #[inline]
-    fn lock_value(&self) -> MutexGuard<'_, Option<Arc<T>>> {
-        self.value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 发布新快照。分配在锁前完成，旧快照在锁外释放。
+    /// 发布新快照。旧快照只在所有已经开始的读者退出后释放。
     pub fn write(&self, new_value: T) {
-        let new_value = Arc::new(new_value);
-        let old_value = {
-            let mut current = self.lock_value();
-            current.replace(new_value)
-        };
-        drop(old_value);
+        let new_ptr = Arc::into_raw(Arc::new(new_value)) as *mut T;
+        let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
+        while self.readers.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        if !old_ptr.is_null() {
+            // SAFETY: old_ptr came from Arc::into_raw and no reader can still
+            // be between pointer load and Arc::increment_strong_count after the
+            // reader counter reached zero.
+            unsafe {
+                drop(Arc::from_raw(old_ptr));
+            }
+        }
     }
 
     /// 读取当前快照并转移一个安全的所有权句柄。
     pub fn read(&self) -> Option<Arc<T>> {
-        self.lock_value().clone()
+        self.readers.fetch_add(1, Ordering::Acquire);
+        let ptr = self.ptr.load(Ordering::Acquire);
+        if ptr.is_null() {
+            self.readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        // SAFETY: a writer cannot free the pointer while readers is non-zero;
+        // the writer that swapped this pointer still owns one Arc reference.
+        unsafe {
+            Arc::increment_strong_count(ptr);
+        }
+        self.readers.fetch_sub(1, Ordering::Release);
+        // SAFETY: the increment above created the owned Arc reference.
+        Some(unsafe { Arc::from_raw(ptr) })
     }
 
-    /// 克隆当前快照值。
     pub fn read_cloned(&self) -> Option<T>
     where
         T: Clone,
@@ -57,7 +72,6 @@ impl<T> Rcu<T> {
         self.read().map(|value| value.as_ref().clone())
     }
 
-    /// 在锁外执行读取闭包；锁内只增加一次 `Arc` 引用计数。
     pub fn read_with<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&T) -> R,
@@ -72,6 +86,24 @@ impl<T> Default for Rcu<T> {
         Self::empty()
     }
 }
+
+impl<T> Drop for Rcu<T> {
+    fn drop(&mut self) {
+        while self.readers.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        let ptr = self.ptr.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: Drop has exclusive access to self and all readers exited.
+            unsafe {
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for Rcu<T> {}
+unsafe impl<T: Send + Sync> Sync for Rcu<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +142,6 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Release);
             }
         }
-
         let drops = AtomicUsize::new(0);
         let rcu = Rcu::new(Tracked(&drops));
         let old = rcu.read().unwrap();
@@ -127,7 +158,6 @@ mod tests {
         let rcu = Arc::new(Rcu::new(0u64));
         let stop = Arc::new(AtomicBool::new(false));
         let mut readers = Vec::new();
-
         for _ in 0..4 {
             let rcu = Arc::clone(&rcu);
             let stop = Arc::clone(&stop);
@@ -140,7 +170,6 @@ mod tests {
                 }
             }));
         }
-
         for value in 1..=10_000 {
             rcu.write(value);
         }

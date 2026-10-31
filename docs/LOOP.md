@@ -14,6 +14,9 @@
 
 ## 2.4.0 架构性能改进（2026-10-31）
 
+- RCU 快照改为原子指针 + reader guard；PCA9555 bit-bang I2C 改为 6KB 独立 worker，DI/DO/LED 通过原子缓存交接；RS485 TX_DONE 余量按波特率动态计算。
+- 三变体开发回归、RCU host 5/5、核心 25/25 通过；PCA9555 worker 需在 F3 真机上继续验证。
+
 - 事件总线将 DI/AI/AO/DO 改为原子合并标志；IP/链路/复位使用关键状态单槽，避免普通采样事件覆盖关键网络状态。
 - BLE DI 状态上报降为 DEBUG，生产 INFO 不再随输入抖动刷串口；日志文档同步当前实现。
 - 5 项事件总线 host 测试、25 项核心测试、DEFAULT/F3/F4 Clippy 和设备测试目标编译通过。

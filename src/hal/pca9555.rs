@@ -23,10 +23,17 @@
 //! - DI LED: `raw` — direct (low-active LED, 0=input-active=LED-ON)
 
 use crate::error::{AppError, AppResult};
-use crate::sync::Spin;
+use crate::sync::{AtomicBits64, Spin};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::digital_io::DigitalIo;
 use super::sw_i2c::SwI2c;
+
+static PCA9555_TASK_HB: crate::health::TaskHb =
+    crate::health::TaskHb::new_with_stall("pca9555-i2c", 10);
 
 // PCA9555 registers
 const REG_INPUT_0: u8 = 0x00;
@@ -238,19 +245,152 @@ const STATUS_LED_FIBER_F4: [u8; 2] = [0xF7, 0x7F];
 const STATUS_LED_BT_F4: u8 = 0xEF;
 
 pub struct Pca9555Duo {
-    io_bus: BusI2c,
-    led_bus: BusI2c,
-    do_cache: crate::sync::AtomicBits64,
-    /// Last written IO port values (bit-reversed), indexed by DO chip.
-    last_io: Spin<[(u8, u8); MAX_CHIPS]>,
-    /// Last written LED port values (inverted), indexed by DO LED chip.
-    last_led: Spin<[(u8, u8); MAX_CHIPS]>,
-    /// Last raw DI values mirrored to DI LED chips.
-    last_di_led: Spin<[(u8, u8); MAX_CHIPS]>,
+    worker: Arc<Pca9555WorkerState>,
+}
+
+struct Pca9555WorkerState {
+    alive: AtomicBool,
+    di_bits: AtomicBits64,
+    do_desired: AtomicBits64,
+    do_hardware: AtomicBits64,
     #[cfg(feature = "f4")]
-    status_led: Spin<(u8, u8)>,
+    status_led: AtomicU16,
     #[cfg(not(feature = "f4"))]
-    status_led: Spin<u8>,
+    status_led: AtomicU16,
+}
+
+#[cfg(feature = "f4")]
+fn pack_status_led(status: (u8, u8)) -> u16 {
+    u16::from(status.0) | (u16::from(status.1) << 8)
+}
+
+#[cfg(not(feature = "f4"))]
+fn pack_status_led(status: u8) -> u16 {
+    u16::from(status)
+}
+
+#[cfg(feature = "f4")]
+fn unpack_status_led(value: u16) -> (u8, u8) {
+    (value as u8, (value >> 8) as u8)
+}
+
+#[cfg(not(feature = "f4"))]
+fn unpack_status_led(value: u16) -> u8 {
+    value as u8
+}
+
+fn pca9555_worker(mut io_bus: BusI2c, mut led_bus: BusI2c, state: Arc<Pca9555WorkerState>) {
+    crate::health::subscribe_wdt();
+    let mut last_io = [(0xFF, 0xFF); MAX_CHIPS];
+    let mut last_led = [(0xFF, 0xFF); MAX_CHIPS];
+    let mut last_di_led = [(0xFF, 0xFF); MAX_CHIPS];
+    let mut last_do = u64::MAX;
+    let mut last_status = u16::MAX;
+    let mut last_warn = Instant::now() - Duration::from_secs(10);
+
+    loop {
+        PCA9555_TASK_HB.tick();
+        crate::health::feed_wdt();
+
+        if let Err(error) = worker_sample_di(&io_bus, &mut led_bus, &mut last_di_led, &state)
+            && last_warn.elapsed() >= Duration::from_secs(10)
+        {
+            log::warn!("[pca9555] worker DI transaction failed: {error}");
+            last_warn = Instant::now();
+        }
+
+        let desired_do = state.do_desired.load_bits();
+        if desired_do != last_do {
+            match worker_apply_do(
+                &mut io_bus,
+                &mut led_bus,
+                desired_do,
+                &mut last_io,
+                &mut last_led,
+            ) {
+                Ok(()) => {
+                    last_do = desired_do;
+                    state.do_hardware.store_bits(desired_do);
+                }
+                Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
+                    log::warn!("[pca9555] worker DO transaction failed: {error}");
+                    last_warn = Instant::now();
+                }
+                Err(_) => {}
+            }
+        }
+
+        let desired_status = state.status_led.load(Ordering::Acquire);
+        if desired_status != last_status {
+            match worker_apply_status(&mut led_bus, desired_status) {
+                Ok(()) => last_status = desired_status,
+                Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
+                    log::warn!("[pca9555] worker status LED transaction failed: {error}");
+                    last_warn = Instant::now();
+                }
+                Err(_) => {}
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn worker_sample_di(
+    io_bus: &BusI2c,
+    led_bus: &mut BusI2c,
+    last_di_led: &mut [(u8, u8); MAX_CHIPS],
+    state: &Pca9555WorkerState,
+) -> AppResult<()> {
+    let mut result = 0u64;
+    for (index, (&io_addr, &led_addr)) in DI_IO_ADDRS.iter().zip(DI_LED_ADDRS).enumerate() {
+        let raw = io_bus.read_regs2(io_addr, REG_INPUT_0)?;
+        if last_di_led[index] != (raw[0], raw[1]) {
+            led_bus.write_regs2(led_addr, REG_OUTPUT_0, raw)?;
+            last_di_led[index] = (raw[0], raw[1]);
+        }
+        let bits = (!raw[0] as u64) | ((bit_reverse(raw[1]) ^ 0xFF) as u64) << 8;
+        result |= bits << (index * 16);
+    }
+    state.di_bits.store_bits(result);
+    Ok(())
+}
+
+fn worker_apply_do(
+    io_bus: &mut BusI2c,
+    led_bus: &mut BusI2c,
+    value: u64,
+    last_io: &mut [(u8, u8); MAX_CHIPS],
+    last_led: &mut [(u8, u8); MAX_CHIPS],
+) -> AppResult<()> {
+    for (index, (&io_addr, &led_addr)) in DO_IO_ADDRS.iter().zip(DO_LED_ADDRS).enumerate() {
+        let raw = ((value >> (index * 16)) & 0xFFFF) as u16;
+        let lo = raw as u8;
+        let hi = (raw >> 8) as u8;
+        let io = [bit_reverse(lo), bit_reverse(hi)];
+        let led = [!lo, !bit_reverse(hi)];
+        if last_io[index] != (io[0], io[1]) {
+            io_bus.write_regs2(io_addr, REG_OUTPUT_0, io)?;
+            last_io[index] = (io[0], io[1]);
+        }
+        if last_led[index] != (led[0], led[1]) {
+            led_bus.write_regs2(led_addr, REG_OUTPUT_0, led)?;
+            last_led[index] = (led[0], led[1]);
+        }
+    }
+    Ok(())
+}
+
+fn worker_apply_status(led_bus: &mut BusI2c, packed: u16) -> AppResult<()> {
+    #[cfg(feature = "f4")]
+    {
+        let status = unpack_status_led(packed);
+        led_bus.write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [status.0, status.1])
+    }
+    #[cfg(not(feature = "f4"))]
+    {
+        led_bus.write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, unpack_status_led(packed))
+    }
 }
 
 impl Pca9555Duo {
@@ -294,116 +434,101 @@ impl Pca9555Duo {
             crate::config::hw_version::DI_COUNT,
             crate::config::hw_version::DO_COUNT
         );
-        Ok(Self {
-            io_bus,
-            led_bus,
-            do_cache: crate::sync::AtomicBits64::new(0),
-            last_io: Spin::new([(0, 0); MAX_CHIPS]),
-            last_led: Spin::new([(0xFF, 0xFF); MAX_CHIPS]),
-            last_di_led: Spin::new([(0xFF, 0xFF); MAX_CHIPS]),
-            status_led: Spin::new(status_led),
-        })
-    }
-
-    fn apply_do(&self, value: u64) -> AppResult<()> {
-        let mut last_io = self.last_io.lock();
-        let mut last_led = self.last_led.lock();
-        for (index, (&io_addr, &led_addr)) in DO_IO_ADDRS.iter().zip(DO_LED_ADDRS).enumerate() {
-            let raw = ((value >> (index * 16)) & 0xFFFF) as u16;
-            let lo = raw as u8;
-            let hi = (raw >> 8) as u8;
-            let io = [bit_reverse(lo), bit_reverse(hi)];
-            let led = [!lo, !bit_reverse(hi)];
-            if last_io[index] != (io[0], io[1]) {
-                self.io_bus.write_regs2(io_addr, REG_OUTPUT_0, io)?;
-                last_io[index] = (io[0], io[1]);
-            }
-            if last_led[index] != (led[0], led[1]) {
-                self.led_bus.write_regs2(led_addr, REG_OUTPUT_0, led)?;
-                last_led[index] = (led[0], led[1]);
-            }
+        let worker = Arc::new(Pca9555WorkerState {
+            alive: AtomicBool::new(true),
+            di_bits: AtomicBits64::new(0),
+            do_desired: AtomicBits64::new(0),
+            do_hardware: AtomicBits64::new(0),
+            status_led: AtomicU16::new(pack_status_led(status_led)),
+        });
+        let worker_state = Arc::clone(&worker);
+        crate::health::set_next_thread_core(crate::health::CORE_NET);
+        let spawn = thread::Builder::new()
+            .name("pca9555-i2c".into())
+            .stack_size(crate::safety::stack_budget::PCA9555_I2C)
+            .spawn(move || pca9555_worker(io_bus, led_bus, worker_state));
+        crate::health::reset_thread_core();
+        if let Err(error) = spawn {
+            worker.alive.store(false, Ordering::Release);
+            return Err(AppError::Io(format!("spawn pca9555 worker: {error}")));
         }
-        Ok(())
-    }
-
-    fn update_di_leds(&self, index: usize, addr: u8, raw: [u8; 2]) -> AppResult<()> {
-        let mut last = self.last_di_led.lock();
-        if last[index] == (raw[0], raw[1]) {
-            return Ok(());
-        }
-        self.led_bus.write_regs2(addr, REG_OUTPUT_0, raw)?;
-        last[index] = (raw[0], raw[1]);
-        Ok(())
+        crate::health::register_with_stack(
+            &PCA9555_TASK_HB,
+            crate::safety::stack_budget::PCA9555_I2C,
+        );
+        Ok(Self { worker })
     }
 
     pub fn set_bt_led(&self, connected: bool) -> AppResult<()> {
         #[cfg(feature = "f4")]
         {
-            let mut current = self.status_led.lock();
-            let next = if connected {
-                (current.0 & STATUS_LED_BT_F4, current.1)
-            } else {
-                (current.0 | !STATUS_LED_BT_F4, current.1)
-            };
-            if next != *current {
-                self.led_bus
-                    .write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [next.0, next.1])?;
-                *current = next;
-            }
-            Ok(())
+            self.update_status_led(|current| {
+                let status = unpack_status_led(current);
+                let next = if connected {
+                    (status.0 & STATUS_LED_BT_F4, status.1)
+                } else {
+                    (status.0 | !STATUS_LED_BT_F4, status.1)
+                };
+                pack_status_led(next)
+            });
         }
         #[cfg(not(feature = "f4"))]
         {
-            let mut current = self.status_led.lock();
-            let next = with_status_led(*current, STATUS_LED_BT, connected);
-            if next != *current {
-                self.led_bus
-                    .write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, next)?;
-                *current = next;
-            }
-            Ok(())
+            self.update_status_led(|current| {
+                with_status_led(unpack_status_led(current), STATUS_LED_BT, connected) as u16
+            });
         }
+        Ok(())
     }
 
     pub fn set_port_leds(&self, rs485: [bool; 2], fiber: [bool; 2]) -> AppResult<()> {
         #[cfg(feature = "f4")]
         {
-            let mut current = self.status_led.lock();
-            let mut next = *current;
-            for (i, &active) in rs485.iter().enumerate() {
-                next.0 = if active {
-                    next.0 & STATUS_LED_RS485_F4[i]
+            self.update_status_led(|current| {
+                let status = unpack_status_led(current);
+                let mut next = status;
+                for (i, &active) in rs485.iter().enumerate() {
+                    next.0 = if active {
+                        next.0 & STATUS_LED_RS485_F4[i]
+                    } else {
+                        next.0 | !STATUS_LED_RS485_F4[i]
+                    };
+                }
+                next.0 = if fiber[0] {
+                    next.0 & STATUS_LED_FIBER_F4[0]
                 } else {
-                    next.0 | !STATUS_LED_RS485_F4[i]
+                    next.0 | !STATUS_LED_FIBER_F4[0]
                 };
-            }
-            next.0 = if fiber[0] {
-                next.0 & STATUS_LED_FIBER_F4[0]
-            } else {
-                next.0 | !STATUS_LED_FIBER_F4[0]
-            };
-            next.1 = if fiber[1] {
-                next.1 & STATUS_LED_FIBER_F4[1]
-            } else {
-                next.1 | !STATUS_LED_FIBER_F4[1]
-            };
-            if next != *current {
-                self.led_bus
-                    .write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [next.0, next.1])?;
-                *current = next;
-            }
-            Ok(())
+                next.1 = if fiber[1] {
+                    next.1 & STATUS_LED_FIBER_F4[1]
+                } else {
+                    next.1 | !STATUS_LED_FIBER_F4[1]
+                };
+                pack_status_led(next)
+            });
         }
         #[cfg(not(feature = "f4"))]
         {
-            let mut current = self.status_led.lock();
-            let next = with_fiber_leds(with_rs485_leds(*current, rs485), fiber);
-            if next != *current {
-                self.led_bus
-                    .write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, next)?;
-                *current = next;
+            self.update_status_led(|current| {
+                with_fiber_leds(with_rs485_leds(unpack_status_led(current), rs485), fiber) as u16
+            });
+        }
+        Ok(())
+    }
+
+    fn update_status_led(&self, update: impl Fn(u16) -> u16) {
+        let mut current = self.worker.status_led.load(Ordering::Acquire);
+        loop {
+            let next = update(current);
+            match self.worker.status_led.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
             }
-            Ok(())
         }
     }
 }
@@ -417,14 +542,8 @@ impl DigitalIo for Pca9555Duo {
     }
 
     fn read_di_all(&self) -> AppResult<u64> {
-        let mut result = 0u64;
-        for (index, (&io_addr, &led_addr)) in DI_IO_ADDRS.iter().zip(DI_LED_ADDRS).enumerate() {
-            let raw = self.io_bus.read_regs2(io_addr, REG_INPUT_0)?;
-            let _ = self.update_di_leds(index, led_addr, raw);
-            let bits = (!raw[0] as u64) | ((bit_reverse(raw[1]) ^ 0xFF) as u64) << 8;
-            result |= bits << (index * 16);
-        }
-        Ok(result)
+        self.worker_alive()?;
+        Ok(self.worker.di_bits.load_bits())
     }
 
     fn read_di(&self, idx: usize) -> AppResult<bool> {
@@ -441,11 +560,11 @@ impl DigitalIo for Pca9555Duo {
             (1u64 << self.do_count()) - 1
         };
         let value = value & mask;
-        if self.do_cache.load_bits() == value {
+        self.worker_alive()?;
+        if self.worker.do_desired.load_bits() == value {
             return Ok(());
         }
-        self.apply_do(value)?;
-        self.do_cache.store_bits(value);
+        self.worker.do_desired.store_bits(value);
         Ok(())
     }
 
@@ -453,7 +572,7 @@ impl DigitalIo for Pca9555Duo {
         if idx >= self.do_count() {
             return Err(AppError::Io(format!("do idx {idx} out of range")));
         }
-        let current = self.do_cache.load_bits();
+        let current = self.worker.do_desired.load_bits();
         let value = if on {
             current | (1u64 << idx)
         } else {
@@ -463,17 +582,22 @@ impl DigitalIo for Pca9555Duo {
     }
 
     fn read_do_cached(&self) -> u64 {
-        self.do_cache.load_bits()
+        self.worker.do_desired.load_bits()
     }
 
     fn read_do_actual(&self) -> AppResult<u64> {
-        let mut result = 0u64;
-        for (index, &addr) in DO_IO_ADDRS.iter().enumerate() {
-            let raw = self.io_bus.read_regs2(addr, REG_OUTPUT_0)?;
-            result |= (bit_reverse(raw[0]) as u64) << (index * 16);
-            result |= (bit_reverse(raw[1]) as u64) << (index * 16 + 8);
+        self.worker_alive()?;
+        Ok(self.worker.do_hardware.load_bits())
+    }
+}
+
+impl Pca9555Duo {
+    fn worker_alive(&self) -> AppResult<()> {
+        if self.worker.alive.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(AppError::Io("pca9555 worker stopped".into()))
         }
-        Ok(result)
     }
 }
 

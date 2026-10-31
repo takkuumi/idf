@@ -16,6 +16,7 @@ pub const MODBUS_RTU_SLAVE: usize = MODBUS_RTU_PORT1;
 pub const UDP_MULTICAST: usize = 4 * KIB;
 pub const NFC: usize = 6 * KIB;
 pub const HTTP: usize = 10 * KIB;
+pub const PCA9555_I2C: usize = 6 * KIB;
 pub const WIFI_HEARTBEAT: usize = 6 * KIB;
 
 pub const BLUEDROID_BTC: usize = 8 * KIB;
@@ -26,8 +27,14 @@ pub const FREERTOS_TIMER: usize = 4 * KIB;
 pub const W5500_RX: usize = 4 * KIB;
 
 /// 默认功能集常驻用户任务栈。
-pub const DEFAULT_USER_STACK_TOTAL: usize =
-    MAIN + DEVICE_ACTOR + MODBUS_RTU_PORT0 + MODBUS_RTU_PORT1 + UDP_MULTICAST + NFC + HTTP;
+pub const DEFAULT_USER_STACK_TOTAL: usize = MAIN
+    + DEVICE_ACTOR
+    + MODBUS_RTU_PORT0
+    + MODBUS_RTU_PORT1
+    + UDP_MULTICAST
+    + NFC
+    + HTTP
+    + PCA9555_I2C;
 
 /// 可选任务全部启用时的用户任务栈上限（不含 ESP-IDF 系统任务）。
 pub const ALL_USER_STACK_TOTAL: usize =
@@ -48,8 +55,8 @@ mod tests {
 
     #[test]
     fn test_all_user_stacks_stay_within_internal_sram_budget() {
-        assert_eq!(DEFAULT_USER_STACK_TOTAL, 80 * KIB);
-        assert_eq!(ALL_USER_STACK_TOTAL, 94 * KIB);
+        assert_eq!(DEFAULT_USER_STACK_TOTAL, 86 * KIB);
+        assert_eq!(ALL_USER_STACK_TOTAL, 100 * KIB);
         assert_eq!(KNOWN_SYSTEM_STACK_TOTAL, 36 * KIB);
         assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
     }

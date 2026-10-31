@@ -49,10 +49,11 @@
 | DeviceActor | 12KB | 1 | NVS/DO 保存及 Web 完成确认；有界消息批次 |
 | mb-rtu-port0 | 8KB | 1 | 第一 UART 独占，按配置运行主站/从站 |
 | mb-rtu-port1 | 8KB | 1 | 第二 UART 独占，按配置运行主站/从站 |
+| pca9555-i2c | 6KB | 1 | F3/F4 软件 I2C 采样、DO 和指示灯输出 worker |
 | udp-mcast | 4KB | 1 | UDP 接收、热重绑与新鲜度 |
 | nfc-st25 | 6KB | 1 | NFC 备份/恢复 |
 | http-srv | 10KB | 1 | Web/OTA；保存转交 Actor 并等待有界确认 |
-| **默认用户任务合计** | **80KB** | **7** | 固定，不随 TCP 连接数变化 |
+| **默认用户任务合计** | **86KB** | **8** | 固定，不随 TCP 连接数变化 |
 
 可选 RTU3 为 8KB，可选 Wi-Fi heartbeat 为 6KB；全部启用时用户任务上限 94KB，
 编译期断言限制为不超过 128KB。

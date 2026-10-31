@@ -30,6 +30,16 @@ fn rtu_silence_us(baud: u32) -> u32 {
     38_500_000u32 / baud.max(1)
 }
 
+/// TX_DONE 超时保护余量，不是固定发送延迟。
+/// 按两个字符时间覆盖 ISR/调度抖动和 UART FSM 状态更新；低速率保留
+/// 足够余量，高速率不再无条件等待 20ms。实际发送完成仍由 UART 硬件提前唤醒。
+#[inline]
+fn tx_guard_ms(baud: u32) -> u64 {
+    let baud = u64::from(baud.max(1));
+    let char_ms = 11_000u64.div_ceil(baud);
+    char_ms.saturating_mul(2).clamp(3, 20)
+}
+
 /// 单路 RS485 端口
 pub struct Rs485Port {
     cfg: Rs485Config,
@@ -171,7 +181,7 @@ impl Rs485Port {
             .saturating_mul(bits_per_char)
             .saturating_mul(1000)
             .div_ceil(self.cfg.baud.max(1) as u64)
-            .saturating_add(20)
+            .saturating_add(tx_guard_ms(self.cfg.baud))
             .min(5000);
         check(
             unsafe { uart_wait_tx_done(port, ms_to_ticks(tx_ms)) },
@@ -360,5 +370,13 @@ mod tests {
         assert_eq!(port.transaction_timeout_ms(8, 5, 60_000), 2000);
         // This unit test does not open a driver; avoid Drop touching UART0.
         std::mem::forget(port);
+    }
+
+    #[test]
+    fn test_tx_guard_scales_with_baud_without_zero_margin() {
+        assert_eq!(tx_guard_ms(1200), 20);
+        assert_eq!(tx_guard_ms(9600), 4);
+        assert_eq!(tx_guard_ms(115_200), 3);
+        assert_eq!(tx_guard_ms(921_600), 3);
     }
 }
