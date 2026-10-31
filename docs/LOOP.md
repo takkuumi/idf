@@ -15,12 +15,13 @@
 ## 2.4.0 架构性能改进（2026-10-31）
 
 - RCU 快照改为原子指针 + reader guard；PCA9555 bit-bang I2C 改为 6KB 独立 worker，DI/DO/LED 通过原子缓存交接；RS485 TX_DONE 余量按波特率动态计算。
-- 三变体开发回归、RCU host 5/5、核心 25/25 通过；PCA9555 worker 需在 F3 真机上继续验证。
+- DEFAULT/F3/F4 Clippy、目标测试编译、RCU host 5/5 和核心 host 25/25 通过。F3 真机 build id `14ee09d3cc1f` 启动后，四个 Modbus TCP 端口只读测试 60.2 秒 224/224 成功；测试窗口内无 Modbus 错误。先前两次短测出现成段连接拒绝/超时，之后服务恢复；原因未由对应串口窗口证实，不能视为已解释。
+- F3 真机 UART 启动记录确认 `pca9555-i2c` worker 注册、配置 IP `192.168.51.227`、reset count 98 / POWERON，未见 panic、WDT 或栈错误。I2C 故障注入、F4 多芯片与真实 PLC 高频 RS485 仍未覆盖。
 
 - 事件总线将 DI/AI/AO/DO 改为原子合并标志；IP/链路/复位使用关键状态单槽，避免普通采样事件覆盖关键网络状态。
 - BLE DI 状态上报降为 DEBUG，生产 INFO 不再随输入抖动刷串口；日志文档同步当前实现。
 - 5 项事件总线 host 测试、25 项核心测试、DEFAULT/F3/F4 Clippy 和设备测试目标编译通过。
-- 设备尚未刷入 2.4.0；完整审计与剩余 RCU/I2C/RS485 遥测项见 `docs/testing/architecture-performance-audit-2026-10-31.md`。
+- 架构实现和 F3 真机只读验收记录见 `docs/testing/architecture-performance-audit-2026-10-31.md`；剩余 RCU/I2C/RS485 故障注入及外设专项见该文档的验证边界。
 
 ## 2.3.1 发布（2026-10-31）
 
