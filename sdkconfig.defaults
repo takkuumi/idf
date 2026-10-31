@@ -44,13 +44,23 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=n
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
-CONFIG_APP_PROJECT_VER="2.2.9"
+CONFIG_APP_PROJECT_VER="2.3.0"
 CONFIG_SPI_FLASH_BROWNOUT_RESET=y
-CONFIG_SPI_FLASH_USE_4BLOCK_ERASE=y
+# ESP-IDF v5.5.4 无 SPI_FLASH_USE_4BLOCK_ERASE，旧选项不会生效。
+# 显式固定现有有效值：保留块擦除能力，擦除期间让出 CPU，避免通信/喂狗饥饿。
+# NVS 回收按 4KB page，holding 按 8KB slot；均不会因此变成 64KB 块擦除。
+CONFIG_SPI_FLASH_BYPASS_BLOCK_ERASE=n
+CONFIG_SPI_FLASH_PLACE_FUNCTIONS_IN_IRAM=y
+CONFIG_SPI_FLASH_YIELD_DURING_ERASE=y
+CONFIG_SPI_FLASH_ERASE_YIELD_DURATION_MS=20
+CONFIG_SPI_FLASH_ERASE_YIELD_TICKS=1
+CONFIG_SPI_FLASH_WRITE_CHUNK_SIZE=8192
+# 自动 suspend/resume 需要按 Flash 型号验证，不作为无条件加速项。
+CONFIG_SPI_FLASH_AUTO_SUSPEND=n
 
 # PSRAM (2MB Quad SPI) - ESP32-S3R2 内置
-# 策略: >4KB 自动走 PSRAM, 保留 16KB 内部 SRAM 给 DMA/中断/栈
-# (ProtoStore 3KB 仍走内部 SRAM; NVS 缓冲区/BLE Mesh 配置走 PSRAM)
+# 策略: 4KB 分配阈值，大对象优先 PSRAM；保留 64KB 内部 SRAM 给 DMA/中断/栈。
+# NVS page cache/hash list 单独保持内部 RAM，避免 SPI PSRAM 访问拖慢 NVS。
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TYPE_AUTO=y
@@ -207,11 +217,12 @@ CONFIG_LOG_COLORS=y
 CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
 
 # ---- NVS ----
-# NVS 加密 (生产环境启用, 开发期禁用以避免 eFuse/Flash-Enc 依赖)
-# 生产部署时需启用: CONFIG_SECURE_FLASH_ENC_ENABLED=y + CONFIG_NVS_ENCRYPTION=y
-#   + CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y (用 nvs_keys 分区)
-# nvs_keys 分区已在 partitions.csv 预留, 开发期不使用但无害
-CONFIG_NVS_ASSERT_ERROR_CHECK=y
+# NVS 加密当前未启用；启用需另行确定密钥/eFuse/量产流程，不是性能开关。
+# 错误通过返回码交给保存失败/dirty 重试路径；不要让可返回的 NVS 错误直接 abort。
+CONFIG_NVS_ASSERT_ERROR_CHECK=n
+# 大分区可用 PSRAM 缓存节省 internal heap，但会降低 NVS 操作速度。
+# 当前 nvs 仅 24KB，保持内部 RAM；holding A/B 位于独立 raw partition。
+CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM=n
 
 # ---- Core Dump (崩溃转储到 Flash, 工业可靠性) ----
 # Panic 时将任务上下文写入 coredump 分区, 重启后可通过 esp_core_dump_get_summary 分析

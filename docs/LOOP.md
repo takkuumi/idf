@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-10-30 (生产核查、保存确认与长期运行边界修复)
+> 最后更新: 2026-10-31 (SDKCONFIG 与持久化性能核查)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,13 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## SDKCONFIG 与持久化核查（2026-10-31）
+
+- 核对 DEFAULT/F3/F4 生成配置和 IDF v5.5.4 源码：NVS cache 已在内部 RAM，Flash 函数已在 IRAM，写块已为 8192 字节。
+- 删除不生效的 `SPI_FLASH_USE_4BLOCK_ERASE`，显式固定现有 Flash 调度值；将 NVS 特定断言检查改为错误码，保留常规安全检查与业务校验。
+- 确认 holding 实际使用 raw A/B 分区；其 2 秒静默条件和 Actor/节流调度才是延迟来源之一，NVS commit 在本版 IDF 中不做后台 flush。未改保存周期或宣称未经测量的性能提升。
+- 新增实际生成配置核验脚本；构建验收与证据见 `docs/testing/sdkconfig-storage-audit-2026-10-31.md`。未刷机，已有发布包不变。
 
 ## LOOP47 生产核查与长期运行修复（2026-10-30）
 
