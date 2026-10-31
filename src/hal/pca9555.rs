@@ -442,7 +442,10 @@ impl Pca9555Duo {
             status_led: AtomicU16::new(pack_status_led(status_led)),
         });
         let worker_state = Arc::clone(&worker);
-        crate::health::set_next_thread_core(crate::health::CORE_NET);
+        // Keep the bit-bang writer off the main/network CPU. AtomicBits64 readers
+        // can otherwise observe the writer's odd seqlock while it is preempted
+        // on the same core, starving the main loop under TCP load.
+        crate::health::set_next_thread_core(crate::health::CORE_RT);
         let spawn = thread::Builder::new()
             .name("pca9555-i2c".into())
             .stack_size(crate::safety::stack_budget::PCA9555_I2C)

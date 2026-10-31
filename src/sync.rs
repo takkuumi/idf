@@ -170,11 +170,13 @@ impl AtomicBits64 {
 
     /// 全量读取 (seqlock 重试, 真无锁).
     pub fn load_bits(&self) -> u64 {
+        let mut retries = 0u16;
         loop {
             let v0 = self.seq.load(Ordering::Acquire);
             if v0 & 1 != 0 {
-                // 写入中: 立刻重试
-                spin_loop();
+                // 写入者可能在同一 CPU 被抢占。短暂自旋后协作让出，
+                // 防止读者把 main loop 卡在 seqlock 上并饿死写者/WDT。
+                cooperative_yield_after(&mut retries);
                 continue;
             }
             let w0 = self.words[0].load(Ordering::Acquire);
@@ -189,7 +191,7 @@ impl AtomicBits64 {
                     | ((w3 as u64) << 48);
             }
             // 中途被写者改写: 重试
-            spin_loop();
+            cooperative_yield_after(&mut retries);
         }
     }
 
@@ -245,10 +247,11 @@ impl AtomicBits64 {
 
     /// 取得唯一写者资格，返回取得时的偶数序号。
     fn begin_write(&self) -> u8 {
+        let mut retries = 0u16;
         loop {
             let seq = self.seq.load(Ordering::Acquire);
             if seq & 1 != 0 {
-                spin_loop();
+                cooperative_yield_after(&mut retries);
                 continue;
             }
             if self
@@ -263,13 +266,30 @@ impl AtomicBits64 {
             {
                 return seq;
             }
-            spin_loop();
+            cooperative_yield_after(&mut retries);
         }
     }
 
     fn end_write(&self, write_seq: u8) {
         self.seq.store(write_seq.wrapping_add(2), Ordering::Release);
     }
+}
+
+/// 在短暂自旋后让出一次调度，避免 seqlock 读写者位于同一 CPU 时互相饿死。
+#[inline]
+fn cooperative_yield_after(retries: &mut u16) {
+    *retries = retries.saturating_add(1);
+    if *retries < 256 {
+        spin_loop();
+        return;
+    }
+    *retries = 0;
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        esp_idf_sys::vTaskDelay(1);
+    }
+    #[cfg(not(target_os = "espidf"))]
+    std::thread::yield_now();
 }
 
 impl Default for AtomicBits64 {
