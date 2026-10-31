@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-10-31 (2.3.1 发布准备与 NVS 优化归档)
+> 最后更新: 2026-10-31 (2.4.0 架构性能改进)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,13 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## 2.4.0 架构性能改进（2026-10-31）
+
+- 事件总线将 DI/AI/AO/DO 改为原子合并标志；IP/链路/复位使用关键状态单槽，避免普通采样事件覆盖关键网络状态。
+- BLE DI 状态上报降为 DEBUG，生产 INFO 不再随输入抖动刷串口；日志文档同步当前实现。
+- 5 项事件总线 host 测试、25 项核心测试、DEFAULT/F3/F4 Clippy 和设备测试目标编译通过。
+- 设备尚未刷入 2.4.0；完整审计与剩余 RCU/I2C/RS485 遥测项见 `docs/testing/architecture-performance-audit-2026-10-31.md`。
 
 ## 2.3.1 发布（2026-10-31）
 

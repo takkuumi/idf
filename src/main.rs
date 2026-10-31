@@ -717,7 +717,7 @@ fn apply_assigned_ip_to_config(
 // ----------------------------------------------------------------------------
 fn init_logger() {
     esp_idf_svc::log::EspLogger::initialize_default();
-    // 默认 INFO 级别 (运行时可通过 Modbus 寄存器 0x0106 调节)
+    // 生产默认 INFO；当前版本没有接通 Modbus 0x0106 动态调节，避免现场误判日志状态。
     log::set_max_level(log::LevelFilter::Info);
     // 安装 Rust panic hook，记录位置；ESP-IDF panic handler/coredump 负责回溯。
     install_panic_hook();

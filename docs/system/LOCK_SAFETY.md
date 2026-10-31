@@ -40,7 +40,7 @@
 | `IO.di` / `IO.do_` bits | `AtomicBits64` | [`src/bus/io_state.rs`](../../src/bus/io_state.rs) | **真无锁** | xtensa 4× AtomicU16 + seqlock |
 | `IO.ai/ao/sys` | `AtomicU16/U32/U8` 原生原子 | [`src/bus/io_state.rs`](../../src/bus/io_state.rs) | **真无锁** | 6 ch raw/scaled + 4 ch AO + sys |
 | `CONFIG` / `STORAGE` | `Rcu<Snapshot>` | [`src/bus/config_state.rs`](../../src/bus/config_state.rs) / [`src/bus/storage_state.rs`](../../src/bus/storage_state.rs) | **真无锁** (读; 1 load+1 fetch_add) | 写 epoch 延迟回收 (无 leak) |
-| `IO_EVENTS` | `MpscRing<IoEvent,32>` | [`src/bus/event_bus.rs`](../../src/bus/event_bus.rs) | **非阻塞** | 满 drop_oldest, 不 park |
+| `IO_EVENTS` | 原子合并标志 + 关键状态单槽 | [`src/bus/event_bus.rs`](../../src/bus/event_bus.rs) | **非阻塞** | DI/AI/AO/DO 合并；IP/链路/复位独立保留最新状态 |
 | `DeviceActor` mailbox | `MpscRing<DeviceCmd,32>` | [`src/device/mod.rs`](../../src/device/mod.rs) | Actor 独占 | NVS/commit/reload 状态由 Actor 线程独占 |
 
 `parking_lot` 依赖已从 [`Cargo.toml`](../../Cargo.toml) 中移除, `rg "parking_lot" src/` 除注释外无残留.

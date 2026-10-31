@@ -1025,34 +1025,14 @@ AT+OTA=REBOOT
 log::set_max_level(log::LevelFilter::Info);
 ```
 
-#### 运行时调节（无需重新编译）
+#### 当前生产行为
 
-**方式 1：Modbus 寄存器** — 写 `HOLD_SYS_LOG_LEVEL` (0x0106)：
-```
-值 0 = Error
-值 1 = Warn
-值 2 = Info（默认）
-值 3 = Debug
-值 4 = Trace
-```
+当前生产固件固定使用 INFO 作为 Rust 日志上限。DEBUG/TRACE 保留在代码中用于开发
+诊断，但默认不会输出；`sdkconfig.defaults` 的最大级别为 DEBUG 只是编译保留上限，
+不代表生产设备正在输出 DEBUG。
 
-`bus.rs::write_hold_reg` 中立即应用：
-```rust
-regs::HOLD_SYS_LOG_LEVEL => {
-    if value <= 4 {
-        self.sys.log_level = value as u8;
-        let level = match value {
-            0 => log::LevelFilter::Error,
-            // ...
-            4 => log::LevelFilter::Trace,
-            _ => log::LevelFilter::Info,
-        };
-        log::set_max_level(level);
-    }
-}
-```
-
-**方式 2：sdkconfig 调整最大级别**
+Modbus `0x0106` 动态调节目前没有接入实际寄存器映射，不能把它当作现场控制入口。
+若后续接入，必须补齐寄存器定义、并发安全、权限和掉电/重启后的默认策略后再发布。
 ```
 CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y   # 允许 Trace 级别输出
 ```

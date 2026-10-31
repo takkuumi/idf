@@ -3396,7 +3396,9 @@ pub fn send_di_status_report(conn_id: u16) {
     }
     // 3. 用 BLE 帧格式包装 (tx_id=0x0001 特殊 ID)
     send_ble_frame(0x0001, 0x0000, &pdu, conn_id);
-    log::info!(
+    // DI 状态上报可能随现场输入变化频繁触发；生产默认 INFO 不应为每个通知写串口。
+    // 需要追踪 BLE 状态帧时，调试构建/运行时 DEBUG 才打开这一条。
+    log::debug!(
         "[ble_at] DI status report: di_bits=0x{:016X} bytes={}",
         di_bits,
         bitmap_bytes
