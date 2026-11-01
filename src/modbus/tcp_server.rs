@@ -24,9 +24,12 @@ const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
 /// 同一连接在单次 5ms tick 内最多处理的流水请求数。
 /// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 8 客户端公平调度。
 const MAX_REQUESTS_PER_POLL: usize = 4;
-/// 服务器每个 5ms tick 的总请求预算。标准最大 FC03 响应实机峰值约 6ms，
-/// 因此每轮只执行一个业务请求；已有响应发送和超时检查仍会轮询所有客户端。
-const MAX_REQUESTS_PER_TICK: usize = 1;
+/// 服务器每个 5ms tick 的总请求预算。先轮转不同端口；其它端口没有
+/// 就绪请求时，同端口的另一个客户端才可借用余下额度。
+const MAX_REQUESTS_PER_TICK: usize = 2;
+/// TCP 业务处理准入窗口；达到窗口后不再启动新的业务请求，
+/// 但仍会在后续 tick 刷新已有响应和检查超时。单个不可分割请求可能超过该窗口。
+const MAX_TCP_WORK_US: u64 = 2_500;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
 /// P0-3: 连接速率限制 - 每秒最多10次新连接（防止SYN flood）
@@ -41,6 +44,8 @@ static NEXT_CONN_ID: AtomicU32 = AtomicU32::new(1);
 
 struct Client {
     id: u32,
+    listener_port: u16,
+    initial_slot: usize,
     peer: SocketAddr,
     stream: TcpStream,
     // 一个完整标准 ADU 足够：首帧处理后其余流水数据继续保留在 socket 接收队列。
@@ -58,7 +63,13 @@ const CLIENT_STATE_ALLOCATION_BYTES: usize = std::mem::size_of::<Client>() * cfg
 const _: () = assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
 
 impl Client {
-    fn new(id: u32, peer: SocketAddr, stream: TcpStream) -> std::io::Result<Self> {
+    fn new(
+        id: u32,
+        listener_port: u16,
+        initial_slot: usize,
+        peer: SocketAddr,
+        stream: TcpStream,
+    ) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         if let Err(error) = configure_keepalive(&stream) {
@@ -68,6 +79,8 @@ impl Client {
         }
         Ok(Self {
             id,
+            listener_port,
+            initial_slot,
             peer,
             stream,
             rx: [0; MAX_ADU_SIZE],
@@ -81,8 +94,15 @@ impl Client {
         })
     }
 
+    fn listener_port_slot(&self, active_ports: &[u16; 4]) -> usize {
+        active_ports
+            .iter()
+            .position(|&port| port == self.listener_port)
+            .unwrap_or(self.initial_slot)
+    }
+
     /// 返回 false 表示连接应关闭。每轮只完成有限工作，避免单客户端饿死其他连接。
-    fn poll(&mut self, backend: &BusBackend, budget: &mut usize) -> bool {
+    fn poll(&mut self, backend: &BusBackend, budget: &mut usize, deadline: Instant) -> bool {
         for _ in 0..MAX_REQUESTS_PER_POLL {
             if !self.flush_tx() {
                 return false;
@@ -92,6 +112,9 @@ impl Client {
                 break;
             }
             if *budget == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
                 break;
             }
 
@@ -120,6 +143,9 @@ impl Client {
                 }
             }
 
+            if Instant::now() >= deadline {
+                break;
+            }
             if !self.process_buffered_request(backend) {
                 return false;
             }
@@ -128,6 +154,11 @@ impl Client {
             }
         }
 
+        // A frame completed on the final receive iteration must not wait an
+        // extra main-loop tick before its response is first sent.
+        if !self.flush_tx() {
+            return false;
+        }
         if self.is_timed_out() {
             log::debug!("[mb-tcp] conn_id={} idle timeout", self.id);
             return false;
@@ -263,7 +294,8 @@ struct TcpServerState {
     clients: Vec<Client>,
     active_ports: [u16; 4],
     next_port_check: Instant,
-    client_cursor: usize,
+    last_served_client: [Option<u32>; 4],
+    port_cursor: usize,
     listener_cursor: usize,
     listener_rebind_due: Option<Instant>,
     next_reject_log: Instant,
@@ -306,7 +338,8 @@ pub fn start() -> AppResult<()> {
             clients,
             active_ports: ports,
             next_port_check: Instant::now(),
-            client_cursor: 0,
+            last_served_client: [None; 4],
+            port_cursor: 0,
             listener_cursor: 0,
             listener_rebind_due: None,
             next_reject_log: Instant::now(),
@@ -348,6 +381,7 @@ pub fn tick_tcp_server() {
                         Ok(()) => {
                             state.active_ports = desired;
                             state.listener_cursor = 0;
+                            state.port_cursor = 0;
                             state.listener_rebind_due = None;
                             log::info!("[mb-tcp] listeners rebound: {:?}", state.active_ports);
                         }
@@ -374,43 +408,111 @@ pub fn tick_tcp_server() {
             schedule_listener_recovery(state, now);
         }
 
-        let mut request_budget = MAX_REQUESTS_PER_TICK;
-        let client_count = state.clients.len();
-        let start = state.client_cursor.min(client_count.saturating_sub(1));
-        let mut dead = [false; cfg::MAX_CONNECTIONS];
-        for offset in 0..client_count {
-            let index = (start + offset) % client_count;
-            // 每个客户端每轮最多消费一个全局请求额度；发送已有响应和超时检查
-            // 不受额度影响，避免前序繁忙连接让后序连接永久饥饿。
-            let mut client_budget = request_budget.min(1);
-            let before = client_budget;
-            if !state.clients[index].poll(&BusBackend, &mut client_budget) {
+        poll_clients(state, Instant::now());
+    });
+}
+
+/// Send pending responses/check every connection even when the business budget
+/// is exhausted. All metadata uses fixed arrays; no per-tick heap allocation.
+fn poll_clients(state: &mut TcpServerState, started: Instant) {
+    let deadline = started + Duration::from_micros(MAX_TCP_WORK_US);
+    let count = state.clients.len();
+    let active_ports = state.active_ports;
+    let mut dead = [false; cfg::MAX_CONNECTIONS];
+    let mut metadata = [(0u32, 0usize); cfg::MAX_CONNECTIONS];
+    for (index, client) in state.clients.iter_mut().enumerate() {
+        let port_slot = client.listener_port_slot(&active_ports);
+        metadata[index] = (client.id, port_slot);
+        if !client.flush_tx() || client.is_timed_out() {
+            dead[index] = true;
+        }
+    }
+    let (order, order_len) = fair_client_schedule(
+        &metadata[..count],
+        state.port_cursor,
+        &state.last_served_client,
+    );
+    let mut remaining = MAX_REQUESTS_PER_TICK;
+    let mut served_ports = [false; 4];
+    let mut polled = [false; cfg::MAX_CONNECTIONS];
+    let mut any_served = false;
+
+    // First pass reserves opportunities for distinct listener slots. Only if
+    // other ports had no ready request may another client borrow the spare slot.
+    for borrow_spare in [false, true] {
+        for &index in &order[..order_len] {
+            if remaining == 0 || Instant::now() >= deadline {
+                break;
+            }
+            let client = &mut state.clients[index];
+            let slot = client.listener_port_slot(&active_ports);
+            if dead[index] || polled[index] || (!borrow_spare && served_ports[slot]) {
+                continue;
+            }
+            polled[index] = true;
+            let mut allowance = 1;
+            if !client.poll(&BusBackend, &mut allowance, deadline) {
                 dead[index] = true;
             }
-            request_budget -= before - client_budget;
-        }
-        let next_id = if client_count == 0 {
-            None
-        } else {
-            Some(state.clients[(start + MAX_REQUESTS_PER_TICK) % client_count].id)
-        };
-        for i in (0..client_count).rev() {
-            if dead[i] {
-                let client = state.clients.swap_remove(i);
-                state.conn_closed_total = state.conn_closed_total.saturating_add(1);
-                log::debug!(
-                    "[mb-tcp] conn_id={} from {} closed (total_closed={})",
-                    client.id,
-                    client.peer,
-                    state.conn_closed_total
-                );
-                CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
+            if allowance == 0 {
+                remaining -= 1;
+                any_served = true;
+                served_ports[slot] = true;
+                state.last_served_client[slot] = Some(client.id);
+                // Advance only after work was actually admitted. An overlong
+                // first request must not skip the next port on the next tick.
+                state.port_cursor = (slot + 1) % served_ports.len();
             }
         }
-        state.client_cursor = next_id
-            .and_then(|id| state.clients.iter().position(|client| client.id == id))
+    }
+    if !any_served {
+        state.port_cursor = (state.port_cursor + 1) % served_ports.len();
+    }
+    for index in (0..count).rev() {
+        if dead[index] {
+            let client = state.clients.swap_remove(index);
+            state.conn_closed_total = state.conn_closed_total.saturating_add(1);
+            log::debug!(
+                "[mb-tcp] conn_id={} from {} closed (total_closed={})",
+                client.id,
+                client.peer,
+                state.conn_closed_total
+            );
+            CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Order all clients by listener slot, then rotate within each slot using stable
+/// connection IDs. Connections on a removed port retain their original slot,
+/// so an old-but-valid connection cannot become unserviceable after renumbering.
+fn fair_client_schedule(
+    clients: &[(u32, usize)],
+    port_cursor: usize,
+    last_served: &[Option<u32>; 4],
+) -> ([usize; cfg::MAX_CONNECTIONS], usize) {
+    let mut order = [0; cfg::MAX_CONNECTIONS];
+    let mut used = 0;
+    let count = clients.len().min(cfg::MAX_CONNECTIONS);
+    for port_offset in 0..last_served.len() {
+        let slot = (port_cursor + port_offset) % last_served.len();
+        let start = last_served[slot]
+            .and_then(|id| {
+                clients[..count]
+                    .iter()
+                    .position(|&(candidate, _)| candidate == id)
+            })
+            .map(|index| (index + 1) % count.max(1))
             .unwrap_or(0);
-    });
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            if clients[index].1 == slot {
+                order[used] = index;
+                used += 1;
+            }
+        }
+    }
+    (order, used)
 }
 
 fn schedule_listener_recovery(state: &mut TcpServerState, now: Instant) {
@@ -575,7 +677,7 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
                 accepted += 1;
                 state.conn_rate_count += 1;
                 let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-                match Client::new(id, peer, stream) {
+                match Client::new(id, state.active_ports[index], index, peer, stream) {
                     Ok(client) => {
                         state.clients.push(client);
                         state.conn_established_total =
@@ -633,11 +735,40 @@ mod tests {
     fn test_tcp_uses_one_bounded_main_loop_state() {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
         assert_eq!(MAX_REQUESTS_PER_POLL, 4);
-        assert_eq!(MAX_REQUESTS_PER_TICK, 1);
+        assert_eq!(MAX_REQUESTS_PER_TICK, 2);
+        assert_eq!(MAX_TCP_WORK_US, 2_500);
         assert_eq!(MAX_ACCEPTS_PER_TICK, 2);
         assert!(cfg::PARTIAL_FRAME_TIMEOUT_MS < cfg::IDLE_TIMEOUT_MS);
         assert!(cfg::KEEPALIVE_COUNT > 0);
         assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
+    }
+
+    #[test]
+    fn test_fair_schedule_rotates_ports_before_revisiting_one_port() {
+        let clients = [(1, 0), (2, 1), (3, 2), (4, 3)];
+        let (first, first_len) = fair_client_schedule(&clients, 0, &[None; 4]);
+        assert_eq!(&first[..first_len], &[0, 1, 2, 3]);
+        let (second, second_len) =
+            fair_client_schedule(&clients, 2, &[Some(1), Some(2), Some(3), Some(4)]);
+        assert_eq!(&second[..second_len], &[2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn test_fair_schedule_rotates_clients_by_id_after_removal() {
+        let clients = [(10, 0), (11, 0), (20, 1)];
+        let (order, len) = fair_client_schedule(&clients, 0, &[Some(10), None, None, None]);
+        assert_eq!(&order[..len], &[1, 0, 2]);
+        let changed = [(20, 1), (11, 0), (12, 0)];
+        let (order, len) = fair_client_schedule(&changed, 0, &[Some(11), None, None, None]);
+        assert_eq!(&order[..len], &[2, 1, 0]);
+    }
+
+    #[test]
+    fn test_fair_schedule_handles_no_clients_and_missing_last_id() {
+        let (_, len) = fair_client_schedule(&[], 0, &[None; 4]);
+        assert_eq!(len, 0);
+        let (order, len) = fair_client_schedule(&[(7, 3)], 99, &[Some(99); 4]);
+        assert_eq!(&order[..len], &[0]);
     }
 
     #[test]
