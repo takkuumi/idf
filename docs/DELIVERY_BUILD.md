@@ -55,7 +55,7 @@ git rev-parse --short HEAD
 cargo check
 cargo check --features f3
 cargo check --features f4
-cargo test --bin gateway --no-run
+cargo test --bin imc --no-run
 git diff --check
 ```
 
@@ -74,7 +74,7 @@ rm -rf target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*
 ## 5. 编译 Release 固件
 
 ```bash
-cargo build --bin gateway --release
+cargo build --bin imc --release
 ```
 
 核心产物：
@@ -83,7 +83,7 @@ cargo build --bin gateway --release
 |---|---|---|
 | Bootloader | `target/xtensa-esp32s3-espidf/release/bootloader.bin` | 首次烧录文件 |
 | 分区表 | `target/xtensa-esp32s3-espidf/release/partition-table.bin` | 编译后的 8MB OTA 分区表 |
-| 应用 ELF | `target/xtensa-esp32s3-espidf/release/gateway` | 仅供构建和内部调试，不交给客户烧录 |
+| 应用 ELF | `target/xtensa-esp32s3-espidf/release/imc` | 仅供构建和内部调试，不交给客户烧录 |
 
 确认生成配置：
 
@@ -109,25 +109,25 @@ espflash save-image --chip esp32s3 \
   --flash-mode dio \
   --flash-freq 40mhz \
   --flash-size 8mb \
-  target/xtensa-esp32s3-espidf/release/gateway \
-  gateway-factory.bin
+  target/xtensa-esp32s3-espidf/release/imc \
+  imc-factory.bin
 ```
 
 生成后必须检查应用镜像不超过单个 OTA 分区 `0x240000`（2,359,296 字节）：
 
 ```bash
-app_bytes=$(stat -f '%z' gateway-factory.bin) # Linux 使用: stat -c '%s'
+app_bytes=$(stat -f '%z' imc-factory.bin) # Linux 使用: stat -c '%s'
 test "$app_bytes" -le $((0x240000))
 ```
 
 2026-08-13 的完整业务 release 基线为 `1,626,928B`，约占 OTA 槽 69.0%，剩余
 `732,368B`。体积回归应与该基线比较；debug ELF 不作为交付体积指标。
 
-同一个 `gateway-factory.bin` 可以作为 Web OTA 的应用镜像内容，但交付包中应复制并使用不同文件名区分用途：
+同一个 `imc-factory.bin` 可以作为 Web OTA 的应用镜像内容，但交付包中应复制并使用不同文件名区分用途：
 
 ```text
-gateway-factory.bin   首次烧录或返厂恢复，写入 0x20000
-gateway-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
+imc-factory.bin   首次烧录或返厂恢复，写入 0x20000
+imc-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
 ```
 
 禁止把包含 Bootloader/分区表的整片合并镜像上传到 Web OTA。
@@ -137,13 +137,13 @@ gateway-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
 建议目录结构：
 
 ```text
-gateway-v2.2.9-<commit>/
+imc-v2.2.9-<commit>/
 ├── flash-download-tool/
 │   ├── bootloader.bin
 │   ├── partition-table.bin
-│   └── gateway-factory.bin
+│   └── imc-factory.bin
 ├── ota/
-│   └── gateway-ota.bin
+│   └── imc-ota.bin
 ├── SHA256SUMS.txt
 ├── RELEASE_NOTES.txt
 └── 客户烧录说明.pdf
@@ -152,16 +152,16 @@ gateway-v2.2.9-<commit>/
 在项目根目录执行以下命令可生成基础交付目录：
 
 ```bash
-release_id="gateway-v2.2.9-$(git rev-parse --short HEAD)"
+release_id="imc-v2.2.9-$(git rev-parse --short HEAD)"
 
 mkdir -p "$release_id/flash-download-tool" "$release_id/ota"
 cp target/xtensa-esp32s3-espidf/release/bootloader.bin \
   "$release_id/flash-download-tool/bootloader.bin"
 cp target/xtensa-esp32s3-espidf/release/partition-table.bin \
   "$release_id/flash-download-tool/partition-table.bin"
-cp gateway-factory.bin \
-  "$release_id/flash-download-tool/gateway-factory.bin"
-cp gateway-factory.bin "$release_id/ota/gateway-ota.bin"
+cp imc-factory.bin \
+  "$release_id/flash-download-tool/imc-factory.bin"
+cp imc-factory.bin "$release_id/ota/imc-ota.bin"
 ```
 
 复制后应确认两个应用镜像的 SHA-256 一致；它们只是交付用途和文件名不同。
@@ -184,8 +184,8 @@ cd "$release_id"
 shasum -a 256 \
   flash-download-tool/bootloader.bin \
   flash-download-tool/partition-table.bin \
-  flash-download-tool/gateway-factory.bin \
-  ota/gateway-ota.bin > SHA256SUMS.txt
+  flash-download-tool/imc-factory.bin \
+  ota/imc-ota.bin > SHA256SUMS.txt
 ```
 
 Windows 在交付目录中可逐个执行：
@@ -193,8 +193,8 @@ Windows 在交付目录中可逐个执行：
 ```powershell
 certutil -hashfile flash-download-tool\bootloader.bin SHA256
 certutil -hashfile flash-download-tool\partition-table.bin SHA256
-certutil -hashfile flash-download-tool\gateway-factory.bin SHA256
-certutil -hashfile ota\gateway-ota.bin SHA256
+certutil -hashfile flash-download-tool\imc-factory.bin SHA256
+certutil -hashfile ota\imc-ota.bin SHA256
 ```
 
 客户烧录前应核对文件校验值，防止传输损坏或使用错误版本。
@@ -215,7 +215,7 @@ LoadMode: UART
 |---|---:|
 | `bootloader.bin` | `0x0000` |
 | `partition-table.bin` | `0x8000` |
-| `gateway-factory.bin` | `0x20000` |
+| `imc-factory.bin` | `0x20000` |
 
 工具参数：
 
@@ -245,7 +245,7 @@ BAUD: 460800
 不要使用 Flash Download Tool 全擦。登录设备 Web 页面：
 
 ```text
-系统维护 -> 固件升级 -> 选择 gateway-ota.bin
+系统维护 -> 固件升级 -> 选择 imc-ota.bin
 ```
 
 上传完成后设备自动重启。新镜像稳定运行 30 秒后才会被标记为有效；确认前异常复位会触发 OTA 自动回滚。

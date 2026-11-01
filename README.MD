@@ -1,6 +1,9 @@
-# ESP32-S3 工业网关固件
+# 工业测控器 IMC 固件
 
 Rust + ESP-IDF v5.5.4，面向 W5500、BLE 手持机配置、Modbus RTU/TCP、IO 和模拟量。
+当前封板版本为 **2.5.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
+出厂网络为 `192.168.1.200 / 255.255.255.0`，网关与 DNS 为 `192.168.1.1`；
+保留 NVS 的升级继续使用设备已保存的网络配置。
 默认构建使用 MCP23017；F3/F4 构建使用 PCA9555（F4 为多芯片 48 点组），必须与实物核对。
 
 ## 开发与验证
@@ -8,8 +11,8 @@ Rust + ESP-IDF v5.5.4，面向 W5500、BLE 手持机配置、Modbus RTU/TCP、IO
 ```bash
 cargo check --locked
 python3 tests/host/run_production_core.py
-cargo test --locked --bin gateway --no-run
-cargo build --locked --release --bin gateway
+cargo test --locked --bin imc --no-run
+cargo build --locked --release --bin imc
 ```
 
 `--no-run` 仅编译设备测试。烧录必须显式指定 bootloader、分区表、factory，使用

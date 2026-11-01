@@ -15,7 +15,8 @@
 // ----------------------------------------------------------------------------
 // 系统参数
 // ----------------------------------------------------------------------------
-pub const APP_NAME: &str = "esp32s3-iot-gateway";
+/// 对外产品标识；保留 Cargo package 名称和 NVS namespace gateway 以兼容现有交付工具和升级路径。
+pub const APP_NAME: &str = "imc-controller";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 主循环网络调度周期 (ms)。
@@ -705,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_app_metadata() {
-        assert_eq!(APP_NAME, "esp32s3-iot-gateway");
+        assert_eq!(APP_NAME, "imc-controller");
         assert_eq!(MAIN_LOOP_PERIOD_MS, 5);
         assert_eq!(BLE_PROCESS_PERIOD_MS, 10);
         assert_eq!(BLE_PROCESS_PERIOD_MS % MAIN_LOOP_PERIOD_MS, 0);

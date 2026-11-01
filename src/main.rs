@@ -72,7 +72,7 @@ fn main() -> AppResult<()> {
     log::info!("================================================");
     log::info!("{} v{}", config::APP_NAME, config::APP_VERSION);
     log::info!("[build] id={BUILD_ID}");
-    log::info!("ESP32-S3R2 IoT Gateway starting...");
+    log::info!("Industrial Measurement Controller (IMC) starting...");
     log::info!("================================================");
 
     // 2. ESP-IDF 基础设施
@@ -496,7 +496,7 @@ fn main_loop(
             let stalled = health::check_all();
             if !stalled.is_empty() {
                 log::error!(
-                    "[health] stalled tasks: {:?}; keeping gateway online",
+                    "[health] stalled tasks: {:?}; keeping imc online",
                     stalled.as_slice()
                 );
                 crate::error::recovery::record_failure(

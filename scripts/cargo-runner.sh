@@ -9,11 +9,11 @@ if [[ -z "$ELF" ]]; then
 fi
 shift
 
-# Cargo test 的目标位于 deps/gateway-<hash>。它是 libtest 运行器，不是设备应用；
+# Cargo test 的目标位于 deps/imc-<hash>。它是 libtest 运行器，不是设备应用；
 # 刷入后会在 app_main 中尝试列出测试并立即 abort。
-if [[ "$ELF" == */deps/* || "$(basename "$ELF")" != "gateway" ]]; then
+if [[ "$ELF" == */deps/* || "$(basename "$ELF")" != "imc" ]]; then
     echo "错误: 拒绝把非应用目标刷入设备: $ELF" >&2
-    echo "测试只允许编译检查: cargo test --bin gateway --no-run" >&2
+    echo "测试只允许编译检查: cargo test --bin imc --no-run" >&2
     exit 2
 fi
 if strings "$ELF" | grep -Fq "io error when listing tests"; then

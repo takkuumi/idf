@@ -1,4 +1,4 @@
-# ESP32-S3 工业网关 — 跨平台烧录 Justfile
+# ESP32-S3 工业测控器 IMC — 跨平台烧录 Justfile
 # 用法: just <recipe>  或  just --list
 # 依赖: just (brew install just), espflash (cargo install espflash --locked), ldproxy, cargo
 # 工具链: rustup + espup (Xtensa Rust toolchain)
@@ -6,8 +6,8 @@
 # ───── 通用变量 ─────
 export PORT      := env_var_or_default("ESPFLASH_PORT", "/dev/cu.usbserial-1430")
 export SERIAL    := PORT
-export ELF_DEBUG   := "target/xtensa-esp32s3-espidf/debug/gateway"
-export ELF_RELEASE := "target/xtensa-esp32s3-espidf/release/gateway"
+export ELF_DEBUG   := "target/xtensa-esp32s3-espidf/debug/imc"
+export ELF_RELEASE := "target/xtensa-esp32s3-espidf/release/imc"
 export BOOTLOADER_DEBUG := "target/xtensa-esp32s3-espidf/debug/bootloader.bin"
 export BOOTLOADER_RELEASE := "target/xtensa-esp32s3-espidf/release/bootloader.bin"
 export PARTITIONS := "partitions.csv"
@@ -40,11 +40,11 @@ env:
 
 # ───── 1. Debug 构建 ─────
 build:
-    cargo build --bin gateway
+    cargo build --bin imc
 
 # ───── 2. Release 构建 ─────
 build-release:
-    cargo build --bin gateway --release
+    cargo build --bin imc --release
 
 # 设置统一固件版本（协议版本编码要求 major/minor/patch 均为单数字）
 set-version version:
@@ -205,11 +205,11 @@ full-flash: build
 rebuild-sys:
     touch build.rs
     rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*
-    cargo build --bin gateway
+    cargo build --bin imc
 
 # ───── 14. 仅编译测试 binary ─────
 test-compile:
-    cargo test --bin gateway --no-run
+    cargo test --bin imc --no-run
 
 # ───── 15. 显示烧录环境变量与工具版本 ─────
 diag:

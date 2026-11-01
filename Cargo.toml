@@ -1,13 +1,13 @@
 [package]
 name = "esp32s3-iot-gateway"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2024"
 authors = ["idf"]
-description = "ESP32-S3R2 嵌入式网关：以太网 W5500 + BLE + IO + AI/AO + RS485 + Modbus"
+description = "ESP32-S3R2 工业测控器：以太网 W5500 + BLE + IO + AI/AO + RS485 + Modbus"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "gateway"
+name = "imc"
 path = "src/main.rs"
 
 [profile.release]

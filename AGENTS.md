@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-ESP32-S3 工业网关固件（Rust + ESP-IDF v5.5）。所有贡献者必须遵循本文档。
+ESP32-S3 工业测控器 IMC 固件（Rust + ESP-IDF v5.5）。所有贡献者必须遵循本文档。
 
 ## Project Structure & Module Organization
 
@@ -24,13 +24,13 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     --partition-table partitions.csv --partition-table-offset 0x8000 \
     --target-app-partition factory --erase-parts otadata \
     --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 
 # 串口监控（按 Ctrl+R 重置芯片）
 espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 
 # 单元测试（受 esp-idf 工具链限制，--no-run 仅做编译检查）
-cargo test --bin gateway --no-run
+cargo test --bin imc --no-run
 
 # 配置修改后必须清构建缓存
 rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*

@@ -73,7 +73,7 @@ print(match.group(1))
 PY
 )"
 OUT_DIR="$ROOT_DIR/release/v${VERSION}/${VARIANT}"
-PREFIX="gateway-v${VERSION}-${VARIANT}"
+PREFIX="imc-v${VERSION}-${VARIANT}"
 CURRENT_COMMIT="$(git rev-parse HEAD)"
 CURRENT_DIRTY=false
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then

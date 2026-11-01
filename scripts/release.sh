@@ -77,20 +77,20 @@ build_variant() {
     local target_dir="$ROOT_DIR/target/release-${variant}"
     local output_dir="$TEMP_DIR/$variant"
     local flash_dir="$output_dir/flash"
-    local prefix="gateway-v${VERSION}-${variant}"
+    local prefix="imc-v${VERSION}-${variant}"
 
     echo ""
     echo "=== 完整编译 ${variant_upper} / v${VERSION} ==="
     cargo clean --target-dir "$target_dir"
     if [[ "$variant" == default || "$variant" == f16 ]]; then
         CARGO_TARGET_DIR="$target_dir" cargo build \
-            --release --locked --bin gateway
+            --release --locked --bin imc
     else
         CARGO_TARGET_DIR="$target_dir" cargo build \
-            --release --locked --bin gateway --features "$variant"
+            --release --locked --bin imc --features "$variant"
     fi
 
-    local elf="$target_dir/xtensa-esp32s3-espidf/release/gateway"
+    local elf="$target_dir/xtensa-esp32s3-espidf/release/imc"
     if [[ ! -f "$elf" ]]; then
         echo "错误: 未找到 ${variant_upper} ELF: $elf" >&2
         exit 1
@@ -204,7 +204,7 @@ from pathlib import Path
 out = Path(sys.argv[1])
 variant, version, commit = sys.argv[2:5]
 dirty = sys.argv[5] == "true"
-prefix = f"gateway-v{version}-{variant}"
+prefix = f"imc-v{version}-{variant}"
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -231,7 +231,7 @@ for role, offset, filename in (
 
 manifest = {
     "schema_version": 1,
-    "product": "esp32s3-iot-gateway",
+    "product": "industrial-measurement-controller",
     "firmware_version": version,
     "hardware_variant": variant.upper(),
     "cargo_features": ["default", variant],

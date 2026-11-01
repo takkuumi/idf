@@ -333,10 +333,10 @@ GPIO21 DI2 / F3-F4 I2C SDA
 | 参数 | 默认值 |
 |------|--------|
 | DHCP | 禁用（默认静态 IP） |
-| 静态 IP | 192.168.51.226 |
+| 静态 IP | 192.168.1.200 |
 | 子网掩码 | 255.255.255.0 |
-| 网关 | 192.168.51.1 |
-| DNS | 192.168.51.1 |
+| 网关 | 192.168.1.1 |
+| DNS | 192.168.1.1 |
 
 可通过 AT+CFGIP 或 Modbus 0x0224-0x022A 修改。
 
@@ -1198,7 +1198,7 @@ backtrace:
 - backtrace：调用栈，由于 release 构建 `strip = true`，地址需用 `xtensa-esp32s3-elf-addr2line` 在 host 上解析：
 
 ```bash
-xtensa-esp32s3-elf-addr2line -e target/xtensaespidf/release/gateway 0x42012380
+xtensa-esp32s3-elf-addr2line -e target/xtensa-esp32s3-espidf/release/imc 0x42012380
 ```
 
 ### 8.3 复位原因（寄存器 0x0104）

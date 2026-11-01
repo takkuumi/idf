@@ -209,7 +209,7 @@ export PATH="$HOME/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-es
 cargo build
 ```
 
-产物路径：`target/xtensa-esp32s3-espidf/debug/gateway`（~23 MB，含调试符号）
+产物路径：`target/xtensa-esp32s3-espidf/debug/imc`（~23 MB，含调试符号）
 
 ### Release 构建（生产级）
 
@@ -220,7 +220,7 @@ export PATH="$HOME/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-es
 cargo build --release
 ```
 
-产物路径：`target/xtensa-esp32s3-espidf/release/gateway`（~1.6 MB，已 strip）
+产物路径：`target/xtensa-esp32s3-espidf/release/imc`（~1.6 MB，已 strip）
 
 Release profile 配置（`Cargo.toml`）：
 ```toml
@@ -250,8 +250,8 @@ just release
 release/v2.2.2/
 ├── f3/
 │   ├── flash/                  # 四个独立烧录段
-│   ├── gateway-v2.2.2-f3-factory-new-device.bin
-│   ├── gateway-v2.2.2-f3.elf
+│   ├── imc-v2.2.2-f3-factory-new-device.bin
+│   ├── imc-v2.2.2-f3.elf
 │   ├── manifest.json
 │   ├── SHA256SUMS
 │   └── flash-command.txt
@@ -349,59 +349,42 @@ cargo build --release --features f4
 
 ## 构建产物
 
-每次构建生成 3 个核心产物（对应 ESP32 启动链的 3 个阶段）：
+生产烧录包含四段镜像，必须使用项目固定分区布局。ELF 是构建和调试文件；
+原始应用 BIN 由 `espflash save-image` 从 ELF 生成，不能直接把 ELF 当作 BIN 交给 esptool。
 
-| 产物 | 大小 (Release) | 烧录位置 | 作用 |
-|------|---------------|----------|------|
-| `bootloader.bin` | ~22 KB | `0x0` | 引导加载器（芯片复位后最先运行） |
-| `partition-table.bin` | ~3 KB | `0x8000` | 分区表（描述 Flash 布局） |
-| `gateway` | ~1.6 MB | factory/ota 分区 | 应用程序（ELF 格式，可直接烧录） |
+| 产物 | 烧录位置 | 作用 |
+|------|----------|------|
+| `bootloader.bin` | `0x0` | 引导加载器 |
+| `partition-table.bin` | `0x8000` | 项目固定分区表 |
+| `ota-data-initial.bin` | `0x10000` | OTA 初始选择数据，恢复 factory 启动 |
+| `imc-…-app.bin` | `0x20000` | factory 应用；同一原始应用镜像可用于 OTA |
 
-**启动流程**：
-```
-上电 → bootloader.bin (0x0)
-         ↓ 读取 partition-table.bin (0x8000)
-         ↓ 找到 factory/ota 分区
-         ↓ 跳转执行 gateway
-       应用程序运行
-```
-
-**首次编译**会编译 ESP-IDF C 库（~1381 个文件）+ Rust 依赖，耗时 15-40 分钟。后续增量编译仅需 10-30 秒。
+**启动流程**：上电 → bootloader → 项目分区表 → factory/OTA 应用 → `imc`。
 
 ## 烧录
 
-### 方式 1: espflash（推荐）
+### 正式发布包（推荐）
 
 ```bash
-# 列出串口
-ls /dev/cu.usbserial-* /dev/ttyUSB* 2>/dev/null
+# 干净提交上编译并生成 DEFAULT、F3、F4 三种发布包
+./scripts/release.sh all
 
-# 烧录 + 监控（自动烧录 bootloader/partition-table/app 三个产物）
-espflash flash --monitor target/xtensa-esp32s3-espidf/release/gateway
-
-# 指定串口
-espflash flash --monitor --port /dev/cu.usbserial-XXXX target/xtensa-esp32s3-espidf/release/gateway
+# 必须按实际硬件选型号；以下例子为 F3，只刷已生成的发布包
+./scripts/release-flash.sh f3 --skip-build
 ```
 
-### 方式 2: cargo run（用安全 runner 完整烧录）
+发布脚本校验版本、提交、四段地址和 SHA-256。四段独立刷写保留业务 NVS；
+`factory-new-device.bin` 合并镜像只用于新设备或明确允许清除配置的场景。
+
+### 开发构建
 
 ```bash
-cargo run --release
+cargo run --release --bin imc
 ```
 
-安全 runner 只接受名称为 `gateway` 的正式应用 ELF，并强制同时使用项目
-Bootloader、`partitions.csv` 和 factory/otadata 参数。`target/**/deps/gateway-*`
-测试运行器会被拒绝，禁止将单个 ELF 直接传给 `espflash flash`，否则会覆盖为
-默认单 factory 分区表并导致设备启动循环。
-
-### 方式 3: esptool.py（备用）
-
-```bash
-esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX --baud 921600 \
-    write_flash 0x0   target/xtensa-esp32s3-espidf/release/bootloader.bin \
-                    0x8000 target/xtensa-esp32s3-espidf/release/partition-table.bin \
-                    0x20000 target/xtensa-esp32s3-espidf/release/gateway
-```
+安全 runner 只接受名称为 `imc` 的正式应用 ELF，并强制同时使用项目
+Bootloader、`partitions.csv` 和 factory/otadata 参数，使用 `--no-skip`。
+`target/**/deps/imc-*` 测试运行器会被拒绝。完整参数见 [烧录指南](FLASH.md)。
 
 ## 监控
 
@@ -409,7 +392,7 @@ esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX --baud 921600 \
 
 ```bash
 # espflash monitor (推荐, 支持地址解析)
-espflash monitor target/xtensa-esp32s3-espidf/release/gateway
+espflash monitor target/xtensa-esp32s3-espidf/release/imc
 
 # 或用 screen
 screen /dev/cu.usbserial-XXXX 115200
@@ -601,7 +584,7 @@ cargo build --release
 cargo check
 
 # 5. 单元测试 (编译测试 binary, ESP-IDF 平台需 qemu 跑)
-cargo test --bin gateway --no-run
+cargo test --bin imc --no-run
 ```
 
 ### 关键 cargo 命令解释

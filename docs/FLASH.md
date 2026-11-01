@@ -49,7 +49,7 @@ just flash
 等价的非交互命令如下：
 
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     --bootloader target/xtensa-esp32s3-espidf/debug/bootloader.bin \
@@ -60,7 +60,7 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     --flash-mode dio \
     --flash-freq 40mhz \
     --flash-size 8mb \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 ```
 
 `--erase-parts otadata` 只清除 OTA 启动选择，使本次串口写入的 factory 镜像立即生效；不会清除 NVS 业务配置。
@@ -69,7 +69,7 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
 
 ```bash
 rm -rf target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*
-cargo build --bin gateway
+cargo build --bin imc
 ```
 
 ## 4. 全擦烧录
@@ -106,20 +106,20 @@ espflash list-ports
 生成“仅应用”OTA 镜像，禁止使用包含 Bootloader/分区表的 merge 镜像：
 
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 espflash save-image --chip esp32s3 \
     --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
-    target/xtensa-esp32s3-espidf/debug/gateway \
-    /tmp/gateway-ota.bin
+    target/xtensa-esp32s3-espidf/debug/imc \
+    /tmp/imc-ota.bin
 ```
 
-登录 Web 系统维护页上传 `/tmp/gateway-ota.bin`，或者直接调用：
+登录 Web 系统维护页上传 `/tmp/imc-ota.bin`，或者直接调用：
 
 ```bash
 curl --fail --show-error \
     -H 'Cookie: ESPSESSIONID=<登录返回的会话>' \
     -H 'Content-Type: application/octet-stream' \
-    --data-binary @/tmp/gateway-ota.bin \
+    --data-binary @/tmp/imc-ota.bin \
     http://<设备IP>/updateota
 ```
 

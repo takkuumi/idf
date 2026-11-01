@@ -1,6 +1,6 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-11-01 (2.4.0 架构优先级改进与实机验收)
+> 最后更新: 2026-11-01 (2.5.0 封板与 IMC 二进制命名)
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -11,6 +11,14 @@
 - ESP-IDF 源码: `/Users/takumi/Workspace/esp-idf` (禁止修改)
 - 原 C++ 系统: `/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE` (禁止修改)
 - 手持机源码: `/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78` (禁止修改)
+
+## 2.5.0 封板（2026-11-01）
+
+- Cargo、lockfile 和 ESP-IDF app 描述版本统一为 `2.5.0`。
+- 正式二进制目标改为 `imc`，产品标识为 `imc-controller`；同步 Justfile、Cargo runner、发布/烧录脚本和现行构建文档。
+- 出厂静态 IP 为 `192.168.1.200`，掩码为 `255.255.255.0`，网关/DNS 为 `192.168.1.1`。
+- Cargo package 名、NVS namespace、持久化布局、硬件映射和四端口调度保持兼容；升级时不覆盖设备已保存的网络配置。
+- 编译、发布包和实际设备验证结果另记于 `docs/testing/v2.5.0-final-seal-2026-11-01.md`；不将旧版本实测等同于新版本验收。
 
 ## 架构按优先级完善（2026-11-01）
 

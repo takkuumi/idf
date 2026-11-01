@@ -29,7 +29,7 @@
 
 每个发布候选必须通过：
 
-1. `cargo test --bin gateway --no-run`；测试运行器禁止直接烧入设备。
+1. `cargo test --bin imc --no-run`；测试运行器禁止直接烧入设备。
 2. `cargo build --release`，并检查警告数为零。
 3. `git diff --check`、Python 手工测试脚本语法检查和发布产物 SHA-256 校验。
 4. 使用完整 bootloader、分区表、otadata、factory 镜像烧录；烧录过程不得中断，业务 NVS 不得全擦。
@@ -50,7 +50,7 @@
 
 ## 2026-10-14 验证记录
 
-- 默认配置：`cargo test --bin gateway --no-run`、`cargo build --release` 通过，编译警告为 0。
-- F3：`CARGO_TARGET_DIR=target/release-f3 cargo build --release --locked --bin gateway --features f3` 通过。
-- F4：`CARGO_TARGET_DIR=target/release-f4 cargo build --release --locked --bin gateway --features f4` 通过。
+- 默认配置：`cargo test --bin imc --no-run`、`cargo build --release` 通过，编译警告为 0。
+- F3：`CARGO_TARGET_DIR=target/release-f3 cargo build --release --locked --bin imc --features f3` 通过。
+- F4：`CARGO_TARGET_DIR=target/release-f4 cargo build --release --locked --bin imc --features f4` 通过。
 - 真实设备基础回归：应用启动、BLE 广播、Web、Modbus TCP 和网络参数重启后回读已通过；本轮代码变更仍需按完整烧录门槛重新刷入后执行现场长测。

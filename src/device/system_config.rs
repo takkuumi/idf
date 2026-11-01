@@ -198,10 +198,10 @@ impl SystemConfig {
             cfg_version: 0,
             eth_mac: [0; 6],
             dhcp: false,
-            ip: [192, 168, 51, 226],
+            ip: [192, 168, 1, 200],
             mask: [255, 255, 255, 0],
-            gateway: [192, 168, 51, 1],
-            dns: [192, 168, 51, 1],
+            gateway: [192, 168, 1, 1],
+            dns: [192, 168, 1, 1],
             ble_mac: [0; 6],
             ble_name,
             rs485: [
@@ -927,7 +927,10 @@ mod tests {
     fn test_default_config() {
         let cfg = SystemConfig::defaults();
         assert_eq!(cfg.dhcp, false);
-        assert_eq!(cfg.ip, [192, 168, 51, 221]);
+        assert_eq!(cfg.ip, [192, 168, 1, 200]);
+        assert_eq!(cfg.mask, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [192, 168, 1, 1]);
+        assert_eq!(cfg.dns, [192, 168, 1, 1]);
         assert_eq!(cfg.eth_mac, [0; 6]);
         assert_eq!(cfg.rs485.len(), 3);
     }
@@ -964,7 +967,7 @@ mod tests {
     fn test_ip_str_format() {
         let cfg = SystemConfig::defaults();
         let s = cfg.ip_str();
-        assert!(s.contains("192.168.51.221"));
+        assert!(s.contains("192.168.1.200"));
     }
 
     #[test]

@@ -230,13 +230,11 @@ cargo run --release
 #### 方式 3：esptool.py（备用）
 
 ```bash
-cargo build --release
-FIRMWARE=target/xtensaespidf/release/gateway
-esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX --baud 921600 \
-    write_flash 0x0 bootloader/bootloader.bin \
-    0x10000 $FIRMWARE \
-    0x8000 partitions.csv
+# 根据实物选择型号；生成并校验四段镜像，保留业务 NVS。
+./scripts/release-flash.sh f3
 ```
+
+禁止把 ELF 当作原始 BIN 交给 esptool；完整参数见 [烧录指南](FLASH.md)。
 
 #### 方式 4：idf.py（需 ESP-IDF 环境）
 
@@ -286,7 +284,7 @@ ESP32-S3 内置 USB-JTAG，无需外接调试器：
 openocd -f board/esp32s3-builtin.cfg
 
 # 另开终端启动 GDB
-xtensa-esp32s3-elf-gdb target/xtensaespidf/release/gateway
+xtensa-esp32s3-elf-gdb target/xtensa-esp32s3-espidf/release/imc
 (gdb) target remote :3333
 (gdb) monitor reset halt
 (gdb) load
@@ -1070,9 +1068,9 @@ ESP-IDF 自身会打印 CPU 寄存器 + Xtensa backtrace（地址），Rust hook
 
 panic 日志中的地址需用 `addr2line` 解析：
 ```bash
-xtensa-esp32s3-elf-addr2line -e target/xtensaespidf/release/gateway 0x42012345
+xtensa-esp32s3-elf-addr2line -e target/xtensa-esp32s3-espidf/release/imc 0x42012345
 # 或用 xtensa-esp32s3-elf-nm + 反汇编
-xtensa-esp32s3-elf-objdump -d target/xtensaespidf/release/gateway | grep -A 20 42012345
+xtensa-esp32s3-elf-objdump -d target/xtensa-esp32s3-espidf/release/imc | grep -A 20 42012345
 ```
 
 #### profile 选择
@@ -1219,9 +1217,9 @@ esptool.py --chip esp32s3 --port /dev/cu.usbserial-XXXX write_flash 0x8000 parti
 
 # === GDB ===
 openocd -f board/esp32s3-builtin.cfg
-xtensa-esp32s3-elf-gdb target/xtensaespidf/release/gateway
+xtensa-esp32s3-elf-gdb target/xtensa-esp32s3-espidf/release/imc
 (gdb) target remote :3333
 
 # === 地址解析 ===
-xtensa-esp32s3-elf-addr2line -e target/xtensaespidf/release/gateway 0x42012345
+xtensa-esp32s3-elf-addr2line -e target/xtensa-esp32s3-espidf/release/imc 0x42012345
 ```

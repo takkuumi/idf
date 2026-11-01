@@ -1,4 +1,4 @@
-# ESP32-S3 工业网关 (esp32s3-iot-gateway)
+# 工业测控器 IMC（ESP32-S3）
 
 文档导航见 [文档索引](index.md)。
 
@@ -63,7 +63,7 @@ espflash flash --port /dev/cu.usbserial-1430 --no-skip \
     --partition-table partitions.csv --partition-table-offset 0x8000 \
     --target-app-partition factory --erase-parts otadata \
     --flash-mode dio --flash-freq 40mhz --flash-size 8mb \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 ```
 
 详细烧录指南见 [烧录指南](FLASH.md)
@@ -76,7 +76,7 @@ espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 
 ## 测试
 
-- 单元测试编译: `cargo test --bin gateway --no-run`（ESP-IDF 目标不在主机执行）
+- 单元测试编译: `cargo test --bin imc --no-run`（ESP-IDF 目标不在主机执行）
 - Modbus TCP: [手工测试工具](../tests/manual/test_modbus_network.py)
 - BLE Android 兼容: [协议流程](ble/BLE_ANDROID_FLOW.md) 和 [手持机测试计划](testing/handheld-network-config.md)
 

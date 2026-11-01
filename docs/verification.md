@@ -7,7 +7,7 @@
 
 - [ ] fmt、diff 检查通过，Clippy `-D warnings` 通过。
 - [ ] `python3 tests/host/run_production_core.py` 实际执行核心主机测试。
-- [ ] `cargo test --locked --bin gateway --no-run` 编译通过；禁止烧入测试 ELF。
+- [ ] `cargo test --locked --bin imc --no-run` 编译通过；禁止烧入测试 ELF。
 - [ ] 默认、F3、F4、TCP-only 分别编译，按实物选择变体。
 - [ ] Release 构建成功，记录 ELF/app SHA-256；app 小于 `0x240000`。
 - [ ] 正式发布固定版本、干净提交和发布清单；候选产物不冒充正式发布。
