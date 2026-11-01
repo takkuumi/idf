@@ -25,7 +25,8 @@
 - 旧逻辑只依赖 ADV_START_COMPLETE 回调维护 `ADV_ACTIVE`；控制器无回调地停止广播时，该标志会永久保持 true。
 - 新逻辑以有界 GAP 操作状态跟踪配置/启动/停止回调：5 秒回调超时后恢复重试；未连接时每 60 秒续期广播租约，连接期间不操作 GAP。
 - 普通断开只恢复广播，不触发改名；改名和续期互斥，GAP 操作失败使用 5 秒退避。计时按 u32 回卷安全计算。
-- 专项主机测试 20/20 通过；F3 零警告构建与刷后串口验证待完成，完成前不计为实机验收。
+- 专项主机测试 20/20、全套 host-check、F3 release/clippy 零 warning 通过。F3 2.5.0 包刷写时 460800 baud 在 app 54% 断连；使用 115200 baud 重刷后四段均 digest matched，未擦除 NVS/holding/storage。
+- 刷后被动 UART 确认 build id `767d12eeade3`、原 IP `192.168.51.226`、GATT 服务和 `Mesh` 广播均启动；采集期无 panic/WDT。日志与验证边界见 `docs/testing/ble-advertising-recovery-2026-11-01.md`。
 
 ## 架构按优先级完善（2026-11-01）
 
