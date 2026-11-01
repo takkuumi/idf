@@ -49,7 +49,7 @@ BAUD="${ESPFLASH_BAUD:-460800}"
 RESET_BEFORE="${ESPFLASH_BEFORE:-default_reset}"
 RESET_BEFORE="${RESET_BEFORE//_/-}"
 BEFORE="${ESPTOOL_BEFORE:-default_reset}"
-BEFORE="${BEFORE//_/-}"
+# esptool uses underscore spellings (default_reset/no_reset); keep them intact.
 AFTER="${ESPFLASH_AFTER:-hard_reset}"
 RESET_AFTER_BEFORE="${ESPFLASH_RESET_BEFORE:-default-reset}"
 ALLOW_STALE_RELEASE="${ALLOW_STALE_RELEASE:-0}"
