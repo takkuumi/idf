@@ -1,0 +1,36 @@
+{
+  "firmware_version": "2.4.0",
+  "source_commit": "8bb6b2cffe7a",
+  "hardware": "F3/PCA9555",
+  "host": "192.168.51.227",
+  "scheduler": {
+    "requests_per_tick": 2,
+    "tcp_admission_window_us": 2500,
+    "fairness": "one request per listener port before same-port spare borrowing"
+  },
+  "four_port_fc05_fc01_60s": {
+    "samples_per_port": {"502": 220, "503": 220, "504": 220, "5002": 220},
+    "errors": 0,
+    "write_ack_p95_ms": {"502": 15.592, "503": 15.474, "504": 12.957, "5002": 15.939},
+    "coil_read_p95_ms": {"502": 15.350, "503": 16.015, "504": 15.814, "5002": 16.602},
+    "restored_bits": "0xfe07"
+  },
+  "mixed_90s": {
+    "modbus_requests": 17073,
+    "modbus_errors": 0,
+    "web_samples": 17,
+    "web_errors": 0,
+    "session_replacements": 0
+  },
+  "do_mixed_120s": {
+    "writes": 780,
+    "errors": 0,
+    "background_reads": 16802,
+    "restored": true
+  },
+  "limits": [
+    "20ms is a target for FC05/FC01 under the dedicated four-port workload, not a hard real-time guarantee",
+    "large mixed FC03/FC04 traffic remains above 20ms at P95",
+    "register confirmation and relay contact timing are not represented by TCP response timing"
+  ]
+}

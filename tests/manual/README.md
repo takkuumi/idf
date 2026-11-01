@@ -41,6 +41,21 @@ GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/test_udp_reconfi
 不连接设备、不烧录。联合压力覆盖四端口、125-word、分片/流水/非法 PDU、Web 认证与
 参数检查，报告错误和延迟。单设备只有一个 Web 会话，勿并行登录或另开浏览器登录。
 
+## 四端口 FC05/FC01 延迟基准
+
+```bash
+python3 tests/manual/tcp_latency_benchmark.py 192.168.51.227 --apply \
+  --duration 60 --interval 0.25 \
+  --backup log/hardware/tcp-latency-original-unique.json \
+  --output log/hardware/tcp-budget2-latency-60s-YYYY-MM-DD.jsonl
+```
+
+脚本在四个长连接上分别使用 Q1/Q2/Q3/Q4 交替执行 FC05，并立即执行 FC01 读取
+16 位线圈镜像；结束、异常或收到中止信号后均尝试逐位恢复并复读原位，最后再次检查
+完整位图。必须显式 `--apply`，且备份与日志路径不能已存在。必须先确认空载或已获现场授权，不能把
+FC01/FC05 网络时延当成物理触点动作时延。脚本只做 Modbus TCP，不登录 Web，因此
+不会制造单 Web 会话替换；仍应避免其它手持机或 PLC 同时写 Q 点。
+
 配置工具备份身份、三个串口、BLE、校准、系统信息、组态，以及原始字 `40259`、`6999`，
 立即重启验证，再恢复后二次重启。确认两字不参与现场业务后才能运行。异常后可对原备份
 执行 `--restore-only --apply`，禁止覆盖备份。UDP 工具恢复原五个配置字，验证热重绑、

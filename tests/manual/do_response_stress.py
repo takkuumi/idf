@@ -72,14 +72,19 @@ def main():
     def api(endpoint, fields=None):
         request = urllib.request.Request(base + endpoint,
             data=None if fields is None else urllib.parse.urlencode(fields).encode())
-        with opener.open(request, timeout=5) as response:
-            if 'application/json' not in response.headers.get('Content-Type', ''):
-                raise PermissionError(
-                    f'{endpoint}: expected JSON, status={response.status}, '
-                    f'final_url={response.url}, '
-                    f'content_type={response.headers.get("Content-Type", "")}; '
-                    'stop output test')
-            result = json.load(response)
+        try:
+            with opener.open(request, timeout=5) as response:
+                if 'application/json' not in response.headers.get('Content-Type', ''):
+                    raise PermissionError(
+                        f'{endpoint}: expected JSON, status={response.status}, '
+                        f'final_url={response.url}, '
+                        f'content_type={response.headers.get("Content-Type", "")}; '
+                        'stop output test')
+                result = json.load(response)
+        except PermissionError:
+            raise
+        except OSError as error:
+            raise OSError(f'HTTP {endpoint}: {type(error).__name__}: {error}') from error
         if str(result.get('code')) != '0':
             raise ValueError(f'{endpoint}: code={result.get("code")}')
         return result.get('data', {})
@@ -120,8 +125,11 @@ def main():
             control = socket.create_connection((args.host, 502), timeout=3)
             control.settimeout(3)
         transaction = (transaction + 1) & 65535
-        control.sendall(request_frame(transaction, pdu))
-        return receive_frame(control, transaction)
+        try:
+            control.sendall(request_frame(transaction, pdu))
+            return receive_frame(control, transaction)
+        except OSError as error:
+            raise OSError(f'Modbus TCP :502 tid={transaction} fc={pdu[0]}: {error}') from error
 
     def read_coils():
         result = modbus(struct.pack('>BHH', 1, 512, count))

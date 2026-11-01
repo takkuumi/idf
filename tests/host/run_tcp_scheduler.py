@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 import tempfile
 from pathlib import Path
 
@@ -24,10 +25,11 @@ def item(text: str, marker: str) -> str:
 
 
 helper = item(SOURCE, "fn fair_client_schedule(")
+request_limit = re.search(r"^const MAX_REQUESTS_PER_TICK:.*;", SOURCE, re.M).group(0)
 program = f"""
 #![allow(dead_code)]
 mod cfg {{ pub const MAX_CONNECTIONS: usize = 8; pub const IDLE_TIMEOUT_MS:u64=120000; pub const TX_TIMEOUT_MS:u64=5000; pub const PARTIAL_FRAME_TIMEOUT_MS:u64=30000; }}
-const MAX_REQUESTS_PER_TICK: usize = 2;
+{request_limit}
 {helper}
 
 #[test]
@@ -151,6 +153,14 @@ fn actual_client_never_executes_buffered_work_after_deadline() {
     assert!(CALLS.lock().unwrap().is_empty());
 }
 """
+
+# Keep admission constants identical to production, not hand-copied test values.
+for constant, placeholder in (
+    ("MAX_TCP_WORK_US", "const MAX_TCP_WORK_US:u64=2500;"),
+    ("MAX_REQUESTS_PER_POLL", "const MAX_REQUESTS_PER_POLL:usize=4;"),
+):
+    actual = re.search(r"^const " + constant + r":.*;", SOURCE, re.M).group(0)
+    program = program.replace(placeholder, actual)
 
 with tempfile.TemporaryDirectory(prefix="gateway-tcp-scheduler-") as directory:
     path = Path(directory)
