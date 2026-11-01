@@ -35,3 +35,5 @@ cargo build --locked --release --bin imc
 当前默认路径是 BLE GATT、W5500、Modbus RTU 主/从站及 TCP、IO、AI/AO、配置保存和 OTA。
 LoRa、透明转发、Wi-Fi 自动故障切换、BLE Mesh 业务和双光口冗余不作为已完成能力。
 所有硬件功能和 7×24 运行结论以对应镜像、硬件、负载和实测记录为准。
+
+

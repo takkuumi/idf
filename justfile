@@ -231,6 +231,8 @@ diag:
     echo "PATH 含 Xtensa GCC? "
     echo "$PATH" | tr ':' '\n' | grep -c esp-elf | xargs echo "  匹配数:"
 
+publish:
+    scp -r ./release/* ling@takumi.eu.org:/Users/ling/Workspace/lik/系统固件
 
 # just flash — 烧 Debug 固件（按提示手动 BOOT+RST）
 # just flash-monitor — 烧完直接看日志（Ctrl+R 复位，Ctrl+C 退出）
