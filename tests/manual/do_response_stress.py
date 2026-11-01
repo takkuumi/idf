@@ -74,7 +74,11 @@ def main():
             data=None if fields is None else urllib.parse.urlencode(fields).encode())
         with opener.open(request, timeout=5) as response:
             if 'application/json' not in response.headers.get('Content-Type', ''):
-                raise PermissionError('Web session changed; stop output test')
+                raise PermissionError(
+                    f'{endpoint}: expected JSON, status={response.status}, '
+                    f'final_url={response.url}, '
+                    f'content_type={response.headers.get("Content-Type", "")}; '
+                    'stop output test')
             result = json.load(response)
         if str(result.get('code')) != '0':
             raise ValueError(f'{endpoint}: code={result.get("code")}')
@@ -260,7 +264,14 @@ def main():
                 control.close()
                 control = None
             write_bulk(original['bits'])
-            observe(original['bits'], timeout=5)
+            try:
+                observe(original['bits'], timeout=5)
+            except PermissionError as changed:
+                # Preserve the test failure; a new session is only for verifying
+                # cleanup, never for silently resuming the measured window.
+                emit('restore_session_replaced', error=str(changed))
+                api('login', dict(username='admin', pwd=password))
+                observe(original['bits'], timeout=5)
             time.sleep(2.2)  # Allow existing DO persistence task to see restored bits.
             observe(original['bits'], timeout=5)
             state = api('getsystemstatus')

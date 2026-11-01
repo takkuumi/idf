@@ -1,0 +1,150 @@
+{
+  "tested_source_commit": "928fe474ff29",
+  "firmware_version": "2.4.0",
+  "hardware": "F3/PCA9555",
+  "host": "192.168.51.227",
+  "run": {
+    "at": "2026-10-31T23:48:16.172443+00:00",
+    "event": "end",
+    "duration": 180.021393152,
+    "requests": 33797,
+    "requests_per_second": 187.73879819641047,
+    "web_samples": 34,
+    "web_errors": 0,
+    "session_replacements": 0,
+    "minimum_heap": 2085968,
+    "errors": 0
+  },
+  "ports": [
+    {
+      "at": "2026-10-31T23:48:16.154648+00:00",
+      "event": "modbus_summary",
+      "port": 5002,
+      "requests": 9820,
+      "successes": 9820,
+      "errors": 0,
+      "mean_ms": 18.32467975560085,
+      "p95_ms": 25.93802200000006,
+      "p99_ms": 30.609124999998016,
+      "maximum_ms": 148.84849199999906,
+      "result_changes": 0,
+      "final_result": [
+        0,
+        0
+      ]
+    },
+    {
+      "at": "2026-10-31T23:48:16.159126+00:00",
+      "event": "modbus_summary",
+      "port": 502,
+      "requests": 9673,
+      "successes": 9673,
+      "errors": 0,
+      "mean_ms": 18.60389677587106,
+      "p95_ms": 26.289129000019784,
+      "p99_ms": 31.139963000001103,
+      "maximum_ms": 157.4974470000008,
+      "result_changes": 0,
+      "final_result": [
+        0,
+        0
+      ]
+    },
+    {
+      "at": "2026-10-31T23:48:16.165165+00:00",
+      "event": "modbus_summary",
+      "port": 503,
+      "requests": 7180,
+      "successes": 7180,
+      "errors": 0,
+      "mean_ms": 25.06571617479116,
+      "p95_ms": 31.526073999998516,
+      "p99_ms": 33.886930999997844,
+      "maximum_ms": 169.44682100000108,
+      "result_changes": 0,
+      "final_result": [
+        0,
+        0
+      ]
+    },
+    {
+      "at": "2026-10-31T23:48:16.171824+00:00",
+      "event": "modbus_summary",
+      "port": 504,
+      "requests": 7124,
+      "successes": 7124,
+      "errors": 0,
+      "mean_ms": 25.26405115819769,
+      "p95_ms": 31.74247300000843,
+      "p99_ms": 34.4595250000026,
+      "maximum_ms": 165.2357139999978,
+      "result_changes": 0,
+      "final_result": [
+        0,
+        0
+      ]
+    }
+  ],
+  "config_checks": {
+    "network_unchanged": true,
+    "ports_unchanged": true,
+    "outputs_unchanged": true,
+    "sensor_min_unchanged": true,
+    "sensor_max_unchanged": true
+  },
+  "reset_counts_observed": [
+    141
+  ],
+  "quality_error_samples": 0,
+  "rcu_max_reclaim_wait_us": {
+    "config": 10,
+    "storage": 16
+  },
+  "last_io_diagnostics": {
+    "worker_age_ms": 5,
+    "di_valid": true,
+    "di_age_ms": 16,
+    "di_generation": 34682,
+    "di_failures": 0,
+    "output_queue": {
+      "depth": 0,
+      "high_water": 1,
+      "rejected": 0,
+      "canceled_after_fault": 0,
+      "requested_generation": 1
+    },
+    "do_readback_valid": true,
+    "do_readback_bits": 53265,
+    "do_readback_age_ms": 42,
+    "do_failures": 0,
+    "do_confirmed_generation": 1,
+    "led_errors": 0,
+    "loop_max_us": 62426
+  },
+  "final_diagnostics": {
+    "at": "2026-10-31T23:55:34.781944+00:00",
+    "event": "end",
+    "duration_s": 300.005074362,
+    "samples": 60,
+    "errors": 0,
+    "session_replacements": 0,
+    "performance_seen": true,
+    "first_uptime_s": 395,
+    "last_uptime_s": 695,
+    "maximum_di_age_ms": 11,
+    "maximum_do_readback_age_ms": 106
+  },
+  "stack_watermark": {
+    "registered_tasks": 8,
+    "low_tasks": 0,
+    "minimum_free_bytes": 1188,
+    "minimum_free_task": "http-srv",
+    "maximum_used_percent": 88,
+    "maximum_used_task": "http-srv"
+  },
+  "uart_fault_events": [],
+  "uart_expected_warnings": [
+    "W (1831) gateway::modbus::rtu_runtime: [modbus-rtu] RS485-3 runtime is implemented but disabled: UART0 is the active console",
+    "W (9739) gateway::channel::calib: [adc-calib] AI0 无有效校准端点，保留默认标定"
+  ]
+}
