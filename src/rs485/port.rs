@@ -32,7 +32,7 @@ fn rtu_silence_us(baud: u32) -> u32 {
 
 /// TX_DONE 超时保护余量，不是固定发送延迟。
 /// 按两个字符时间覆盖 ISR/调度抖动和 UART FSM 状态更新；低速率保留
-/// 足够余量，高速率不再无条件等待 20ms。实际发送完成仍由 UART 硬件提前唤醒。
+/// 足够余量，高速率缩短超时上限。正常发送通常提前返回，并非每帧固定等待该余量。
 #[inline]
 fn tx_guard_ms(baud: u32) -> u64 {
     let baud = u64::from(baud.max(1));

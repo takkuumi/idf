@@ -5,6 +5,26 @@
 `--apply`，会暂改配置并恢复；禁止在生产控制回路运行。BLE IP 写入仍须 `--write-ip`
 并确认目标地址。
 
+## DO 写入、读取和连续压测
+
+```bash
+GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/do_response_stress.py \
+  192.168.51.227 --apply --duration 600 --idle-duration 60 \
+  --backup log/hardware/do-original-unique.json \
+  > log/hardware/do-response-unique.jsonl
+```
+
+必须先确认空载、所有 DO 均可安全动作，并独占 Web 会话。脚本实际切换输出：
+交替使用 Web、FC05 单点和 FC15 批量写入，逐笔核对 FC01 目标状态与 PCA9555
+OUTPUT 寄存器确认代号；包含逐点和全开/全关/交错位图，至少间隔 100ms 发起下一次
+切换，不保证固定频率。前 60 秒空闲，随后四个 Modbus 端口持续读并发施压。
+分别统计写应答、线圈读取、从写入到首次观察到寄存器确认的延迟，后者包含网络与
+HTTP 采样开销，不能当作精确电气延迟或触点反馈。异常/结束会尝试恢复原输出；
+必须检查 `restored` 事件及最终 `end`，不能只看成功写入计数。
+
+备份必须使用新路径。中断恢复可用同一脚本加 `--restore-only --apply --backup <原备份>`；
+只使用本机当前测试的原备份，禁止恢复其它设备或其它会话的输出。
+
 ## 生产核心与联合验收
 
 ```bash
@@ -81,6 +101,9 @@ python3 tests/manual/serial_soak.py --port /dev/cu.usbserial-1430 --baud 115200 
 
 脚本只读 UART，并在端口暂时不可用时退避重连。用串口 monitor 或烧录工具前应先停止该采集器，
 因为一个串口不能同时由多个进程读取。
+脚本在打开前设 DTR/RTS 为非活动态，避免持续拉住 ESP32 控制脚；部分 USB 串口驱动
+仍可能在打开时产生复位脉冲。必须先连接 UART、等待设备网络就绪，再建立测试的
+uptime/reset_count 基线；测试中避免重新开关串口。采集器不主动发送软件复位命令。
 
 ## NVS 保存时延基准
 

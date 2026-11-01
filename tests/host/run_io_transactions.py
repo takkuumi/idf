@@ -9,12 +9,15 @@ ROOT=Path(__file__).resolve().parents[2]
 s=(ROOT/'src/hal/pca9555.rs').read_text()
 functions='\n'.join(item(s,'fn '+name+'(') for name in (
     'bit_reverse','worker_sample_di','worker_write_do','worker_read_do'))
+submission = item(s, 'fn submit_output(')
 for chips,di,do in ((1,[0x40],[0x42]),(3,[0x40,0x44,0x42],[0x48,0x4c,0x4e])):
  source='''
 #![allow(dead_code)]
 use std::cell::{RefCell,Cell};
 use std::collections::BTreeMap;
-#[derive(Debug)] enum AppError { Io(String) }
+use std::sync::{Arc,Mutex,TryLockError};
+use std::sync::atomic::{AtomicU32,AtomicU64,Ordering};
+#[derive(Debug)] enum AppError { Io(String), Busy(&'static str) }
 type AppResult<T> = Result<T,AppError>;
 const REG_INPUT_0:u8=0;
 const REG_OUTPUT_0:u8=2;
@@ -30,7 +33,40 @@ impl BusI2c {
   self.data.borrow_mut().insert((addr,reg),data); Ok(())
  }
 }
-'''+f'const MAX_CHIPS:usize={chips};\nconst DI_IO_ADDRS:&[u8]=&{di};\nconst DO_IO_ADDRS:&[u8]=&{do};\n'+functions+'''
+'''+f'const MAX_CHIPS:usize={chips};\nconst DI_IO_ADDRS:&[u8]=&{di};\nconst DO_IO_ADDRS:&[u8]=&{do};\n'+functions+f'''
+#[path = "{ROOT / 'src/hal/io_worker_state.rs'}"] mod io_worker_state;
+use io_worker_state::{{OutputQueue,OUTPUT_QUEUE_CAPACITY}};
+struct AtomicBits64(AtomicU64);
+impl AtomicBits64 {{ fn store_bits(&self,bits:u64) {{ self.0.store(bits,Ordering::SeqCst); }} }}
+struct Pca9555WorkerState {{ outputs:Mutex<OutputQueue>,do_submit_busy:AtomicU32,do_desired:AtomicBits64 }}
+struct Pca9555Duo {{ worker:Arc<Pca9555WorkerState> }}
+impl Pca9555Duo {{ {submission} }}
+'''+'''
+fn driver() -> Pca9555Duo {
+ Pca9555Duo { worker:Arc::new(Pca9555WorkerState {
+  outputs:Mutex::new(OutputQueue::new()),do_submit_busy:AtomicU32::new(0),
+  do_desired:AtomicBits64(AtomicU64::new(0)) }) }
+}
+#[test]
+fn test_actual_submission_distinguishes_contention_full_and_poisoned() {
+ let drv=driver();
+ let guard=drv.worker.outputs.lock().unwrap();
+ assert!(matches!(drv.submit_output(|_|1),Err(AppError::Busy(_))));
+ assert_eq!(drv.worker.do_submit_busy.load(Ordering::Relaxed),1);
+ assert_eq!(drv.worker.do_desired.0.load(Ordering::SeqCst),0);
+ drop(guard);
+ for value in 1..=OUTPUT_QUEUE_CAPACITY as u64 { drv.submit_output(|_|value).unwrap(); }
+ assert!(matches!(drv.submit_output(|_|999),Err(AppError::Busy(_))));
+ assert_eq!(drv.worker.do_desired.0.load(Ordering::SeqCst),OUTPUT_QUEUE_CAPACITY as u64);
+ let mut queue=drv.worker.outputs.lock().unwrap();
+ assert_eq!(queue.rejected,1);
+ let first=queue.front().unwrap(); assert!(queue.confirm(first)); drop(queue);
+ drv.submit_output(|_|999).unwrap();
+ assert_eq!(drv.worker.do_desired.0.load(Ordering::SeqCst),999);
+ let worker=Arc::clone(&drv.worker);
+ let _=std::thread::spawn(move|| {let _guard=worker.outputs.lock().unwrap();panic!("injected poison");}).join();
+ assert!(matches!(drv.submit_output(|_|123),Err(AppError::Io(_))));
+}
 #[test]
 fn test_output_readback_and_nack_are_real_bus_results() {
  let bus=BusI2c::new();

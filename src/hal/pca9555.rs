@@ -25,7 +25,7 @@
 use crate::error::{AppError, AppResult};
 use crate::sync::{AtomicBits64, Spin};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -267,6 +267,7 @@ struct Pca9555WorkerState {
     do_readback_valid: AtomicBool,
     do_readback_ms: AtomicU32,
     do_failures: AtomicU32,
+    do_submit_busy: AtomicU32,
     do_confirmed_generation: AtomicU32,
     outputs: Mutex<OutputQueue>,
     led_errors: AtomicU32,
@@ -283,18 +284,22 @@ pub fn diagnostics_json() -> String {
     let generation = state.di_generation.load(Ordering::SeqCst);
     let sampled = state.di_sampled_ms.load(Ordering::SeqCst);
     let failures = state.di_failures.load(Ordering::SeqCst);
-    let queue = state
-        .outputs
-        .try_lock()
-        .ok()
-        .map(|q| {
+    let queue_snapshot = state.outputs.try_lock().ok().map(|q| {
+        (
+            q.len(),
+            q.high_water,
+            q.rejected,
+            q.canceled_after_fault,
+            q.latest().generation,
+        )
+    });
+    // Formatting/heap work is outside the submission lock; Web polling must not
+    // lengthen the main-loop try_lock contention window.
+    let queue = queue_snapshot
+        .map(|(depth, high_water, rejected, canceled, generation)| {
             format!(
                 r#"{{"depth":{},"high_water":{},"rejected":{},"canceled_after_fault":{},"requested_generation":{}}}"#,
-                q.len(),
-                q.high_water,
-                q.rejected,
-                q.canceled_after_fault,
-                q.latest().generation
+                depth, high_water, rejected, canceled, generation
             )
         })
         .unwrap_or_else(|| "null".into());
@@ -304,7 +309,7 @@ pub fn diagnostics_json() -> String {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".into());
     format!(
-        r#"{{"worker_age_ms":{},"di_valid":{},"di_age_ms":{},"di_generation":{},"di_failures":{},"output_queue":{},"do_readback_valid":{},"do_readback_bits":{},"do_readback_age_ms":{},"do_failures":{},"do_confirmed_generation":{},"led_errors":{},"loop_max_us":{}}}"#,
+        r#"{{"worker_age_ms":{},"di_valid":{},"di_age_ms":{},"di_generation":{},"di_failures":{},"output_queue":{},"do_readback_valid":{},"do_readback_bits":{},"do_readback_age_ms":{},"do_failures":{},"do_submit_busy":{},"do_confirmed_generation":{},"led_errors":{},"loop_max_us":{}}}"#,
         now.wrapping_sub(state.heartbeat_ms.load(Ordering::Acquire)),
         generation >= 2 && sample_is_fresh(true, now, sampled, failures),
         if generation == 0 {
@@ -320,6 +325,7 @@ pub fn diagnostics_json() -> String {
         bits,
         now.wrapping_sub(state.do_readback_ms.load(Ordering::Acquire)),
         state.do_failures.load(Ordering::Acquire),
+        state.do_submit_busy.load(Ordering::Relaxed),
         state.do_confirmed_generation.load(Ordering::Acquire),
         state.led_errors.load(Ordering::Relaxed),
         state.loop_max_us.load(Ordering::Relaxed)
@@ -603,6 +609,7 @@ impl Pca9555Duo {
             do_readback_valid: AtomicBool::new(false),
             do_readback_ms: AtomicU32::new(0),
             do_failures: AtomicU32::new(0),
+            do_submit_busy: AtomicU32::new(0),
             do_confirmed_generation: AtomicU32::new(0),
             outputs: Mutex::new(OutputQueue::new()),
             led_errors: AtomicU32::new(0),
@@ -804,14 +811,19 @@ impl DigitalIo for Pca9555Duo {
 
 impl Pca9555Duo {
     fn submit_output(&self, update: impl FnOnce(u64) -> u64) -> AppResult<()> {
-        let mut queue = self
-            .worker
-            .outputs
-            .try_lock()
-            .map_err(|_| AppError::Io("DO queue busy, retry required".into()))?;
+        let mut queue = match self.worker.outputs.try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::WouldBlock) => {
+                self.worker.do_submit_busy.fetch_add(1, Ordering::Relaxed);
+                return Err(AppError::Busy("DO queue contended"));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(AppError::Io("DO queue poisoned".into()));
+            }
+        };
         let value = update(queue.latest().bits);
         if !queue.submit(value) {
-            return Err(AppError::Io("DO queue full, retry required".into()));
+            return Err(AppError::Busy("DO queue full"));
         }
         self.worker.do_desired.store_bits(value);
         Ok(())

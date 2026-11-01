@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::hw_version;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::hal::Hal;
 use crate::sync::MainLoopCell;
 
@@ -33,6 +33,39 @@ struct DoState {
     tick_count: u32,
     consecutive_failures: u32,
     retry_ticks: u32,
+}
+
+impl DoState {
+    /// 返回是否仍需提交；只有成功才能推进 last，短暂争用不进入硬件退避。
+    fn submission_completed(&mut self, bits: u64, result: AppResult<()>) -> bool {
+        match result {
+            Ok(()) => {
+                self.last = bits;
+                self.consecutive_failures = 0;
+                self.retry_ticks = 0;
+                false
+            }
+            Err(AppError::Busy(_)) => {
+                self.retry_ticks = 0;
+                true
+            }
+            Err(error) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                if self.consecutive_failures == 1
+                    || self.consecutive_failures == 3
+                    || self.consecutive_failures.is_multiple_of(100)
+                {
+                    log::error!(
+                        "[do] write_do_all failed (attempt={}): {}",
+                        self.consecutive_failures,
+                        error
+                    );
+                }
+                self.retry_ticks = RETRY_TICKS;
+                true
+            }
+        }
+    }
 }
 
 static DO_STATE: MainLoopCell<DoState> = MainLoopCell::new();
@@ -74,30 +107,9 @@ pub fn tick_do_output(hal: &Hal) {
         state.tick_count = 0;
 
         let bits = crate::bus::IO.do_.load_bits();
-        if bits != state.last {
-            match hal.dio().write_do_all(bits) {
-                Ok(()) => {
-                    state.last = bits;
-                    state.consecutive_failures = 0;
-                }
-                Err(e) => {
-                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                    if state.consecutive_failures == 1
-                        || state.consecutive_failures == 3
-                        || state.consecutive_failures.is_multiple_of(100)
-                    {
-                        log::error!(
-                            "[do] write_do_all failed (attempt={}): {}",
-                            state.consecutive_failures,
-                            e
-                        );
-                    }
-                    // P0-4: 保持 last 不变，确保下次仍识别为未同步；
-                    // 同时保持dirty标志以便100ms后重试
-                    DO_DIRTY.store(true, Ordering::Release);
-                    state.retry_ticks = RETRY_TICKS;
-                }
-            }
+        if bits != state.last && state.submission_completed(bits, hal.dio().write_do_all(bits)) {
+            // Busy 下一 tick 重试；硬件故障保留 100ms 退避，均不推进 last。
+            DO_DIRTY.store(true, Ordering::Release);
         }
     });
 }
@@ -119,5 +131,47 @@ mod tests {
         }
         assert!(!retry_pending(&mut ticks));
         assert!(!retry_pending(&mut ticks));
+    }
+
+    #[test]
+    fn test_do_queue_contention_retries_next_tick_without_false_hardware_failure() {
+        let mut state = DoState {
+            last: 0xD011,
+            tick_count: 0,
+            consecutive_failures: 0,
+            retry_ticks: 0,
+        };
+        for _ in 0..3 {
+            assert!(state.submission_completed(0xD010, Err(AppError::Busy("DO queue contended"))));
+            assert_eq!(state.last, 0xD011);
+            assert_eq!(state.consecutive_failures, 0);
+            assert!(!retry_pending(&mut state.retry_ticks));
+        }
+        assert!(!state.submission_completed(0xD010, Ok(())));
+        assert_eq!(state.last, 0xD010);
+    }
+
+    #[test]
+    fn test_do_hardware_failure_keeps_backoff_and_latest_target_after_busy() {
+        let mut state = DoState {
+            last: 1,
+            tick_count: 0,
+            consecutive_failures: 0,
+            retry_ticks: 0,
+        };
+        assert!(state.submission_completed(2, Err(AppError::Io("injected failure".into()))));
+        assert_eq!(state.last, 1);
+        assert_eq!(state.consecutive_failures, 1);
+        for _ in 1..RETRY_TICKS {
+            assert!(retry_pending(&mut state.retry_ticks));
+        }
+        assert!(!retry_pending(&mut state.retry_ticks));
+        assert!(state.submission_completed(3, Err(AppError::Busy("DO queue full"))));
+        assert_eq!(state.last, 1);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(!retry_pending(&mut state.retry_ticks));
+        assert!(!state.submission_completed(4, Ok(())));
+        assert_eq!(state.last, 4);
+        assert_eq!(state.consecutive_failures, 0);
     }
 }

@@ -45,11 +45,16 @@ def main() -> None:
         "test_analog_period_survives_millisecond_wrap",
         "test_configured_seconds_are_not_saturated_to_65_seconds",
         "test_pulse_requires_capacity_for_both_edges"))
-    do_test = "#[test]\n" + item(output, "fn test_do_failure_waits_full_retry_interval_despite_dirty_flag(")
+    do_test = "\n".join("#[test]\n" + item(output, "fn " + name + "(") for name in (
+        "test_do_failure_waits_full_retry_interval_despite_dirty_flag",
+        "test_do_queue_contention_retries_next_tick_without_false_hardware_failure",
+        "test_do_hardware_failure_keeps_backoff_and_latest_target_after_busy"))
     source = f'''
 // This harness includes unchanged production modules/sections. Some constants
 // belong to the device-only polling loop and are intentionally unused here.
 #![allow(dead_code)]
+extern crate self as log;
+#[macro_export] macro_rules! error {{ ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }}
 #[path = "{ROOT / 'src/config.rs'}"] mod config;
 mod bus {{
     #[path = "{ROOT / 'src/bus/register_snapshot.rs'}"] pub(crate) mod register_snapshot;
@@ -61,7 +66,14 @@ mod control {{
     {pure_tests}
 }}
 mod output {{
+    #[derive(Debug)] enum AppError {{ Busy(&'static str), Io(String) }}
+    impl std::fmt::Display for AppError {{
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{ write!(f, "{{:?}}", self) }}
+    }}
+    type AppResult<T> = Result<T, AppError>;
     const RETRY_TICKS: u32 = 100 / crate::config::MAIN_LOOP_PERIOD_MS as u32;
+    {item(output, 'struct DoState ')}
+    {item(output, 'impl DoState ')}
     {item(output, 'fn retry_pending(')}
     {do_test}
 }}

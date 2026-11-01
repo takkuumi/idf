@@ -28,6 +28,8 @@ pub enum AppError {
     Rs485(String),
     /// IO 点
     Io(String),
+    /// 非阻塞提交暂未接受；调用方应稍后重试，不等价于硬件故障。
+    Busy(&'static str),
     /// AI/AO 通道
     Channel(String),
     /// 配置错误
@@ -51,6 +53,7 @@ impl fmt::Display for AppError {
             AppError::Modbus(s) => write!(f, "modbus: {s}"),
             AppError::Rs485(s) => write!(f, "rs485: {s}"),
             AppError::Io(s) => write!(f, "io: {s}"),
+            AppError::Busy(s) => write!(f, "busy: {s}"),
             AppError::Channel(s) => write!(f, "channel: {s}"),
             AppError::Config(s) => write!(f, "config: {s}"),
             AppError::Sys(s) => write!(f, "sys: {s}"),

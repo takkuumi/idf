@@ -56,7 +56,7 @@ pub trait DigitalIo: Send + Sync {
     ///
     /// bit 数量 = `do_count()`, 超出部分忽略。
     /// 默认版本 (MCP23017): I2C 写入
-    /// F3/F4 (PCA9555): 软件 I2C 写入
+    /// F3/F4 (PCA9555): worker 队列提交；Busy 表示尚未接受，调用方需重试。
     fn write_do_all(&self, value: u64) -> AppResult<()>;
 
     /// 写入单个 DO 通道 (idx 从 0 开始)

@@ -28,7 +28,14 @@ def main() -> None:
     )
     while time.monotonic() < deadline:
         try:
-            with serial.Serial(args.port, args.baud, timeout=1) as source:
+            # Avoid leaving ESP32 EN/GPIO0 asserted. Some USB serial drivers may
+            # still pulse control lines on open; establish the test baseline
+            # only after UART connection and network readiness.
+            source = serial.Serial(port=None, baudrate=args.baud, timeout=1)
+            source.dtr = False
+            source.rts = False
+            source.port = args.port
+            with source:
                 sessions += 1
                 print(
                     f"serial_connected n={sessions} at={datetime.now(timezone.utc).isoformat()}",

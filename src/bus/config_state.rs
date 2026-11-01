@@ -48,7 +48,7 @@ impl Default for ConfigSnapshot {
 pub static CONFIG: LazyLock<Rcu<ConfigSnapshot>> =
     LazyLock::new(|| Rcu::new(ConfigSnapshot::new()));
 
-/// 读（锁内只克隆 Arc）
+/// 读：原子登记后获取一个独立 Arc，业务读取不持发布锁。
 /// 返回 Arc 让调用方可以安全持有 (即使 RCU 被更新, 引用仍有效)
 pub fn config_read() -> Option<Arc<ConfigSnapshot>> {
     CONFIG.read()

@@ -87,7 +87,7 @@ impl Default for StorageSnapshot {
 pub static STORAGE: LazyLock<Rcu<StorageSnapshot>> =
     LazyLock::new(|| Rcu::new(StorageSnapshot::new()));
 
-/// 读（锁内只克隆 Arc）
+/// 读：原子登记后获取一个独立 Arc，业务读取不持发布锁。
 pub fn storage_read() -> Option<Arc<StorageSnapshot>> {
     STORAGE.read()
 }
