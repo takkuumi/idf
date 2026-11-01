@@ -5,6 +5,11 @@
 - `ci.yml`：PR 执行主机回归；推送提交执行主机回归和 DEFAULT/F3/F4 固件 Clippy；推送 `main` 后自动生成三种生产包并保存 14 天。
 - `release.yml`：推送 `vX.Y.Z` 标签后，在 self-hosted ESP32 runner 上执行完整检查、三种生产构建、SHA-256 校验和 GitHub Release 发布。
 
+主机回归运行在 `ubuntu-latest`，由 `dtolnay/rust-toolchain` 安装 stable，并设置
+`RUSTUP_TOOLCHAIN=stable`。这是必要的：仓库根目录的 `rust-toolchain.toml`
+面向 ESP32 固件选择 `esp`，不能让独立的 host harness 继承该选择。需要编译固件
+的 self-hosted job 不设置这个变量，继续使用 ESP 工具链。
+
 ## Self-hosted runner
 
 固件目标是 `xtensa-esp32s3-espidf`，依赖 ESP-IDF v5.5.4、ESP Rust 工具链、`ldproxy`、`espflash` 和 Python `esptool`。固件 job 使用标签：`self-hosted, esp32s3`。

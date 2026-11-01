@@ -166,7 +166,7 @@ with tempfile.TemporaryDirectory(prefix="gateway-tcp-scheduler-") as directory:
     path = Path(directory)
     (path / "tests.rs").write_text(program)
     subprocess.run(
-        ["rustc", "--edition=2024", "--test", str(path / "tests.rs"), "-o", str(path / "tests")],
+        ["rustc", "+stable", "--edition=2024", "--test", str(path / "tests.rs"), "-o", str(path / "tests")],
         check=True,
     )
     subprocess.run([str(path / "tests"), "--test-threads=1"], check=True, timeout=30)

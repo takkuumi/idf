@@ -94,6 +94,6 @@ fn test_led_bus_failure_cannot_invalidate_input_sample() {
 '''
  with tempfile.TemporaryDirectory(prefix='gateway-io-transactions-') as directory:
   p=Path(directory);(p/'tests.rs').write_text(source)
-  subprocess.run(['rustc','--edition=2024','--test',str(p/'tests.rs'),'-o',str(p/'tests')],check=True)
+  subprocess.run(['rustc','+stable','--edition=2024','--test',str(p/'tests.rs'),'-o',str(p/'tests')],check=True)
   print(f'Actual PCA helpers: {chips} chip bank(s)',flush=True)
   subprocess.run([str(p/'tests')],check=True,timeout=30)

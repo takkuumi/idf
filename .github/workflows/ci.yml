@@ -18,6 +18,11 @@ jobs:
   host-check:
     name: Host checks
     runs-on: ubuntu-latest
+    # rust-toolchain.toml selects the ESP target toolchain for firmware jobs.
+    # Host tests compile standalone Rust harnesses and must use the installed
+    # stable toolchain even when a script invokes rustc/cargo indirectly.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -36,6 +41,16 @@ jobs:
         run: python3 tests/host/run_production_core.py
       - name: Run TCP scheduler tests
         run: python3 tests/host/run_tcp_scheduler.py
+      - name: Run IO transaction tests
+        run: python3 tests/host/run_io_transactions.py
+      - name: Run architecture priority tests
+        run: python3 tests/host/run_architecture_priority.py
+      - name: Run event bus tests
+        run: python3 tests/host/run_event_bus.py
+      - name: Run RCU model tests
+        run: python3 tests/host/run_rcu_model.py
+      - name: Run NVS adapter tests
+        run: python3 tests/host/run_nvs_store.py
       - name: Check storage defaults
         run: python3 tests/host/check_storage_sdkconfig.py --generated sdkconfig.defaults
 

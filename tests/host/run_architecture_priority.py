@@ -72,5 +72,5 @@ with tempfile.TemporaryDirectory(prefix='gateway-architecture-tests-') as direct
     path = Path(directory)
     (path/'tests.rs').write_text(source)
     env = dict(os.environ, CARGO_PKG_VERSION=re.search(r'^version\s*=\s*"([^"]+)"', (ROOT/'Cargo.toml').read_text(), re.M).group(1))
-    subprocess.run(['rustc', '--edition=2024', '--test', str(path/'tests.rs'), '-o', str(path/'tests')], check=True, env=env)
+    subprocess.run(['rustc', '+stable', '--edition=2024', '--test', str(path/'tests.rs'), '-o', str(path/'tests')], check=True, env=env)
     subprocess.run([str(path/'tests'), '--test-threads=4'], check=True, timeout=120)
