@@ -43,11 +43,13 @@ fi
 
 PORT="${ESPFLASH_PORT:-/dev/cu.usbserial-1430}"
 BAUD="${ESPFLASH_BAUD:-460800}"
-# 先用 espflash 的 default-reset 完成 CH340 DTR/RTS 握手，再让 esptool
-# 接管已进入的 ROM/stub。full-flash 使用的就是这条可靠路径。
+# 先用 espflash 的 default-reset 完成 CH340 DTR/RTS 握手并核对芯片；
+# board-info 结束后临时 stub 可能退出，因此 esptool 必须再次 default-reset，
+# 不能假定 no-reset 仍有可用的 ROM/stub 连接。
 RESET_BEFORE="${ESPFLASH_BEFORE:-default_reset}"
 RESET_BEFORE="${RESET_BEFORE//_/-}"
-BEFORE="no_reset"
+BEFORE="${ESPTOOL_BEFORE:-default_reset}"
+BEFORE="${BEFORE//_/-}"
 AFTER="${ESPFLASH_AFTER:-hard_reset}"
 RESET_AFTER_BEFORE="${ESPFLASH_RESET_BEFORE:-default-reset}"
 ALLOW_STALE_RELEASE="${ALLOW_STALE_RELEASE:-0}"
