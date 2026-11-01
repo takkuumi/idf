@@ -1,0 +1,92 @@
+name: IMC Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to publish, for example v2.5.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: imc-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: [self-hosted, esp32s3]
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate version tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)"
+          [[ "$TAG" == "v${VERSION}" ]] || {
+            echo "Tag ${TAG} does not match Cargo.toml version ${VERSION}" >&2
+            exit 1
+          }
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Verify ESP-IDF runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          command -v cargo
+          command -v espflash
+          command -v python3
+          command -v git
+          python3 -m esptool version
+          test -d "${IDF_PATH:-/Users/takumi/Workspace/esp-idf}"
+
+      - name: Run release checks
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --bin imc --no-run
+          cargo clippy --locked --bin imc -- -D warnings
+          cargo clippy --locked --bin imc --features f3 -- -D warnings
+          cargo clippy --locked --bin imc --features f4 -- -D warnings
+          python3 tests/host/run_production_core.py
+
+      - name: Build all production variants
+        run: OVERWRITE_RELEASE=1 ./scripts/release.sh all
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ARCHIVE="imc-v${VERSION}-production.tar.gz"
+          tar -czf "$ARCHIVE" -C "release/v${VERSION}" .
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: IMC v${{ env.VERSION }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            imc-v${{ env.VERSION }}-production.tar.gz
+            imc-v${{ env.VERSION }}-production.tar.gz.sha256

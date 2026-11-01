@@ -5,6 +5,7 @@
 - [项目概览与功能](README.md)
 - [架构与任务资源边界](architecture.md)
 - [构建指南](build.md) · [Release 交付指南](DELIVERY_BUILD.md)
+- [GitHub CI 与发布](CI.md)
 - [烧录与 OTA](FLASH.md)
 - [用户手册](user-manual.md)
 - [引脚映射](pinmap.md) · [内存布局](MEMORY_LAYOUT.md)

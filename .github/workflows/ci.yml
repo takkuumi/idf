@@ -1,0 +1,93 @@
+name: IMC CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imc-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-check:
+    name: Host checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Run production core tests
+        run: python3 tests/host/run_production_core.py
+      - name: Run TCP scheduler tests
+        run: python3 tests/host/run_tcp_scheduler.py
+      - name: Check storage defaults
+        run: python3 tests/host/check_storage_sdkconfig.py --generated sdkconfig.defaults
+
+  firmware-check:
+    name: Firmware checks (${{ matrix.variant }})
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, esp32s3]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        variant: [default, f3, f4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify ESP-IDF runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          command -v cargo
+          command -v espflash
+          command -v python3
+          test -d "${IDF_PATH:-/Users/takumi/Workspace/esp-idf}"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Compile device tests
+        run: cargo test --locked --bin imc --no-run
+      - name: Run Clippy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "${{ matrix.variant }}" == "default" ]]; then
+            cargo clippy --locked --bin imc -- -D warnings
+          else
+            cargo clippy --locked --bin imc --features "${{ matrix.variant }}" -- -D warnings
+          fi
+
+  package-main:
+    name: Package main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [host-check, firmware-check]
+    runs-on: [self-hosted, esp32s3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build production packages
+        shell: bash
+        run: OVERWRITE_RELEASE=1 ./scripts/release.sh all
+      - name: Upload production packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: imc-production-${{ github.sha }}
+          path: release/v*/
+          if-no-files-found: error
+          retention-days: 14
