@@ -1044,7 +1044,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                         config_needs_version_bump = true;
                     }
                     WriteResult::Reset => {
-                        cs.cfg = SystemConfig::defaults();
+                        cs.cfg = SystemConfig::defaults_with_hardware_sn();
                         config_changed = true;
                         request_config_persist = true;
                         request_runtime_apply = true;
@@ -1232,7 +1232,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
                 return true;
             }
             WriteResult::Reset => {
-                cs.cfg = SystemConfig::defaults();
+                cs.cfg = SystemConfig::defaults_with_hardware_sn();
                 super::config_state::CONFIG.write(cs);
                 crate::device::request_apply_config();
                 return true;

@@ -18,7 +18,11 @@ use esp_idf_svc::nvs::EspDefaultNvs;
 
 const NVS_KEY_BLOB: &str = "sys_cfg";
 const NVS_KEY_MAGIC: &str = "sys_cfg_mag";
+const NVS_KEY_SCHEMA: &str = "sys_cfg_ver";
 const NVS_MAGIC: u32 = 0x4757_4346; // "GWCF"
+/// 2.5.0 is the first production schema. Future releases must explicitly
+/// migrate this schema before accepting older system configuration data.
+const NVS_SCHEMA_VERSION: u16 = 0x0205;
 
 /// 序列化后字节数 (固定布局)
 /// SN(32) + name(16) + hw(2) + fw(2) + cfg_ver(2) = 54
@@ -173,9 +177,9 @@ impl SystemConfig {
     /// 与 UTF-16 BE 解码不兼容 → 手持机写入 SN/LOCATION 后读出乱码.
     /// ASCII 编码下 sn_str()/name_str()/ble_name_str() 直接按字节截取到第一个 0x00.
     pub fn defaults() -> Self {
-        let mut sn = [0u8; 32];
-        let sn_ascii: &[u8] = b"ESP32-001";
-        sn[..sn_ascii.len()].copy_from_slice(sn_ascii);
+        // A new device receives its hardware-derived SN during device init.
+        // Keep defaults allocation-free and deterministic for host tests.
+        let sn = [0u8; 32];
 
         let mut name = [0u8; 16];
         let name_ascii: &[u8] = b"GW-ESP32";
@@ -240,6 +244,44 @@ impl SystemConfig {
             esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), 2);
         }
         mac
+    }
+
+    /// Build the production SN used when a device has no configured SN.
+    ///
+    /// The ESP32 eFuse-derived Ethernet MAC is stable for the life of the
+    /// MCU. Keep the result within the legacy 18-byte handheld window while
+    /// retaining the full six-byte identity.
+    pub fn sn_from_eth_mac(mac: [u8; 6]) -> [u8; 32] {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut sn = [0u8; 32];
+        sn[..4].copy_from_slice(b"IMC-");
+        for (index, byte) in mac.into_iter().enumerate() {
+            sn[4 + index * 2] = HEX[(byte >> 4) as usize];
+            sn[5 + index * 2] = HEX[(byte & 0x0F) as usize];
+        }
+        sn
+    }
+
+    /// Replace only an empty SN with the hardware-derived value. Explicitly
+    /// configured SNs remain untouched; this release has no legacy SN mode.
+    pub fn fill_default_sn_from_eth_mac(&mut self, hardware_mac: [u8; 6]) -> bool {
+        if hardware_mac == [0; 6] || hardware_mac == [0xFF; 6] {
+            return false;
+        }
+        let current = self.sn_str();
+        if !current.is_empty() {
+            return false;
+        }
+        self.sn = Self::sn_from_eth_mac(hardware_mac);
+        true
+    }
+
+    /// Defaults used by an explicit factory reset on a running device.
+    pub fn defaults_with_hardware_sn() -> Self {
+        let mut cfg = Self::defaults();
+        let hardware_mac = Self::read_hw_eth_mac();
+        cfg.fill_default_sn_from_eth_mac(hardware_mac);
+        cfg
     }
 
     /// 从 Cargo.toml 解析固件版本 → u16
@@ -384,8 +426,15 @@ impl SystemConfig {
             .map_err(|e| AppError::Config(format!("nvs get magic: {e:?}")))?
             .unwrap_or(0);
 
-        if magic != NVS_MAGIC {
-            log::info!("[cfg] nvs empty, using defaults");
+        let schema = nvs
+            .get_u16(NVS_KEY_SCHEMA)
+            .map_err(|e| AppError::Config(format!("nvs get schema: {e:?}")))?
+            .unwrap_or(0);
+
+        if magic != NVS_MAGIC || schema != NVS_SCHEMA_VERSION {
+            log::info!(
+                "[cfg] nvs schema unavailable or unsupported (magic={magic:#010x}, schema={schema:#06x}), using 2.5.0 defaults"
+            );
             return Ok(Self::defaults());
         }
 
@@ -422,6 +471,8 @@ impl SystemConfig {
             .map_err(|e| AppError::Config(format!("nvs set blob: {e:?}")))?;
         nvs.set_u32(NVS_KEY_MAGIC, NVS_MAGIC)
             .map_err(|e| AppError::Config(format!("nvs set magic: {e:?}")))?;
+        nvs.set_u16(NVS_KEY_SCHEMA, NVS_SCHEMA_VERSION)
+            .map_err(|e| AppError::Config(format!("nvs set schema: {e:?}")))?;
         Ok(())
     }
 
@@ -936,6 +987,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sn_from_eth_mac_uses_full_mac_and_legacy_length() {
+        let sn = SystemConfig::sn_from_eth_mac([0xFC, 0x01, 0x2C, 0x05, 0x64, 0xBB]);
+        assert_eq!(&sn[..16], b"IMC-FC012C0564BB");
+        assert_eq!(sn[16], 0);
+        assert_eq!(sn[31], 0);
+    }
+
+    #[test]
+    fn test_empty_sn_is_replaced_but_explicit_sn_is_preserved() {
+        let mut cfg = SystemConfig::defaults();
+        cfg.eth_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert!(cfg.fill_default_sn_from_eth_mac([0xFC, 0x01, 0x2C, 0x05, 0x64, 0xBB]));
+        assert_eq!(cfg.sn_str(), "IMC-FC012C0564BB");
+
+        cfg.sn[..7].copy_from_slice(b"CUSTOM-");
+        assert!(!cfg.fill_default_sn_from_eth_mac([0xFC, 0x01, 0x2C, 0x05, 0x64, 0xBB]));
+        assert_eq!(&cfg.sn[..7], b"CUSTOM-");
+    }
+
+    #[test]
     fn test_parse_ipv4() {
         assert_eq!(parse_ipv4("192.168.1.1"), Some([192, 168, 1, 1]));
         assert_eq!(parse_ipv4("0.0.0.0"), Some([0, 0, 0, 0]));
@@ -1037,8 +1108,8 @@ mod tests {
             first == 'M' || first == 'm',
             "BLE name must start with m/M for handheld visibility"
         );
-        // 默认 SN = "ESP32-001"
-        assert_eq!(cfg.sn_str(), "ESP32-001");
+        // New devices start blank until init reads the hardware eFuse MAC.
+        assert_eq!(cfg.sn_str(), "");
         // 默认设备名 = "GW-ESP32"
         assert_eq!(cfg.name_str(), "GW-ESP32");
     }

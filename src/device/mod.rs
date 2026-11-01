@@ -570,19 +570,19 @@ pub fn init() -> AppResult<()> {
         log::warn!("[device] NVS unavailable, using default SystemConfig");
         SystemConfig::defaults()
     };
-    let mut network_repaired = false;
+    let mut config_repaired = false;
     if !system_config::valid_tcp_ports(&cfg.tcp_ports) {
         log::warn!(
             "[device] invalid saved Modbus TCP ports {:?}; restored defaults",
             cfg.tcp_ports
         );
         cfg.tcp_ports = crate::config::regs::TCP_PORTS_DEFAULT;
-        network_repaired = true;
+        config_repaired = true;
     }
     // v2.2.6 briefly wrote Android's mask/gateway fields in reverse. Repair
     // only the unmistakable legacy pattern before starting the network stack.
     if cfg.repair_legacy_network_swap() {
-        network_repaired = true;
+        config_repaired = true;
         log::warn!(
             "[device] repaired legacy network field swap: mask={} gw={}",
             cfg.mask_str(),
@@ -599,7 +599,7 @@ pub fn init() -> AppResult<()> {
         cfg.mask = defaults.mask;
         cfg.gateway = defaults.gateway;
         cfg.dns = defaults.dns;
-        network_repaired = true;
+        config_repaired = true;
         log::error!(
             "[device] invalid persisted network config ({error}); restored network defaults"
         );
@@ -616,7 +616,15 @@ pub fn init() -> AppResult<()> {
         }
         log::info!("[device] repaired legacy hardware model to 0x{legacy_model:04X}");
     }
+    let hardware_eth_mac = SystemConfig::read_hw_eth_mac();
     cfg.fill_hw_macs();
+    if cfg.fill_default_sn_from_eth_mac(hardware_eth_mac) {
+        config_repaired = true;
+        log::info!(
+            "[device] generated hardware SN from eth_mac: {}",
+            cfg.sn_str()
+        );
+    }
     // fw_version 始终从 Cargo.toml 同步, 防止固件升级后版本号不更新
     cfg.fw_version = SystemConfig::fw_version_from_cargo();
 
@@ -680,7 +688,7 @@ pub fn init() -> AppResult<()> {
 
         let cs = ConfigSnapshot { cfg: cfg.clone() };
         config_write(cs);
-        if network_repaired {
+        if config_repaired {
             request_persist_config();
         }
 

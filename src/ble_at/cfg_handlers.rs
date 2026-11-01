@@ -273,7 +273,7 @@ pub fn handle_cfgapply(_args: &str) -> String {
 // AT+CFGRESET
 // ----------------------------------------------------------------------------
 pub fn handle_cfgreset(_args: &str) -> String {
-    with_cfg_mut(|c| *c = SystemConfig::defaults());
+    with_cfg_mut(|c| *c = SystemConfig::defaults_with_hardware_sn());
     match device::apply_config_sync() {
         Ok(_) => {
             device::request_apply_config();
