@@ -36,6 +36,7 @@
 //!   OK <data>\r\n          成功 (有数据)
 //!   ERROR <code>\r\n       失败
 
+mod advertising_health;
 pub mod cfg_handlers;
 pub mod handlers;
 pub mod logic_handlers;
@@ -54,6 +55,7 @@ use crate::modbus::shared::modbus_crc16;
 use std::ffi::CString;
 
 use crate::health::TaskHb;
+use advertising_health::{AdvertisingHealth, Operation as AdvOperation, Recovery as AdvRecovery};
 
 /// 与原 C++ 固件及手持机 1.0.78 完全一致的 GATT UUID。
 pub const SERVICE_UUID: &str = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -242,10 +244,10 @@ static GATT_CONGESTED: AtomicBool = AtomicBool::new(false);
 /// 断线回调不与 main-loop 争抢多个缓冲区锁；由 main-loop 在下一 tick 统一清理。
 static CONNECTION_BUFFERS_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// LOOP15: 广播启动完成标志 (ADV_START_COMPLETE_EVT 成功后置位).
-/// 用于 process_tick 周期自检 — 若启动后仍 false, 重新触发 config_adv_data → 广播.
-/// 防止启动期任意一步静默失败导致设备永久不可发现 (手持机搜不到蓝牙).
-static ADV_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// GAP callbacks confirm a bounded lease; an old success flag must not hide a
+/// silent controller stop forever. This lock protects only a few scalar fields;
+/// SDK calls and logging always happen after releasing it.
+static ADV_HEALTH: Spin<AdvertisingHealth> = Spin::new(AdvertisingHealth::new());
 /// 改名时只停止一次广播，等待 STOP_COMPLETE 后重建 ADV data。
 static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
 /// LOOP15: GATT 服务是否已启动 (CREAT_ATTR_TAB_EVT 后 start_service 成功)
@@ -376,7 +378,21 @@ static ATTRIBUTE_TABLE: [SyncGattAttrDb; ATTR_TABLE_LEN] = [
 // GATT 事件回调
 // ============================================================================
 
+fn advertising_now_ms() -> u32 {
+    (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32
+}
+
+fn begin_advertising_operation(operation: AdvOperation) -> bool {
+    if CONN_ID.load(Ordering::Acquire) != 0xFFFF {
+        return false;
+    }
+    ADV_HEALTH.lock().begin(operation, advertising_now_ms())
+}
+
 fn start_advertising() {
+    if !begin_advertising_operation(AdvOperation::Start) {
+        return;
+    }
     let mut adv_params = esp_idf_sys::esp_ble_adv_params_t {
         // 160 ms；工业现场兼顾发现速度与空口占用。
         adv_int_min: 0x0100,
@@ -390,7 +406,39 @@ fn start_advertising() {
     };
     let ret = unsafe { esp_idf_sys::esp_ble_gap_start_advertising(&mut adv_params) };
     if ret != esp_idf_sys::ESP_OK {
+        ADV_HEALTH
+            .lock()
+            .complete(AdvOperation::Start, false, advertising_now_ms());
         log::error!("[ble_at] start_advertising failed: 0x{:x}", ret);
+    }
+}
+
+fn stop_advertising() -> bool {
+    if !begin_advertising_operation(AdvOperation::Stop) {
+        return false;
+    }
+    let ret = unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() };
+    if ret != esp_idf_sys::ESP_OK {
+        ADV_HEALTH
+            .lock()
+            .complete(AdvOperation::Stop, false, advertising_now_ms());
+        log::warn!("[ble_at] stop_advertising failed: 0x{:x}", ret);
+        return false;
+    }
+    true
+}
+
+fn advertising_connected() {
+    ADV_HEALTH.lock().connected(advertising_now_ms());
+    if ADV_RECONFIGURE_PENDING.swap(false, Ordering::AcqRel) {
+        PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+    }
+}
+
+fn advertising_disconnected() {
+    ADV_HEALTH.lock().connected(advertising_now_ms());
+    if !PENDING_GAP_NAME_UPDATE.load(Ordering::Acquire) {
+        start_advertising();
     }
 }
 
@@ -431,7 +479,10 @@ fn gap_name_from_ble_id(id: &str) -> heapless::String<16> {
 /// - **31 字节限制**: flags(3) + 128bit UUID(18) + name(2+len). "Mesh"(4) → 3+18+6=27B 安全.
 ///   若用户改名 > 9 字节, Bluedroid 会截断为 `BTM_BLE_AD_TYPE_NAME_SHORT`,
 ///   只要首字符仍是 m/M, metuory 过滤仍能命中.
-fn config_adv_data() {
+fn config_adv_data() -> bool {
+    if !begin_advertising_operation(AdvOperation::Configure) {
+        return false;
+    }
     let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
         set_scan_rsp: false, // LOOP17: 不用 scan_rsp, 名字+UUID 同放 ADV (size=27B<31)
         include_name: true,  // name 放 ADV data, 兼容所有扫描器 (含旧 startLeScan)
@@ -451,11 +502,14 @@ fn config_adv_data() {
     // config_adv_data 异步: 成功后触发 ADV_DATA_SET_COMPLETE_EVT → gap_event_cb → start_advertising
     let ret = unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data as *mut _) };
     if ret != 0 {
+        ADV_HEALTH
+            .lock()
+            .complete(AdvOperation::Configure, false, advertising_now_ms());
         log::error!("[ble_at] config_adv_data failed: 0x{:x}", ret);
-        // 失败时清 ADV_ACTIVE, process_tick 下个周期会重试
-        ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        false
     } else {
         log::info!("[ble_at] config_adv_data queued (name + UUID + flags)");
+        true
     }
 }
 
@@ -470,6 +524,13 @@ unsafe extern "C" fn gap_event_cb(
                 return;
             }
             let status = unsafe { (*param).adv_data_cmpl.status };
+            let success = status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS;
+            if !ADV_HEALTH
+                .lock()
+                .complete(AdvOperation::Configure, success, advertising_now_ms())
+            {
+                return;
+            }
             if status != esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS {
                 log::error!("[ble_at] advertising data configuration failed: {}", status);
                 return;
@@ -482,21 +543,45 @@ unsafe extern "C" fn gap_event_cb(
                 return;
             }
             let status = unsafe { (*param).adv_start_cmpl.status };
-            if status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS {
-                log::info!("[ble_at] BLE advertising active (svc={})", SERVICE_UUID);
-                // LOOP15: 标记广播已成功启动, 供 process_tick 自检
-                ADV_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+            let success = status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS;
+            let was_active = {
+                let mut health = ADV_HEALTH.lock();
+                let was_active = health.active();
+                if !health.complete(AdvOperation::Start, success, advertising_now_ms()) {
+                    return;
+                }
+                was_active
+            };
+            if success {
+                if was_active {
+                    log::debug!("[ble_at] idle advertising lease renewed");
+                } else {
+                    log::info!("[ble_at] BLE advertising active (svc={})", SERVICE_UUID);
+                }
             } else {
                 log::error!("[ble_at] advertising start failed: {}", status);
-                // LOOP15: 失败时清零, process_tick 下个周期会重试
-                ADV_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT => {
-            ADV_ACTIVE.store(false, Ordering::Release);
+            if param.is_null() {
+                return;
+            }
+            let status = unsafe { (*param).adv_stop_cmpl.status };
+            let success = status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS;
+            if !ADV_HEALTH
+                .lock()
+                .complete(AdvOperation::Stop, success, advertising_now_ms())
+            {
+                return;
+            }
             if ADV_RECONFIGURE_PENDING.swap(false, Ordering::AcqRel) {
-                log::info!("[ble_at] advertising stopped; applying updated name");
-                config_adv_data();
+                if success {
+                    log::info!("[ble_at] advertising stopped; applying updated name");
+                    config_adv_data();
+                } else {
+                    PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+                    log::warn!("[ble_at] advertising stop failed: {}", status);
+                }
             }
         }
         _ => {}
@@ -722,7 +807,7 @@ unsafe extern "C" fn gatts_event_cb(
             GATTS_IF.store(gatts_if, Ordering::Release);
             NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
             GATT_CONGESTED.store(false, Ordering::Release);
-            ADV_ACTIVE.store(false, Ordering::Release);
+            advertising_connected();
             log::info!("[ble_at] GATT client connected (conn_id={})", p.conn_id);
 
             // MCA 兼容: 连接后立即产一个心跳通知到 BINARY_TX 队列
@@ -765,8 +850,9 @@ unsafe extern "C" fn gatts_event_cb(
                 p.conn_id,
                 p.reason
             );
-            // 可连接广播在建立连接时会停止，断开后必须显式恢复。
-            start_advertising();
+            // A normal disconnect only needs to resume advertising. A name
+            // update requested while connected is handled by the main loop.
+            advertising_disconnected();
         }
         ESP_GATTS_MTU_EVT => {
             if param.is_null() {
@@ -996,53 +1082,94 @@ pub fn start() -> AppResult<()> {
     Ok(())
 }
 
-/// AT 命令处理循环
-///
-/// LOOP7: 写完 BLE 名字后立即同步 GAP 设备名
-/// LOOP17: 关键修复 — `esp_ble_gap_set_device_name` 仅更新 controller 内部 BD name,
-/// **不会**自动重建已经发出的 ADV 包. 若不重新 `config_adv_data`, 新名字仍在 BD name
-/// 缓存里但 ADV data 里仍是旧名字 → 手持机用 `device.getName()` 读到旧名 → 改名无效.
-///
-/// 修复: 改名后立即调 `config_adv_data()` 触发 ADV_DATA_SET_COMPLETE_EVT → start_advertising,
-/// 让新名字真正进入空口. 这是 LOOP17 的核心 bug 修复.
+/// Apply the latest name only between GAP operations and while disconnected.
+/// Connected clients keep their link; disconnect schedules the pending rename.
 pub fn update_gap_device_name() {
-    // LOOP11: 零拷贝, 闭包内返回 String (ble_name_str() 返回 String, 不含借用)
-    // LOOP17: 统一 fallback 为 "Mesh" (与 start() 完全一致), 防止空名导致 metuory 过滤失败.
+    if CONN_ID.load(Ordering::Acquire) != 0xFFFF
+        || !SVC_STARTED.load(Ordering::Acquire)
+        || !ADV_HEALTH.lock().can_update_name(advertising_now_ms())
+    {
+        PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+        return;
+    }
     let configured_id =
         crate::bus::config_state::config_read_with(|cs| cs.cfg.ble_name_str()).unwrap_or_default();
     let configured_name = gap_name_from_ble_id(&configured_id);
+    let Ok(cname) = CString::new(configured_name.as_str()) else {
+        log::warn!("[ble_at] BLE name contains NUL");
+        return;
+    };
+    // Reserve a phase even for this short API call so immediate failures use
+    // the same bounded backoff rather than flooding BTC every main-loop tick.
+    if !begin_advertising_operation(AdvOperation::Name) {
+        PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+        return;
+    }
+    let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
+    // set_device_name has no corresponding legacy GAP completion event.
+    // Preserve whether advertising was active before reserving this phase.
+    let was_active = {
+        let mut health = ADV_HEALTH.lock();
+        let active = health.active();
+        health.complete(
+            AdvOperation::Name,
+            ret == esp_idf_sys::ESP_OK,
+            advertising_now_ms(),
+        );
+        active
+    };
+    if ret != esp_idf_sys::ESP_OK {
+        PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+        log::warn!("[ble_at] set_device_name failed: 0x{:x}", ret);
+        return;
+    }
     log::info!(
         "[ble_at] update_gap_device_name: ble_id='{}', gap_name='{}'",
         configured_id,
         configured_name
     );
-    if let Ok(cname) = std::ffi::CString::new(configured_name.as_str()) {
-        let ret = unsafe { esp_idf_sys::esp_ble_gap_set_device_name(cname.as_ptr()) };
-        log::info!("[ble_at] esp_ble_gap_set_device_name ret=0x{:x}", ret);
-        if ret == esp_idf_sys::ESP_OK {
-            // 关键: set_device_name 后必须重发 config_adv_data 让新名字进入 ADV 包
-            // 仅在服务已启动时重发, 否则首次启动链仍由 CREAT_ATTR_TAB_EVT 负责
-            if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire) {
-                if ADV_ACTIVE.load(Ordering::Acquire) {
-                    // Bluedroid 不保证在正在广播时原地替换 ADV data。先异步停止，
-                    // STOP_COMPLETE 回调再配置，避免 start/stop 周期抖动和旧名称残留。
-                    ADV_RECONFIGURE_PENDING.store(true, Ordering::Release);
-                    let stop_ret = unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() };
-                    if stop_ret != esp_idf_sys::ESP_OK {
-                        ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
-                        log::warn!(
-                            "[ble_at] stop advertising for rename failed: 0x{:x}",
-                            stop_ret
-                        );
-                    }
-                } else {
-                    log::info!("[ble_at] reconfigure advertising data after rename");
-                    config_adv_data();
-                }
+    if was_active {
+        ADV_RECONFIGURE_PENDING.store(true, Ordering::Release);
+        if !stop_advertising() {
+            ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
+            PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+        }
+    } else if !config_adv_data() {
+        PENDING_GAP_NAME_UPDATE.store(true, Ordering::Release);
+    }
+}
+
+fn maintain_advertising() {
+    let now_ms = advertising_now_ms();
+    let connected = CONN_ID.load(Ordering::Acquire) != 0xFFFF;
+    let recovery = ADV_HEALTH.lock().recovery(
+        now_ms,
+        SVC_STARTED.load(Ordering::Acquire),
+        connected,
+        PENDING_GAP_NAME_UPDATE.load(Ordering::Acquire),
+    );
+    match recovery {
+        AdvRecovery::None => {}
+        AdvRecovery::Retry => {
+            ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
+            log::warn!("[ble_at] advertising inactive or GAP callback timed out; retrying");
+            // A pending rename must be applied before rebuilding ADV data.
+            if !PENDING_GAP_NAME_UPDATE.load(Ordering::Acquire) {
+                config_adv_data();
             }
         }
-    } else {
-        log::warn!("[ble_at] CString::new failed (NUL in name?)");
+        AdvRecovery::Renew => {
+            // IDF implements start_advertising with a stop/start internally.
+            // Renew once per idle minute, never once per main-loop tick.
+            log::debug!("[ble_at] renewing idle advertising lease");
+            start_advertising();
+        }
+    }
+    if !connected
+        && ADV_HEALTH.lock().can_update_name(now_ms)
+        && PENDING_GAP_NAME_UPDATE.swap(false, Ordering::AcqRel)
+    {
+        update_gap_device_name();
     }
 }
 
@@ -1069,28 +1196,7 @@ pub fn process_tick(hal: &crate::hal::Hal) {
             }
         }
     }
-    // 广播只在启动/回调失败时被动恢复。正常广播不做周期 stop/start，避免扫描
-    // 窗口丢失和 controller churn。仅在未连接时执行恢复。
-    if SVC_STARTED.load(std::sync::atomic::Ordering::Acquire)
-        && CONN_ID.load(Ordering::Acquire) == 0xFFFF
-    {
-        static TICK_DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let tick = TICK_DIV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // 被动重试: ADV_ACTIVE=false 时每 ~5s 重新 config_adv_data。
-        const ADV_RETRY_TICKS: u32 = 5_000 / crate::config::BLE_PROCESS_PERIOD_MS as u32;
-        // LOOP17: 统一使用 config_adv_data() 入口 (与 start/update_gap_device_name 一致)
-        if !ADV_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
-            && tick.is_multiple_of(ADV_RETRY_TICKS)
-        {
-            log::warn!("[ble_at] advertising not active, retrying config_adv_data");
-            config_adv_data();
-        }
-    }
-    // LOOP7: 处理待更新的 GAP 设备名 (Metuory 写完 0x08E2 后)
-    if PENDING_GAP_NAME_UPDATE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        update_gap_device_name();
-    }
+    maintain_advertising();
     if CONNECTION_BUFFERS_DIRTY.swap(false, Ordering::AcqRel) {
         let tx_cleared = BINARY_TX.try_lock().is_some_and(|mut tx| {
             tx.clear();
