@@ -2304,22 +2304,31 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
 /// | 0x03 | 0x08D7   | 0x0006  | ETH_MAC      | [6][mac(6)]
 /// | 0x03 | 0x08E2   | 0x0004  | BT_ID        | [8][ble_id(8)]
 ///
-/// LOOP10: 波特率 → metuory packed nibble 索引 (与 system_config.rs baud_table 顺序一致)
+/// 波特率 → 手持机 SerialBaudRateEnum 的 packed nibble 索引。
+///
+/// 手持机枚举不是“去重后的波特率列表”：索引 0 和 4 都显示 9600，
+/// 之后 14400=5、19200=6、38400=7、57600=8、115200=9。
+/// 这里必须使用手持机的原始 code，否则 Web 保存 115200 后，手持机
+/// 会把错误的索引 7 显示成 38400。
 /// 对齐 CommandDataUtil.decodeSerialBaudRate: (value & 0xf0) >> 4
 fn baud_to_index(baud: u32) -> u8 {
     match baud {
-        1200 => 0,
-        2400 => 1,
-        4800 => 2,
-        9600 => 3,
-        19200 => 4,
-        38400 => 5,
-        57600 => 6,
-        115200 => 7,
-        230400 => 8,
-        460800 => 9,
-        921600 => 10,
-        _ => 3, // 默认 9600
+        9600 => 0, // DEFAULT；手持机 code 4 也显示 9600
+        1200 => 1,
+        2400 => 2,
+        4800 => 3,
+        14400 => 5,
+        19200 => 6,
+        38400 => 7,
+        57600 => 8,
+        115200 => 9,
+        128000 => 10,
+        153600 => 11,
+        230400 => 12,
+        256000 => 13,
+        460800 => 14,
+        921600 => 15,
+        _ => 0, // 默认 9600
     }
 }
 
@@ -3705,14 +3714,43 @@ mod tests {
     /// metuory: (value & 0xf0) >> 4, 故索引 7 (115200) 应编入 high nibble = 0x70
     #[test]
     fn test_baud_to_index_alignment() {
-        assert_eq!(baud_to_index(9600), 3);
-        assert_eq!(baud_to_index(115200), 7);
-        assert_eq!(baud_to_index(460800), 9);
-        // 未知波特率默认回退 9600 (索引 3)
-        assert_eq!(baud_to_index(12345), 3);
+        assert_eq!(baud_to_index(9600), 0);
+        assert_eq!(baud_to_index(38400), 7);
+        assert_eq!(baud_to_index(115200), 9);
+        assert_eq!(baud_to_index(460800), 14);
+        // 未知波特率默认回退 9600 (索引 0)
+        assert_eq!(baud_to_index(12345), 0);
         // 验证编码后 metuory 解码回正确索引
         let packed = (baud_to_index(115200) & 0xF) << 4;
-        assert_eq!((packed >> 4) & 0xF, 7);
+        assert_eq!((packed >> 4) & 0xF, 9);
+    }
+
+    #[test]
+    fn test_baud_to_index_matches_handheld_enum() {
+        let expected = [
+            (9600, 0),
+            (1200, 1),
+            (2400, 2),
+            (4800, 3),
+            (14_400, 5),
+            (19_200, 6),
+            (38_400, 7),
+            (57_600, 8),
+            (115_200, 9),
+            (128_000, 10),
+            (153_600, 11),
+            (230_400, 12),
+            (256_000, 13),
+            (460_800, 14),
+            (921_600, 15),
+        ];
+        for (baud, index) in expected {
+            assert_eq!(
+                baud_to_index(baud),
+                index,
+                "baud {baud} must use handheld code {index}"
+            );
+        }
     }
 
     #[test]

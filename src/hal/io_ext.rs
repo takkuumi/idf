@@ -36,6 +36,9 @@ const MAX_DO_CHIPS: usize = 3;
 /// 用 Mutex 保护, 多任务访问安全 (DI 扫描 / DO 输出 / Modbus 读状态)。
 pub struct IoExtender {
     bus: Spin<I2cBus>,
+    /// A missing expansion board is a supported degraded hardware state.
+    /// The counts let runtime operations report unavailable IO instead of
+    /// silently treating an empty bus as valid all-zero hardware.
     di_chips: [Mcp23017; MAX_DI_CHIPS],
     di_chip_count: usize,
     /// DO 扩展芯片数组
@@ -60,41 +63,69 @@ impl IoExtender {
         // 探测 DI 芯片
         let mut di_chips: [Mcp23017; MAX_DI_CHIPS] =
             [Mcp23017::new(0), Mcp23017::new(0), Mcp23017::new(0)];
+        let mut di_chip_count = 0;
         for (i, &addr) in di_addrs.iter().enumerate() {
             let chip = Mcp23017::new(addr);
             if !chip.probe(&mut bus_guard) {
-                return Err(AppError::Hal(format!(
-                    "MCP23017 DI chip {} at 0x{:02X} not found",
-                    i, addr
-                )));
+                log::warn!(
+                    "[io_ext] MCP23017 DI chip {} at 0x{:02X} not found; continuing without DI bank",
+                    i,
+                    addr
+                );
+                continue;
             }
-            chip.init_as_input(&mut bus_guard)?;
-            di_chips[i] = chip;
+            if let Err(error) = chip.init_as_input(&mut bus_guard) {
+                log::warn!(
+                    "[io_ext] MCP23017 DI chip {} at 0x{:02X} initialization failed: {error}; continuing without DI bank",
+                    i,
+                    addr
+                );
+                continue;
+            }
+            di_chips[di_chip_count] = chip;
+            di_chip_count += 1;
             log::info!("[io_ext] DI chip {} at 0x{:02X} initialized", i, addr);
         }
 
         // 探测 + 初始化 DO 芯片 (F3: 1 片; F4: 3 片)
         let mut do_chips: [Mcp23017; MAX_DO_CHIPS] =
             [Mcp23017::new(0), Mcp23017::new(0), Mcp23017::new(0)];
+        let mut do_chip_count = 0;
         for (i, &addr) in do_addrs.iter().enumerate() {
             let chip = Mcp23017::new(addr);
             if !chip.probe(&mut bus_guard) {
-                return Err(AppError::Hal(format!(
-                    "MCP23017 DO chip {} at 0x{:02X} not found",
-                    i, addr
-                )));
+                log::warn!(
+                    "[io_ext] MCP23017 DO chip {} at 0x{:02X} not found; continuing without DO bank",
+                    i,
+                    addr
+                );
+                continue;
             }
-            chip.init_as_output(&mut bus_guard)?;
-            do_chips[i] = chip;
+            if let Err(error) = chip.init_as_output(&mut bus_guard) {
+                log::warn!(
+                    "[io_ext] MCP23017 DO chip {} at 0x{:02X} initialization failed: {error}; continuing without DO bank",
+                    i,
+                    addr
+                );
+                continue;
+            }
+            do_chips[do_chip_count] = chip;
+            do_chip_count += 1;
             log::info!("[io_ext] DO chip {} at 0x{:02X} initialized", i, addr);
+        }
+
+        if di_chip_count == 0 && do_chip_count == 0 {
+            log::warn!(
+                "[io_ext] no MCP23017 board detected; continuing with unavailable digital IO"
+            );
         }
 
         Ok(Self {
             bus: Spin::new(bus_guard),
             di_chips,
-            di_chip_count: di_addrs.len(),
+            di_chip_count,
             do_chips,
-            do_chip_count: do_addrs.len(),
+            do_chip_count,
             do_cache: AtomicBits64::new(0),
         })
     }
@@ -104,6 +135,9 @@ impl IoExtender {
     /// 默认: 16 bit
     #[inline]
     pub fn read_di(&self) -> AppResult<u64> {
+        if self.di_chip_count == 0 {
+            return Err(AppError::Io("MCP23017 DI board unavailable".into()));
+        }
         let mut bus = self.bus.lock();
         let mut result: u64 = 0;
         for i in 0..self.di_chip_count {
@@ -128,6 +162,9 @@ impl IoExtender {
     /// 默认: 16 bit
     #[inline]
     pub fn write_do(&self, value: u64) -> AppResult<()> {
+        if self.do_chip_count == 0 {
+            return Err(AppError::Io("MCP23017 DO board unavailable".into()));
+        }
         // 限制为 DO_COUNT 位 (超出 bit 忽略)
         let mask = if hw_version::DO_COUNT >= 64 {
             u64::MAX
@@ -175,6 +212,9 @@ impl IoExtender {
 
     /// 读取当前 DO 输出状态 (从 MCP23017 读取)
     pub fn read_do_actual(&self) -> AppResult<u64> {
+        if self.do_chip_count == 0 {
+            return Err(AppError::Io("MCP23017 DO board unavailable".into()));
+        }
         let mut bus = self.bus.lock();
         let mut result: u64 = 0;
         for i in 0..self.do_chip_count {

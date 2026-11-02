@@ -284,6 +284,8 @@ pub fn diagnostics_json() -> String {
     let generation = state.di_generation.load(Ordering::SeqCst);
     let sampled = state.di_sampled_ms.load(Ordering::SeqCst);
     let failures = state.di_failures.load(Ordering::SeqCst);
+    let do_readback_valid = state.do_readback_valid.load(Ordering::Acquire);
+    let do_readback_ms = state.do_readback_ms.load(Ordering::Acquire);
     let queue_snapshot = state.outputs.try_lock().ok().map(|q| {
         (
             q.len(),
@@ -320,10 +322,9 @@ pub fn diagnostics_json() -> String {
         generation,
         failures,
         queue,
-        state.do_readback_valid.load(Ordering::Acquire)
-            && now.wrapping_sub(state.do_readback_ms.load(Ordering::Acquire)) <= 250,
+        do_readback_valid && now.wrapping_sub(do_readback_ms) <= 250,
         bits,
-        now.wrapping_sub(state.do_readback_ms.load(Ordering::Acquire)),
+        now.wrapping_sub(do_readback_ms),
         state.do_failures.load(Ordering::Acquire),
         state.do_submit_busy.load(Ordering::Relaxed),
         state.do_confirmed_generation.load(Ordering::Acquire),
@@ -354,9 +355,12 @@ fn unpack_status_led(value: u16) -> u8 {
 
 fn pca9555_worker(io_bus: BusI2c, led_bus: BusI2c, state: Arc<Pca9555WorkerState>) {
     crate::health::subscribe_wdt();
-    let mut last_warn = Instant::now() - Duration::from_secs(10);
-    let mut last_do_check = Instant::now() - Duration::from_millis(100);
-    let mut retry_at = Instant::now();
+    let initial_now = Instant::now();
+    let mut last_warn = initial_now - Duration::from_secs(10);
+    let mut last_do_check = initial_now - Duration::from_millis(100);
+    let mut retry_at = initial_now;
+    let mut io_retry_at = initial_now;
+    let mut led_retry_at = initial_now;
     let mut di_led = [[0xFF; 2]; MAX_CHIPS];
     let mut do_led = [[0xFF; 2]; MAX_CHIPS];
     let mut last_status = u16::MAX;
@@ -367,128 +371,163 @@ fn pca9555_worker(io_bus: BusI2c, led_bus: BusI2c, state: Arc<Pca9555WorkerState
         crate::health::feed_wdt();
 
         // 输入读取和发布独立于灯总线；LED NACK 不得阻止有效 DI 更新。
-        match worker_sample_di(&io_bus) {
-            Ok((bits, raw)) => {
-                state.di_generation.fetch_add(1, Ordering::SeqCst);
-                state.di_bits.store_bits(bits);
-                state.di_sampled_ms.store(now_ms(), Ordering::SeqCst);
-                state.di_failures.store(0, Ordering::SeqCst);
-                state.di_generation.fetch_add(1, Ordering::SeqCst);
-                for (i, &addr) in DI_LED_ADDRS.iter().enumerate() {
-                    if di_led[i] != raw[i] {
-                        match led_bus.write_regs2(addr, REG_OUTPUT_0, raw[i]) {
-                            Ok(()) => di_led[i] = raw[i],
+        // When every bank is absent, avoid hammering the bit-banged bus every
+        // 10ms. A responding bank immediately restores the normal cadence.
+        let now = Instant::now();
+        let io_due = now >= io_retry_at;
+        let mut io_bus_success = false;
+        let led_due = now >= led_retry_at;
+        if io_due {
+            let mut led_failed = false;
+            match worker_sample_di(&io_bus) {
+                Ok((bits, raw)) => {
+                    io_bus_success = true;
+                    state.di_generation.fetch_add(1, Ordering::SeqCst);
+                    state.di_bits.store_bits(bits);
+                    state.di_sampled_ms.store(now_ms(), Ordering::SeqCst);
+                    state.di_failures.store(0, Ordering::SeqCst);
+                    state.di_generation.fetch_add(1, Ordering::SeqCst);
+                    if led_due {
+                        for (i, &addr) in DI_LED_ADDRS.iter().enumerate() {
+                            if di_led[i] != raw[i] {
+                                match led_bus.write_regs2(addr, REG_OUTPUT_0, raw[i]) {
+                                    Ok(()) => {
+                                        di_led[i] = raw[i];
+                                    }
+                                    Err(_) => {
+                                        state.led_errors.fetch_add(1, Ordering::Relaxed);
+                                        led_failed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    state.di_failures.fetch_add(1, Ordering::SeqCst);
+                    warn_worker(&mut last_warn, "DI", &error);
+                }
+            }
+
+            // 一轮最多应用一个输出边沿，保留至少一个 worker 调度间隔；
+            // 失败保留队首，按 100ms 重试，禁止 LED 故障阻塞输出确认。
+            let command = {
+                let mut queue = state.outputs.lock().unwrap_or_else(|e| e.into_inner());
+                if state.do_failures.load(Ordering::Acquire) != 0 {
+                    queue.retain_latest_after_fault();
+                }
+                queue.front()
+            };
+            if let Some(command) = command
+                && Instant::now() >= retry_at
+            {
+                let outcome = worker_write_do(&io_bus, command.bits)
+                    .and_then(|()| worker_read_do(&io_bus))
+                    .and_then(|actual| {
+                        if actual == command.bits {
+                            Ok(actual)
+                        } else {
+                            Err(AppError::Io("DO output register readback mismatch".into()))
+                        }
+                    });
+                match outcome {
+                    Ok(actual) => {
+                        io_bus_success = true;
+                        publish_do_readback(&state, actual);
+                        state.do_failures.store(0, Ordering::Release);
+                        state
+                            .do_confirmed_generation
+                            .store(command.generation, Ordering::Release);
+                        state
+                            .outputs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .confirm(command);
+                        last_do_check = Instant::now();
+                    }
+                    Err(error) => {
+                        state.do_readback_valid.store(false, Ordering::Release);
+                        state.do_failures.fetch_add(1, Ordering::AcqRel);
+                        retry_at = Instant::now() + Duration::from_millis(100);
+                        warn_worker(&mut last_warn, "DO", &error);
+                    }
+                }
+            } else if command.is_none() && last_do_check.elapsed() >= Duration::from_millis(100) {
+                last_do_check = Instant::now();
+                let target = state
+                    .outputs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .latest()
+                    .bits;
+                match worker_read_do(&io_bus).and_then(|actual| {
+                    if actual == target {
+                        Ok(actual)
+                    } else {
+                        // Expander brownout/reset: rewrite and verify instead of trusting a cache.
+                        worker_write_do(&io_bus, target)?;
+                        let actual = worker_read_do(&io_bus)?;
+                        if actual == target {
+                            Ok(actual)
+                        } else {
+                            Err(AppError::Io("DO recovery readback mismatch".into()))
+                        }
+                    }
+                }) {
+                    Ok(actual) => {
+                        io_bus_success = true;
+                        publish_do_readback(&state, actual);
+                        state.do_failures.store(0, Ordering::Release);
+                    }
+                    Err(error) => {
+                        state.do_readback_valid.store(false, Ordering::Release);
+                        state.do_failures.fetch_add(1, Ordering::AcqRel);
+                        warn_worker(&mut last_warn, "DO readback", &error);
+                    }
+                }
+            }
+            if led_due && state.do_readback_valid.load(Ordering::Acquire) {
+                let actual = state.do_hardware.load_bits();
+                for (i, &addr) in DO_LED_ADDRS.iter().enumerate() {
+                    let raw = (actual >> (i * 16)) as u16;
+                    let led = [!(raw as u8), !bit_reverse((raw >> 8) as u8)];
+                    if do_led[i] != led {
+                        match led_bus.write_regs2(addr, REG_OUTPUT_0, led) {
+                            Ok(()) => {
+                                do_led[i] = led;
+                            }
                             Err(_) => {
                                 state.led_errors.fetch_add(1, Ordering::Relaxed);
+                                led_failed = true;
                             }
                         }
                     }
                 }
             }
-            Err(error) => {
-                state.di_failures.fetch_add(1, Ordering::SeqCst);
-                warn_worker(&mut last_warn, "DI", &error);
-            }
-        }
-
-        // 一轮最多应用一个输出边沿，保留至少一个 worker 调度间隔；
-        // 失败保留队首，按 100ms 重试，禁止 LED 故障阻塞输出确认。
-        let command = {
-            let mut queue = state.outputs.lock().unwrap_or_else(|e| e.into_inner());
-            if state.do_failures.load(Ordering::Acquire) != 0 {
-                queue.retain_latest_after_fault();
-            }
-            queue.front()
-        };
-        if let Some(command) = command
-            && Instant::now() >= retry_at
-        {
-            let outcome = worker_write_do(&io_bus, command.bits)
-                .and_then(|()| worker_read_do(&io_bus))
-                .and_then(|actual| {
-                    if actual == command.bits {
-                        Ok(actual)
-                    } else {
-                        Err(AppError::Io("DO output register readback mismatch".into()))
+            let status = state.status_led.load(Ordering::Acquire);
+            if led_due && status != last_status {
+                match worker_apply_status(&led_bus, status) {
+                    Ok(()) => {
+                        last_status = status;
                     }
-                });
-            match outcome {
-                Ok(actual) => {
-                    publish_do_readback(&state, actual);
-                    state.do_failures.store(0, Ordering::Release);
-                    state
-                        .do_confirmed_generation
-                        .store(command.generation, Ordering::Release);
-                    state
-                        .outputs
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .confirm(command);
-                    last_do_check = Instant::now();
-                }
-                Err(error) => {
-                    state.do_readback_valid.store(false, Ordering::Release);
-                    state.do_failures.fetch_add(1, Ordering::AcqRel);
-                    retry_at = Instant::now() + Duration::from_millis(100);
-                    warn_worker(&mut last_warn, "DO", &error);
+                    Err(error) => {
+                        state.led_errors.fetch_add(1, Ordering::Relaxed);
+                        warn_worker(&mut last_warn, "LED", &error);
+                        led_failed = true;
+                    }
                 }
             }
-        } else if command.is_none() && last_do_check.elapsed() >= Duration::from_millis(100) {
-            last_do_check = Instant::now();
-            let target = state
-                .outputs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .latest()
-                .bits;
-            match worker_read_do(&io_bus).and_then(|actual| {
-                if actual == target {
-                    Ok(actual)
+            if led_due {
+                led_retry_at = if led_failed {
+                    Instant::now() + Duration::from_millis(500)
                 } else {
-                    // Expander brownout/reset: rewrite and verify instead of trusting a cache.
-                    worker_write_do(&io_bus, target)?;
-                    let actual = worker_read_do(&io_bus)?;
-                    if actual == target {
-                        Ok(actual)
-                    } else {
-                        Err(AppError::Io("DO recovery readback mismatch".into()))
-                    }
-                }
-            }) {
-                Ok(actual) => {
-                    publish_do_readback(&state, actual);
-                    state.do_failures.store(0, Ordering::Release);
-                }
-                Err(error) => {
-                    state.do_readback_valid.store(false, Ordering::Release);
-                    state.do_failures.fetch_add(1, Ordering::AcqRel);
-                    warn_worker(&mut last_warn, "DO readback", &error);
-                }
+                    Instant::now()
+                };
             }
-        }
-        if state.do_readback_valid.load(Ordering::Acquire) {
-            let actual = state.do_hardware.load_bits();
-            for (i, &addr) in DO_LED_ADDRS.iter().enumerate() {
-                let raw = (actual >> (i * 16)) as u16;
-                let led = [!(raw as u8), !bit_reverse((raw >> 8) as u8)];
-                if do_led[i] != led {
-                    match led_bus.write_regs2(addr, REG_OUTPUT_0, led) {
-                        Ok(()) => do_led[i] = led,
-                        Err(_) => {
-                            state.led_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-        }
-        let status = state.status_led.load(Ordering::Acquire);
-        if status != last_status {
-            match worker_apply_status(&led_bus, status) {
-                Ok(()) => last_status = status,
-                Err(error) => {
-                    state.led_errors.fetch_add(1, Ordering::Relaxed);
-                    warn_worker(&mut last_warn, "LED", &error);
-                }
+            if !io_bus_success {
+                io_retry_at = Instant::now() + Duration::from_millis(500);
+            } else {
+                io_retry_at = Instant::now();
             }
         }
         let elapsed = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
@@ -566,13 +605,25 @@ impl Pca9555Duo {
 
         // Inputs are high-impedance with the board's external pull-ups.
         for &addr in DI_IO_ADDRS {
-            io_bus.write_reg(addr, REG_CONFIG_0, 0xFF)?;
-            io_bus.write_reg(addr, REG_CONFIG_1, 0xFF)?;
+            if let Err(error) = io_bus
+                .write_reg(addr, REG_CONFIG_0, 0xFF)
+                .and_then(|()| io_bus.write_reg(addr, REG_CONFIG_1, 0xFF))
+            {
+                log::warn!(
+                    "[pca9555] DI chip 0x{addr:02X} unavailable during init; continuing without that bank: {error}"
+                );
+            }
         }
         // Set safe output latches before enabling outputs.
         for &addr in DO_IO_ADDRS {
-            io_bus.write_regs2(addr, REG_OUTPUT_0, [0x00, 0x00])?;
-            io_bus.write_regs2(addr, REG_CONFIG_0, [0x00, 0x00])?;
+            if let Err(error) = io_bus
+                .write_regs2(addr, REG_OUTPUT_0, [0x00, 0x00])
+                .and_then(|()| io_bus.write_regs2(addr, REG_CONFIG_0, [0x00, 0x00]))
+            {
+                log::warn!(
+                    "[pca9555] DO chip 0x{addr:02X} unavailable during init; continuing without that bank: {error}"
+                );
+            }
         }
         // DI/DO mirrors and status LEDs are all active-low outputs.
         for &addr in DI_LED_ADDRS
@@ -580,8 +631,14 @@ impl Pca9555Duo {
             .chain(DO_LED_ADDRS)
             .chain([STATUS_LED_ADDR].iter())
         {
-            led_bus.write_regs2(addr, REG_CONFIG_0, [0x00, 0x00])?;
-            led_bus.write_regs2(addr, REG_OUTPUT_0, [0xFF, 0xFF])?;
+            if let Err(error) = led_bus
+                .write_regs2(addr, REG_CONFIG_0, [0x00, 0x00])
+                .and_then(|()| led_bus.write_regs2(addr, REG_OUTPUT_0, [0xFF, 0xFF]))
+            {
+                log::warn!(
+                    "[pca9555] LED chip 0x{addr:02X} unavailable during init; continuing without that bank: {error}"
+                );
+            }
         }
 
         #[cfg(feature = "f4")]
@@ -589,12 +646,18 @@ impl Pca9555Duo {
         #[cfg(not(feature = "f4"))]
         let status_led = 0xDE; // F3/F16-compatible PWR+RUN state
         #[cfg(feature = "f4")]
-        led_bus.write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [status_led.0, status_led.1])?;
+        if let Err(error) =
+            led_bus.write_regs2(STATUS_LED_ADDR, REG_OUTPUT_0, [status_led.0, status_led.1])
+        {
+            log::warn!("[pca9555] status LED unavailable during init; continuing: {error}");
+        }
         #[cfg(not(feature = "f4"))]
-        led_bus.write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, status_led)?;
+        if let Err(error) = led_bus.write_reg(STATUS_LED_ADDR, REG_OUTPUT_0, status_led) {
+            log::warn!("[pca9555] status LED unavailable during init; continuing: {error}");
+        }
 
         log::info!(
-            "[pca9555] initialized: DI={:?} DO={:?} ({}DI/{}DO)",
+            "[pca9555] worker initialized: DI={:?} DO={:?} ({}DI/{}DO; missing boards are degraded)",
             DI_IO_ADDRS,
             DO_IO_ADDRS,
             crate::config::hw_version::DI_COUNT,

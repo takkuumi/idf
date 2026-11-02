@@ -332,19 +332,20 @@ pub fn start() -> AppResult<()> {
     bind_ports(&ports, &mut listeners)
         .map_err(|(port, e)| AppError::Modbus(format!("bind {port}: {e}")))?;
 
+    let initial_now = Instant::now();
     SERVER_STATE
         .init(TcpServerState {
             listeners,
             clients,
             active_ports: ports,
-            next_port_check: Instant::now(),
+            next_port_check: initial_now,
             last_served_client: [None; 4],
             port_cursor: 0,
             listener_cursor: 0,
             listener_rebind_due: None,
-            next_reject_log: Instant::now(),
+            next_reject_log: initial_now,
             rejected_connections: 0,
-            conn_rate_window: Instant::now(),
+            conn_rate_window: initial_now,
             conn_rate_count: 0,
             conn_established_total: 0,
             conn_closed_total: 0,

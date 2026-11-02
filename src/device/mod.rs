@@ -80,13 +80,14 @@ pub struct DeviceActor {
 
 impl DeviceActor {
     fn new() -> Self {
+        let initial_now = Instant::now();
         Self {
-            next_holding_persist: Instant::now(),
-            next_device_text_persist: Instant::now(),
-            next_config_persist: Instant::now(),
-            next_web_system_info_persist: Instant::now(),
+            next_holding_persist: initial_now,
+            next_device_text_persist: initial_now,
+            next_config_persist: initial_now,
+            next_web_system_info_persist: initial_now,
             #[cfg(feature = "io-di-do")]
-            next_do_persist: Instant::now(),
+            next_do_persist: initial_now,
         }
     }
 }
