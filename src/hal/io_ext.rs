@@ -204,9 +204,9 @@ impl crate::hal::digital_io::DigitalIo for IoExtender {
         hw_version::DO_COUNT
     }
 
-    /// 读取所有 DI 通道 (F3: 16 bit / F4: 48 bit)
+    /// 读取所有 DI 通道 (Default: 16 bit)
     ///
-    /// 内部逐片读取 MCP23017, F4 需 3 次 I2C 读 (约 600μs @ 400kHz)
+    /// Default 构建使用 MCP23017；F3/F4 不编译本模块，使用 PCA9555 worker。
     fn read_di_all(&self) -> AppResult<u64> {
         self.read_di()
     }

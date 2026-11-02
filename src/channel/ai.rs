@@ -21,13 +21,11 @@ const SAMPLE_PERIOD_MS: u64 = 100;
 const AVG_WINDOW: usize = 8;
 /// 位移数 (log2(AVG_WINDOW))
 const AVG_SHIFT: u32 = 3;
-/// AI 通道数 (LOOP12: F4/F48 设备 8 通道, F16/F3 保持 6 通道).
-/// 物理 ADC 仍只采集 6 路 (ESP32-S3 ADC1_CH0..5), F4 模式下 ch[6]/ch[7] 由软件填 0.
-/// 未来硬件扩展 (MCP3424 ADC2) 真正补齐 8 路硬件采样时, 只需替换 hal/adc.rs 的 DMA buffer.
+/// AI 通道数。F3 四路，F4 八路，Default 六路。
 #[cfg(feature = "f4")]
 pub const CHANNEL_COUNT: usize = 8;
 #[cfg(not(feature = "f4"))]
-pub const CHANNEL_COUNT: usize = 6;
+pub const CHANNEL_COUNT: usize = 4;
 
 // AI 已合并到 main_loop，状态用 MainLoopCell 保护。
 
@@ -59,7 +57,7 @@ pub fn start_sample_task(hal: Arc<Hal>, _timer_svc: EspTaskTimerService) -> AppR
 /// main_loop 每 100ms 调用一次
 pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     let _ = AI_STATE.with_mut(|state| {
-        let raws: [u16; 6] = hal.adc.sample_all();
+        let raws: [u16; 8] = hal.adc.sample_all();
 
         // 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)。
         // 原 MCA 只有在 min/max 都非零时才启用现场校准，否则使用 605/3016 默认值。
@@ -70,7 +68,7 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
             let raw: u16 = if ch < raws.len() {
                 raws[ch]
             } else {
-                0 // F4/F48 设备 ch6/ch7: 硬件暂未接线, 返回 0 (后续扩展 HAL 驱动时替换)
+                0 // 仅用于未启用的兼容槽位；F4 的 ADC2 已在 HAL 采样。
             };
             state.buf[ch][state.pos % AVG_WINDOW] = raw;
             let sum: u32 = state.buf[ch].iter().map(|&v| v as u32).sum();

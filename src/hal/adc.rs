@@ -3,7 +3,7 @@
 //! 支持两种模式 (通过 feature flag 切换):
 //!
 //! - **Continuous + DMA 模式** (`feature = "adc-continuous"`, 默认):
-//!   ADC1 6 通道在后台 DMA 连续采样, CPU 仅读环形缓冲区, 零 CPU 占用。
+//!   ADC1 按硬件变体配置通道在后台 DMA 连续采样, CPU 仅读环形缓冲区, 零 CPU 占用。
 //!   用 `esp_idf_sys` 直接调用 `adc_continuous_*` API。
 //!   每 100ms 调用 `sample_all()` 时, 从 DMA 缓冲区读取 N 帧并取平均。
 //!
@@ -18,12 +18,17 @@
 //! | CH0 | GPIO1 | AI0 |
 //! | CH1 | GPIO2 | AI1 |
 //! | CH2 | GPIO3 | AI2 |
-//! | CH3 | GPIO4 | AI3 |
-//! | CH4 | GPIO5 | AI4 |
-//! | CH5 | GPIO6 | AI5 |
+//! | CH7 | GPIO8 | F3/F4 AI3 |
 
 use crate::error::{AppError, AppResult};
 use crate::hal::pins::Adc1Cfg;
+
+#[inline]
+fn cfg_channel_index(channel: usize) -> Option<usize> {
+    crate::config::pins::AI_CHANNELS[..crate::config::pins::AI_ADC1_CHANNEL_COUNT]
+        .iter()
+        .position(|&configured| usize::from(configured) == channel)
+}
 
 // ============================================================================
 // 统一对外句柄 (根据 feature 切换内部实现)
@@ -41,7 +46,7 @@ pub struct AdcHandle {
 }
 
 impl AdcHandle {
-    /// 初始化 ADC1 + 6 个通道
+    /// 初始化 ADC1 的变体通道（Default/F3 四路，F4 前四路）
     pub fn init(cfg: Adc1Cfg) -> AppResult<Self> {
         Ok(Self {
             #[cfg(feature = "adc-continuous")]
@@ -51,12 +56,12 @@ impl AdcHandle {
         })
     }
 
-    /// 批量采样全部 6 通道
+    /// 批量采样全部启用通道（返回缓冲区最多 8 路）
     ///
     /// - Continuous 模式: 从 DMA 环形缓冲区读取并取平均 (零 CPU 占用)
-    /// - OneShot 模式: 一次 Mutex 锁采样 6 通道
+    /// - OneShot 模式: 一次 Spin 锁采样全部启用通道
     #[inline]
-    pub fn sample_all(&self) -> [u16; 6] {
+    pub fn sample_all(&self) -> [u16; 8] {
         self.inner.sample_all()
     }
 
@@ -75,16 +80,83 @@ impl AdcHandle {
 mod adc_continuous {
     use super::*;
 
+    #[cfg(feature = "f4")]
+    struct Adc2OneShot {
+        handle: esp_idf_sys::adc_oneshot_unit_handle_t,
+    }
+
+    #[cfg(feature = "f4")]
+    impl Adc2OneShot {
+        fn init() -> AppResult<Self> {
+            let unit_cfg = esp_idf_sys::adc_oneshot_unit_init_cfg_t {
+                unit_id: esp_idf_sys::adc_unit_t_ADC_UNIT_2,
+                ..Default::default()
+            };
+            let mut handle = core::ptr::null_mut();
+            let ret = unsafe { esp_idf_sys::adc_oneshot_new_unit(&unit_cfg, &mut handle) };
+            if ret != esp_idf_sys::ESP_OK {
+                return Err(AppError::Hal(format!(
+                    "adc2 oneshot init failed: 0x{ret:08X}"
+                )));
+            }
+            let cfg = esp_idf_sys::adc_oneshot_chan_cfg_t {
+                atten: esp_idf_sys::adc_atten_t_ADC_ATTEN_DB_11,
+                bitwidth: esp_idf_sys::adc_bitwidth_t_ADC_BITWIDTH_DEFAULT,
+            };
+            for &channel in &crate::config::pins::AI_ADC2_CHANNELS {
+                let ret = unsafe {
+                    esp_idf_sys::adc_oneshot_config_channel(
+                        handle,
+                        channel as esp_idf_sys::adc_channel_t,
+                        &cfg,
+                    )
+                };
+                if ret != esp_idf_sys::ESP_OK {
+                    unsafe { esp_idf_sys::adc_oneshot_del_unit(handle) };
+                    return Err(AppError::Hal(format!(
+                        "adc2 channel {channel} config failed: 0x{ret:08X}"
+                    )));
+                }
+            }
+            Ok(Self { handle })
+        }
+
+        fn sample_into(&self, out: &mut [u16; 8]) {
+            for (offset, &channel) in crate::config::pins::AI_ADC2_CHANNELS.iter().enumerate() {
+                let mut value = 0i32;
+                let ret = unsafe {
+                    esp_idf_sys::adc_oneshot_read(
+                        self.handle,
+                        channel as esp_idf_sys::adc_channel_t,
+                        &mut value,
+                    )
+                };
+                if ret == esp_idf_sys::ESP_OK {
+                    out[4 + offset] = value.clamp(0, u16::MAX as i32) as u16;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "f4")]
+    impl Drop for Adc2OneShot {
+        fn drop(&mut self) {
+            unsafe { esp_idf_sys::adc_oneshot_del_unit(self.handle) };
+        }
+    }
+
     /// ADC Continuous + DMA 句柄
     ///
-    /// ADC1 6 通道以 1kHz 总频率在后台 DMA 连续采样，CPU 仅读缓冲区。
+    /// ADC1 变体通道以 1kHz 总频率在后台 DMA 连续采样，CPU 仅读缓冲区。
     /// `sample_all()` 从 DMA 环形缓冲区读取所有可读帧, 按通道分组取平均,
     /// 返回 6 个 12-bit 平均值。
     pub struct AdcContinuous {
         handle: esp_idf_sys::adc_continuous_handle_t,
-        last: [core::sync::atomic::AtomicU16; 6],
+        last: [core::sync::atomic::AtomicU16; 8],
         read_errors: core::sync::atomic::AtomicU32,
         read_lock: crate::sync::Spin<()>,
+        #[cfg(feature = "f4")]
+        adc2: Adc2OneShot,
     }
 
     // SAFETY: DMA reads are serialized by read_lock and Drop requires exclusive ownership.
@@ -111,47 +183,16 @@ mod adc_continuous {
                 )));
             }
 
-            // 2. 配置 6 个通道 (ADC1_CH0-5, 12-bit, 11dB 衰减 = 0-3.1V)
+            // 2. 配置本变体声明的 ADC1 通道 (12-bit, 11dB 衰减 = 0-3.1V)。
             let atten = esp_idf_sys::adc_atten_t_ADC_ATTEN_DB_11 as u8;
             let bit_width = esp_idf_sys::SOC_ADC_DIGI_MAX_BITWIDTH as u8;
-            let pattern: [esp_idf_sys::adc_digi_pattern_config_t; 6] = [
-                esp_idf_sys::adc_digi_pattern_config_t {
+            let pattern: [esp_idf_sys::adc_digi_pattern_config_t; 6] =
+                core::array::from_fn(|i| esp_idf_sys::adc_digi_pattern_config_t {
                     atten,
-                    channel: cfg.channels[0],
+                    channel: cfg.channels[i],
                     unit: 0,
                     bit_width,
-                },
-                esp_idf_sys::adc_digi_pattern_config_t {
-                    atten,
-                    channel: cfg.channels[1],
-                    unit: 0,
-                    bit_width,
-                },
-                esp_idf_sys::adc_digi_pattern_config_t {
-                    atten,
-                    channel: cfg.channels[2],
-                    unit: 0,
-                    bit_width,
-                },
-                esp_idf_sys::adc_digi_pattern_config_t {
-                    atten,
-                    channel: cfg.channels[3],
-                    unit: 0,
-                    bit_width,
-                },
-                esp_idf_sys::adc_digi_pattern_config_t {
-                    atten,
-                    channel: cfg.channels[4],
-                    unit: 0,
-                    bit_width,
-                },
-                esp_idf_sys::adc_digi_pattern_config_t {
-                    atten,
-                    channel: cfg.channels[5],
-                    unit: 0,
-                    bit_width,
-                },
-            ];
+                });
 
             let dig_cfg = esp_idf_sys::adc_continuous_config_t {
                 conv_mode: esp_idf_sys::adc_digi_convert_mode_t_ADC_CONV_SINGLE_UNIT_1,
@@ -161,7 +202,7 @@ mod adc_continuous {
                 // 可容纳约 256ms 数据，覆盖 100ms 主循环周期及合理调度抖动。
                 sample_freq_hz: 1_000,
                 adc_pattern: pattern.as_ptr() as *mut _,
-                pattern_num: 6,
+                pattern_num: cfg.channel_count as u32,
             };
             let r = unsafe { esp_idf_sys::adc_continuous_config(handle, &dig_cfg) };
             if r != 0 {
@@ -184,13 +225,18 @@ mod adc_continuous {
                 )));
             }
 
-            log::info!("[adc] Continuous+DMA mode started: 6 ch, 1kHz total, Type2 12-bit");
+            log::info!(
+                "[adc] Continuous+DMA mode started: {} ch, 1kHz total, Type2 12-bit",
+                cfg.channel_count
+            );
 
             Ok(Self {
                 handle,
-                last: [const { core::sync::atomic::AtomicU16::new(0) }; 6],
+                last: [const { core::sync::atomic::AtomicU16::new(0) }; 8],
                 read_errors: core::sync::atomic::AtomicU32::new(0),
                 read_lock: crate::sync::Spin::new(()),
+                #[cfg(feature = "f4")]
+                adc2: Adc2OneShot::init()?,
             })
         }
 
@@ -198,12 +244,12 @@ mod adc_continuous {
         ///
         /// ESP32-S3 ADC Continuous Type2 输出格式 (12-bit mode):
         /// 每样本 4 字节，data=bits 0..11，channel=bits 13..16，unit=bit 17。
-        pub fn sample_all(&self) -> [u16; 6] {
+        pub fn sample_all(&self) -> [u16; 8] {
             let _read_guard = self.read_lock.lock();
-            let mut sum = [0u32; 6];
-            let mut count = [0u32; 6];
+            let mut sum = [0u32; 8];
+            let mut count = [0u32; 8];
 
-            // DMA 读取缓冲区 (栈分配, 单帧容纳 6 通道 × N 次采样)
+            // DMA 读取缓冲区 (栈分配, 单帧容纳全部 ADC1 通道 × N 次采样)
             let mut buf = [0u8; 512];
 
             // 循环读取直到 DMA 缓冲区为空 (timeout=0 非阻塞)
@@ -235,9 +281,11 @@ mod adc_continuous {
                 for sample in buf[..ret_num as usize].chunks_exact(4) {
                     let encoded = [sample[0], sample[1], sample[2], sample[3]];
                     let (unit, channel, data) = decode_type2_sample(encoded);
-                    if unit == 0 && channel < 6 {
-                        sum[channel] += data as u32;
-                        count[channel] += 1;
+                    if unit == 0
+                        && let Some(index) = cfg_channel_index(channel)
+                    {
+                        sum[index] += data as u32;
+                        count[index] += 1;
                     }
                 }
             }
@@ -245,12 +293,14 @@ mod adc_continuous {
             // 计算每通道平均值
             let mut out =
                 core::array::from_fn(|i| self.last[i].load(core::sync::atomic::Ordering::Acquire));
-            for i in 0..6 {
+            for i in 0..8 {
                 if count[i] > 0 {
                     out[i] = (sum[i] / count[i]) as u16;
                     self.last[i].store(out[i], core::sync::atomic::Ordering::Release);
                 }
             }
+            #[cfg(feature = "f4")]
+            self.adc2.sample_into(&mut out);
             if count.iter().any(|&samples| samples != 0) {
                 self.read_errors
                     .store(0, core::sync::atomic::Ordering::Relaxed);
@@ -260,7 +310,7 @@ mod adc_continuous {
 
         /// 单通道采样 (从 sample_all 结果取一个)
         pub fn sample(&self, idx: usize) -> u16 {
-            if idx >= 6 {
+            if idx >= 8 {
                 return 0;
             }
             self.sample_all()[idx]
@@ -316,13 +366,81 @@ mod adc_oneshot {
     use super::*;
     use crate::sync::Spin;
 
+    #[cfg(feature = "f4")]
+    struct Adc2OneShot {
+        handle: esp_idf_sys::adc_oneshot_unit_handle_t,
+    }
+
+    #[cfg(feature = "f4")]
+    impl Adc2OneShot {
+        fn init() -> AppResult<Self> {
+            let cfg = esp_idf_sys::adc_oneshot_unit_init_cfg_t {
+                unit_id: esp_idf_sys::adc_unit_t_ADC_UNIT_2,
+                ..Default::default()
+            };
+            let mut handle = core::ptr::null_mut();
+            let ret = unsafe { esp_idf_sys::adc_oneshot_new_unit(&cfg, &mut handle) };
+            if ret != esp_idf_sys::ESP_OK {
+                return Err(AppError::Hal(format!(
+                    "adc2 oneshot init failed: 0x{ret:08X}"
+                )));
+            }
+            let chan_cfg = esp_idf_sys::adc_oneshot_chan_cfg_t {
+                atten: esp_idf_sys::adc_atten_t_ADC_ATTEN_DB_11,
+                bitwidth: esp_idf_sys::adc_bitwidth_t_ADC_BITWIDTH_DEFAULT,
+            };
+            for &channel in &crate::config::pins::AI_ADC2_CHANNELS {
+                let ret = unsafe {
+                    esp_idf_sys::adc_oneshot_config_channel(
+                        handle,
+                        channel as esp_idf_sys::adc_channel_t,
+                        &chan_cfg,
+                    )
+                };
+                if ret != esp_idf_sys::ESP_OK {
+                    unsafe { esp_idf_sys::adc_oneshot_del_unit(handle) };
+                    return Err(AppError::Hal(format!(
+                        "adc2 channel {channel} config failed: 0x{ret:08X}"
+                    )));
+                }
+            }
+            Ok(Self { handle })
+        }
+
+        fn sample_into(&self, out: &mut [u16; 8]) {
+            for (offset, &channel) in crate::config::pins::AI_ADC2_CHANNELS.iter().enumerate() {
+                let mut value = 0i32;
+                let ret = unsafe {
+                    esp_idf_sys::adc_oneshot_read(
+                        self.handle,
+                        channel as esp_idf_sys::adc_channel_t,
+                        &mut value,
+                    )
+                };
+                if ret == esp_idf_sys::ESP_OK {
+                    out[4 + offset] = value.clamp(0, u16::MAX as i32) as u16;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "f4")]
+    impl Drop for Adc2OneShot {
+        fn drop(&mut self) {
+            unsafe { esp_idf_sys::adc_oneshot_del_unit(self.handle) };
+        }
+    }
+
     /// ADC OneShot 句柄 (fallback, 不启用 feature = "adc-continuous" 时使用)
     pub struct AdcOneShot {
         handle: esp_idf_sys::adc_oneshot_unit_handle_t,
         channels: [u8; 6],
+        channel_count: usize,
         read_lock: Spin<()>,
-        last: [core::sync::atomic::AtomicU16; 6],
-        failures: [core::sync::atomic::AtomicU32; 6],
+        last: [core::sync::atomic::AtomicU16; 8],
+        failures: [core::sync::atomic::AtomicU32; 8],
+        #[cfg(feature = "f4")]
+        adc2: Adc2OneShot,
     }
 
     // SAFETY: all reads are serialized and Drop has exclusive ownership.
@@ -347,7 +465,7 @@ mod adc_oneshot {
                 atten: esp_idf_sys::adc_atten_t_ADC_ATTEN_DB_11,
                 bitwidth: esp_idf_sys::adc_bitwidth_t_ADC_BITWIDTH_DEFAULT,
             };
-            for &channel in &cfg.channels {
+            for &channel in &cfg.channels[..cfg.channel_count] {
                 let ret = unsafe {
                     esp_idf_sys::adc_oneshot_config_channel(
                         handle,
@@ -368,16 +486,19 @@ mod adc_oneshot {
             Ok(Self {
                 handle,
                 channels: cfg.channels,
+                channel_count: cfg.channel_count,
                 read_lock: Spin::new(()),
-                last: [const { core::sync::atomic::AtomicU16::new(0) }; 6],
-                failures: [const { core::sync::atomic::AtomicU32::new(0) }; 6],
+                last: [const { core::sync::atomic::AtomicU16::new(0) }; 8],
+                failures: [const { core::sync::atomic::AtomicU32::new(0) }; 8],
+                #[cfg(feature = "f4")]
+                adc2: Adc2OneShot::init()?,
             })
         }
 
-        pub fn sample_all(&self) -> [u16; 6] {
-            let mut out = [0u16; 6];
+        pub fn sample_all(&self) -> [u16; 8] {
+            let mut out = [0u16; 8];
             let _guard = self.read_lock.lock();
-            for (i, sample) in out.iter_mut().enumerate() {
+            for (i, sample) in out.iter_mut().enumerate().take(self.channel_count) {
                 *sample = match self.read_raw(i) {
                     Ok(value) => {
                         self.last[i].store(value, core::sync::atomic::Ordering::Release);
@@ -395,11 +516,13 @@ mod adc_oneshot {
                     }
                 };
             }
+            #[cfg(feature = "f4")]
+            self.adc2.sample_into(&mut out);
             out
         }
 
         pub fn sample(&self, idx: usize) -> u16 {
-            if idx >= 6 {
+            if idx >= self.channel_count {
                 return 0;
             }
             let _guard = self.read_lock.lock();

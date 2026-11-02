@@ -15,13 +15,17 @@
 //! `LedcDriver::set_duty` 要求 `&mut self`，多线程 AO 输出任务
 //! 并发写入时通过 `Spin` 短临界区串行化 (不阻塞内核).
 
+#[cfg(not(feature = "f4"))]
 use crate::sync::Spin;
 
+#[cfg(not(feature = "f4"))]
 use esp_idf_hal::gpio::AnyOutputPin;
+#[cfg(not(feature = "f4"))]
 use esp_idf_hal::ledc::{
     CHANNEL0, CHANNEL1, CHANNEL2, CHANNEL3, LedcDriver, LedcTimerDriver, LowSpeed, Resolution,
     TIMER0, TIMER1, TIMER2, TIMER3, config::TimerConfig,
 };
+#[cfg(not(feature = "f4"))]
 use esp_idf_hal::units::Hertz;
 
 use crate::error::{AppError, AppResult};
@@ -35,10 +39,12 @@ const AO_CHANNEL_COUNT: usize = 4;
 /// 持有 4 路 PWM 输出通道，每路独立 Spin.
 /// timer 已 leak 到堆上为 `'static`，被各 channel 借用。
 pub struct LedcHandle {
+    #[cfg(not(feature = "f4"))]
     channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT],
 }
 
 /// 根据 u8 编号解析 Resolution 枚举
+#[cfg(not(feature = "f4"))]
 fn resolution_from_bits(bits: u8) -> AppResult<Resolution> {
     Ok(match bits {
         1 => Resolution::Bits1,
@@ -71,67 +77,82 @@ impl LedcHandle {
     /// - `channels`: `[(ledc_channel, gpio_num); 4]`
     pub fn init(
         timer_cfg: LedcTimerCfg,
-        channels: [(u8, u8); AO_CHANNEL_COUNT],
+        #[allow(unused_variables)] channels: [(u8, u8); AO_CHANNEL_COUNT],
     ) -> AppResult<Self> {
-        let resolution = resolution_from_bits(timer_cfg.resolution_bits)?;
-        // LOOP14: LEDC 时钟源选择
-        // esp-idf-hal TimerConfig::default() 隐式选 LEDC_USE_XTAL_CLK (40MHz 晶振),
-        // 相比 LEDC_USE_RC_FAST_CLK (~8MHz, 受温度漂移 ±5%) 更精确, 对工业
-        // 4-20mA 输出至关重要 (RC 漂移会偏置满度输出). 不显式覆盖 = 显式选 XTAL.
-        //
-        // 12-bit @ 5kHz 分辨率: 周期 = 4096 ticks × 200ns/tick = 819.2µs, 频率精确
-        // 5kHz. AO 通道 4 路, RC 滤波后输出 0-10V. ESP32-S3 LEDC 支持到 20-bit,
-        // 但 5kHz × 2^20 = 5GHz 远超时钟, 因此 12-bit 是 AO 工业级最佳折衷.
-        let config = TimerConfig::default()
-            .frequency(Hertz(timer_cfg.freq_hz))
-            .resolution(resolution);
-
-        // 1. 创建 LedcTimerDriver 并 leak 到堆上获取 'static
-        //    根据 timer 编号选择对应的 typed peripheral
-        //    SAFETY: timer 配置来自 config，确保未被其它驱动占用
-        macro_rules! make_timer {
-            ($timer:expr, $cfg:expr) => {{
-                Box::leak(Box::new(
-                    LedcTimerDriver::new($timer, $cfg)
-                        .map_err(|e| AppError::Hal(format!("ledc timer: {e:?}")))?,
-                ))
-            }};
+        #[cfg(feature = "f4")]
+        let _ = timer_cfg;
+        #[cfg(feature = "f4")]
+        {
+            log::info!("[ao] disabled on F4; GPIO15..18 are assigned to ADC2 AI4..AI7");
+            Ok(Self {})
         }
-        let timer_driver: &'static mut LedcTimerDriver<'static, LowSpeed> = match timer_cfg.timer {
-            0 => make_timer!(unsafe { TIMER0::steal() }, &config),
-            1 => make_timer!(unsafe { TIMER1::steal() }, &config),
-            2 => make_timer!(unsafe { TIMER2::steal() }, &config),
-            3 => make_timer!(unsafe { TIMER3::steal() }, &config),
-            _ => {
-                return Err(AppError::Hal(format!(
-                    "invalid ledc timer: {}",
-                    timer_cfg.timer
-                )));
-            }
-        };
+        #[cfg(not(feature = "f4"))]
+        {
+            let resolution = resolution_from_bits(timer_cfg.resolution_bits)?;
+            // LOOP14: LEDC 时钟源选择
+            // esp-idf-hal TimerConfig::default() 隐式选 LEDC_USE_XTAL_CLK (40MHz 晶振),
+            // 相比 LEDC_USE_RC_FAST_CLK (~8MHz, 受温度漂移 ±5%) 更精确, 对工业
+            // 4-20mA 输出至关重要 (RC 漂移会偏置满度输出). 不显式覆盖 = 显式选 XTAL.
+            //
+            // 12-bit @ 5kHz 分辨率: 周期 = 4096 ticks × 200ns/tick = 819.2µs, 频率精确
+            // 5kHz. AO 通道 4 路, RC 滤波后输出 0-10V. ESP32-S3 LEDC 支持到 20-bit,
+            // 但 5kHz × 2^20 = 5GHz 远超时钟, 因此 12-bit 是 AO 工业级最佳折衷.
+            let config = TimerConfig::default()
+                .frequency(Hertz(timer_cfg.freq_hz))
+                .resolution(resolution);
 
-        // 2. 创建 4 个 LedcDriver
-        //    每个 LedcDriver 借用 timer_driver (通过 &* reborrow, 不移动所有权)
-        //    SAFETY: GPIO 编号来自 config，确保未被其它驱动占用
-        let mut chs: Vec<Spin<LedcDriver<'static>>> = Vec::with_capacity(AO_CHANNEL_COUNT);
-        for (i, (ch_num, gpio)) in channels.iter().enumerate() {
-            let pin = unsafe { AnyOutputPin::steal(*gpio) };
-            let driver = match *ch_num {
-                0 => LedcDriver::new(unsafe { CHANNEL0::steal() }, &*timer_driver, pin),
-                1 => LedcDriver::new(unsafe { CHANNEL1::steal() }, &*timer_driver, pin),
-                2 => LedcDriver::new(unsafe { CHANNEL2::steal() }, &*timer_driver, pin),
-                3 => LedcDriver::new(unsafe { CHANNEL3::steal() }, &*timer_driver, pin),
-                _ => return Err(AppError::Hal(format!("invalid ledc channel: {ch_num}"))),
+            // 1. 创建 LedcTimerDriver 并 leak 到堆上获取 'static
+            //    根据 timer 编号选择对应的 typed peripheral
+            //    SAFETY: timer 配置来自 config，确保未被其它驱动占用
+            macro_rules! make_timer {
+                ($timer:expr, $cfg:expr) => {{
+                    Box::leak(Box::new(
+                        LedcTimerDriver::new($timer, $cfg)
+                            .map_err(|e| AppError::Hal(format!("ledc timer: {e:?}")))?,
+                    ))
+                }};
             }
-            .map_err(|e| AppError::Hal(format!("ledc chan {i}: {e:?}")))?;
-            chs.push(Spin::new(driver));
+            let timer_driver: &'static mut LedcTimerDriver<'static, LowSpeed> =
+                match timer_cfg.timer {
+                    0 => make_timer!(unsafe { TIMER0::steal() }, &config),
+                    1 => make_timer!(unsafe { TIMER1::steal() }, &config),
+                    2 => make_timer!(unsafe { TIMER2::steal() }, &config),
+                    3 => make_timer!(unsafe { TIMER3::steal() }, &config),
+                    _ => {
+                        return Err(AppError::Hal(format!(
+                            "invalid ledc timer: {}",
+                            timer_cfg.timer
+                        )));
+                    }
+                };
+
+            // 2. 创建 4 个 LedcDriver
+            //    每个 LedcDriver 借用 timer_driver (通过 &* reborrow, 不移动所有权)
+            //    SAFETY: GPIO 编号来自 config，确保未被其它驱动占用
+            let mut chs: Vec<Spin<LedcDriver<'static>>> = Vec::with_capacity(AO_CHANNEL_COUNT);
+            for (i, (ch_num, gpio)) in channels.iter().enumerate() {
+                let pin = unsafe { AnyOutputPin::steal(*gpio) };
+                let driver = match *ch_num {
+                    0 => LedcDriver::new(unsafe { CHANNEL0::steal() }, &*timer_driver, pin),
+                    1 => LedcDriver::new(unsafe { CHANNEL1::steal() }, &*timer_driver, pin),
+                    2 => LedcDriver::new(unsafe { CHANNEL2::steal() }, &*timer_driver, pin),
+                    3 => LedcDriver::new(unsafe { CHANNEL3::steal() }, &*timer_driver, pin),
+                    _ => return Err(AppError::Hal(format!("invalid ledc channel: {ch_num}"))),
+                }
+                .map_err(|e| AppError::Hal(format!("ledc chan {i}: {e:?}")))?;
+                chs.push(Spin::new(driver));
+            }
+
+            // Vec -> array (长度已知为 4)
+            let channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT] =
+                [chs.remove(0), chs.remove(0), chs.remove(0), chs.remove(0)];
+
+            Ok(Self { channels })
         }
+    }
 
-        // Vec -> array (长度已知为 4)
-        let channels: [Spin<LedcDriver<'static>>; AO_CHANNEL_COUNT] =
-            [chs.remove(0), chs.remove(0), chs.remove(0), chs.remove(0)];
-
-        Ok(Self { channels })
+    pub const fn is_available(&self) -> bool {
+        !cfg!(feature = "f4")
     }
 
     /// 设置 AO 通道 idx (0..4) 的占空比。
@@ -139,11 +160,21 @@ impl LedcHandle {
     /// `duty` 范围 0..=2^resolution_bits-1 (12-bit 即 0..=4095)。
     /// 越界或硬件错误向上传播，调用方只有在成功后才能更新已应用缓存。
     pub fn set_duty(&self, idx: usize, duty: u32) -> AppResult<()> {
-        if idx >= AO_CHANNEL_COUNT {
-            return Err(AppError::Hal(format!("ledc channel {idx} out of range")));
+        #[cfg(feature = "f4")]
+        {
+            let _ = (idx, duty);
+            Err(AppError::Hal(
+                "AO unavailable on F4: GPIO15..18 are AI inputs".into(),
+            ))
         }
-        let mut ch = self.channels[idx].lock();
-        ch.set_duty(duty)
-            .map_err(|e| AppError::Hal(format!("ledc set_duty ch{idx}: {e:?}")))
+        #[cfg(not(feature = "f4"))]
+        {
+            if idx >= AO_CHANNEL_COUNT {
+                return Err(AppError::Hal(format!("ledc channel {idx} out of range")));
+            }
+            let mut ch = self.channels[idx].lock();
+            ch.set_duty(duty)
+                .map_err(|e| AppError::Hal(format!("ledc set_duty ch{idx}: {e:?}")))
+        }
     }
 }

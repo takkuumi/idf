@@ -8,7 +8,7 @@
 //!   - 3 个 UART (UART0/1/2), 4 个 SPI (SPI0/1 Flash/PSRAM, SPI2/3 外设)
 //!   - 2 个 ADC (ADC1: 10 通道, ADC2: 10 通道, 12-bit)
 //!   - 8 通道 LEDC PWM
-//!   - 45 个 GPIO (GPIO0~GPIO48), GPIO26~31 被 Quad SPI Flash/PSRAM 占用
+//!   - 45 个 GPIO (GPIO0~GPIO48), GPIO26~32 被 Quad SPI Flash/PSRAM 占用
 //!
 //! 实际硬件改版只需修改本文件。
 
@@ -32,7 +32,7 @@ pub const BLE_PROCESS_PERIOD_MS: u64 = 10;
 // ----------------------------------------------------------------------------
 // GPIO 引脚分配 (ESP32-S3R2)
 // ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)
-// GPIO26~31: 被 Quad SPI Flash/PSRAM 占用 (2MB PSRAM), 不可用
+// GPIO26~32: 被 Quad SPI Flash/PSRAM 占用 (2MB Quad PSRAM), 不可用
 // GPIO0:    strapping (boot mode, 需外部上拉)
 // GPIO3:    strapping (JTAG source)
 // GPIO45/46: strapping (VDD_SPI / system freq)
@@ -59,14 +59,16 @@ pub mod pins {
     pub const RS485_0_UART: u8 = 1; // UART1
     pub const RS485_0_TX: u8 = 45;
     pub const RS485_0_RX: u8 = 46;
-    pub const RS485_0_DE: u8 = 7; // DE/RE 共控 (高=发送, 低=接收)
+    // 项目板级映射：UART1 的 RS485-1 DE/RE 共控脚为 GPIO7。
+    pub const RS485_0_DE: u8 = 7;
 
     // ---- RS485 #1 (Modbus RTU, UART2) ----
     // 引脚来自参考固件: rs485_2.begin(baud, cfg, 41, 42) → RX=41, TX=42
     pub const RS485_1_UART: u8 = 2; // UART2
     pub const RS485_1_TX: u8 = 42;
     pub const RS485_1_RX: u8 = 41;
-    pub const RS485_1_DE: u8 = 8;
+    // 参考固件仅配置 UART2 TX/RX，没有 RTS/DE 输出；GPIO8 是 F3 AI3。
+    pub const RS485_1_DE: u8 = 255;
 
     // ---- RS485 #2 (第 3 端口, UART0, 对齐参考固件 RS485-3) ----
     // 参考固件: rs485_3 使用 Serial (UART0), 默认 9600 8N1.
@@ -112,13 +114,32 @@ pub mod pins {
     // 当前变体均由 I2C 扩展驱动；这些 GPIO 仅保留给旧配置接口。
     pub const DO_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
 
-    // ---- AI 模拟输入 (ADC1, 6 通道, 12-bit SAR ADC) ----
-    // ADC1_CH0-5 = GPIO1-6, 不与 UART1/UART2 冲突
+    // ---- AI 模拟输入 (ESP32-S3 ADC, 12-bit SAR ADC) ----
+    // F3: GPIO1/2/3/8 = ADC1_CH0/1/2/7。
+    // F4: 在 F3 前四路基础上增加 GPIO15/16/17/18 = ADC2_CH4/5/6/7。
+    // Default/F16 与 F3: GPIO1/2/3/8 = ADC1_CH0/1/2/7。
     pub const AI_ADC_UNIT: u8 = 1; // ADC1
-    pub const AI_CHANNELS: [u8; 6] = [0, 1, 2, 3, 4, 5];
+    #[cfg(feature = "f4")]
+    pub const AI_CHANNEL_COUNT: usize = 8;
+    #[cfg(feature = "f3")]
+    pub const AI_CHANNEL_COUNT: usize = 4;
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    pub const AI_CHANNEL_COUNT: usize = 4;
+    #[cfg(any(feature = "f3", feature = "f4"))]
+    pub const AI_ADC1_CHANNEL_COUNT: usize = 4;
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    pub const AI_ADC1_CHANNEL_COUNT: usize = 4;
+    #[cfg(any(feature = "f3", feature = "f4"))]
+    pub const AI_CHANNELS: [u8; 6] = [0, 1, 2, 7, 0, 0];
+    #[cfg(not(any(feature = "f3", feature = "f4")))]
+    pub const AI_CHANNELS: [u8; 6] = [0, 1, 2, 7, 0, 0];
+    #[cfg(feature = "f4")]
+    pub const AI_ADC2_CHANNELS: [u8; 4] = [4, 5, 6, 7];
+    #[cfg(not(feature = "f4"))]
+    pub const AI_ADC2_CHANNELS: [u8; 4] = [0, 0, 0, 0];
 
-    // ---- AO 模拟输出 (LEDC PWM, 4 通道) ----
-    // 使用空闲 GPIO: 15, 16, 17, 18 (不与 W5500/RS485/NCA9555 冲突)
+    // ---- AO 模拟输出 (LEDC PWM, 4 通道; Default/F3 only) ----
+    // F4 将 GPIO15..18 用作 ADC2 AI4..AI7，hal::ledc 在 F4 编译分支禁用。
     pub const AO_CHANNELS: [(u8, u8); 4] = [
         (0, 15), // (ledc_channel, gpio)
         (1, 16),
@@ -197,7 +218,7 @@ pub mod hw_version {
     pub const DO_EXT_CHIPS: usize = 0;
 
     /// AI 通道数 (Modbus 报告值, 与 MCA F16/F48 一致).
-    /// 物理仍由 hal::adc 提供 6 路 (ADC1_CH0..5); 越界寄存器返回 0 对齐 MCA 无硬件时的 0 行为.
+    /// 物理采样由 hal::adc 按变体提供；F4 前四路走 ADC1 DMA，后四路走 ADC2 OneShot。
     /// - F16 (默认): 4 路 (MCA `REG_AMAX = REG_A04`)
     /// - F4 (MCA F48): 8 路 (MCA `MCA_F48_HARDWARE_RESOURCE` 时 `REG_AMAX = REG_A08`)
     /// - F3: 4 路 (无 8 路 AI 子型号)

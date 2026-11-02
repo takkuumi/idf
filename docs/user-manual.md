@@ -1,6 +1,6 @@
 # ESP32-S3R2 工业网关 用户手册
 
-> 固件版本：v2.2.6 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-09-24）
+> 固件版本：v2.5.0 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-11-02）
 >
 > 适用硬件版本：Default / F3 / F4（详见第 2 章）
 
@@ -33,14 +33,14 @@
 | 内部 SRAM | 512 KB |
 | 片外 PSRAM | 2 MB Quad SPI（80MHz） |
 | 片上 Flash | 8 MB Quad SPI |
-| 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI2 @ 40MHz） |
+| 以太网 | WIZnet W5500（硬件 TCP/IP 协议栈，10/100M，SPI3_HOST @ 40MHz） |
 | RS485 | 2 路（UART1 主站 + UART2 从站，独立隔离） |
 | 蓝牙 | BLE 5.0 GATT（Bluedroid 协议栈） |
 | Wi-Fi | 802.11 b/g/n（可选，作为以太网冗余链路，需 `--features wifi` 编译） |
 | 数字输入 DI | 8 / 16 / 48 路（按硬件版本，光耦隔离） |
 | 数字输出 DO | 8 / 16 路（按硬件版本，开漏输出 100mA） |
-| 模拟输入 AI | 6 路（12-bit SAR ADC，0~3.1V，4-20mA 转换） |
-| 模拟输出 AO | 4 路（LEDC PWM，5kHz / 12-bit，与 DO0-DO3 共用引脚） |
+| 模拟输入 AI | Default/F3 4 路；F4 8 路（12-bit SAR ADC，0~3.1V，4-20mA 转换） |
+| 模拟输出 AO | Default/F3 4 路 LEDC PWM（5kHz / 12-bit）；F4 无 AO，GPIO15–18 用作 AI4–AI7 |
 | 看门狗 | 硬件任务看门狗（10s）+ 软件心跳（双级保护） |
 | 加密 | AES/SHA/MPI/GCM/ECC 硬件加速器 |
 | 供电 | 5V DC（典型值，工业供电） |
@@ -62,7 +62,7 @@
 ### 1.3 软件技术栈
 
 - **语言**：Rust（nightly，Xtensa target）
-- **HAL**：`esp-idf-hal` v0.45 + `esp-idf-svc`
+- **HAL**：`esp-idf-hal` v0.47 + `esp-idf-svc` v0.53
 - **系统**：ESP-IDF v5.5.4 + FreeRTOS SMP
 - **并发模型**：`std::thread` + `parking_lot::Mutex` + `once_cell::Lazy`
 - **任务绑定**：双核 SMP 亲和性（Core 0 网络/协议，Core 1 实时 IO）
@@ -80,15 +80,15 @@
 | **编译命令** | `cargo build` | `cargo build --features f3` | `cargo build --features f4` |
 | **DI 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
 | **DO 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
-| **AI 通道数** | 6 | 6 | 6 |
-| **AO 通道数** | 4 | 4 | 4 |
+| **AI 通道数** | 4 | 4 | 8 |
+| **AO 通道数** | 4 | 4 | 0 |
 | **MCP23017 数量** | 2 片 | 0 | 0 |
 | **PCA9555 数量** | 0 | 单组 | 多组 |
 | **I2C 总线** | 启用（GPIO21/33） | 软件 I2C（GPIO35/36、38/37） | 软件 I2C（GPIO35/36、38/37） |
 | **DI 寄存器范围** | 0x0000-0x0007 | 0x0000-0x000F | 0x0000-0x002F |
 | **DO 寄存器范围** | 0x0000-0x000F | 0x0000-0x000F | 0x0000-0x002F |
 
-> **注意**：AO 通道与 DO0~DO3 共用 GPIO（GPIO8/9/16/38），硬件互斥，由硬件跳线或硬件版本决定使用模式。
+> **注意**：F4 不提供 AO，GPIO15～18 固定用于 AI4～AI7。Default/F3 的 AO 使用 GPIO15～18。
 
 ### 2.2 Default/F3/F4 IO 扩展地址分配
 
@@ -111,48 +111,53 @@ Default MCP23017 总线参数：I2C0，SDA=GPIO21，SCL=GPIO33，400kHz。F3/F4 
 
 | 模块 | 引脚 | 功能 | 备注 |
 |------|------|------|------|
-| **SPI2 (W5500)** | GPIO11 | MOSI | W5500 SPI 主出从入 |
-| | GPIO13 | MISO | W5500 SPI 主入从出 |
-| | GPIO12 | SCLK | W5500 SPI 时钟 |
-| | GPIO10 | CS | W5500 SPI 片选 |
-| | GPIO14 | INT | W5500 中断（低有效） |
-| | GPIO15 | RST | W5500 复位（低有效，50ms 脉冲） |
+| **SPI3_HOST (W5500)** | GPIO12 | MOSI | W5500 SPI 主出从入 |
+| | GPIO11 | MISO | W5500 SPI 主入从出 |
+| | GPIO10 | SCLK | W5500 SPI 时钟 |
+| | GPIO9 | CS | W5500 SPI 片选 |
+| | GPIO13 | INT | W5500 中断（低有效） |
+| | GPIO14 | RST | W5500 复位（低有效，50ms 脉冲） |
 | **UART0 (下载/日志)** | GPIO43 | TX | 115200-N-8-1 |
 | | GPIO44 | RX | 与下载串口共用 |
-| **UART1 (RS485 #0)** | GPIO40 | TX | RTU Master，9600bps |
+| **UART1 (RS485 #0)** | GPIO45 | TX | RTU Master，9600bps |
+| | GPIO46 | RX | |
+| **UART2 (RS485 #1)** | GPIO42 | TX | RTU Slave，9600bps，地址 1 |
 | | GPIO41 | RX | |
-| | GPIO42 | DE/RE | RTS 共控（高=发送，低=接收） |
-| **UART2 (RS485 #1)** | GPIO17 | TX | RTU Slave，9600bps，地址 1 |
-| | GPIO18 | RX | |
-| | GPIO7 | DE/RE | RTS 共控 |
+| | GPIO8 | AI3 | F3/F4 AI 输入，不作为 RS485 DE/RE |
 | **DI (默认版本 8 路)** | GPIO19/20/21/33/34/35/36/37 | DI0~DI7 | 光耦隔离，Pull Down |
 | **DO (默认版本 8 路)** | GPIO8/9/16/38/39/45/46/48 | DO0~DO7 | OC 输出 |
-| **AI (6 路, ADC1)** | GPIO1/2/3/4/5/6 | AI0~AI5 | 12-bit SAR ADC，对应 ADC1_CH0~CH5 |
-| **AO (4 路, LEDC)** | GPIO8/9/16/38 | AO0~AO3 | 与 DO0~DO3 共用引脚（硬件互斥） |
+| **AI (Default/F3)** | GPIO1/2/3/8 | AI0~AI3 | 12-bit SAR ADC，对应 ADC1_CH0/1/2/7 |
+| **AI (F3)** | GPIO1/2/3/8 | AI0~AI3 | ADC1_CH0/1/2/7 |
+| **AI (F4)** | GPIO1/2/3/8/15/16/17/18 | AI0~AI7 | ADC1 前四路 + ADC2_CH4~7 |
+| **AO (Default/F3)** | GPIO15/16/17/18 | AO0~AO3 | F4 不启用，避免与 AI4~AI7 冲突 |
 | **I2C (仅 Default)** | GPIO21 | SDA | MCP23017 数据线 |
 | | GPIO33 | SCL | MCP23017 时钟线 |
 
-### 3.2 ADC1 通道映射
+### 3.2 ADC 通道映射
+
+Default/F3 使用 ADC1 的 GPIO1/2/3/8 四路；F4 额外使用 ADC2 的 GPIO15/16/17/18 四路。
 
 | ADC 通道 | 对应 GPIO | 用途 |
 |----------|-----------|------|
 | ADC1_CH0 | GPIO1 | AI0 |
 | ADC1_CH1 | GPIO2 | AI1 |
 | ADC1_CH2 | GPIO3 | AI2（同时是 strapping，ADC 高阻输入不影响） |
-| ADC1_CH3 | GPIO4 | AI3 |
-| ADC1_CH4 | GPIO5 | AI4 |
-| ADC1_CH5 | GPIO6 | AI5 |
+| ADC1_CH7 | GPIO8 | Default/F3/F4 AI3 |
+| ADC2_CH4 | GPIO15 | F4 AI4 |
+| ADC2_CH5 | GPIO16 | F4 AI5 |
+| ADC2_CH6 | GPIO17 | F4 AI6 |
+| ADC2_CH7 | GPIO18 | F4 AI7 |
 
 ### 3.3 W5500 以太网接线
 
 ```
 ESP32-S3R2                W5500 Module
-GPIO11 (MOSI) ──────────── MOSI
-GPIO13 (MISO) ──────────── MISO
-GPIO12 (SCLK) ──────────── SCLK
-GPIO10 (CS)   ──────────── SCSn
-GPIO14 (INT)  ──────────── INTn   (低有效中断)
-GPIO15 (RST)  ──────────── RSTn   (低有效复位)
+GPIO12 (MOSI) ──────────── MOSI
+GPIO11 (MISO) ──────────── MISO
+GPIO10 (SCLK) ──────────── SCLK
+GPIO9  (CS)   ──────────── SCSn
+GPIO13 (INT)  ──────────── INTn   (低有效中断)
+GPIO14 (RST)  ──────────── RSTn   (低有效复位)
 3V3           ──────────── VCC
 GND           ──────────── GND
                           RJ45 → 网线
@@ -168,9 +173,8 @@ GND           ──────────── GND
 
 ```
 ESP32-S3R2                RS485 收发器 (如 SP3485/MAX485)
-GPIO40 (TX)   ──────────── DI   (Driver Input)
-GPIO41 (RX)   ──────────── RO   (Receiver Output)
-GPIO42 (DE/RE) ─────────── DE + /RE  (共控，高=发送)
+GPIO45 (TX)   ──────────── DI   (Driver Input)
+GPIO46 (RX)   ──────────── RO   (Receiver Output)
                           A  ────  RS485 A
                           B  ────  RS485 B
                           GND ────  RS485 GND（建议共地）
@@ -180,37 +184,30 @@ GPIO42 (DE/RE) ─────────── DE + /RE  (共控，高=发送)
 
 ```
 ESP32-S3R2                RS485 收发器
-GPIO17 (TX)   ──────────── DI
-GPIO18 (RX)   ──────────── RO
-GPIO7  (DE/RE) ─────────── DE + /RE
+GPIO42 (TX)   ──────────── DI
+GPIO41 (RX)   ──────────── RO
                           A  ────  RS485 A
                           B  ────  RS485 B
                           GND ────  RS485 GND
 ```
 
-> **注意**：ESP-IDF UART RS485 模式自动控制 DE/RE 时序，无需外部方向切换电路。
+> **注意**：UART1 使用 GPIO7 作为 DE/RE；GPIO8 保留给 F3/F4 AI3，UART2 不使用 GPIO8 作为 DE/RE。旧固件没有 AO/PWM 输出实现。
 
 ### 3.5 I2C 扩展接线（Default MCP23017 / F3-F4 PCA9555）
 
 ```
-ESP32-S3R2                MCP23017 (U1, 0x20)
-GPIO21 (SDA) ─┬────────── SDA
-GPIO33 (SCL) ─┼────────── SCL
-              │            A0=0, A1=0, A2=0
-              │            VCC=3V3, GND=GND
-              │
-              ├────────── MCP23017 (U2, 0x21, F3/F4)
-              │            A0=1, A1=0, A2=0
-              │
-              ├────────── MCP23017 (U3, 0x22, F4 only)
-              │            A0=0, A1=1, A2=0
-              │
-              └────────── MCP23017 (U4, 0x23, F4 only)
-                           A0=1, A1=1, A2=0
+Default: MCP23017 IO bus
+GPIO21 (SDA) ───────────── MCP23017 DI @ 0x20, DO @ 0x21
+GPIO33 (SCL) ───────────── (hardware I2C0)
+
+F3/F4: PCA9555 bit-banged buses
+GPIO35 (SDA), GPIO36 (SCL)  IO bus:  DI @ 0x40/0x44/0x42
+GPIO38 (SDA), GPIO37 (SCL)  LED bus: DI mirror, status, DO mirror
+                             DO @ 0x48/0x4C/0x4E; status @ 0x46 (F4)
 ```
 
 - I2C 频率 400kHz（Fast Mode）
-- MCP23017 内部上拉使能，外部可不接上拉电阻
+- Default 使用硬件 I2C；F3/F4 软件 I2C 采用板载上拉
 - 建议在 SDA/SCL 上各串接 100Ω 阻尼电阻
 
 ### 3.6 供电与接地
@@ -224,27 +221,26 @@ GPIO33 (SCL) ─┼────────── SCL
 
 ```
 GPIO0  (strapping)   GPIO26~32 (Flash/PSRAM, 不可用)
-GPIO1  AI0 (ADC1_0)  GPIO33 DI3 / F3-F4 I2C SCL
-GPIO2  AI1 (ADC1_1)  GPIO34 DI4
-GPIO3  AI2 (ADC1_2)  GPIO35 DI5   (strapping)
-GPIO4  AI3 (ADC1_3)  GPIO36 DI6
-GPIO5  AI4 (ADC1_4)  GPIO37 DI7
-GPIO6  AI5 (ADC1_5)  GPIO38 DO3/AO3
-GPIO7  RS485_1 DE    GPIO39 DO4
-GPIO8  DO0/AO0       GPIO40 RS485_0 TX (UART1)
-GPIO9  DO1/AO1       GPIO41 RS485_0 RX
-GPIO10 W5500 CS      GPIO42 RS485_0 DE
-GPIO11 W5500 MOSI    GPIO43 UART0 TX (下载/日志)
-GPIO12 W5500 SCLK    GPIO44 UART0 RX
-GPIO13 W5500 MISO    GPIO45 DO5 (strapping)
-GPIO14 W5500 INT     GPIO46 DO6 (strapping)
-GPIO15 W5500 RST     GPIO47 (未分配)
-GPIO16 DO2/AO2       GPIO48 DO7
-GPIO17 RS485_1 TX    (UART2)
-GPIO18 RS485_1 RX
-GPIO19 DI0           (USB Serial/JTAG, 可作 GPIO)
-GPIO20 DI1           (USB Serial/JTAG, 可作 GPIO)
-GPIO21 DI2 / F3-F4 I2C SDA
+GPIO1  AI0 (ADC1_0)  GPIO33 RELAY_EN / Default I2C SCL
+GPIO2  AI1 (ADC1_1)  GPIO34 ESP_STOP / PCA9555 INT
+GPIO3  AI2 (ADC1_2)  GPIO35 F3/F4 I2C SDA
+GPIO4  未复用          GPIO36 F3/F4 I2C SCL
+GPIO5  未复用          GPIO37 LED I2C SCL
+GPIO6  未复用          GPIO38 LED I2C SDA
+GPIO7  RS485_0 DE     GPIO39 FIB1 输入
+GPIO8  F3/F4 AI3     GPIO40 FIB2 输入
+GPIO9  W5500 CS      GPIO41 RS485_1 RX (UART2)
+GPIO10 W5500 SCLK    GPIO42 RS485_1 TX (UART2)
+GPIO11 W5500 MISO    GPIO43 UART0 TX (下载/日志)
+GPIO12 W5500 MOSI    GPIO44 UART0 RX
+GPIO13 W5500 INT     GPIO45 RS485_0 TX (strapping)
+GPIO14 W5500 RST     GPIO46 RS485_0 RX (strapping)
+GPIO15 AO0/F4 AI4    GPIO47 AD3
+GPIO16 AO1/F4 AI5    GPIO48 AD2
+GPIO17 AO2/F4 AI6    GPIO22 未分配
+GPIO18 AO3/F4 AI7    GPIO23 未分配
+GPIO19 AD0 (USB Serial/JTAG)  GPIO25 未分配
+GPIO20 AD1 (USB Serial/JTAG)  GPIO21 LED_EN / Default I2C SDA
 ```
 
 ---
@@ -255,7 +251,7 @@ GPIO21 DI2 / F3-F4 I2C SDA
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| 串口 | UART1 (GPIO40/41/42) | DE/RE 自动控制 |
+| 串口 | UART1 (TX/RX=GPIO45/46) | 参考固件未使用独立 DE/RE |
 | 波特率 | 9600 | 可配置为 115200 等 |
 | 数据位 | 8 | |
 | 停止位 | 1 | |
@@ -269,7 +265,7 @@ GPIO21 DI2 / F3-F4 I2C SDA
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| 串口 | UART2 (GPIO17/18/7) | DE/RE 自动控制 |
+| 串口 | UART2 (TX/RX=GPIO42/41) | GPIO8 保留给 F3/F4 AI3 |
 | 波特率 | 9600 | 可配置 |
 | 数据位 | 8 | |
 | 停止位 | 1 | |
@@ -373,7 +369,7 @@ UDP socket）：
 | 线圈 Coil | 0x01 / 0x05 / 0x0F | 0x0000-0x000F | DO 输出（8/16 路） |
 | 离散输入 Disc | 0x02 | 0x0000-0x002F | DI 输入（8/16/48 路） |
 | 输入寄存器 | 0x04 | 0x0000-0x0005 / 0x0010-0x0015 | AI 原始 / AI 工程量 |
-| 保持寄存器 | 0x03 / 0x06 / 0x10 | 0x0000-0x0003 / 0x0100-0x0106 / 0x0107-0x010F / 0x0200-0x025F / 0x4000-0x45E1 | AO 输出 / 系统 / OTA / 配置 / 协议存储 |
+| 保持寄存器 | 0x03 / 0x06 / 0x10 | 0x0000-0x012B / 0x0880-0x107F / 0x1388-0x1B77 / 0x4000-0x45E1 | 控制字 / 系统配置 / 设备文本 / 协议存储 |
 
 ### 5.2 线圈表（Coil, FC=0x01/0x05/0x0F）
 
@@ -407,14 +403,9 @@ Web 监控页显示的是旧 MCA 兼容的 `0..4095` 校准量，不是直接的
 
 ### 5.5 保持寄存器表（FC=0x03/0x06/0x10）
 
-#### 5.5.1 AO 输出区（0x0000-0x0003）
+#### 5.5.1 Legacy 控制字区（0x0000-0x012B）
 
-| 地址 | 名称 | 读写 | 说明 |
-|------|------|------|------|
-| 0x0000 | AO0 | RW | 工程量（单位 mA×1000，4000-20000） |
-| 0x0001 | AO1 | RW | 同上 |
-| 0x0002 | AO2 | RW | 同上 |
-| 0x0003 | AO3 | RW | 同上 |
+该区对应旧固件的 `PCtrlBuf`，由组态逻辑使用；旧文档中将 0x0000～0x0003 标为 AO 的说明已废弃。当前 F4 没有物理 AO 输出。
 
 #### 5.5.2 系统寄存器区（0x0100-0x0106）
 

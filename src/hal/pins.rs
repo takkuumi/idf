@@ -5,7 +5,7 @@
 //!
 //! # ESP32-S3 说明
 //!
-//! ESP32-S3 有 45 个 GPIO (GPIO0~GPIO48), GPIO26~31 被 Quad SPI Flash/PSRAM 占用。
+//! ESP32-S3 有 45 个 GPIO (GPIO0~GPIO48), GPIO26~32 被 Quad SPI Flash/PSRAM 占用。
 //! 本模块不依赖 `Pins` 的具体字段，而是直接使用 GPIO 编号 (u8)。
 //! 各子模块通过 `esp_idf_hal::gpio::AnyInputPin::new(num)` /
 //! `AnyOutputPin::new(num)` 等 unsafe 构造器创建类型擦除引脚。
@@ -20,6 +20,7 @@ use crate::error::AppResult;
 pub struct Adc1Cfg {
     pub unit: u8,
     pub channels: [u8; 6],
+    pub channel_count: usize,
 }
 
 /// LEDC 定时器配置
@@ -35,7 +36,7 @@ pub struct LedcTimerCfg {
 /// 字段均为 GPIO 编号或简单配置结构，由各 HAL 子模块的 `init` 函数
 /// 接收后创建实际的 `PinDriver` / `SpiDriver` 等驱动对象。
 pub struct HalPins {
-    // ---- SPI2 (W5500) ----
+    // ---- SPI3_HOST (W5500) ----
     pub spi_mosi: u8,
     pub spi_miso: u8,
     pub spi_sclk: u8,
@@ -101,6 +102,7 @@ impl HalPins {
             adc1: Adc1Cfg {
                 unit: cfg::AI_ADC_UNIT,
                 channels: cfg::AI_CHANNELS,
+                channel_count: cfg::AI_ADC1_CHANNEL_COUNT,
             },
 
             ledc_timer: LedcTimerCfg {

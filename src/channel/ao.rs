@@ -32,6 +32,10 @@ struct AoState {
 static AO_STATE: MainLoopCell<AoState> = MainLoopCell::new();
 
 pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
+    if !_hal.ledc.is_available() {
+        log::info!("[ao] task not registered: F4 reserves AO GPIO15..18 for ADC2 AI");
+        return Ok(());
+    }
     AO_STATE
         .init(AoState {
             last_duty: [u32::MAX; CHANNEL_COUNT],
@@ -47,6 +51,9 @@ pub fn start_output_task(_hal: Arc<Hal>) -> AppResult<()> {
 
 /// main_loop 每 100ms 调用一次
 pub fn tick_ao_output(hal: &crate::hal::Hal) {
+    if !hal.ledc.is_available() {
+        return;
+    }
     let _ = AO_STATE.with_mut(|state| {
         let mut duties = [0u32; CHANNEL_COUNT];
         for (ch, duty) in duties.iter_mut().enumerate() {

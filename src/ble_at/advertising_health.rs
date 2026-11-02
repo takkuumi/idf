@@ -90,6 +90,19 @@ impl AdvertisingHealth {
         self.retry_backoff = false;
     }
 
+    /// A stop callback without a matching stop request means the controller
+    /// stopped advertising on its own. Drop the stale lease immediately so
+    /// the caller can restart while the device is still disconnected.
+    pub(super) fn unexpected_stop(&mut self, now_ms: u32) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.active = false;
+        self.last_attempt_ms = now_ms;
+        self.retry_backoff = false;
+        true
+    }
+
     pub(super) fn recovery(
         &mut self,
         now_ms: u32,
@@ -237,5 +250,15 @@ mod tests {
         assert!(health.busy());
         assert!(health.complete(Operation::Start, true, 202));
         assert!(health.active());
+    }
+
+    #[test]
+    fn test_unexpected_stop_invalidates_active_lease() {
+        let mut health = running(100);
+        assert!(health.active());
+        assert!(health.unexpected_stop(200));
+        assert!(!health.active());
+        assert_eq!(health.recovery(5_199, true, false, false), Recovery::None);
+        assert_eq!(health.recovery(5_200, true, false, false), Recovery::Retry);
     }
 }

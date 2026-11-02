@@ -534,9 +534,9 @@ async function pollIO() {
         const min = Number((d.ai_data_min || {})[`ai_addr_min_${n}`] || 0);
         const max = Number((d.ai_data_max || {})[`ai_addr_max_${n}`] || 0);
         const calibrated = min > 0 && max > min;
-        const pct = calibrated ? Math.min(100, (v / 4095) * 100) : 0;
-        const value = calibrated ? v : '—';
-        const state = calibrated ? '校准量/4095' : '未校准/无输入';
+        const pct = Math.min(100, (v / 4095) * 100);
+        const value = v;
+        const state = calibrated ? '校准量/4095' : '默认标定/待校准';
         aiHtml += `<div class="ai-item"><span style="min-width:32px;font-size:12px;color:var(--dim)">AI${n}</span>
           <div class="ai-bar"><i style="width:${pct}%"></i></div>
           <span class="ai-val${calibrated ? '' : ' invalid'}">${value}</span>

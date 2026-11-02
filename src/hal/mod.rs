@@ -6,7 +6,7 @@
 //!
 //! # SPI 总线
 //!
-//! SPI2_HOST 由 [`crate::ethernet::w5500`] 模块独占管理 (W5500 是 SPI 总线上
+//! SPI3_HOST 由 [`crate::ethernet::w5500`] 模块独占管理 (W5500 是 SPI 总线上
 //! 唯一外设)，故 HAL 不再持有 SpiBus。引脚号仍集中在 [`crate::config::pins`]
 //! 中 (`ETH_SPI_MOSI/MISO/SCLK/CS`)，由 ethernet 模块读取使用。
 //!

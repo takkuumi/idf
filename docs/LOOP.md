@@ -952,7 +952,7 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 | 2 | DEVICE_FUNCTION 0xB0/B1 (FUNC_COUNT) | ✅ | B0 读取兼容；B1 是 BLE FC16 transaction ID，写完整数量/偏移表 |
 | 2b | DEVICE_FUNCTION 0xB2/B3 (logic config) | ✅ | B3 是 BLE FC16 transaction ID，2300+ 逻辑表落入 holding A/B |
 | 3 | NFC blob 仅 880 words | ✅ **LOOP29 已按实机纠正** | ST25DV16KC: `MEMORY_END=0x07FF`, 0x0120..0x07FF 共 1760 字节/880 words，与原 C++ 对齐 |
-| 4 | AI 通道数硬编码 6 (F4 8 通道) | ✅ **LOOP12 已实施** | cfg 切换: f4=8 通道, 其它=6 通道 |
+| 4 | AI 通道数硬编码 | ✅ **LOOP12 已实施** | cfg 切换: F3/Default=4 通道, F4=8 通道 |
 | 5 | MONITOR_PLC/CONTROL_PLC 区未实现 | ✅ **LOOP12 已实施** | DI/DO/AI/holding_buf 别名映射 |
 | 6 | eth heartbeat 拔线延迟 | ✅ **LOOP12 已实施** | 订阅 `ETHERNET_EVENT_DISCONNECTED`, 秒级检测 |
 | 7 | Web CSRF/HTTPS | ✓ 保留 | LOOP11 内网决策, 不变更 |

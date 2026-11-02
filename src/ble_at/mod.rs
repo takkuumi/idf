@@ -568,10 +568,25 @@ unsafe extern "C" fn gap_event_cb(
             }
             let status = unsafe { (*param).adv_stop_cmpl.status };
             let success = status == esp_idf_sys::esp_bt_status_t_ESP_BT_STATUS_SUCCESS;
-            if !ADV_HEALTH
-                .lock()
-                .complete(AdvOperation::Stop, success, advertising_now_ms())
-            {
+            let now = advertising_now_ms();
+            let unexpected = {
+                let mut health = ADV_HEALTH.lock();
+                if health.complete(AdvOperation::Stop, success, now) {
+                    false
+                } else if CONN_ID.load(Ordering::Acquire) == 0xFFFF {
+                    health.unexpected_stop(now)
+                } else {
+                    false
+                }
+            };
+            if unexpected {
+                log::warn!("[ble_at] controller stopped advertising unexpectedly; restarting");
+                if success {
+                    start_advertising();
+                }
+                return;
+            }
+            if CONN_ID.load(Ordering::Acquire) != 0xFFFF {
                 return;
             }
             if ADV_RECONFIGURE_PENDING.swap(false, Ordering::AcqRel) {

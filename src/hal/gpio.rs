@@ -33,7 +33,7 @@ pub struct GpioBank {
     /// W5500 复位输出 (低脉冲)
     pub eth_rst: Spin<PinDriver<'static, Output>>,
     /// RS485 #0 / #1 的 DE 引脚
-    pub rs485_de: [Spin<PinDriver<'static, Output>>; 2],
+    pub rs485_de: [Option<Spin<PinDriver<'static, Output>>>; 2],
     /// 板载运行状态 LED (蓝灯, 用于 heartbeat)
     pub run_led: Spin<Option<PinDriver<'static, Output>>>,
 }
@@ -63,20 +63,27 @@ impl GpioBank {
             let _ = pin.set_high();
         }
 
-        // RS485 #0/#1 DE (输出, 默认低 = 接收模式)
-        let rs485_de = [
-            Spin::new(
+        // GPIO255 表示端口不使用独立 DE/RE 引脚（UART 使用普通 TX/RX 模式）。
+        let de0 = if rs485_de_pins[0] == u8::MAX {
+            None
+        } else {
+            Some(Spin::new(
                 PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[0]) }).map_err(
                     |e| AppError::Hal(format!("rs485_de[0] gpio{}: {e:?}", rs485_de_pins[0])),
                 )?,
-            ),
-            Spin::new(
+            ))
+        };
+        let de1 = if rs485_de_pins[1] == u8::MAX {
+            None
+        } else {
+            Some(Spin::new(
                 PinDriver::output(unsafe { AnyOutputPin::steal(rs485_de_pins[1]) }).map_err(
                     |e| AppError::Hal(format!("rs485_de[1] gpio{}: {e:?}", rs485_de_pins[1])),
                 )?,
-            ),
-        ];
-        for pin in rs485_de.iter() {
+            ))
+        };
+        let rs485_de = [de0, de1];
+        for pin in rs485_de.iter().flatten() {
             let _ = pin.lock().set_level(Level::Low);
         }
 
@@ -107,7 +114,9 @@ impl GpioBank {
             return;
         }
         let level = if tx { Level::High } else { Level::Low };
-        if let Err(e) = self.rs485_de[idx].lock().set_level(level) {
+        if let Some(pin) = &self.rs485_de[idx]
+            && let Err(e) = pin.lock().set_level(level)
+        {
             log::warn!("[gpio] rs485_de[{idx}] set_level: {e:?}");
         }
     }

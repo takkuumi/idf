@@ -40,11 +40,10 @@
 - BLE 协议格式: 一致
 - **OTA 保持自己实现**: 基于 ESP-IDF `esp_ota_*` API, 与 MCA 不同
 
-### 5. ✅ F3 / F4 完全实现 (用户更正: F4 是 48 输入 + 48 输出)
-- F3: 16 DI + 16 DO, I2C MCP23017 × 2 片 (DI @ 0x20, DO @ 0x21)
-- F4: **48 DI + 48 DO**, I2C MCP23017 × 6 片
-  - DI: 0x20 / 0x21 / 0x22 (各 16 路)
-  - DO: 0x23 / 0x24 / 0x25 (各 16 路)
+### 5. ✅ F3 / F4 硬件扩展实现
+- F3: 16 DI + 16 DO，PCA9555：IO 总线 DI=0x40、DO=0x42；LED 总线 DI 镜像=0x40、状态=0x44、DO 镜像=0x48。
+- F4: **48 DI + 48 DO**，PCA9555：IO 总线 DI=0x40/0x44/0x42、DO=0x48/0x4C/0x4E；LED 总线使用对应镜像地址，状态 LED=0x46。
+- F4 AI4–AI7 使用 GPIO15/16/17/18 的 ADC2_CH4/5/6/7；F4 不启用 LEDC AO，避免与模拟输入冲突。
 - 修复 DigitalIo trait 的无限递归 bug
 - 多芯片 DO 写入支持 (write_do 遍历所有芯片)
 
