@@ -29,7 +29,7 @@
 
 ## 验证状态
 
-- `cargo test --bin gateway --no-run`：通过，测试目标编译成功。
+- `cargo test --bin imc --no-run`：通过，测试目标编译成功。
 - `cargo fmt --check`：仓库还有 `src/modbus/rtu_runtime.rs` 和
   `src/modbus/tcp_server.rs` 的既存格式差异；本次涉及的三个 Rust 文件已单独
   rustfmt。

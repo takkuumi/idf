@@ -1,7 +1,7 @@
 # 产品经理差距分析 (2026-07-20)
 
 > 对照 MCA_F16V2_1_F48_BLE 与 metuory-wireless-management-app-1.0.78,
-> 列出本系统(esp32s3-iot-gateway)尚未支持或部分支持的功能.
+> 列出本系统(esp32s3-imc)尚未支持或部分支持的功能.
 
 ## 1. Android 1.0.78 业务交互流程
 

@@ -50,9 +50,9 @@
   已恢复并复读，期间 reset_count 保持 76、Recovery 为 Normal。此数据包含 HTTP/Actor
   调度，不能直接当作物理 Flash 编程时间。
 - `tests/host/run_production_core.py`：25/25 通过。
-- F3 `cargo clippy --locked --bin gateway --features f3 -- -D warnings`：通过。
-- 默认/F4 `cargo clippy --locked --bin gateway [--features f4] -- -D warnings`：通过。
-- `cargo test --locked --bin gateway --no-run`：通过。
+- F3 `cargo clippy --locked --bin imc --features f3 -- -D warnings`：通过。
+- 默认/F4 `cargo clippy --locked --bin imc [--features f4] -- -D warnings`：通过。
+- `cargo test --locked --bin imc --no-run`：通过。
 - `cargo fmt --all -- --check`、`git diff --check`：通过。
 
 优化后的 F3 Release 已完成构建；设备刷入和现场重复基准应单独记录。上述 NVS engine

@@ -39,7 +39,7 @@ fn send_ble_rsp(data: &[u8], conn_id: u16) {
 1. 烧录固件
 2. 用nRF Connect或手持机连接设备
 3. 写入AT命令（如 "AT+VERSION\r\n"）
-4. 应该能立即收到 "OK esp32s3-iot-gateway v0.1.0 (HW: F16)\r\n" 响应
+4. 应该能立即收到 "OK esp32s3-imc v0.1.0 (HW: F16)\r\n" 响应
 5. 如果之前连接无响应是正确路径，现在应该能收到响应了
 
 ## 修改文件

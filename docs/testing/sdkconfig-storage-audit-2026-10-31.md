@@ -73,7 +73,7 @@ python3 tests/host/check_storage_sdkconfig.py --generated \
 python3 tests/host/run_production_core.py
 ```
 
-本轮验证：配置脚本对 defaults 与生成 sdkconfig 均通过（13 项）；F3 `cargo build --locked --bin gateway --features f3` 通过；`cargo fmt --all -- --check` 通过；`tests/host/run_production_core.py` 25/25 通过；`cargo check --locked --bin gateway --features f3` 0 warning。未进行本版本实机写耗时 A/B 测量、强制 NVS 故障注入或物理掉电测试，不能从编译结果推导毫秒级性能提升或全系统量产放行。
+本轮验证：配置脚本对 defaults 与生成 sdkconfig 均通过（13 项）；F3 `cargo build --locked --bin imc --features f3` 通过；`cargo fmt --all -- --check` 通过；`tests/host/run_production_core.py` 25/25 通过；`cargo check --locked --bin imc --features f3` 0 warning。未进行本版本实机写耗时 A/B 测量、强制 NVS 故障注入或物理掉电测试，不能从编译结果推导毫秒级性能提升或全系统量产放行。
 
 ## 实现依据
 

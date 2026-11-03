@@ -1,13 +1,13 @@
 # ESP32-S3 烧录指南 (2026-07-20)
 
-> 完整烧录流程 + 常见问题解决. 适用于 esp32s3-iot-gateway 项目.
+> 完整烧录流程 + 常见问题解决. 适用于 esp32s3-imc 项目.
 
 ## 1. 一键烧录 + 监控（推荐流程）
 
 ```bash
 cd /Users/takumi/Workspace/idf
 cargo build && \
-espflash flash --port /dev/cu.usbserial-1430 target/xtensa-esp32s3-espidf/debug/gateway && \
+espflash flash --port /dev/cu.usbserial-1430 target/xtensa-esp32s3-espidf/debug/imc && \
 espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
 ```
 
@@ -122,7 +122,7 @@ cargo build
 
 # 3. 烧录
 espflash flash --port /dev/cu.usbserial-1430 \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 
 # 4. 监控 + 重启
 espflash monitor --port /dev/cu.usbserial-1430 --monitor-baud 115200
@@ -145,14 +145,14 @@ cargo build
 ```bash
 cargo build --features f3
 espflash flash --port /dev/cu.usbserial-1430 \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 ```
 
 ### 7.3 F4 (48 DI + 48 DO I2C 扩展)
 ```bash
 cargo build --features f4
 espflash flash --port /dev/cu.usbserial-1430 \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 ```
 
 ## 8. 故障排查清单
