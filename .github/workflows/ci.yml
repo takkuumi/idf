@@ -41,6 +41,8 @@ jobs:
         run: python3 tests/host/run_production_core.py
       - name: Run TCP scheduler tests
         run: python3 tests/host/run_tcp_scheduler.py
+      - name: Run Modbus coil snapshot tests
+        run: python3 tests/host/run_coil_batch.py
       - name: Run BLE advertising recovery tests
         run: python3 tests/host/run_ble_advertising.py
       - name: Run IO transaction tests

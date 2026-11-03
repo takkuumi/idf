@@ -129,6 +129,11 @@ pub fn init() {
 pub fn mark_config_changed() {
     CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
+
+#[inline]
+pub(crate) fn config_generation() -> u32 {
+    CONFIG_GENERATION.load(Ordering::Acquire)
+}
 pub fn transient_mask() -> u64 {
     TRANSIENT_MASK.load_bits()
 }
@@ -565,12 +570,32 @@ pub fn on_control_word_written(address: u16, value: u16) {
 }
 
 pub fn feedback_word(address: u16) -> Option<u16> {
+    capture_feedback_snapshot()
+        .as_ref()
+        .and_then(|snapshot| snapshot.read(address))
+}
+
+pub(crate) struct FeedbackSnapshot {
+    table: std::sync::Arc<LogicTable>,
+    di_bits: u64,
+    do_bits: u64,
+}
+
+impl FeedbackSnapshot {
+    pub(crate) fn read(&self, address: u16) -> Option<u16> {
+        feedback_from_table(&self.table, address, self.di_bits, self.do_bits)
+    }
+}
+
+pub(crate) fn capture_feedback_snapshot() -> Option<FeedbackSnapshot> {
     refresh_table();
     let di_bits = IO.di.load_bits();
     let do_bits = IO.do_.load_bits();
-    TABLE
-        .read_with(|table| feedback_from_table(table, address, di_bits, do_bits))
-        .flatten()
+    Some(FeedbackSnapshot {
+        table: TABLE.read()?,
+        di_bits,
+        do_bits,
+    })
 }
 
 fn feedback_from_table(
@@ -613,18 +638,21 @@ fn apply_output(mask: u64, value: u64, transient: bool) {
 
 pub fn tick() {
     refresh_table();
-    let now = now_ms();
+    let tick_now = now_ms();
     let last = LAST_ANALOG_UPDATE_MS.load(Ordering::Relaxed);
-    if analog_update_due(now as u32, last) {
+    if analog_update_due(tick_now as u32, last) {
         let _ = TABLE.read_with(update_analog_results);
-        LAST_ANALOG_UPDATE_MS.store(now as u32, Ordering::Relaxed);
+        LAST_ANALOG_UPDATE_MS.store(tick_now as u32, Ordering::Relaxed);
     }
     // A continuously refilled queue must not monopolize the 5ms main loop.
+    // Give commands dequeued in this pass one common time base, avoiding a
+    // timer read for every queue item while keeping delay semantics millisecond-based.
+    let command_now = now_ms();
     for _ in 0..8 {
         let Some(command) = COMMANDS.dequeue() else {
             break;
         };
-        let due = now_ms().saturating_add(u64::from(command.delay_ms));
+        let due = command_now.saturating_add(u64::from(command.delay_ms));
         let _ = SCHEDULED.with_mut(|scheduled| {
             let replaced = scheduled.iter().filter(|item| item.logic_id == command.logic_id).count();
             let required = if command.pulse_ms > 0 { 2 } else { 1 };
@@ -653,11 +681,13 @@ pub fn tick() {
             }
         });
     }
-    let now = now_ms();
+    // Refresh after queue processing so zero-delay work and deadlines that
+    // became due during this pass retain the existing same-tick behavior.
+    let scheduled_now = now_ms();
     let _ = SCHEDULED.with_mut(|scheduled| {
         let mut index = 0;
         while index < scheduled.len() {
-            if scheduled[index].due_ms <= now {
+            if scheduled[index].due_ms <= scheduled_now {
                 let action = scheduled.swap_remove(index);
                 apply_output(action.mask, action.value, action.transient);
             } else {
@@ -755,6 +785,26 @@ mod tests {
             2
         );
         assert_eq!(feedback_from_table(&table, 18, 0, 1u64 << 5), Some(9));
+    }
+
+    #[test]
+    fn feedback_snapshot_matches_direct_table_lookup_for_repeated_words() {
+        let table = LogicTable {
+            entries: vec![logic(1, 17, 18, 1u64 << 2)],
+            analog_channels: Vec::new(),
+        };
+        let snapshot = FeedbackSnapshot {
+            table: std::sync::Arc::new(table.clone()),
+            di_bits: 0,
+            do_bits: 1u64 << 2,
+        };
+        for address in [17, 18, 18, 19] {
+            assert_eq!(
+                snapshot.read(address),
+                feedback_from_table(&table, address, 0, 1u64 << 2),
+                "feedback address={address}"
+            );
+        }
     }
 
     #[test]

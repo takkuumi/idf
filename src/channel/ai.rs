@@ -61,8 +61,7 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
 
         // 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)。
         // 原 MCA 只有在 min/max 都非零时才启用现场校准，否则使用 605/3016 默认值。
-        let sensor_min = read_sensor_calib(true);
-        let sensor_max = read_sensor_calib(false);
+        let (sensor_min, sensor_max) = read_sensor_calibration();
 
         for ch in 0..CHANNEL_COUNT {
             let raw: u16 = if ch < raws.len() {
@@ -119,25 +118,28 @@ fn legacy_scaled_value(raw: u16, cal_min: u16, cal_max: u16) -> u16 {
 ///
 /// F4 设备返回 8 个值, F16/F3 设备返回 6 个值, 对齐 HOLD_SENSOR_MIN/MAX_BASE 区长度.
 /// LOOP9: 校准值由 calib::run_auto_calibration 写入 holding_buf (2280..2288 / 2288..2296).
-fn read_sensor_calib(is_min: bool) -> [u16; CHANNEL_COUNT] {
+fn read_sensor_calibration() -> ([u16; CHANNEL_COUNT], [u16; CHANNEL_COUNT]) {
     use crate::config::regs;
-    let base = if is_min {
-        regs::HOLD_SENSOR_MIN_BASE
-    } else {
-        regs::HOLD_SENSOR_MAX_BASE
-    };
-    // LOOP11: 零拷贝 (避免 AI 高频采样时 storage_read() 触发 Box alloc)
-    let mut out = [0u16; CHANNEL_COUNT];
-    let idx_base = (base as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
+    let mut minimum = [0u16; CHANNEL_COUNT];
+    let mut maximum = [0u16; CHANNEL_COUNT];
+    let min_base =
+        (regs::HOLD_SENSOR_MIN_BASE as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
+    let max_base =
+        (regs::HOLD_SENSOR_MAX_BASE as usize).saturating_sub(regs::HOLD_CFG_BASE as usize);
+    // One immutable storage image serves both calibration arrays.
     crate::bus::storage_state::storage_read_with(|snap| {
-        for (ch, value) in out.iter_mut().enumerate() {
-            let i = idx_base + ch;
-            if i < snap.holding_buf.len() {
-                *value = snap.holding_buf[i];
+        for channel in 0..CHANNEL_COUNT {
+            let min_index = min_base + channel;
+            let max_index = max_base + channel;
+            if min_index < snap.holding_buf.len() {
+                minimum[channel] = snap.holding_buf[min_index];
+            }
+            if max_index < snap.holding_buf.len() {
+                maximum[channel] = snap.holding_buf[max_index];
             }
         }
     });
-    out
+    (minimum, maximum)
 }
 
 /// 线性映射 (对齐 Arduino map / 参考固件): 把 x 从 [in_min, in_max] 映射到 [out_min, out_max].

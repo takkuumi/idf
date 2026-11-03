@@ -38,9 +38,8 @@ impl Histogram {
     pub fn record(&mut self, us: u64) {
         let us = us.min(u64::from(u32::MAX)) as u32;
         let index = LIMITS_US
-            .iter()
-            .position(|&upper| us <= upper)
-            .unwrap_or(15);
+            .partition_point(|&upper| us > upper)
+            .min(LIMITS_US.len() - 1);
         self.bins[index] = self.bins[index].saturating_add(1);
         self.count = self.count.saturating_add(1);
         self.peak_us = self.peak_us.max(us);

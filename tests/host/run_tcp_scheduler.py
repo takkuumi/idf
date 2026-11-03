@@ -58,7 +58,8 @@ fn empty_and_missing_ids_are_bounded() {{
 # Exercise the production socket state machine/scheduler with a deterministic
 # backend. Only business response construction/keepalive are host substitutes.
 program += "\n" + "\n".join(item(SOURCE, marker) for marker in (
-    "struct Client {", "impl Client {", "struct TcpServerState {", "fn poll_clients("))
+    "struct Client {", "impl Client {", "fn client_timed_out_at(",
+    "struct TcpServerState {", "fn poll_clients("))
 program += r"""
 use std::io::{ErrorKind,Read,Write};
 use std::net::{TcpStream,TcpListener,SocketAddr};
@@ -103,10 +104,21 @@ fn state(slots:&[usize])->(TcpServerState,Vec<TcpStream>) {
       conn_established_total:0,conn_closed_total:0},peers)
 }
 #[test]
-fn actual_scheduler_admits_two_distinct_ports_then_remaining_ports() {
+fn timeout_boundaries_use_a_single_consistent_sample() {
+    let start=Instant::now();
+    assert!(!client_timed_out_at(start,None,None,start,false));
+    assert!(!client_timed_out_at(start+Duration::from_millis(cfg::TX_TIMEOUT_MS-1),None,None,start,true));
+    assert!(client_timed_out_at(start+Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS),Some(start),None,start,false));
+    assert!(client_timed_out_at(start+Duration::from_millis(cfg::TX_TIMEOUT_MS),None,Some(start),start,true));
+    assert!(client_timed_out_at(start+Duration::from_millis(cfg::IDLE_TIMEOUT_MS),None,None,start,false));
+}
+#[test]
+fn actual_scheduler_admits_one_request_per_tick_and_rotates_ports() {
     let (mut s,_peers)=state(&[0,1,2,3]);
+    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1]);
+    assert_eq!(s.port_cursor,1);
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2]);
-    assert_eq!(s.port_cursor,2);
+    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2,3]);
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2,3,4]);
 }
 #[test]
@@ -114,20 +126,21 @@ fn actual_scheduler_time_budget_preserves_next_unserved_port() {
     let (mut s,_peers)=state(&[0,1,2,3]);s.clients[0].rx[7]=0x7e;
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1]);
     assert_eq!(s.port_cursor,1);
-    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2,3]);
+    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2]);
 }
 #[test]
-fn actual_scheduler_borrows_spare_slot_for_same_port_without_starving_another() {
+fn actual_scheduler_rotates_same_port_clients_without_starving_another() {
     let (mut s,_peers)=state(&[0,0,1]);
+    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1]);
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,3]);
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,3,2]);
     let (mut s,_peers)=state(&[0,0]);
-    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1,2]);
+    poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1]);
 }
 #[test]
 fn actual_scheduler_services_all_eight_connections_in_four_ticks() {
     let (mut s,_peers)=state(&[0,0,1,1,2,2,3,3]);
-    for _ in 0..4 {poll_clients(&mut s,Instant::now());}
+    for _ in 0..8 {poll_clients(&mut s,Instant::now());}
     let mut calls=CALLS.lock().unwrap().clone();calls.sort();assert_eq!(calls,[1,2,3,4,5,6,7,8]);
 }
 #[test]

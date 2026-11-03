@@ -33,6 +33,28 @@ pub const PDU_BUF_SIZE: usize = MODBUS_MAX_PDU_LEN;
 pub trait ModbusBackend {
     fn read_coil(&self, addr: u16) -> Option<bool>;
     fn read_discrete_input(&self, addr: u16) -> Option<bool>;
+    /// Encode one packed FC01/FC02 response. Snapshot-capable backends can
+    /// override this to avoid re-reading shared state for every requested bit.
+    fn encode_bits(&self, addr: u16, count: u16, discrete: bool, out: &mut [u8]) -> bool {
+        if count == 0 || out.len() != usize::from(count).div_ceil(8) {
+            return false;
+        }
+        out.fill(0);
+        for offset in 0..count {
+            let value = if discrete {
+                self.read_discrete_input(addr + offset)
+            } else {
+                self.read_coil(addr + offset)
+            };
+            let Some(value) = value else {
+                return false;
+            };
+            if value {
+                out[usize::from(offset) / 8] |= 1 << (offset % 8);
+            }
+        }
+        true
+    }
     fn encode_holding_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool;
     fn encode_input_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool;
     fn write_single_coil(&self, addr: u16, value: bool) -> bool;
@@ -53,6 +75,10 @@ impl ModbusBackend for BusBackend {
     #[inline]
     fn read_discrete_input(&self, addr: u16) -> Option<bool> {
         crate::bus::backends::read_disc(addr)
+    }
+
+    fn encode_bits(&self, addr: u16, count: u16, _discrete: bool, out: &mut [u8]) -> bool {
+        crate::bus::backends::encode_coil_bits(addr, count, out)
     }
 
     fn encode_holding_registers(&self, addr: u16, count: u16, out: &mut [u8]) -> bool {
@@ -377,8 +403,7 @@ pub fn handle_pdu<B: ModbusBackend>(
     // 内部函数从 out[1] 开始写 body (out[0] 留给 func)
     // 返回 body 长度 (不含 func), 或异常码
     let result = match func {
-        0x01 => read_bits_pdu(backend, pdu, |b, a| b.read_coil(a), out),
-        0x02 => read_bits_pdu(backend, pdu, |b, a| b.read_discrete_input(a), out),
+        0x01 | 0x02 => read_bits_pdu(backend, pdu, func == 0x02, out),
         0x03 => read_regs_pdu(
             backend,
             pdu,
@@ -417,11 +442,12 @@ pub fn handle_pdu<B: ModbusBackend>(
     }
 }
 
-fn read_bits_pdu<B, F>(backend: &B, pdu: &[u8], f: F, out: &mut [u8; PDU_BUF_SIZE]) -> PduResult
-where
-    B: ModbusBackend,
-    F: Fn(&B, u16) -> Option<bool>,
-{
+fn read_bits_pdu<B: ModbusBackend>(
+    backend: &B,
+    pdu: &[u8],
+    discrete: bool,
+    out: &mut [u8; PDU_BUF_SIZE],
+) -> PduResult {
     if pdu.len() != 4 {
         return PduResult::Err(exc::ILLEGAL_DATA_VALUE);
     }
@@ -443,17 +469,8 @@ where
     // 重构: 直接写完整 PDU
     out[0] = 0; // func 占位, 由 handle_pdu 覆写
     out[1] = byte_count as u8;
-    // 清零 bit 字节区域
-    for i in 0..byte_count {
-        out[2 + i] = 0;
-    }
-    for i in 0..count as usize {
-        let Some(bit) = f(backend, addr + i as u16) else {
-            return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
-        };
-        if bit {
-            out[2 + i / 8] |= 1 << (i % 8);
-        }
+    if !backend.encode_bits(addr, count, discrete, &mut out[2..2 + byte_count]) {
+        return PduResult::Err(exc::ILLEGAL_DATA_ADDRESS);
     }
     // body = byte_count(1) + packed bits(N)，不含 out[0] 的功能码。
     PduResult::Ok(1 + byte_count)

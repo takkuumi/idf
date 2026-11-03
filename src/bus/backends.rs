@@ -130,42 +130,123 @@ fn rcu_write_guard() -> MutexGuard<'static, ()> {
 /// 读线圈 (DO, FC=01): 地址语义同 `Bus::read_coil`.
 #[inline]
 pub fn read_coil(addr: u16) -> Option<bool> {
-    // 旧 MCA FC01 的地址窗口是 0..0x7FF，而不仅是物理 D 点：
-    // 0..47 为输入镜像，48..511 为保留内部位，512..559 为物理输出，
-    // 560..2047 为持久化 DRegBuf 扩展位。
-    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
-        return Some((addr as usize) < hw_version::DI_COUNT && IO.di.get_bit(addr as usize));
-    }
-    if (regs::COIL_DO_BASE..regs::COIL_DO_END).contains(&addr) {
-        let ch = (addr - regs::COIL_DO_BASE) as usize;
-        return Some(ch < hw_version::DO_COUNT && IO.do_.get_bit(ch));
-    }
-    // Internal control coils overlap the legacy DRegBuf address window. They
-    // must be resolved first so the restart aliases are never exposed as
-    // persistent user coils.
-    if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
-        return Some(false);
-    }
-    if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
-        return storage_read_with(|storage| {
-            storage
-                .legacy_coils
-                .get((addr - regs::LEGACY_COIL_BASE) as usize)
-                .copied()
-                .map(|value| value != 0)
-        })
-        .flatten();
-    }
-    if (regs::LEGACY_POINT_WINDOW_COUNT..regs::COIL_DO_BASE).contains(&addr) {
-        return Some(false);
-    }
-    None
+    let storage = if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr)
+        && !(regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr)
+    {
+        storage_read()
+    } else {
+        None
+    };
+    let di_bits = if usize::from(addr) < hw_version::DI_COUNT {
+        IO.di.load_bits()
+    } else {
+        0
+    };
+    let do_bits =
+        if (regs::COIL_DO_BASE..regs::COIL_DO_BASE + hw_version::DO_COUNT as u16).contains(&addr) {
+            IO.do_.load_bits()
+        } else {
+            0
+        };
+    read_coil_from_snapshot(addr, storage.as_deref(), di_bits, do_bits)
 }
 
 /// 读离散输入 (DI, FC=02).
 #[inline]
 pub fn read_disc(addr: u16) -> Option<bool> {
     read_coil(addr)
+}
+
+/// Batch FC01/FC02 encoder. The storage RCU is acquired once for the whole
+/// request; physical IO remains lock-free and legacy/reserved windows retain
+/// the same per-address semantics as `read_coil`.
+pub fn encode_coil_bits(addr: u16, count: u16, out: &mut [u8]) -> bool {
+    if count == 0
+        || out.len() != usize::from(count).div_ceil(8)
+        || (u32::from(addr) + u32::from(count) - 1) > u32::from(u16::MAX)
+    {
+        return false;
+    }
+    let end_exclusive = u32::from(addr) + u32::from(count);
+    let legacy_start = u32::from(regs::COIL_DO_END);
+    let legacy_end = u32::from(regs::LEGACY_COIL_END) + 1;
+    let storage = if u32::from(addr) < legacy_end && end_exclusive > legacy_start {
+        storage_read()
+    } else {
+        None
+    };
+    let di_bits = if u32::from(addr) < hw_version::DI_COUNT as u32 {
+        IO.di.load_bits()
+    } else {
+        0
+    };
+    let do_base = u32::from(regs::COIL_DO_BASE);
+    let do_end = do_base + hw_version::DO_COUNT as u32;
+    let do_bits = if u32::from(addr) < do_end && end_exclusive > do_base {
+        IO.do_.load_bits()
+    } else {
+        0
+    };
+    encode_coil_bits_from_snapshot(addr, count, out, storage.as_deref(), di_bits, do_bits)
+}
+
+fn encode_coil_bits_from_snapshot(
+    addr: u16,
+    count: u16,
+    out: &mut [u8],
+    storage: Option<&StorageSnapshot>,
+    di_bits: u64,
+    do_bits: u64,
+) -> bool {
+    if count == 0
+        || out.len() != usize::from(count).div_ceil(8)
+        || (u32::from(addr) + u32::from(count) - 1) > u32::from(u16::MAX)
+    {
+        return false;
+    }
+    out.fill(0);
+    for offset in 0..usize::from(count) {
+        let current = addr + offset as u16;
+        let value = read_coil_from_snapshot(current, storage, di_bits, do_bits);
+        let Some(value) = value else {
+            return false;
+        };
+        if value {
+            out[offset / 8] |= 1 << (offset % 8);
+        }
+    }
+    true
+}
+
+fn read_coil_from_snapshot(
+    addr: u16,
+    storage: Option<&StorageSnapshot>,
+    di_bits: u64,
+    do_bits: u64,
+) -> Option<bool> {
+    // Legacy FC01 address windows: DI mirror, reserved bits, physical DO,
+    // internal control aliases, then the persistent extension coil image.
+    if addr < regs::LEGACY_POINT_WINDOW_COUNT {
+        let index = usize::from(addr);
+        return Some(index < hw_version::DI_COUNT && (di_bits & (1u64 << index)) != 0);
+    }
+    if (regs::COIL_DO_BASE..regs::COIL_DO_END).contains(&addr) {
+        let index = usize::from(addr - regs::COIL_DO_BASE);
+        return Some(index < hw_version::DO_COUNT && (do_bits & (1u64 << index)) != 0);
+    }
+    if (regs::COIL_INTERNAL_START..=regs::COIL_LOGIC_RESTART).contains(&addr) {
+        return Some(false);
+    }
+    if (regs::COIL_DO_END..=regs::LEGACY_COIL_END).contains(&addr) {
+        return storage?
+            .legacy_coils
+            .get(usize::from(addr - regs::LEGACY_COIL_BASE))
+            .map(|value| *value != 0);
+    }
+    if (regs::LEGACY_POINT_WINDOW_COUNT..regs::COIL_DO_BASE).contains(&addr) {
+        return Some(false);
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------
@@ -396,21 +477,47 @@ struct RuntimeRegisterSnapshot {
     analog: RegisterSnapshot,
     #[cfg(feature = "modbus-rtu")]
     rs485: RegisterSnapshot,
+    feedback: Option<crate::control_logic::FeedbackSnapshot>,
 }
 
 impl RuntimeRegisterSnapshot {
     fn capture(addr: u16, count: u16, holding: bool) -> Self {
         // FC03 0..299 are control words, not FC04 monitoring results.
-        let count =
+        let result_count =
             if holding && u32::from(addr) + u32::from(count) <= u32::from(regs::HOLD_USER_BASE) {
                 0
             } else {
                 count
             };
         Self {
-            analog: crate::control_logic::snapshot_results(addr, count),
+            analog: if crate::bus::register_snapshot::overlaps_results(
+                addr,
+                result_count,
+                regs::MONITOR_WORD_COUNT,
+                regs::HOLD_USER_BASE,
+                regs::HOLD_USER_COUNT,
+            ) {
+                crate::control_logic::snapshot_results(addr, result_count)
+            } else {
+                RegisterSnapshot::empty(addr)
+            },
             #[cfg(feature = "modbus-rtu")]
-            rs485: crate::modbus::rtu_master::snapshot_results(addr, count),
+            rs485: if crate::bus::register_snapshot::overlaps_results(
+                addr,
+                result_count,
+                regs::MONITOR_WORD_COUNT,
+                regs::HOLD_USER_BASE,
+                regs::HOLD_USER_COUNT,
+            ) {
+                crate::modbus::rtu_master::snapshot_results(addr, result_count)
+            } else {
+                RegisterSnapshot::empty(addr)
+            },
+            feedback: (holding
+                && u32::from(addr) < u32::from(regs::CONTROL_WORD_COUNT)
+                && u32::from(addr) + u32::from(count) > 0)
+                .then(crate::control_logic::capture_feedback_snapshot)
+                .flatten(),
         }
     }
 }
@@ -427,6 +534,13 @@ fn rs485_word(addr: u16, runtime: Option<&RuntimeRegisterSnapshot>) -> Option<u1
     match runtime {
         Some(snapshot) => snapshot.rs485.get(addr),
         None => crate::modbus::rtu_master::read_result_reg(addr),
+    }
+}
+
+fn feedback_word(addr: u16, runtime: Option<&RuntimeRegisterSnapshot>) -> Option<u16> {
+    match runtime.and_then(|snapshot| snapshot.feedback.as_ref()) {
+        Some(snapshot) => snapshot.read(addr),
+        None => crate::control_logic::feedback_word(addr),
     }
 }
 
@@ -510,7 +624,7 @@ fn read_hold_reg_from_snapshots(
                 _ => ((IO.di.load_bits() >> 8) & 0xFF) as u16,
             };
         }
-        if let Some(feedback) = crate::control_logic::feedback_word(addr) {
+        if let Some(feedback) = feedback_word(addr, runtime) {
             value = feedback;
         }
         return Some(value);
@@ -575,7 +689,7 @@ fn read_hold_reg_from_snapshots(
     // PMntrBuf 共用数值范围，但功能码语义不同，不能混为一谈。
     if addr < regs::CONTROL_WORD_COUNT {
         let mut value = storage.control_words.get(addr as usize).copied()?;
-        if let Some(feedback) = crate::control_logic::feedback_word(addr) {
+        if let Some(feedback) = feedback_word(addr, runtime) {
             value = feedback;
         }
         return Some(value);
@@ -614,6 +728,48 @@ mod tests {
         assert!(write_hold_regs(regs::HOLD_TCP_COM_BASE, &swapped));
         assert_eq!(config_read().unwrap().cfg.tcp_ports, swapped);
         assert!(write_hold_regs(regs::HOLD_TCP_COM_BASE, &original));
+    }
+
+    #[test]
+    fn test_batched_coil_encoding_matches_legacy_per_address_mapping() {
+        let mut storage = StorageSnapshot::new();
+        Arc::make_mut(&mut storage.legacy_coils)[usize::from(700 - regs::LEGACY_COIL_BASE)] = 1;
+        let di_bits = 0b1010_0101;
+        let do_bits = 0b1101_0011;
+        for (start, count) in [
+            (0, 64),
+            (48, 32),
+            (regs::COIL_DO_BASE, 64),
+            (500, 80),
+            (700, 16),
+        ] {
+            let mut packed = [0xFF; 16];
+            assert!(encode_coil_bits_from_snapshot(
+                start,
+                count,
+                &mut packed[..usize::from(count).div_ceil(8)],
+                Some(&storage),
+                di_bits,
+                do_bits,
+            ));
+            for offset in 0..count {
+                assert_eq!(
+                    packed[usize::from(offset) / 8] & (1 << (offset % 8)) != 0,
+                    read_coil_from_snapshot(start + offset, Some(&storage), di_bits, do_bits,)
+                        .expect("valid legacy coil address"),
+                    "address={}",
+                    start + offset,
+                );
+            }
+        }
+        assert!(!encode_coil_bits_from_snapshot(
+            u16::MAX,
+            2,
+            &mut [0; 1],
+            Some(&storage),
+            di_bits,
+            do_bits,
+        ));
     }
 
     #[test]
@@ -1096,7 +1252,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 } else if protect_touched {
                     LOGIC_WRITE_ARMED.store(logic_commit, Ordering::Release);
                 }
-                if addr >= regs::HOLD_DEVICE_CONFIG {
+                if logic_changed {
                     crate::control_logic::mark_config_changed();
                 }
                 if multicast_changed {

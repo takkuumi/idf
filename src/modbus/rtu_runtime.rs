@@ -199,6 +199,7 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
     let mut port: Option<Rs485Port> = None;
     let mut poll_table = heapless::Vec::<rtu_master::PollItem, 64>::new();
     let mut poll_cursor = 0usize;
+    let mut poll_config_generation = u32::MAX;
     let mut last_warn = std::time::Instant::now() - Duration::from_secs(10);
 
     loop {
@@ -239,18 +240,34 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
         };
         match desired.mode {
             PortMode::Master => {
-                match configured_runtime_poll_table() {
-                    Ok(updated) if updated != poll_table => {
-                        rtu_master::publish_result_ranges(&updated);
-                        poll_table = updated;
-                        poll_cursor = 0;
+                let requested_generation = crate::control_logic::config_generation();
+                if requested_generation != poll_config_generation {
+                    let refreshed = configured_runtime_poll_table();
+                    // Do not publish a table parsed across concurrent writes.
+                    // The changed generation causes another attempt next pass.
+                    if crate::control_logic::config_generation() == requested_generation {
+                        match refreshed {
+                            Ok(updated) => {
+                                if updated != poll_table {
+                                    rtu_master::publish_result_ranges(&updated);
+                                    poll_table = updated;
+                                    poll_cursor = 0;
+                                }
+                                poll_config_generation = requested_generation;
+                            }
+                            Err(error) => {
+                                if last_warn.elapsed() >= Duration::from_secs(10) {
+                                    log::warn!(
+                                        "[modbus-rtu] ignored incomplete 2300+ configuration: {error}"
+                                    );
+                                    last_warn = std::time::Instant::now();
+                                }
+                                // Keep the prior valid poll table and avoid
+                                // reparsing until the next configuration write.
+                                poll_config_generation = requested_generation;
+                            }
+                        }
                     }
-                    Ok(_) => {}
-                    Err(error) if last_warn.elapsed() >= Duration::from_secs(10) => {
-                        log::warn!("[modbus-rtu] ignored incomplete 2300+ configuration: {error}");
-                        last_warn = std::time::Instant::now();
-                    }
-                    Err(_) => {}
                 }
                 let table_len = poll_table.len();
                 let round_deadline =

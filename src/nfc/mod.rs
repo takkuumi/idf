@@ -1078,6 +1078,8 @@ fn restore_from_nfc(nfc_words: &[u16]) {
         buf[..n].copy_from_slice(&nfc_words[..n]);
     });
 
+    crate::control_logic::mark_config_changed();
+
     crate::bus::storage_state::HOLDING_NFC_DIRTY.store(false, std::sync::atomic::Ordering::Release);
     crate::device::request_persist_holding();
 

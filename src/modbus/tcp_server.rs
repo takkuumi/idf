@@ -24,12 +24,12 @@ const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
 /// 同一连接在单次 5ms tick 内最多处理的流水请求数。
 /// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 8 客户端公平调度。
 const MAX_REQUESTS_PER_POLL: usize = 4;
-/// 服务器每个 5ms tick 的总请求预算。先轮转不同端口；其它端口没有
-/// 就绪请求时，同端口的另一个客户端才可借用余下额度。
-const MAX_REQUESTS_PER_TICK: usize = 2;
+/// 服务器每个 5ms tick 的总请求预算。单次只准入一个完整业务请求，
+/// 给 IO、BLE、AI 和看门狗保留确定的调度余量。
+const MAX_REQUESTS_PER_TICK: usize = 1;
 /// TCP 业务处理准入窗口；达到窗口后不再启动新的业务请求，
 /// 但仍会在后续 tick 刷新已有响应和检查超时。单个不可分割请求可能超过该窗口。
-const MAX_TCP_WORK_US: u64 = 2_500;
+const MAX_TCP_WORK_US: u64 = 1_500;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
 /// P0-3: 连接速率限制 - 每秒最多10次新连接（防止SYN flood）
@@ -129,11 +129,14 @@ impl Client {
             match self.stream.read(&mut self.rx[self.rx_len..]) {
                 Ok(0) => return false,
                 Ok(n) => {
+                    // The partial-frame and idle timers start on the same
+                    // receive event; share one clock sample for both fields.
+                    let received_at = Instant::now();
                     if self.rx_len == 0 {
-                        self.partial_frame_started = Some(Instant::now());
+                        self.partial_frame_started = Some(received_at);
                     }
                     self.rx_len += n;
-                    self.last_activity = Instant::now();
+                    self.last_activity = received_at;
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -167,23 +170,17 @@ impl Client {
     }
 
     fn is_timed_out(&self) -> bool {
-        if self.partial_frame_started.is_some_and(|started| {
-            started.elapsed() >= Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS)
-        }) {
-            return true;
-        }
-        if self
-            .tx_started
-            .is_some_and(|started| started.elapsed() >= Duration::from_millis(cfg::TX_TIMEOUT_MS))
-        {
-            return true;
-        }
-        let timeout_ms = if self.tx_len == 0 {
-            cfg::IDLE_TIMEOUT_MS
-        } else {
-            cfg::TX_TIMEOUT_MS
-        };
-        self.last_activity.elapsed() >= Duration::from_millis(timeout_ms)
+        self.is_timed_out_at(Instant::now())
+    }
+
+    fn is_timed_out_at(&self, now: Instant) -> bool {
+        client_timed_out_at(
+            now,
+            self.partial_frame_started,
+            self.tx_started,
+            self.last_activity,
+            self.tx_len != 0,
+        )
     }
 
     fn flush_tx(&mut self) -> bool {
@@ -247,6 +244,32 @@ impl Client {
         }
         true
     }
+}
+
+fn client_timed_out_at(
+    now: Instant,
+    partial_frame_started: Option<Instant>,
+    tx_started: Option<Instant>,
+    last_activity: Instant,
+    tx_pending: bool,
+) -> bool {
+    if partial_frame_started.is_some_and(|started| {
+        now.saturating_duration_since(started)
+            >= Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS)
+    }) {
+        return true;
+    }
+    if tx_started.is_some_and(|started| {
+        now.saturating_duration_since(started) >= Duration::from_millis(cfg::TX_TIMEOUT_MS)
+    }) {
+        return true;
+    }
+    let timeout_ms = if tx_pending {
+        cfg::TX_TIMEOUT_MS
+    } else {
+        cfg::IDLE_TIMEOUT_MS
+    };
+    now.saturating_duration_since(last_activity) >= Duration::from_millis(timeout_ms)
 }
 
 fn configure_keepalive(stream: &TcpStream) -> std::io::Result<()> {
@@ -438,8 +461,9 @@ fn poll_clients(state: &mut TcpServerState, started: Instant) {
     let mut polled = [false; cfg::MAX_CONNECTIONS];
     let mut any_served = false;
 
-    // First pass reserves opportunities for distinct listener slots. Only if
-    // other ports had no ready request may another client borrow the spare slot.
+    // First pass reserves opportunities for distinct listener slots. The current
+    // one-request budget means the spare-slot pass is normally empty; retaining
+    // it keeps the fairness rule explicit if the budget is raised later.
     for borrow_spare in [false, true] {
         for &index in &order[..order_len] {
             if remaining == 0 || Instant::now() >= deadline {
@@ -736,12 +760,47 @@ mod tests {
     fn test_tcp_uses_one_bounded_main_loop_state() {
         assert_eq!(cfg::MAX_CONNECTIONS, 8);
         assert_eq!(MAX_REQUESTS_PER_POLL, 4);
-        assert_eq!(MAX_REQUESTS_PER_TICK, 2);
-        assert_eq!(MAX_TCP_WORK_US, 2_500);
+        assert_eq!(MAX_REQUESTS_PER_TICK, 1);
+        assert_eq!(MAX_TCP_WORK_US, 1_500);
         assert_eq!(MAX_ACCEPTS_PER_TICK, 2);
         assert!(cfg::PARTIAL_FRAME_TIMEOUT_MS < cfg::IDLE_TIMEOUT_MS);
         assert!(cfg::KEEPALIVE_COUNT > 0);
         assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
+    }
+
+    #[test]
+    fn test_client_timeout_checks_share_one_time_sample_at_deadlines() {
+        let started = Instant::now();
+        let active = || client_timed_out_at(started, None, None, started, false);
+        assert!(!active());
+        assert!(client_timed_out_at(
+            started + Duration::from_millis(cfg::PARTIAL_FRAME_TIMEOUT_MS),
+            Some(started),
+            None,
+            started,
+            false,
+        ));
+        assert!(client_timed_out_at(
+            started + Duration::from_millis(cfg::TX_TIMEOUT_MS),
+            None,
+            Some(started),
+            started,
+            true,
+        ));
+        assert!(!client_timed_out_at(
+            started + Duration::from_millis(cfg::TX_TIMEOUT_MS - 1),
+            None,
+            None,
+            started,
+            true,
+        ));
+        assert!(client_timed_out_at(
+            started + Duration::from_millis(cfg::IDLE_TIMEOUT_MS),
+            None,
+            None,
+            started,
+            false,
+        ));
     }
 
     #[test]

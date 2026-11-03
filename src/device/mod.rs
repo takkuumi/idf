@@ -179,17 +179,21 @@ impl Actor for DeviceActor {
     fn idle(&mut self) -> Duration {
         // 心跳喂狗 (Actor 线程独占调用, 等同原 watch_loop 每 50ms 一次)
         WATCH_HB.tick();
+        // One sample is sufficient for all due checks. Refresh each next
+        // deadline immediately before its work, preserving retry pacing if a
+        // previous persistence operation took a long time.
+        let now = Instant::now();
         // Flash work belongs to this bounded background actor, not the 5ms
         // network/IO loop. The existing throttle and value deduplication stay
         // authoritative; pulse-only outputs are still excluded from saving.
         #[cfg(feature = "io-di-do")]
-        if Instant::now() >= self.next_do_persist {
+        if now >= self.next_do_persist {
             self.next_do_persist = Instant::now() + Duration::from_secs(1);
             let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000) as u32;
             persist_do_bits_throttled(now_ms);
         }
         // 合并 PC/RTU/TCP 的连续 PRegBuf 写，在 Actor 上统一异步落盘。
-        if Instant::now() >= self.next_holding_persist
+        if now >= self.next_holding_persist
             && (bus::storage_state::HOLDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
                 || bus::storage_state::LEGACY_IO_DIRTY.load(std::sync::atomic::Ordering::Acquire))
             && bus::storage_state::storage_mutation_quiet_for(2_000)
@@ -199,7 +203,7 @@ impl Actor for DeviceActor {
                 log::error!("[device] holding idle persist failed: {e}");
             }
         }
-        if Instant::now() >= self.next_config_persist
+        if now >= self.next_config_persist
             && CONFIG_DIRTY.load(std::sync::atomic::Ordering::Acquire)
         {
             self.next_config_persist = Instant::now() + Duration::from_secs(1);
@@ -207,14 +211,14 @@ impl Actor for DeviceActor {
                 log::error!("[device] config idle persist failed: {e}");
             }
         }
-        if Instant::now() >= self.next_web_system_info_persist {
+        if now >= self.next_web_system_info_persist {
             self.next_web_system_info_persist = Instant::now() + Duration::from_secs(1);
             match crate::web::persist_pending_system_info() {
                 Ok(_) => {}
                 Err(error) => log::error!("[device] web system info persist failed: {error}"),
             }
         }
-        if Instant::now() >= self.next_device_text_persist
+        if now >= self.next_device_text_persist
             && DEVICE_TEXT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
         {
             self.next_device_text_persist = Instant::now() + Duration::from_secs(1);
