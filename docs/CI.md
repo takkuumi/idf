@@ -30,7 +30,7 @@ test -d /Users/takumi/Workspace/esp-idf
 
 普通提交和 PR 执行检测。推送到 `main` 自动生成 `release/v<version>/default`、`f3`、`f4` 三种生产包并保存为 artifact。
 
-正式发布前必须统一 `Cargo.toml`、`Cargo.lock` 和 `sdkconfig.defaults` 的版本，然后推送匹配标签，例如 `v2.5.0`。工作流会拒绝版本不匹配的标签。
+正式发布前必须统一 `Cargo.toml`、`Cargo.lock` 和 `sdkconfig.defaults` 的版本，然后推送匹配标签，例如 `v2.7.0`。工作流会拒绝版本不匹配的标签。
 
 发布资产格式为 `imc-v<version>-production.tar.gz` 及其 SHA-256 文件。GitHub Actions 使用内置 `GITHUB_TOKEN`，仓库设置需允许 Actions 创建和写入 Releases。
 

@@ -167,6 +167,8 @@ if [[ "${RELEASE_FLASH_DRY_RUN:-0}" == 1 ]]; then
     echo "=== dry-run：跳过设备连接和烧录 ==="
     printf 'ESPFLASH_SKIP_UPDATE_CHECK=true espflash board-info --port %q --baud %q --before %q --after no-reset --non-interactive\n' \
         "$PORT" "$BAUD" "$RESET_BEFORE"
+    printf 'python3 -m esptool --chip esp32s3 --port %q --baud %q --before %q --after no_reset erase_flash\n' \
+        "$PORT" "$BAUD" "$BEFORE"
     printf 'python3 -m esptool --chip esp32s3 --port %q --baud %q --before %q --after no_reset write_flash --verify --flash_mode dio --flash_freq 40m --flash_size 8MB\n' \
         "$PORT" "$BAUD" "$BEFORE"
     printf '  0x0 %q 0x8000 %q 0x10000 %q 0x20000 %q\n' \
@@ -218,7 +220,10 @@ if ! printf '%s\n' "$FLASH_OUTPUT" | grep -Eiq '8MB|8388608'; then
     exit 1
 fi
 
-echo "=== 开始刷入 ${VARIANT_UPPER} v${VERSION}（保留业务 NVS，不执行全擦） ==="
+echo "=== 全擦 Flash（2.7.0 首个生产基线，不导入旧版本数据） ==="
+python3 -m esptool "${COMMON_ARGS[@]}" --after no_reset erase_flash
+
+echo "=== 开始刷入 ${VARIANT_UPPER} v${VERSION}（完整写入生产镜像） ==="
 python3 -m esptool "${COMMON_ARGS[@]}" --after no_reset write_flash \
     --verify --flash_mode dio --flash_freq 40m --flash_size 8MB \
     0x0 "$BOOTLOADER" \

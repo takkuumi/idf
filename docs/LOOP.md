@@ -1,6 +1,13 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-11-01 (2.5.0 封板与 IMC 二进制命名)
+> 最后更新: 2026-11-03 (2.7.0 首个生产基线)
+
+## 2.7.0 首个生产基线（2026-11-03）
+
+- Cargo package、lockfile、ESP-IDF app 描述和发布清单统一为 `2.7.0`；工程标识为 `esp32s3-imc`，二进制为 `imc`。
+- 2.7.0 是全新生产基线：首次刷写必须全擦 Flash，不读取或迁移此前版本的 NVS、holding、协议 blob 和 DO 数据。
+- 系统配置使用 `imc` namespace、schema `0x0207` / magic `IMCF`；协议和 holding 使用新的 IMC 数据 magic。
+- 发布包和全新安装说明见 `docs/releases/v2.7.0.md`。
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
 ## 项目背景
@@ -254,7 +261,7 @@
   ADU、5ms 非阻塞轮询、当前每 tick 全局 1 个请求、keepalive 与监听器退避恢复。
 - 完整业务 release 应用镜像实测 `1,626,928B`，约占单 OTA 槽 69.0%；静态内部
   DRAM `.data + .bss = 53,853B`。交付文档增加 OTA 槽容量硬检查和体积回归基线。
-- 默认、F3、F4 编译检查与 `cargo test --bin gateway --no-run` 通过；本轮不修改
+- 默认、F3、F4 编译检查与 `cargo test --bin imc --no-run` 通过；本轮不修改
   BLE/Modbus/Web/NFC/OTA 协议和寄存器映射。
 
 ## LOOP29 实机纠偏（2026-08-13）
@@ -422,7 +429,7 @@ esp_core_dump_flash: Save core dump to flash...
 ### 单元测试
 - LOOP4 length-prefix 5 个回归测试编译通过
 - RS485 全 5 字段 round-trip 测试通过
-- `cargo test --bin gateway --no-run` 编译通过 (19 个 warning, 0 error)
+- `cargo test --bin imc --no-run` 编译通过 (19 个 warning, 0 error)
 
 ## 待解决问题
 
@@ -663,9 +670,9 @@ StorageSnapshot 到 Arc, 每次 device_text 写入都产生 11KB heap churn。
 
 ### 烧录命令
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 espflash reset --port /dev/cu.usbserial-1430
 ```
 
@@ -707,8 +714,8 @@ espflash reset --port /dev/cu.usbserial-1430
 - `test_regbuf_equal` 更新 — NFC 前缀比较语义
 
 ### 编译验证
-- `cargo build --bin gateway`: **0 error, 0 warning**
-- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 167 个单元测试编译通过
+- `cargo build --bin imc`: **0 error, 0 warning**
+- `cargo test --bin imc --no-run`: **0 error, 0 warning**, 167 个单元测试编译通过
 - 测试用例: 167 个 (较 LOOP8 的 127+ 新增 40 个)
 
 ### 已知限制 (不在本 LOOP 范围)
@@ -720,9 +727,9 @@ espflash reset --port /dev/cu.usbserial-1430
 
 ### 烧录命令
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 espflash reset --port /dev/cu.usbserial-1430
 ```
 
@@ -810,8 +817,8 @@ espflash reset --port /dev/cu.usbserial-1430
 - `test_layout_bt_addr_matches_mca` → `test_layout_bt_addr_matches_design` (断言 0x0FA4 + BLE_NAME 0x08E2)
 
 ### 编译验证
-- `cargo build --bin gateway`: **0 error, 0 warning**
-- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 测试编译通过
+- `cargo build --bin imc`: **0 error, 0 warning**
+- `cargo test --bin imc --no-run`: **0 error, 0 warning**, 测试编译通过
 
 ### 已知限制 (不在本 LOOP 范围)
 - Web 认证仍为硬编码 Cookie (ESPSESSIONID=1), 无 CSRF/签名 — 仅适合内网
@@ -824,9 +831,9 @@ espflash reset --port /dev/cu.usbserial-1430
 
 ### 烧录命令
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 espflash reset --port /dev/cu.usbserial-1430
 ```
 
@@ -927,8 +934,8 @@ send_json_with_cookie(stream, 200, &json_response("login", "0"), &cookie_str)
 - `test_session_constant_time_compare` — 验证常量时间比较
 
 ### 编译验证
-- `cargo build --bin gateway`: **0 error, 0 warning**
-- `cargo test --bin gateway --no-run`: **0 error, 0 warning**, 全部测试编译通过
+- `cargo build --bin imc`: **0 error, 0 warning**
+- `cargo test --bin imc --no-run`: **0 error, 0 warning**, 全部测试编译通过
 
 ### 改造后保证
 | 线程 | 栈 | ConfigSnapshot clone 成本 | 风险 |
@@ -973,9 +980,9 @@ Web 认证继续以 `HttpOnly` Cookie 为内网标准 (LOOP11 不引入 CSRF/HTT
 - **Web CSRF/HTTPS/密码哈希**: LOOP11 内网决策保留
 
 ### 编译验证
-- `cargo build --bin gateway`: **0 error, 0 warning**
-- `cargo build --bin gateway --features f4`: **0 error, 0 warning** (NFC sw_i2c 兼容修复)
-- `cargo test --bin gateway --no-run`: **0 error, 0 warning**
+- `cargo build --bin imc`: **0 error, 0 warning**
+- `cargo build --bin imc --features f4`: **0 error, 0 warning** (NFC sw_i2c 兼容修复)
+- `cargo test --bin imc --no-run`: **0 error, 0 warning**
 
 ### 关键文件
 - `src/ethernet/w5500.rs`: ETH_EVENT 订阅 + AtomicBool link cache
@@ -1005,7 +1012,7 @@ just test-compile    # 仅编译测试 binary
 | 项 | 值 |
 |---|---|
 | 时间 | 2026-07-26 |
-| Binary | `target/xtensa-esp32s3-espidf/debug/gateway` |
+| Binary | `target/xtensa-esp32s3-espidf/debug/imc` |
 | ESP-IDF | v5.5.4 |
 | BTC_TASK 栈 | 12288 bytes (8KB → 12KB) |
 | BTU_TASK 栈 | 12288 bytes |
@@ -1026,7 +1033,7 @@ just test-compile    # 仅编译测试 binary
 ### 验证
 
 - `cargo check`: 通过，0 warning。
-- `cargo test --bin gateway --no-run`: 通过，测试二进制成功生成。
+- `cargo test --bin imc --no-run`: 通过，测试二进制成功生成。
 - 新增 Android 兼容边界回归：32-byte SN length-prefix 与 ATT 分片帧长度校验。
 
 ### 必须继续的实机验证

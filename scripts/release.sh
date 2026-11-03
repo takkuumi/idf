@@ -181,8 +181,9 @@ PY
         0x20000 "$app"
 
     cat > "$output_dir/flash-command.txt" <<EOF
-# 推荐：四段独立烧录，不覆盖业务 NVS。先设置串口，例如:
+# 2.7.0 首个生产基线：必须全擦，不导入旧版本 NVS/holding 数据。先设置串口:
 # export ESPFLASH_PORT=/dev/cu.usbserial-1430
+python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_PORT}" --baud 460800 erase_flash
 python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_PORT}" --baud 460800 write_flash \\
   --flash_mode dio --flash_freq 40m --flash_size 8MB \\
   0x0 flash/${prefix}-bootloader.bin \\
@@ -190,7 +191,7 @@ python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_P
   0x10000 flash/${prefix}-ota-data-initial.bin \\
   0x20000 flash/${prefix}-app.bin
 
-# factory-new-device.bin 仅用于新设备/全量产烧录；从 0x0 写入会擦写间隙中的 NVS。
+# factory-new-device.bin 是包含分区间隙的完整工厂镜像；仍应先执行 erase_flash。
 # python3 -m esptool --chip esp32s3 --port "\$ESPFLASH_PORT" write_flash 0x0 ${prefix}-factory-new-device.bin
 EOF
 
@@ -231,8 +232,15 @@ for role, offset, filename in (
 
 manifest = {
     "schema_version": 1,
+    "package_name": "esp32s3-imc",
     "product": "industrial-measurement-controller",
     "firmware_version": version,
+    "data_baseline": "fresh-install-2.7.0",
+    "old_version_data_compatible": False,
+    "installation": {
+        "requires_erase_flash": True,
+        "imports_legacy_data": False,
+    },
     "hardware_variant": variant.upper(),
     "cargo_features": ["default", variant],
     "built_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

@@ -61,7 +61,7 @@ use crate::error::AppResult;
 use crate::hal::Hal;
 
 static MAIN_HB: health::TaskHb = health::TaskHb::new("main");
-const BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
+const BUILD_ID: &str = env!("IMC_BUILD_ID");
 
 use crate::telemetry::MainLoopPerf;
 

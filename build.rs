@@ -73,7 +73,7 @@ fn emit_build_identity() {
         .ok()
         .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
     let suffix = if dirty { "-dirty" } else { "" };
-    println!("cargo:rustc-env=GATEWAY_BUILD_ID={revision}{suffix}");
+    println!("cargo:rustc-env=IMC_BUILD_ID={revision}{suffix}");
 }
 
 /// Reject builds whose generated firmware would violate the verified hardware

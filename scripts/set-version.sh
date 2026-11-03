@@ -41,7 +41,7 @@ replace_exact(
 lock = root / "Cargo.lock"
 if lock.exists():
     text = lock.read_text(encoding="utf-8")
-    pattern = r'(?ms)(^name = "esp32s3-iot-gateway"\nversion = ")[^"]+("$)'
+    pattern = r'(?ms)(^name = "esp32s3-imc"\nversion = ")[^"]+("$)'
     text, count = re.subn(pattern, rf'\g<1>{version}\g<2>', text, count=1)
     if count != 1:
         raise SystemExit("错误: Cargo.lock 中未唯一匹配本地包版本")

@@ -3,9 +3,9 @@
 //! holding_buf 为 4096 字节；连同 proto A/B、设备文本和系统配置继续放在
 //! 24KB NVS 中会耗尽 NVS 页面。这里使用独立 `holding` 原始分区的 A/B 双槽：
 //! 擦除并写入 inactive slot，回读 CRC 成功后才发布新的 generation。掉电时至少
-//! 保留一个完整槽。旧版 NVS `hld_buf_a/b` 仅作为一次兼容回退，不再继续写入。
+//! 保留一个完整槽。2.7.0 使用专属 magic/version，不加载开发版本的数据。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use esp_idf_svc::nvs::EspDefaultNvs;
@@ -22,17 +22,9 @@ const SLOT_BYTES: usize = 0x2000;
 const PARTITION_MIN_BYTES: usize = 0x8000;
 const NO_ACTIVE_SLOT: u8 = u8::MAX;
 
-const RAW_MAGIC: u32 = 0x484C_4431; // "HLD1"
-const RAW_VERSION: u16 = 2;
-const LEGACY_RAW_VERSION: u16 = 1;
+const RAW_MAGIC: u32 = 0x494D_4332; // "IMC2"
+const RAW_VERSION: u16 = 1;
 const RAW_HEADER_BYTES: usize = 16;
-
-const LEGACY_NVS_KEY_BLOB_A: &str = "hld_buf_a";
-const LEGACY_NVS_KEY_BLOB_B: &str = "hld_buf_b";
-const LEGACY_NVS_KEY_ACTIVE: &str = "hld_act";
-const LEGACY_MAGIC: u16 = 0x4842;
-const LEGACY_VERSION: u16 = 1;
-const LEGACY_HEADER_BYTES: usize = 8;
 
 pub const HOLDING_WORDS: usize = 2048;
 pub const HOLDING_DATA_BYTES: usize = HOLDING_WORDS * 2;
@@ -46,12 +38,9 @@ const RAW_TOTAL_BYTES: usize = RAW_HEADER_BYTES
     + MONITOR_DATA_BYTES
     + CONTROL_DATA_BYTES
     + LEGACY_COIL_BYTES;
-const LEGACY_RAW_TOTAL_BYTES: usize = RAW_HEADER_BYTES + HOLDING_DATA_BYTES;
-const LEGACY_TOTAL_BYTES: usize = LEGACY_HEADER_BYTES + HOLDING_DATA_BYTES;
 
 static ACTIVE_SLOT: AtomicU8 = AtomicU8::new(NO_ACTIVE_SLOT);
 static ACTIVE_GENERATION: AtomicU32 = AtomicU32::new(0);
-static LEGACY_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 /// Serialize generation/target-slot selection and the flash write. Immediate
 /// BLE saves and delayed DeviceActor saves may otherwise race and choose the
 /// same inactive A/B slot.
@@ -219,7 +208,6 @@ pub fn save_to_nvs() -> AppResult<()> {
             ACTIVE_SLOT.store(target_slot, Ordering::Release);
             ACTIVE_GENERATION.store(generation, Ordering::Release);
             HOLDING_NVS_VALID.store(true, Ordering::Release);
-            cleanup_legacy_nvs_blobs();
             log::info!(
                 "[holding] persisted {} words to raw slot {} generation {}",
                 HOLDING_WORDS,
@@ -239,29 +227,8 @@ pub fn save_to_nvs() -> AppResult<()> {
     }
 }
 
-fn cleanup_legacy_nvs_blobs() {
-    if LEGACY_CLEANUP_DONE.load(Ordering::Acquire) {
-        return;
-    }
-    let removed = crate::device::try_with_nvs_mut(|nvs| {
-        for key in [
-            LEGACY_NVS_KEY_BLOB_A,
-            LEGACY_NVS_KEY_BLOB_B,
-            LEGACY_NVS_KEY_ACTIVE,
-        ] {
-            if let Err(error) = nvs.remove(key) {
-                log::warn!("[holding] failed to remove legacy NVS key {key}: {error:?}");
-            }
-        }
-    });
-    if removed.is_some() {
-        LEGACY_CLEANUP_DONE.store(true, Ordering::Release);
-        log::info!("[holding] legacy NVS blobs retired after raw snapshot verification");
-    }
-}
-
-/// 从 raw A/B 槽加载；若两个槽均无效，再尝试旧 NVS blob。
-pub fn load_from_nvs(nvs: &EspDefaultNvs) -> AppResult<LoadedHoldingState> {
+/// 仅从 2.7.0 raw A/B 槽加载，不读取其他格式。
+pub fn load_from_nvs(_nvs: &EspDefaultNvs) -> AppResult<LoadedHoldingState> {
     if let Some(slot) = load_best_raw_slot()? {
         ACTIVE_SLOT.store(slot.slot, Ordering::Release);
         ACTIVE_GENERATION.store(slot.generation, Ordering::Release);
@@ -277,16 +244,6 @@ pub fn load_from_nvs(nvs: &EspDefaultNvs) -> AppResult<LoadedHoldingState> {
             monitor_words: slot.monitor_words,
             control_words: slot.control_words,
             legacy_coils: slot.legacy_coils,
-        });
-    }
-
-    if let Some(words) = load_legacy_nvs(nvs)? {
-        HOLDING_NVS_VALID.store(true, Ordering::Release);
-        HOLDING_DIRTY.store(true, Ordering::Release);
-        log::warn!("[holding] loaded legacy NVS snapshot; queued one-time copy to raw partition");
-        return Ok(LoadedHoldingState {
-            words,
-            ..LoadedHoldingState::empty()
         });
     }
 
@@ -347,8 +304,6 @@ fn log_invalid_slot(slot: u8, blob: &[u8]) {
     let stored_crc = u32::from_le_bytes(blob[12..16].try_into().unwrap_or_default());
     let computed_crc = if version == RAW_VERSION && blob.len() >= RAW_TOTAL_BYTES {
         crate::device::crc32(&blob[RAW_HEADER_BYTES..RAW_TOTAL_BYTES])
-    } else if version == LEGACY_RAW_VERSION && blob.len() >= LEGACY_RAW_TOTAL_BYTES {
-        crate::device::crc32(&blob[RAW_HEADER_BYTES..LEGACY_RAW_TOTAL_BYTES])
     } else {
         0
     };
@@ -410,23 +365,19 @@ fn encode_raw_header(blob: &mut [u8], generation: u32) {
 }
 
 fn decode_raw_blob(blob: &[u8], slot: u8) -> Option<DecodedSlot> {
-    if blob.len() < LEGACY_RAW_TOTAL_BYTES
+    if blob.len() < RAW_TOTAL_BYTES
         || u32::from_le_bytes(blob[0..4].try_into().ok()?) != RAW_MAGIC
         || u16::from_le_bytes(blob[6..8].try_into().ok()?) as usize != HOLDING_WORDS
     {
         return None;
     }
     let version = u16::from_le_bytes(blob[4..6].try_into().ok()?);
-    if version != RAW_VERSION && version != LEGACY_RAW_VERSION {
+    if version != RAW_VERSION {
         return None;
     }
     let generation = u32::from_le_bytes(blob[8..12].try_into().ok()?);
     let stored_crc = u32::from_le_bytes(blob[12..16].try_into().ok()?);
-    let data_len = if version == LEGACY_RAW_VERSION {
-        HOLDING_DATA_BYTES
-    } else {
-        RAW_TOTAL_BYTES - RAW_HEADER_BYTES
-    };
+    let data_len = RAW_TOTAL_BYTES - RAW_HEADER_BYTES;
     if blob.len() < RAW_HEADER_BYTES + data_len {
         return None;
     }
@@ -438,30 +389,18 @@ fn decode_raw_blob(blob: &[u8], slot: u8) -> Option<DecodedSlot> {
         .chunks_exact(2)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .collect();
-    let (monitor_words, control_words, legacy_coils) = if version == LEGACY_RAW_VERSION {
-        (
-            vec![0u16; MONITOR_WORDS],
-            vec![0u16; CONTROL_WORDS],
-            vec![0u8; LEGACY_COIL_BYTES],
-        )
-    } else {
-        let mut offset = HOLDING_DATA_BYTES;
-        let monitor_words = data[offset..offset + MONITOR_DATA_BYTES]
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-            .collect();
-        offset += MONITOR_DATA_BYTES;
-        let control_words = data[offset..offset + CONTROL_DATA_BYTES]
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-            .collect();
-        offset += CONTROL_DATA_BYTES;
-        (
-            monitor_words,
-            control_words,
-            data[offset..offset + LEGACY_COIL_BYTES].to_vec(),
-        )
-    };
+    let mut offset = HOLDING_DATA_BYTES;
+    let monitor_words = data[offset..offset + MONITOR_DATA_BYTES]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    offset += MONITOR_DATA_BYTES;
+    let control_words = data[offset..offset + CONTROL_DATA_BYTES]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    offset += CONTROL_DATA_BYTES;
+    let legacy_coils = data[offset..offset + LEGACY_COIL_BYTES].to_vec();
     Some(DecodedSlot {
         slot,
         generation,
@@ -474,53 +413,6 @@ fn decode_raw_blob(blob: &[u8], slot: u8) -> Option<DecodedSlot> {
 
 fn generation_is_newer(candidate: u32, current: u32) -> bool {
     candidate != current && candidate.wrapping_sub(current) < (1u32 << 31)
-}
-
-fn load_legacy_nvs(nvs: &EspDefaultNvs) -> AppResult<Option<Vec<u16>>> {
-    let active = nvs.get_u8(LEGACY_NVS_KEY_ACTIVE).ok().flatten();
-    let first = if matches!(active, Some(1)) {
-        LEGACY_NVS_KEY_BLOB_B
-    } else {
-        LEGACY_NVS_KEY_BLOB_A
-    };
-    let second = if first == LEGACY_NVS_KEY_BLOB_A {
-        LEGACY_NVS_KEY_BLOB_B
-    } else {
-        LEGACY_NVS_KEY_BLOB_A
-    };
-    if let Some(words) = try_load_legacy_blob(nvs, first)? {
-        return Ok(Some(words));
-    }
-    try_load_legacy_blob(nvs, second)
-}
-
-fn try_load_legacy_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<Vec<u16>>> {
-    let mut buffer = HOLDING_BUFFER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    buffer.fill(0);
-    let bytes = match nvs
-        .get_blob(key, buffer.as_mut())
-        .map_err(|error| AppError::Config(format!("nvs get_blob {key}: {error:?}")))?
-    {
-        Some(bytes) if bytes.len() == LEGACY_TOTAL_BYTES => bytes,
-        _ => return Ok(None),
-    };
-    if u16::from_le_bytes([bytes[0], bytes[1]]) != LEGACY_MAGIC
-        || u16::from_le_bytes([bytes[2], bytes[3]]) != LEGACY_VERSION
-    {
-        return Ok(None);
-    }
-    let stored_crc = u32::from_le_bytes(bytes[4..8].try_into().expect("fixed legacy header"));
-    let data = &bytes[LEGACY_HEADER_BYTES..LEGACY_TOTAL_BYTES];
-    if crate::device::crc32(data) != stored_crc {
-        return Ok(None);
-    }
-    Ok(Some(
-        data.chunks_exact(2)
-            .map(|word| u16::from_le_bytes([word[0], word[1]]))
-            .collect(),
-    ))
 }
 
 #[cfg(test)]
@@ -552,25 +444,6 @@ mod tests {
 
         blob[RAW_HEADER_BYTES + 7] ^= 0x80;
         assert!(decode_raw_blob(&blob, 1).is_none());
-    }
-
-    #[test]
-    fn test_v1_raw_slot_loads_with_zeroed_legacy_state() {
-        let mut blob = vec![0u8; RAW_TOTAL_BYTES];
-        blob[0..4].copy_from_slice(&RAW_MAGIC.to_le_bytes());
-        blob[4..6].copy_from_slice(&LEGACY_RAW_VERSION.to_le_bytes());
-        blob[6..8].copy_from_slice(&(HOLDING_WORDS as u16).to_le_bytes());
-        blob[8..12].copy_from_slice(&7u32.to_le_bytes());
-        blob[RAW_HEADER_BYTES..RAW_HEADER_BYTES + 2].copy_from_slice(&0xABCDu16.to_le_bytes());
-        let crc =
-            crate::device::crc32(&blob[RAW_HEADER_BYTES..RAW_HEADER_BYTES + HOLDING_DATA_BYTES]);
-        blob[12..16].copy_from_slice(&crc.to_le_bytes());
-
-        let decoded = decode_raw_blob(&blob, 0).expect("v1 raw slot remains readable");
-        assert_eq!(decoded.words[0], 0xABCD);
-        assert!(decoded.monitor_words.iter().all(|&value| value == 0));
-        assert!(decoded.control_words.iter().all(|&value| value == 0));
-        assert!(decoded.legacy_coils.iter().all(|&value| value == 0));
     }
 
     #[test]

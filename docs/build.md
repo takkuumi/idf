@@ -373,7 +373,7 @@ cargo build --release --features f4
 ./scripts/release-flash.sh f3 --skip-build
 ```
 
-发布脚本校验版本、提交、四段地址和 SHA-256。四段独立刷写保留业务 NVS；
+发布脚本校验版本、提交、四段地址和 SHA-256。v2.7.0 首次生产刷写先全擦，再写入四段镜像；
 `factory-new-device.bin` 合并镜像只用于新设备或明确允许清除配置的场景。
 
 ### 开发构建

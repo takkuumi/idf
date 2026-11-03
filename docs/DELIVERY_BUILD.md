@@ -1,16 +1,16 @@
 # 固件编译与客户交付指南
 
-> 适用产品：ESP32-S3 工业网关固件 v2.2.9 RC1
+> 适用产品：ESP32-S3 IMC 工业测控器固件 v2.7.0
 >
 > 适用硬件：ESP32-S3 rev 0.2、8MB Flash、2MB PSRAM
 >
-> 交付方式：乐鑫 Flash Download Tool 首次烧录/返厂恢复，以及 Web OTA 升级
+> 交付方式：乐鑫 Flash Download Tool v2.7.0 首次全擦烧录，以及后续经验证的 Web OTA 升级
 
 ## 1. 交付原则
 
 - 客户不接触 Rust ELF、源码、`partitions.csv` 或命令行构建环境。
 - 首次烧录包必须包含 Bootloader、编译后的分区表和 factory 应用镜像。
-- 后续普通升级优先使用 Web OTA，避免清除 NVS 中的网络、端口和业务配置。
+- v2.7.0 首次交付必须全擦 Flash；后续版本只有显式迁移并验收 2.7.0 schema 后才能保留配置升级。
 - Flash 参数固定为 **DIO / 40MHz / 8MB**，禁止使用 QIO / 80MHz。
 - 每个交付包必须附版本说明和 SHA-256 校验文件。
 - 发布前必须完成真实设备烧录、启动、TCP、BLE、Web 和 OTA 回归。
@@ -137,7 +137,7 @@ imc-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
 建议目录结构：
 
 ```text
-imc-v2.2.9-<commit>/
+imc-v2.7.0-<commit>/
 ├── flash-download-tool/
 │   ├── bootloader.bin
 │   ├── partition-table.bin
@@ -152,7 +152,7 @@ imc-v2.2.9-<commit>/
 在项目根目录执行以下命令可生成基础交付目录：
 
 ```bash
-release_id="imc-v2.2.9-$(git rev-parse --short HEAD)"
+release_id="imc-v2.7.0-$(git rev-parse --short HEAD)"
 
 mkdir -p "$release_id/flash-download-tool" "$release_id/ota"
 cp target/xtensa-esp32s3-espidf/release/bootloader.bin \
@@ -240,7 +240,7 @@ BAUD: 460800
 
 全擦会删除 NVS、端口配置、逻辑配置、DO 状态、OTA 状态、BLE Mesh 数据和存储文件。
 
-### 10.2 保留配置的普通升级
+### 10.2 v2.7.0 之后的保留配置升级
 
 不要使用 Flash Download Tool 全擦。登录设备 Web 页面：
 
@@ -250,9 +250,11 @@ BAUD: 460800
 
 上传完成后设备自动重启。新镜像稳定运行 30 秒后才会被标记为有效；确认前异常复位会触发 OTA 自动回滚。
 
-### 10.3 串口覆盖但保留 NVS
+### 10.3 v2.7.0 全新生产安装
 
-此方式仅供技术支持人员使用。Flash Download Tool 不应点击 `ERASE`，但旧 `otadata` 可能仍指向 `ota_0/ota_1`，导致新写入的 factory 不启动。因此客户现场普通升级仍应使用 Web OTA。
+v2.7.0 是首个生产基线，首次交付必须在 Flash Download Tool 执行 `ERASE`，再写入完整的 bootloader、partition table、otadata 和 factory 镜像。不得保留旧版本 NVS、holding 或 OTA 选择数据。该操作会清除设备全部运行数据。
+
+项目脚本 `just release-flash <default|f3|f4>` 会检查 ESP32-S3 和 8MB Flash，然后执行全擦和镜像回读校验。后续版本只有在已实现并验收从 2.7.0 schema 迁移后，才能通过 OTA 保留配置升级。
 
 ## 11. 连接失败处理
 

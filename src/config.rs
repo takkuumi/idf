@@ -15,7 +15,7 @@
 // ----------------------------------------------------------------------------
 // 系统参数
 // ----------------------------------------------------------------------------
-/// 对外产品标识；保留 Cargo package 名称和 NVS namespace gateway 以兼容现有交付工具和升级路径。
+/// 对外产品标识。
 pub const APP_NAME: &str = "imc-controller";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -362,7 +362,7 @@ pub mod modbus {
 // ----------------------------------------------------------------------------
 pub mod wifi {
     /// 固定 Station SSID（当前未接入 SystemConfig）
-    pub const SSID: &str = "iot-gateway";
+    pub const SSID: &str = "imc-controller";
     /// 默认 Station 密码 (空字符串 = 开放网络)
     pub const PASSWORD: &str = "";
     /// Wi-Fi 心跳周期 (s)

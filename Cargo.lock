@@ -592,8 +592,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "esp32s3-iot-gateway"
-version = "2.6.0"
+name = "esp32s3-imc"
+version = "2.7.0"
 dependencies = [
  "anyhow",
  "embedded-hal 1.0.0",

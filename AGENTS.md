@@ -89,7 +89,7 @@ P0: 根本修复 pthread Stack canary + ENOMEM
 
 ## Security & Configuration Tips
 
-- **NVS namespace**：`gateway`（`src/device/mod.rs`），修改后需 `AT+CFGAPPLY` 触发 NVS 写入。
+- **NVS namespace**：`imc`（`src/device/mod.rs`），修改后需 `AT+CFGAPPLY` 触发 NVS 写入。
 - **设备 ID 默认值**：`src/device/system_config.rs::defaults()`（SN、IP、MAC）。
 - **引脚分配**：必须改 `src/config.rs::pins` 而非硬件层；改动后同步 `docs/pinmap.md`。
 - **禁止修改**：`/Users/takumi/Workspace/esp-idf`、`/Users/takumi/Workspace/MCA_F16V2_1_F48_BLE`、`/Users/takumi/Workspace/metuory-wireless-management-app-1.0.78`。

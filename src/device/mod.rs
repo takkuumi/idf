@@ -25,7 +25,7 @@
 //! - `proto_act` key 标记当前有效 blob (0=A, 1=B)
 //! - 写入流程: 先写 inactive blob → 校验 CRC → 切换 active 标志
 //! - 读取流程: 读 active blob → CRC 校验失败则回退到 inactive → 都失败用默认值
-//! - 兼容旧格式: 若 `proto_act` 不存在但 `proto_data` 存在, 迁移到 A
+//! - 2.7.0 使用独立 magic 和命名空间，不读取开发版本数据
 
 pub mod holding_store;
 pub(crate) mod nvs_store;
@@ -256,8 +256,8 @@ static WATCH_HB: TaskHb = TaskHb::new("device-store");
 // 常量
 // ----------------------------------------------------------------------------
 
-/// NVS 命名空间 (≤ 15 字符)
-const NVS_NAMESPACE: &str = "gateway";
+/// 2.7.0 首个生产基线使用独立命名空间，避免读取开发版本遗留数据。
+const NVS_NAMESPACE: &str = "imc";
 
 // ---- 协议数据双 blob (A/B 轮换, 原子写入) ----
 /// blob A key (含 magic+ver+len+crc+data, 共 3010 字节)
@@ -333,7 +333,7 @@ static CONFIG_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 
 /// 为原 C++/PC 工具的通用 PRegBuf 字段补齐出厂值。
 /// 只在整组仍为空或擦除态时初始化，绝不覆盖用户已保存的端口/远端地址。
-fn initialize_legacy_preg_defaults(buf: &mut [u16]) {
+fn initialize_preg_defaults(buf: &mut [u16]) {
     fn index(addr: u16) -> usize {
         (addr - regs::HOLD_PXX_BASE) as usize
     }
@@ -355,50 +355,15 @@ fn initialize_legacy_preg_defaults(buf: &mut [u16]) {
     }
 }
 
-/// Import the Bluetooth ID kept in the legacy MCA PRegBuf (D98..D101).
-///
-/// Older IDF images persisted this value only in the raw holding snapshot,
-/// while the BLE stack now uses `SystemConfig::ble_name` as its authoritative
-/// source.  On first boot after an upgrade, prefer a non-empty legacy value
-/// when the structured config still contains the factory default, then mirror
-/// the authoritative bytes back into the holding window.  This closes the
-/// otherwise silent gap where Modbus reads showed an ID but the GAP name stayed
-/// `Mesh` after reboot.
-fn reconcile_legacy_ble_name(cfg: &mut SystemConfig, holding: &mut [u16]) -> bool {
+/// Mirror the authoritative structured BLE name into its public holding-register view.
+fn mirror_ble_name_to_holding(ble_name: &[u8; 8], holding: &mut [u16]) -> bool {
     let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
     let end = start + regs::HOLD_BLE_ADDR_COUNT as usize;
     if end > holding.len() {
         return false;
     }
-
-    let mut legacy = [0u8; 8];
-    for (index, word) in holding[start..end].iter().copied().enumerate() {
-        let [hi, lo] = word.to_be_bytes();
-        legacy[index * 2] = hi;
-        legacy[index * 2 + 1] = lo;
-    }
-    // An erased/invalid holding slot is commonly filled with 0xFFFF.  Never
-    // turn that marker into a visible BLE name; IDs are ASCII in the MCA
-    // protocol and may contain NUL padding only.
-    let legacy_non_empty = legacy.iter().any(|&byte| byte != 0)
-        && legacy
-            .iter()
-            .all(|&byte| byte == 0 || (0x20..=0x7E).contains(&byte));
-    let defaults = SystemConfig::defaults().ble_name;
-    let config_is_factory = cfg.ble_name == defaults || cfg.ble_name.iter().all(|&b| b == 0);
-
-    if legacy_non_empty && config_is_factory {
-        cfg.ble_name = legacy;
-        log::info!(
-            "[device] imported legacy BLE ID from D98..D101: '{}'",
-            cfg.ble_name_str()
-        );
-    }
-
-    // Keep the legacy register view physically coherent for code paths that
-    // access the raw snapshot directly (the public read path aliases cfg).
     let mut changed = false;
-    for (index, chunk) in cfg.ble_name.chunks_exact(2).enumerate() {
+    for (index, chunk) in ble_name.chunks_exact(2).enumerate() {
         let word = u16::from_be_bytes([chunk[0], chunk[1]]);
         if holding[start + index] != word {
             holding[start + index] = word;
@@ -409,48 +374,22 @@ fn reconcile_legacy_ble_name(cfg: &mut SystemConfig, holding: &mut [u16]) -> boo
 }
 
 #[cfg(test)]
-mod legacy_ble_tests {
-    use super::{reconcile_legacy_ble_name, system_config::SystemConfig};
+mod ble_name_mirror_tests {
+    use super::mirror_ble_name_to_holding;
     use crate::config::regs;
 
     #[test]
-    fn imports_legacy_d98_id_when_structured_config_is_factory_default() {
-        let mut cfg = SystemConfig::defaults();
+    fn mirrors_structured_name_to_holding_view() {
         let mut holding = vec![0u16; regs::HOLD_PXX_COUNT];
+        let changed = mirror_ble_name_to_holding(b"CfgName\0", &mut holding);
         let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
-        for (index, word) in [0x4E6F, 0x6465, 0x3232, 0x3100].into_iter().enumerate() {
-            holding[start + index] = word;
-        }
-
-        assert!(reconcile_legacy_ble_name(&mut cfg, &mut holding));
-        assert_eq!(cfg.ble_name_str(), "Node221");
-        assert_eq!(
-            &holding[start..start + 4],
-            &[0x4E6F, 0x6465, 0x3232, 0x3100]
-        );
-    }
-
-    #[test]
-    fn structured_config_wins_and_mirrors_into_d98_window() {
-        let mut cfg = SystemConfig::defaults();
-        cfg.ble_name = *b"CfgName\0";
-        let mut holding = vec![0u16; regs::HOLD_PXX_COUNT];
-        let start = (regs::HOLD_BLE_ADDR_BASE - regs::HOLD_PXX_BASE) as usize;
-
-        assert!(reconcile_legacy_ble_name(&mut cfg, &mut holding));
+        assert!(changed);
         assert_eq!(
             &holding[start..start + 4],
             &[0x4366, 0x674E, 0x616D, 0x6500]
         );
-        assert_eq!(cfg.ble_name_str(), "CfgName");
     }
 }
-
-// ---- 兼容旧格式 (单 blob, 仅用于迁移) ----
-const NVS_KEY_DATA_LEGACY: &str = "proto_data";
-const NVS_KEY_MAGIC_LEGACY: &str = "proto_magic";
-const NVS_KEY_VERSION_LEGACY: &str = "proto_ver";
-const NVS_KEY_LENGTH_LEGACY: &str = "proto_len";
 
 /// 设备文本区 NVS key (Android 1.0.78 0x1388-0x1B77, 4000 字节 UTF-16LE)
 const NVS_KEY_DEV_TEXT: &str = "dev_text";
@@ -460,7 +399,7 @@ const NVS_KEY_DEV_TEXT_MAGIC: &str = "dev_text_mag";
 const DEV_TEXT_MAGIC: u16 = 0xDE54;
 
 /// 魔数标识, 用于校验 NVS 是否已初始化
-pub const PROTO_MAGIC: u16 = 0x4757; // 'G'<<8 | 'W'
+pub const PROTO_MAGIC: u16 = 0x494D; // 'I'<<8 | 'M'
 
 /// 复位计数 NVS key
 const NVS_KEY_RESET_CNT: &str = "rst_cnt";
@@ -476,7 +415,7 @@ const NVS_KEY_MESH_APP_IDX: &str = "mesh_aidx";
 const NVS_KEY_DO_BITS: &str = "do_bits";
 /// DO NVS magic (0xD05D = "DO")
 const NVS_KEY_DO_MAGIC: &str = "do_magic";
-const DO_NVS_MAGIC: u16 = 0xD05D;
+const DO_NVS_MAGIC: u16 = 0x1D07;
 
 /// 协议数据字数 (U16)
 const PROTO_WORDS: usize = 1500;
@@ -517,7 +456,7 @@ pub static NVS_PARTITION: LazyLock<Option<EspDefaultNvsPartition>> =
         }
     });
 
-/// NVS 句柄 (gateway namespace)
+/// NVS 句柄 (imc namespace)
 /// 注意 esp_idf_svc 0.50: EspDefaultNvs::new 第三参数 read_write: bool
 /// 使用 Option 内部存储, 初始化失败时设为 None, 后续操作 graceful fail
 pub static NVS: LazyLock<Mutex<Option<EspDefaultNvs>>> = LazyLock::new(|| {
@@ -584,16 +523,6 @@ pub fn init() -> AppResult<()> {
         cfg.tcp_ports = crate::config::regs::TCP_PORTS_DEFAULT;
         config_repaired = true;
     }
-    // v2.2.6 briefly wrote Android's mask/gateway fields in reverse. Repair
-    // only the unmistakable legacy pattern before starting the network stack.
-    if cfg.repair_legacy_network_swap() {
-        config_repaired = true;
-        log::warn!(
-            "[device] repaired legacy network field swap: mask={} gw={}",
-            cfg.mask_str(),
-            cfg.gw_str()
-        );
-    }
     // Never start Ethernet with a malformed persisted network snapshot. Keep
     // identity/serial/BLE fields, replace only network fields with defaults,
     // then persist the repaired snapshot after the RCU is published.
@@ -608,18 +537,6 @@ pub fn init() -> AppResult<()> {
         log::error!(
             "[device] invalid persisted network config ({error}); restored network defaults"
         );
-    }
-    // Older IDF builds used 0x0100 as a placeholder model.  Repair that
-    // value on boot so the handheld's device-model field remains MCA
-    // compatible, while preserving intentional user-written model values.
-    let legacy_model = crate::config::hw_version::MODEL_CODE;
-    if matches!(cfg.hw_version, 0 | 0xFFFF | 0x0100) {
-        cfg.hw_version = legacy_model;
-        let mut nvs_guard = nvs_lock();
-        if let Some(nvs) = nvs_guard.as_mut() {
-            cfg.save_to_nvs(nvs)?;
-        }
-        log::info!("[device] repaired legacy hardware model to 0x{legacy_model:04X}");
     }
     let hardware_eth_mac = SystemConfig::read_hw_eth_mac();
     cfg.fill_hw_macs();
@@ -652,23 +569,10 @@ pub fn init() -> AppResult<()> {
             log::warn!("[device] NVS unavailable, using empty holding_buf");
             holding_store::LoadedHoldingState::empty()
         };
-        initialize_legacy_preg_defaults(&mut holding_state.words);
+        initialize_preg_defaults(&mut holding_state.words);
 
-        // D98..D101 belonged to the legacy MCA PRegBuf.  Keep upgrades from
-        // older images lossless: import that value into SystemConfig once,
-        // then mirror the authoritative config back to the raw holding view.
-        let previous_ble_name = cfg.ble_name;
-        let holding_ble_changed = reconcile_legacy_ble_name(&mut cfg, &mut holding_state.words);
-        if cfg.ble_name != previous_ble_name {
-            let mut nvs_guard = nvs_lock();
-            if let Some(nvs) = nvs_guard.as_mut() {
-                if let Err(error) = cfg.save_to_nvs(nvs) {
-                    log::error!("[device] failed to persist migrated BLE ID: {error}");
-                }
-            } else {
-                log::warn!("[device] NVS unavailable; migrated BLE ID remains RAM-only");
-            }
-        }
+        let holding_ble_changed =
+            mirror_ble_name_to_holding(&cfg.ble_name, &mut holding_state.words);
         let snap = StorageSnapshot {
             proto: ProtoStore {
                 data: Arc::from(data),
@@ -685,9 +589,6 @@ pub fn init() -> AppResult<()> {
         };
         storage_write(snap);
         if holding_ble_changed {
-            // Mark only after the repaired snapshot is published; the actor
-            // will write the mirror to the raw holding partition on its next
-            // quiet tick.
             crate::bus::storage_state::mark_holding_dirty();
         }
 
@@ -1027,10 +928,6 @@ fn commit() -> AppResult<()> {
         nvs.set_u8(NVS_KEY_ACTIVE, new_active)
             .map_err(|e| AppError::Config(format!("nvs set active: {e:?}")))?;
         // 清理 legacy key
-        let _ = nvs.remove(NVS_KEY_DATA_LEGACY);
-        let _ = nvs.remove(NVS_KEY_MAGIC_LEGACY);
-        let _ = nvs.remove(NVS_KEY_VERSION_LEGACY);
-        let _ = nvs.remove(NVS_KEY_LENGTH_LEGACY);
         Ok(new_active)
     });
 
@@ -1459,15 +1356,9 @@ fn load_proto_from_nvs(nvs: &EspDefaultNvs) -> AppResult<LoadedProto> {
             log::warn!("[device] recovered from inactive blob {}", second_key);
             return Ok((d, v, l));
         }
-        log::warn!("[device] both blobs corrupted, trying legacy");
+        log::warn!("[device] both IMC blobs corrupted, using defaults");
     } else {
-        log::info!("[device] no active flag, trying legacy single blob");
-    }
-
-    // 兼容 legacy 单 blob 格式
-    if let Some((d, v, l)) = load_legacy_blob(nvs)? {
-        log::info!("[device] loaded from legacy blob, will migrate to A/B on next commit");
-        return Ok((d, v, l));
+        log::info!("[device] no active IMC blob, using defaults");
     }
 
     // 全部失败, 返回默认空数据
@@ -1525,54 +1416,6 @@ fn load_single_blob(nvs: &EspDefaultNvs, key: &str) -> AppResult<Option<LoadedPr
         data[i] = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
     }
 
-    Ok(Some((data, version, length)))
-}
-
-/// 读取 legacy 单 blob 格式 (兼容旧固件, 仅用于迁移)
-fn load_legacy_blob(nvs: &EspDefaultNvs) -> AppResult<Option<LoadedProto>> {
-    // 1. 检查 legacy magic
-    let magic = nvs
-        .get_u16(NVS_KEY_MAGIC_LEGACY)
-        .map_err(|e| AppError::Config(format!("nvs get legacy magic: {e:?}")))?
-        .unwrap_or(0);
-
-    if magic != PROTO_MAGIC {
-        return Ok(None);
-    }
-
-    // 2. 读 legacy blob
-    let mut buf = PROTO_BLOB_BUFFER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let blob = nvs
-        .get_blob(NVS_KEY_DATA_LEGACY, &mut buf[..PROTO_DATA_BYTES])
-        .map_err(|e| AppError::Config(format!("nvs get legacy blob: {e:?}")))?;
-
-    let bytes = match blob {
-        Some(b) => b,
-        None => return Ok(None),
-    };
-
-    let mut data = vec![0u16; PROTO_WORDS].into_boxed_slice();
-    let words = (bytes.len() / 2).min(PROTO_WORDS);
-    for i in 0..words {
-        data[i] = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-    }
-
-    let version = nvs
-        .get_u16(NVS_KEY_VERSION_LEGACY)
-        .map_err(|e| AppError::Config(format!("nvs get legacy ver: {e:?}")))?
-        .unwrap_or(0);
-    let length = nvs
-        .get_u16(NVS_KEY_LENGTH_LEGACY)
-        .map_err(|e| AppError::Config(format!("nvs get legacy len: {e:?}")))?
-        .unwrap_or(0);
-
-    log::info!(
-        "[device] legacy blob loaded: {} words, ver={:#06x}",
-        length,
-        version
-    );
     Ok(Some((data, version, length)))
 }
 

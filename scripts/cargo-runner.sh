@@ -54,7 +54,7 @@ COMMAND=(
     "$ELF"
 )
 
-if [[ "${GATEWAY_RUNNER_DRY_RUN:-0}" == 1 ]]; then
+if [[ "${IMC_RUNNER_DRY_RUN:-0}" == 1 ]]; then
     printf '%q %q\n' "$ROOT_DIR/scripts/enter-bootloader.sh" "$PORT"
     printf '%q ' "${COMMAND[@]}"
     printf '\n'

@@ -116,7 +116,7 @@ fn nvs_key_for(sub: u8) -> String {
 
 /// 存储配置到 NVS
 ///
-/// 复用 device 模块的全局 NVS 句柄 (gateway namespace), 用 key 前缀 "lg_" 隔离.
+/// 复用 device 模块的全局 NVS 句柄 (imc namespace), 用 key 前缀 "lg_" 隔离.
 /// 避免 open 新 namespace (EspDefaultNvsInstance 在 esp-idf-svc 0.52 不存在).
 fn store_config(sub: u8, data: &[u8]) -> bool {
     // blob = [valid_flag][len][data...]

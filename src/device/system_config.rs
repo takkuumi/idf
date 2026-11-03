@@ -19,10 +19,9 @@ use esp_idf_svc::nvs::EspDefaultNvs;
 const NVS_KEY_BLOB: &str = "sys_cfg";
 const NVS_KEY_MAGIC: &str = "sys_cfg_mag";
 const NVS_KEY_SCHEMA: &str = "sys_cfg_ver";
-const NVS_MAGIC: u32 = 0x4757_4346; // "GWCF"
-/// 2.5.0 is the first production schema. Future releases must explicitly
-/// migrate this schema before accepting older system configuration data.
-const NVS_SCHEMA_VERSION: u16 = 0x0205;
+const NVS_MAGIC: u32 = 0x494D_4346; // "IMCF"
+/// 2.7.0 is the first production system-configuration baseline.
+const NVS_SCHEMA_VERSION: u16 = 0x0207;
 
 /// 序列化后字节数 (固定布局)
 /// SN(32) + name(16) + hw(2) + fw(2) + cfg_ver(2) = 54
@@ -31,8 +30,6 @@ const NVS_SCHEMA_VERSION: u16 = 0x0205;
 /// rs485[0](15) + rs485[1](15) + rs485[2](15) = 45  (对齐参考固件 3 端口)
 /// tcp_ports(8)；总使用 145 字节，取 152 留余量。
 const CFG_BLOB_SIZE: usize = 152;
-/// v2.2.1 及更早版本的 NVS blob 大小；升级时必须保留原配置并为新增字段补默认值。
-const CFG_BLOB_LEGACY_SIZE: usize = 144;
 
 // NVS 偏移
 const OFF_SN: usize = 0;
@@ -156,20 +153,6 @@ pub enum WriteResult {
 pub const SENSOR_CHANNELS: usize = 8; // 校准寄存器通道数 (对齐参考固件 SENSOR_NUM=8)
 
 impl SystemConfig {
-    /// Repair the field swap written by older BLE handheld firmware.
-    ///
-    /// Affected snapshots have a non-contiguous value in `mask` (for example
-    /// `192.168.51.1`) and a valid contiguous netmask in `gateway`. Normal
-    /// configurations do not satisfy this pattern, so they remain unchanged.
-    pub fn repair_legacy_network_swap(&mut self) -> bool {
-        if is_ipv4_netmask(&self.gateway) && !is_ipv4_netmask(&self.mask) {
-            core::mem::swap(&mut self.mask, &mut self.gateway);
-            true
-        } else {
-            false
-        }
-    }
-
     /// 默认配置 (出厂值)
     ///
     /// LOOP9: 字符串默认值改回 ASCII 编码 (与 MCA 参考固件 + metuory 1.0.78 一致).
@@ -182,7 +165,7 @@ impl SystemConfig {
         let sn = [0u8; 32];
 
         let mut name = [0u8; 16];
-        let name_ascii: &[u8] = b"GW-ESP32";
+        let name_ascii: &[u8] = b"IMC-S3";
         name[..name_ascii.len()].copy_from_slice(name_ascii);
 
         let mut ble_name = [0u8; 8];
@@ -365,7 +348,7 @@ impl SystemConfig {
     }
 
     fn decode(b: &[u8]) -> Self {
-        if b.len() < CFG_BLOB_LEGACY_SIZE {
+        if b.len() != CFG_BLOB_SIZE {
             return Self::defaults();
         }
         let mut s = Self::defaults();
@@ -433,7 +416,7 @@ impl SystemConfig {
 
         if magic != NVS_MAGIC || schema != NVS_SCHEMA_VERSION {
             log::info!(
-                "[cfg] nvs schema unavailable or unsupported (magic={magic:#010x}, schema={schema:#06x}), using 2.5.0 defaults"
+                "[cfg] nvs schema unavailable or unsupported (magic={magic:#010x}, schema={schema:#06x}), using 2.7.0 defaults"
             );
             return Ok(Self::defaults());
         }
@@ -452,12 +435,8 @@ impl SystemConfig {
             }
         };
 
-        if data.len() < CFG_BLOB_LEGACY_SIZE {
-            log::warn!(
-                "[cfg] nvs blob truncated: {}/{}",
-                data.len(),
-                CFG_BLOB_LEGACY_SIZE
-            );
+        if data.len() != CFG_BLOB_SIZE {
+            log::warn!("[cfg] nvs blob truncated: {}/{}", data.len(), CFG_BLOB_SIZE);
             return Ok(Self::defaults());
         }
 
@@ -1110,8 +1089,8 @@ mod tests {
         );
         // New devices start blank until init reads the hardware eFuse MAC.
         assert_eq!(cfg.sn_str(), "");
-        // 默认设备名 = "GW-ESP32"
-        assert_eq!(cfg.name_str(), "GW-ESP32");
+        // 默认设备名 = "IMC-S3"
+        assert_eq!(cfg.name_str(), "IMC-S3");
     }
 
     // ========================================================================
@@ -1559,25 +1538,6 @@ mod tests {
             expected >= 4 && expected <= 8,
             "AI_COUNT must be 4..=8 (MCA F16/F48)"
         );
-    }
-
-    #[test]
-    fn test_repair_legacy_network_swap() {
-        let mut cfg = SystemConfig::defaults();
-        cfg.ip = [192, 168, 51, 220];
-        cfg.mask = [192, 168, 51, 1];
-        cfg.gateway = [255, 255, 255, 0];
-        assert!(cfg.repair_legacy_network_swap());
-        assert_eq!(cfg.mask, [255, 255, 255, 0]);
-        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
-    }
-
-    #[test]
-    fn test_repair_network_swap_leaves_valid_config_unchanged() {
-        let mut cfg = SystemConfig::defaults();
-        assert!(!cfg.repair_legacy_network_swap());
-        assert_eq!(cfg.mask, [255, 255, 255, 0]);
-        assert_eq!(cfg.gateway, [192, 168, 51, 1]);
     }
 
     #[test]

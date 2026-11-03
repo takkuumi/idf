@@ -163,8 +163,8 @@ MBAP.length 包含 unit_id，与 pymodbus/libmodbus 主流客户端期望不符�
 ## 烧录命令
 
 ```bash
-cargo build --bin gateway
+cargo build --bin imc
 espflash flash --port /dev/cu.usbserial-1430 --no-skip \
-    target/xtensa-esp32s3-espidf/debug/gateway
+    target/xtensa-esp32s3-espidf/debug/imc
 espflash reset --port /dev/cu.usbserial-1430
 ```

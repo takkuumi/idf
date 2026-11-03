@@ -1,6 +1,6 @@
 # ESP32-S3R2 工业网关 用户手册
 
-> 固件版本：v2.5.0 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-11-02）
+> 固件版本：v2.7.0 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-11-02）
 >
 > 适用硬件版本：Default / F3 / F4（详见第 2 章）
 
@@ -295,7 +295,7 @@ GPIO20 AD1 (USB Serial/JTAG)  GPIO21 LED_EN / Default I2C SDA
 | 配网方式 | 静态 OOB | Provisioner 配网 |
 | Proxy 节点 | 启用 | 手机远离 mesh 时通过设备转发 |
 | 心跳周期 | 60s | `mesh-heartbeat` 任务 |
-| 默认 BLE 名称 | "GW-S3" | 可通过 AT+CFGBTNAME 修改 |
+| 默认 BLE 名称 | "Mesh" | 可通过 AT+CFGBTNAME 修改 |
 | BLE Mesh 使能 | 默认启用 | 可通过 AT+CFGMESH=0 关闭 |
 | 默认 MAC | 从 `esp_read_mac(ESP_MAC_BT)` 读取 | |
 
@@ -659,7 +659,7 @@ c.write_register(address=0x45DC, value=0xC5C5)
 **示例**：
 ```
 > AT+VERSION
-< OK esp32s3-iot-gateway v0.1.0
+< OK esp32s3-imc v0.1.0
 ```
 
 #### AT+RESET - 触发复位
@@ -680,10 +680,10 @@ c.write_register(address=0x45DC, value=0xC5C5)
 
 **示例**：
 ```
-> AT+CFGSN=ESP32S3-GW-0001
+> AT+CFGSN=IMC-FC012C0564BB
 < OK
 > AT+CFGSN
-< OK ESP32S3-GW-0001
+< OK IMC-FC012C0564BB
 ```
 
 > SN 最长 32 字符（ASCII）。
@@ -694,7 +694,7 @@ c.write_register(address=0x45DC, value=0xC5C5)
 
 **示例**：
 ```
-> AT+CFGNAME=MyGateway
+> AT+CFGNAME=IMC-S3
 < OK
 ```
 
@@ -748,7 +748,7 @@ c.write_register(address=0x45DC, value=0xC5C5)
 
 **示例**：
 ```
-> AT+CFGBTNAME=GW-S3
+> AT+CFGBTNAME=Mesh
 < OK
 ```
 
@@ -819,7 +819,7 @@ c.write_register(address=0x45DC, value=0xC5C5)
 **示例**：
 ```
 > AT+CFGINFO
-< OK sn=ESP32S3-GW-0001,name=MyGateway,ip=192.168.1.100,mask=255.255.255.0,gw=192.168.1.1,dhcp=0,ble=GW-S3,mesh=1,rs485_0=9600/8N1/slave=1,rs485_1=9600/8N1/slave=1
+< OK sn=IMC-FC012C0564BB,name=IMC-S3,ip=192.168.1.100,mask=255.255.255.0,gw=192.168.1.1,dhcp=0,ble=Mesh,mesh=1,rs485_0=9600/8N1/slave=1,rs485_1=9600/8N1/slave=1
 ```
 
 #### AT+CFGREAD - 按 Modbus 地址读 U16
@@ -1141,8 +1141,8 @@ Web/Modbus/以太网/BLE/RS485 仍可用，DI/DO 操作返回硬件不可用并�
 
 ```
 ================================================
-esp32s3-iot-gateway v0.1.0
-ESP32-S3R2 IoT Gateway starting...
+esp32s3-imc v0.1.0
+Industrial Measurement Controller (IMC) starting...
 ================================================
 [main] starting device protocol store...
 [main] device init ok
