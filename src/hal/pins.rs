@@ -69,12 +69,6 @@ pub struct HalPins {
     pub eth_rst: u8,
     /// RS485 #0 / #1 的 DE 引脚
     pub rs485_de: [u8; 2],
-
-    // ---- 兼容 DI / DO 引脚号（当前硬件变体均由 I2C 扩展管理） ----
-    #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
-    pub di: [u8; 8],
-    #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
-    pub do_: [u8; 8],
 }
 
 impl HalPins {
@@ -112,16 +106,9 @@ impl HalPins {
             },
             ledc_channels: cfg::AO_CHANNELS,
 
-            #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
-            di: cfg::DI_PINS,
-            #[cfg(all(feature = "io-di-do", not(any(feature = "f3", feature = "f4"))))]
-            do_: cfg::DO_PINS,
             eth_int: cfg::ETH_INT,
             eth_rst: cfg::ETH_RST,
             rs485_de: [cfg::RS485_0_DE, cfg::RS485_1_DE],
         })
     }
 }
-
-// 注: 当前变体下 HalPins 不包含 di/do_ 字段（由 I2C 扩展驱动），
-// split 也不设置 di/do_, 不引用 cfg::DI_PINS/DO_PINS。

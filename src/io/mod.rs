@@ -21,7 +21,7 @@ pub mod do_;
 /// 启动 IO 扫描任务
 ///
 /// 仅在 io-di-do 或 F3/F4 启用时编译。
-/// 默认实际硬件 DI/DO 走 MCP23017；F3/F4 使用 PCA9555 组。
+/// 所有硬件变体均通过 PCA9555 组提供 DI/DO。
 #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
 pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     di::start_scan_task(_hal.clone())?;

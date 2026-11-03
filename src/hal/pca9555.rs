@@ -1,6 +1,6 @@
 //! PCA9555 (NCA9555 compatible) driver — matching reference firmware nca9555.cpp.
 //!
-//! Hardware models: **F3** (16 DI + 16 DO) and **F4** (48 DI + 48 DO),
+//! Hardware models: **Default/F3** (16 DI + 16 DO) and **F4** (48 DI + 48 DO),
 //! matching the reference NCA9555 F16/F48 address banks.
 //!
 //! ## IO Bus (SDA=GPIO35, SCL=GPIO36)
@@ -908,12 +908,13 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "f3")]
-    fn test_f3_pca_bank_layout() {
+    #[cfg(not(feature = "f4"))]
+    fn test_default_and_f3_pca_bank_layout() {
         assert_eq!(DI_IO_ADDRS, &[0x40]);
         assert_eq!(DO_IO_ADDRS, &[0x42]);
         assert_eq!(crate::config::hw_version::DI_COUNT, 16);
         assert_eq!(crate::config::hw_version::DO_COUNT, 16);
+        assert!(crate::config::hw_version::USE_PCA9555);
     }
 
     #[test]

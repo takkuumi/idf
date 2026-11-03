@@ -35,8 +35,7 @@
 | GPIO `eth_rst`/`rs485_de`/`run_led` | `Spin<PinDriver<Output>>` | [`src/hal/gpio.rs`](../../src/hal/gpio.rs) | 短临界区 | `set_level` 需 `&mut self` |
 | LEDC `channels[4]` | `Spin<LedcDriver>` | [`src/hal/ledc.rs`](../../src/hal/ledc.rs) | 短临界区 | `set_duty` 需 `&mut self` |
 | ADC oneshot `driver` | `Spin<AdcDriver>` | [`src/hal/adc.rs`](../../src/hal/adc.rs) | 短临界区 | fallback 路径 (无 feature `adc-continuous`) |
-| I2C `bus` (io_ext) + `do_cache` | `Spin<I2cBus>` + `AtomicBits64` | [`src/hal/io_ext.rs`](../../src/hal/io_ext.rs) | 短临界区 + **真无锁位图** | do_cache 真无锁 |
-| I2C `io_bus`/`led_bus` (pca9555) + `do_cache` | `Spin<SwI2c>` + `AtomicU16` | [`src/hal/pca9555.rs`](../../src/hal/pca9555.rs) | 短临界区 + 真无锁 | do_cache CAS 单位写 |
+| PCA9555 IO/LED worker | `Spin<SwI2c>` + `AtomicBits64` snapshots | [`src/hal/pca9555.rs`](../../src/hal/pca9555.rs) | 独立 worker + 有界队列 | 读者不持有 I2C 锁 |
 | `IO.di` / `IO.do_` bits | `AtomicBits64` | [`src/bus/io_state.rs`](../../src/bus/io_state.rs) | **真无锁** | xtensa 4× AtomicU16 + seqlock |
 | `IO.ai/ao/sys` | `AtomicU16/U32/U8` 原生原子 | [`src/bus/io_state.rs`](../../src/bus/io_state.rs) | **真无锁** | 6 ch raw/scaled + 4 ch AO + sys |
 | `CONFIG` / `STORAGE` | `Rcu<Snapshot>` | [`src/bus/config_state.rs`](../../src/bus/config_state.rs) / [`src/bus/storage_state.rs`](../../src/bus/storage_state.rs) | **真无锁** (读; 1 load+1 fetch_add) | 写 epoch 延迟回收 (无 leak) |
@@ -70,7 +69,6 @@ BLE HANDLE/GATTS_IF/CONN_ID      ← 最低层级 (Bluedroid 回调内)
 | Modbus 写 → `request_apply_config()` | mailbox send (不持锁) | ✅ 安全 (异步) |
 | `BLE WRITE_EVT` → `handle_modbus_rtu` | HANDLE_TABLE(已释放) → BUS | ✅ 安全 |
 | DI/DO/AI 采样更新 | 原子数组 (无 BUS 锁) | ✅ 安全 (无锁) |
-| `io_ext.write_do` | do_cache CAS (无锁) + I2C Spin | ✅ 安全 |
 | `pca9555.write_do_all` | do_cache CAS (无锁) + I2C Spin | ✅ 安全 |
 
 **当前代码中不存在 ABBA 死锁路径.** `Spin` 的非阻塞语义还消除了原来 `parking_lot`

@@ -91,8 +91,8 @@ pub mod pins {
     pub const RS485_ADDR_PINS: [u8; 4] = [19, 20, 48, 47];
     pub const ESP_STOP_PIN: u8 = 34;
 
-    // ---- F3/F4 NCA9555 (PCA9555) IO 扩展芯片 (软件 I2C) ----
-    // Default 使用下方 I2C0 的 MCP23017；所有变体均不使用 ESP32 GPIO 直驱 DI/DO
+    // ---- NCA9555 (PCA9555) IO 扩展芯片 (软件 I2C) ----
+    // 所有变体均不使用 ESP32 GPIO 直驱 DI/DO
     // IIC_SCL=36, IIC_SDA=35, IIC_LED_SCL=37, IIC_LED_SDA=38, INT=34
     pub const NCA9555_IIC_SCL: u8 = 36;
     pub const NCA9555_IIC_SDA: u8 = 35;
@@ -104,15 +104,6 @@ pub mod pins {
     // 参考固件: FIB1=digitalRead(39), FIB2=digitalRead(40)
     pub const FIB1_PIN: u8 = 39;
     pub const FIB2_PIN: u8 = 40;
-
-    // ---- 数字输入 DI (兼容占位窗口) ----
-    // 当前变体均由 I2C 扩展驱动；这些 GPIO 仅保留给旧配置接口，
-    // 不得作为现场 DI 引脚使用。
-    pub const DI_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
-
-    // ---- 数字输出 DO (兼容占位窗口) ----
-    // 当前变体均由 I2C 扩展驱动；这些 GPIO 仅保留给旧配置接口。
-    pub const DO_PINS: [u8; 8] = [15, 16, 17, 18, 7, 8, 15, 16];
 
     // ---- AI 模拟输入 (ESP32-S3 ADC, 12-bit SAR ADC) ----
     // F3: GPIO1/2/3/8 = ADC1_CH0/1/2/7。
@@ -148,19 +139,13 @@ pub mod pins {
     ];
     pub const AO_FREQ_HZ: u32 = 5000; // PWM 频率，0-10V 模拟输出经 RC 滤波
     pub const AO_RESOLUTION_BITS: u8 = 12; // 12-bit 与 ADC 对齐
-
-    // ---- I2C 总线 (默认构建用 MCP23017 IO 扩展) ----
-    pub const I2C_PORT: u8 = 0; // I2C0
-    pub const I2C_SDA: u8 = 21; // 默认版本下也是普通 GPIO, 无副作用
-    pub const I2C_SCL: u8 = 33;
-    pub const I2C_FREQ_HZ: u32 = 400_000; // 400kHz Fast Mode (MCP23017 支持到 1.7MHz)
 }
 
 // ----------------------------------------------------------------------------
 // 硬件版本 (F3 / F4 / Default)
 // ----------------------------------------------------------------------------
 // 编译期 feature flag 切换, 不支持运行时切换
-// - Default: 16 DI + 16 DO (MCP23017, I2C 扩展)
+// - Default: 16 DI + 16 DO (PCA9555, 软件 I2C)
 // - F3:      16 DI + 16 DO (PCA9555, 软件 I2C)
 // - F4:      48 DI + 48 DO (多片 PCA9555, 软件 I2C)
 // ----------------------------------------------------------------------------
@@ -193,7 +178,7 @@ pub mod hw_version {
     /// DO 通道数
     /// - F3: 16 DO (PCA9555)
     /// - F4: 48 DO (多片 PCA9555)
-    /// - 默认: 16 DO (1 片 MCP23017)
+    /// - 默认: 16 DO (PCA9555)
     #[cfg(feature = "f3")]
     pub const DO_COUNT: usize = 16;
     #[cfg(feature = "f4")]
@@ -201,21 +186,7 @@ pub mod hw_version {
     #[cfg(not(any(feature = "f3", feature = "f4")))]
     pub const DO_COUNT: usize = 16;
 
-    /// 是否使用 MCP23017 IO 扩展 (默认构建)
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const USE_IO_EXT: bool = true;
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const USE_IO_EXT: bool = false;
-
-    /// MCP23017 扩展芯片数量 (默认构建使用一片)
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const DI_EXT_CHIPS: usize = 1;
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const DI_EXT_CHIPS: usize = 0;
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const DO_EXT_CHIPS: usize = 1;
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const DO_EXT_CHIPS: usize = 0;
+    pub const USE_PCA9555: bool = true;
 
     /// AI 通道数 (Modbus 报告值, 与 MCA F16/F48 一致).
     /// 物理采样由 hal::adc 按变体提供；F4 前四路走 ADC1 DMA，后四路走 ADC2 OneShot。
@@ -226,44 +197,6 @@ pub mod hw_version {
     pub const AI_COUNT: u16 = 8;
     #[cfg(not(feature = "f4"))]
     pub const AI_COUNT: u16 = 4;
-}
-
-// ----------------------------------------------------------------------------
-// MCP23017 IO 扩展芯片配置 (仅默认构建使用)
-// ----------------------------------------------------------------------------
-// MCP23017: 16 通道 I2C IO 扩展, 地址 0x20-0x27 (A0/A1/A2 接地/接高)
-// 每片 2 个端口 (PORTA + PORTB), 各 8 位, 共 16 位
-// ----------------------------------------------------------------------------
-pub mod io_ext {
-    /// MCP23017 DI 芯片 I2C 地址列表 (7-bit, 不含 R/W 位)
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const DI_ADDRS: &[u8] = &[0x20]; // 1 片, 16 DI
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const DI_ADDRS: &[u8] = &[];
-
-    /// MCP23017 DO 芯片 I2C 地址列表 (F3: 1 片; F4: 3 片)
-    /// F4: DI 已占用 0x20/0x21/0x22, DO 用 0x23/0x24/0x25
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const DO_ADDRS: &[u8] = &[0x21]; // F3: 1 片 DO @ 0x21
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const DO_ADDRS: &[u8] = &[];
-
-    /// 单 DO 芯片地址 (向后兼容, 取第一个地址)
-    #[cfg(not(any(feature = "f3", feature = "f4")))]
-    pub const DO_ADDR: u8 = 0x21;
-    #[cfg(any(feature = "f3", feature = "f4"))]
-    pub const DO_ADDR: u8 = 0;
-
-    // ---- MCP23017 寄存器地址 (Byte mode, IOCON.BANK=0) ----
-    pub const REG_IODIRA: u8 = 0x00; // PORTA 方向 (1=输入, 0=输出)
-    pub const REG_IODIRB: u8 = 0x01; // PORTB 方向
-    pub const REG_IOCON: u8 = 0x0A; // 配置寄存器 (BANK=0 模式, LOOP13: 强制写 0x00)
-    pub const REG_GPPUA: u8 = 0x0C; // PORTA 上拉 (1=使能)
-    pub const REG_GPPUB: u8 = 0x0D; // PORTB 上拉
-    pub const REG_GPIOA: u8 = 0x12; // PORTA 数据 (读=输入电平, 写=输出锁存)
-    pub const REG_GPIOB: u8 = 0x13; // PORTB 数据
-    pub const REG_OLATA: u8 = 0x14; // PORTA 输出锁存
-    pub const REG_OLATB: u8 = 0x15; // PORTB 输出锁存
 }
 
 // ----------------------------------------------------------------------------
@@ -678,7 +611,6 @@ mod tests {
         assert_eq!(hw_version::DI_COUNT, 48);
         assert_eq!(hw_version::DO_COUNT, 48);
         assert_eq!(hw_version::NAME, "F4");
-        assert_eq!(hw_version::DO_EXT_CHIPS, 0);
     }
 
     #[test]
@@ -687,6 +619,7 @@ mod tests {
         assert_eq!(hw_version::NAME, "F16");
         assert_eq!(hw_version::DI_COUNT, 16);
         assert_eq!(hw_version::DO_COUNT, 16);
+        assert!(hw_version::USE_PCA9555);
         assert_eq!(hw_version::MODEL_CODE, 0x00F3);
     }
 

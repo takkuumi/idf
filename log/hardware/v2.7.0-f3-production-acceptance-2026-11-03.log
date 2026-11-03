@@ -1,0 +1,394 @@
+serial_start=2026-11-03T10:59:36.436418+00:00 port=/dev/cu.usbserial-1430 baud=115200 duration=180s
+serial_connected n=1 at=2026-11-03T10:59:36.440814+00:00
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x1 (POWERON),boot:0x2b (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:2
+load:0x3fce2820,len:0x14f0
+load:0x403c8700,len:0xd24
+load:0x403cb700,len:0x2f48
+entry 0x403c8924
+I (29) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (29) boot: compile time Nov  3 2026 18:52:24
+I (30) boot: Multicore bootloader
+I (30) boot: chip revision: v0.2
+I (33) boot: efuse block revision: v1.3
+I (36) boot.esp32s3: Boot SPI Speed : 40MHz
+I (40) boot.esp32s3: SPI Mode       : DIO
+I (44) boot.esp32s3: SPI Flash Size : 8MB
+I (48) boot: Enabling RNG early entropy source...
+I (52) boot: Partition Table:
+I (55) boot: ## Label            Usage          Type ST Offset   Length
+I (61) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (67) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (74) boot:  2 otadata          OTA data         01 00 00010000 00002000
+I (81) boot:  3 nvs_keys         NVS keys         01 04 00017000 00001000
+I (87) boot:  4 holding          Unknown data     01 06 00018000 00008000
+I (94) boot:  5 factory          factory app      00 00 00020000 00240000
+I (100) boot:  6 ota_0            OTA app          00 10 00260000 00240000
+I (107) boot:  7 ota_1            OTA app          00 11 004a0000 00240000
+I (113) boot:  8 coredump         Unknown data     01 03 006e0000 00010000
+I (120) boot:  9 ble_mesh         WiFi data        01 02 006f0000 00010000
+I (126) boot: 10 storage          Unknown data     01 81 00700000 00100000
+I (133) boot: End of partition table
+I (136) boot: Defaulting to factory image
+I (140) esp_image: segment 0: paddr=00020020 vaddr=3c140020 size=5a354h (369492) map
+I (238) esp_image: segment 1: paddr=0007a37c vaddr=3fca3000 size=05c9ch ( 23708) load
+I (245) esp_image: segment 2: paddr=00080020 vaddr=42000020 size=133d78h (1260920) map
+I (555) esp_image: segment 3: paddr=001b3da0 vaddr=3fca8c9c size=00e24h (  3620) load
+I (556) esp_image: segment 4: paddr=001b4bcc vaddr=40378000 size=1afb4h (110516) load
+I (590) esp_image: segment 5: paddr=001cfb88 vaddr=50000000 size=00020h (    32) load
+I (601) boot: Loaded app from partition at offset 0x20000
+I (601) boot: Disabling RNG early entropy source...
+[0;32mI (612) esp_psram: Found 2MB PSRAM device[0m
+[0;32mI (612) esp_psram: Speed: 80MHz[0m
+[0;32mI (612) cpu_start: Multicore app[0m
+[0;32mI (807) esp_psram: SPI SRAM memory test OK[0m
+[0;32mI (815) cpu_start: GPIO 44 and 43 are used as console UART I/O pins[0m
+[0;32mI (816) cpu_start: Pro cpu start user code[0m
+[0;32mI (816) cpu_start: cpu freq: 240000000 Hz[0m
+[0;32mI (820) app_init: Application information:[0m
+[0;32mI (825) app_init: Project name:     libespidf[0m
+[0;32mI (830) app_init: App version:      2.7.0[0m
+[0;32mI (835) app_init: Compile time:     Nov  3 2026 18:51:47[0m
+[0;32mI (841) app_init: ELF file SHA256:  d11ecc473...[0m
+[0;32mI (846) app_init: ESP-IDF:          v5.5.4[0m
+[0;32mI (851) efuse_init: Min chip rev:     v0.0[0m
+[0;32mI (856) efuse_init: Max chip rev:     v0.99 [0m
+[0;32mI (861) efuse_init: Chip rev:         v0.2[0m
+[0;32mI (866) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (873) heap_init: At 3FCB0308 len 00039408 (229 KiB): RAM[0m
+[0;32mI (879) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM[0m
+[0;32mI (885) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM[0m
+[0;32mI (891) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM[0m
+[0;32mI (898) esp_psram: Adding pool of 2048K of PSRAM memory to heap allocator[0m
+[0;32mI (906) spi_flash: detected chip: winbond[0m
+[0;32mI (909) spi_flash: flash io: dio[0m
+[0;32mI (914) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (921) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (928) esp_core_dump_flash: Init core dump to flash[0m
+[0;32mI (934) esp_core_dump_flash: Found partition 'coredump' @ 6e0000 65536 bytes[0m
+D (941) esp_core_dump_flash: Blank core dump partition![0m
+[0;32mI (947) coexist: coex firmware version: 093e3d2[0m
+[0;32mI (952) coexist: coexist rom version e7ae62f[0m
+[0;32mI (957) main_task: Started on CPU0[0m
+[0;32mI (961) esp_psram: Reserving pool of 64K of internal memory for DMA/internal allocations[0m
+[0;32mI (970) main_task: Calling app_main()[0m
+[0;32mI (975) imc: ================================================[0m
+[0;32mI (980) imc: imc-controller v2.7.0[0m
+[0;32mI (984) imc: [build] id=f2267a17b308-dirty[0m
+[0;32mI (989) imc: Industrial Measurement Controller (IMC) starting...[0m
+[0;32mI (996) imc: ================================================[0m
+[0;32mI (1006) imc::hal::adc::adc_continuous: [adc] Continuous+DMA mode started: 4 ch, 1kHz total, Type2 12-bit[0m
+[0;32mI (1065) imc::hal: [hal] IO/LED board power enabled (gpio21 + gpio33 HIGH)[0m
+[0;32mI (1071) imc::hal::pca9555: [pca9555] worker initialized: DI=[64] DO=[66] (16DI/16DO; missing boards are degraded)[0m
+[0;32mI (1074) imc: [main] initializing NVS flash...[0m
+[0;32mI (1092) imc::device: [device] NVS namespace 'imc' opened[0m
+[0;32mI (1092) imc: [main] reset reason=1 (POWERON) previous=1 (POWERON)[0m
+[0;32mI (1094) imc::rs485::dip: [dip] AD0=0 AD1=0 AD2=0 AD3=0 → address=0 (gpio 19/20/48/47)[0m
+[0;32mI (1102) imc: [main] starting device protocol store...[0m
+[0;32mI (1108) imc::device: [device] no active IMC blob, using defaults[0m
+[0;32mI (1115) imc::device: [device] nvs empty or all blobs corrupted, using defaults[0m
+[0;32mI (1124) imc::device: [device] dev_text blob not present, using empty[0m
+[0;32mI (1130) imc::device: [device] no valid dev_text blob, using empty[0m
+[0;32mI (1140) imc::device::holding_store: [holding] raw partition found: offset=0x18000 size=32KB[0m
+[0;33mW (1151) imc::device::holding_store: [holding] slot 1 invalid: magic=0xFFFFFFFF version=65535 words=65535 generation=4294967295 crc=0xFFFFFFFF/0x00000000[0m
+[0;32mI (1161) imc::device::holding_store: [holding] loaded raw slot 0 generation 1 (2048 words)[0m
+[0;32mI (1171) imc::device: [device] do_bits magic not found or wrong (0x0), default 0[0m
+[0;32mI (1178) imc::device: [device] DO bits loaded: 0x0000000000000000[0m
+[0;32mI (1184) imc::device: [device] proto loaded: 0 words, version=0x0000[0m
+[0;32mI (1192) imc::device: [device] cfg loaded: sn='IMC-FC012C0564BB' ip=192.168.1.200 mac=FC:01:2C:05:64:BB fw=0x010E[0m
+[0;32mI (1204) imc::device: [device] DeviceActor started (mailbox consumer thread)[0m
+[0;32mI (1210) imc: [main] device init ok[0m
+[0;32mI (1215) imc: [main] reset count=2 reason=1 (POWERON)[0m
+[0;32mI (1220) imc: [main] starting ethernet (W5500)...[0m
+[0;32mI (1225) imc::ethernet::w5500: [eth] initializing W5500 over SPI2 (MISO=11,MOSI=12,SCLK=10,CS=9,INT=13,RST=14)...[0m
+[0;32mI (1237) imc::ethernet::w5500: [eth] resetting W5500 via GPIO14...[0m
+[0;32mI (1295) imc::ethernet::w5500: [eth] SPI bus initialized (host=2, DMA=auto)[0m
+[0;32mI (1307) imc::ethernet::w5500: [eth] setting MAC: FC:01:2C:05:64:BB[0m
+[0;32mI (1309) esp_eth.netif.netif_glue: fc:01:2c:05:64:bb[0m
+[0;32mI (1309) esp_eth.netif.netif_glue: ethernet attached to netif[0m
+[0;32mI (1316) imc::ethernet::w5500: [eth] network config: dhcp=false ip=192.168.1.200 mask=255.255.255.0 gw=192.168.1.1 dns=192.168.1.1[0m
+[0;32mI (1329) imc::ethernet::w5500: [eth] static IP configured: 192.168.1.200 / 255.255.255.0 gw 192.168.1.1 dns 192.168.1.1[0m
+[0;32mI (1339) imc::ethernet::w5500: [eth] IP/ETH event handlers registered[0m
+[0;32mI (1356) imc::ethernet::w5500: [eth] W5500 driver installed and started, eth_handle=0x3fcd01a0[0m
+[0;32mI (1357) imc::ethernet::w5500: [eth] heartbeat registered in main_loop (period=5s)[0m
+[0;32mI (1364) imc::ethernet::w5500: [eth] W5500 startup complete[0m
+[0;32mI (1370) imc: [main] starting ble gatt server...[0m
+[0;32mI (1375) imc::ble_at: [ble_at] service starting (uuid=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1384) imc::ble_at: [ble_at] initializing BT controller (BLE mode)[0m
+[0;32mI (1391) imc::ble_at: [ble_at] controller config magic=0x5a5aa5a5, version=0x02509280[0m
+[0;32mI (1400) BLE_INIT: BT controller compile version [b7de11e][0m
+[0;32mI (1406) BLE_INIT: Using main XTAL as clock source[0m
+[0;32mI (1412) BLE_INIT: Feature Config, ADV:1, BLE_50:1, DTM:1, SCAN:1, CCA:0, SMP:1, CONNECT:1[0m
+[0;32mI (1421) BLE_INIT: Bluetooth MAC: fc:01:2c:05:64:ba[0m
+[0;32mI (1428) phy_init: phy_version 711,97bcf0a2,Aug 25 2025,19:04:10[0m
+[0;32mI (1475) phy_init: Saving new calibration data due to checksum failure or outdated calibration data, mode(0)[0m
+[0;32mI (1513) imc::ble_at: [ble_at] BLE device name set to 'Mesh'[0m
+[0;32mI (1514) imc::ble_at: [ble_at] BLE MAC = FC:01:2C:05:64:BA[0m
+[0;32mI (1515) imc::ble_at: [ble_at] ETH MAC = FC:01:2C:05:64:BB[0m
+[0;32mI (1522) imc::ble_at: [ble_at] local MTU set to 500[0m
+[0;32mI (1528) imc::ble_at: [ble_at] GATT app registered, gatts_if=3[0m
+[0;32mI (1533) imc::ble_at: [ble_at] REG_EVT status=0, app_id=1[0m
+[0;32mI (1540) imc::ble_at: [ble_at] calling create_attr_tab(gatts_if=3, n_attr=4)[0m
+[0;32mI (1547) imc::ble_at: [ble_at] create_attr_tab returned 0[0m
+[0;32mI (1555) imc::ble_at: [ble_at] GOT CREAT_ATTR_TAB_EVT[0m
+[0;32mI (1559) imc::ble_at: [ble_at] CREAT_ATTR_TAB_EVT status=0 num_handle=4 handles=0x3fcad402[0m
+[0;32mI (1568) imc::ble_at: [ble_at] attr_tab created (handles=4, svc=40, status=0)[0m
+[0;32mI (1576) imc::ble_at: [ble_at] about to call start_service(handle=40)[0m
+[0;32mI (1583) imc::ble_at: [ble_at] GATT service started (uuid=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1592) imc::ble_at: [ble_at] config_adv_data queued (name + UUID + flags)[0m
+[0;32mI (1603) imc::ble_at: [ble_at] ADV_DATA configured; starting advertising...[0m
+[0;32mI (1611) imc::ble_at: [ble_at] BLE advertising active (svc=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1617) imc::ble_at: [ble_at] service startup queued (GATT callback registered, AT parser ready)[0m
+[0;32mI (1627) imc::ble_at: [ble_at] notification sender runs in main loop (no dedicated thread)[0m
+[0;32mI (1636) imc: [main] starting io scan task...[0m
+[0;32mI (1641) imc::io::di: [di] scan task registered in main_loop (period=20ms, channels=16 version F3)[0m
+[0;32mI (1650) imc::io::do_: [do] output task registered in main_loop (fallback=2000 ticks version F3)[0m
+[0;32mI (1660) imc: [main] starting ai/ao task...[0m
+[0;32mI (1665) imc::channel::ao: [ao] output task registered in main_loop (period=100ms)[0m
+[0;32mI (1673) imc::channel::ai: [ai] sample task registered in main_loop (period=100ms)[0m
+[0;32mI (1681) imc::channel::calib: [adc-calib] AI0 开始非阻塞 8 秒校准，通信服务继续启动[0m
+[0;32mI (1693) imc::udp_multicast: [udp-mcast] join group=239.0.0.1[0m
+[0;32mI (1698) imc::udp_multicast: [udp-mcast] joined via INADDR_ANY[0m
+[0;32mI (1704) imc::udp_multicast: [udp-mcast] receiver thread spawned[0m
+[0;32mI (1710) imc::udp_multicast: [udp-mcast] listening on port 5003, group 239.0.0.1[0m
+[0;32mI (1719) imc::nfc: [nfc] background thread spawned (5s polling, bounded retry backoff)[0m
+[0;33mW (1727) imc::udp_multicast: [udp-mcast] source IP filter is unconfigured; dropping all packets[0m
+[0;32mI (1737) imc::web: [http] web server started on port 80[0m
+[0;32mI (1742) imc::web: [http] listening on 0.0.0.0:80[0m
+[0;32mI (1748) imc: [main] registering modbus rtu...[0m
+[0;32mI (1753) imc::protocol: [protocol] registered: modbus-rtu[0m
+[0;32mI (1759) imc: [main] registering modbus tcp...[0m
+[0;32mI (1764) imc::protocol: [protocol] registered: modbus-tcp[0m
+[0;33mW (1773) imc::modbus::rtu_runtime: [modbus-rtu] RS485-3 runtime is implemented but disabled: UART0 is the active console[0m
+[0;32mI (1782) imc::protocol: [protocol] modbus-rtu started[0m
+[0;32mI (1788) imc::rs485::port: [rs485] opened uart1 @9600 bps, tx=45, rx=46, de=7[0m
+[0;32mI (1795) imc::modbus::rtu_runtime: [modbus-rtu] RS485-1 switched to Master, addr=1, 9600bps[0m
+[0;32mI (1804) imc::modbus::tcp_server: [mb-tcp] bound :502[0m
+[0;32mI (1810) imc::rs485::port: [rs485] opened uart2 @9600 bps, tx=42, rx=41, de=255[0m
+[0;32mI (1818) imc::modbus::rtu_runtime: [modbus-rtu] RS485-2 switched to Slave, addr=1, 9600bps[0m
+[0;32mI (1827) imc::modbus::tcp_server: [mb-tcp] bound :503[0m
+[0;32mI (1834) imc::modbus::tcp_server: [mb-tcp] bound :504[0m
+[0;32mI (1839) imc::modbus::tcp_server: [mb-tcp] bound :5002[0m
+[0;32mI (1844) imc::modbus::tcp_server: [mb-tcp] 4 ports, max 8 clients, main-loop polling[0m
+[0;32mI (1853) imc::protocol: [protocol] modbus-tcp started[0m
+[0;32mI (1859) imc::control_logic: [control] MCA table loaded: 0 IO records, 0 analog channels[0m
+[0;32mI (1867) imc: [main] entering main loop (period=5ms)[0m
+[0;32mI (1873) imc::health: === Task-Core Assignment (8 tasks) ===[0m
+[0;32mI (1879) imc::health:   [ 0] pca9555-i2c (max_stall=10)[0m
+[0;32mI (1885) imc::health:   [ 1] device-store (max_stall=3)[0m
+[0;32mI (1891) imc::health:   [ 2] udp-mcast (max_stall=30)[0m
+[0;32mI (1897) imc::health:   [ 3] nfc-st25 (max_stall=30)[0m
+[0;32mI (1902) imc::health:   [ 4] http-srv (max_stall=30)[0m
+[0;32mI (1908) imc::health:   [ 5] mb-rtu-port0 (max_stall=30)[0m
+[0;32mI (1914) imc::health:   [ 6] mb-rtu-port1 (max_stall=30)[0m
+[0;32mI (1920) imc::health:   [ 7] main (max_stall=3)[0m
+[0;32mI (1931) imc::ble_at: [ble_at] physical BT LED off[0m
+[0;32mI (3358) esp_netif_handlers: eth ip: 192.168.1.200, mask: 255.255.255.0, gw: 192.168.1.1[0m
+[0;32mI (3362) imc: [eth] IP assigned at uptime=2461ms (event dispatch=3ms): 192.168.1.200[0m
+[0;32mI (9686) imc::channel::calib: [adc-calib] AI0 raw_min=2843 raw_max=2845 samples=155[0m
+[0;33mW (9687) imc::channel::calib: [adc-calib] AI0 无有效校准端点，保留默认标定[0m
+[0;32mI (61926) imc: [main] uptime=59s heap=2045KB min=2039KB internal=55KB internal_min=54KB tick=12000[0m
+[0;32mI (61926) imc: [perf] main_loop period=5ms max_work=7259us deadline_miss=1[0m
+[0;32mI (61934) imc::telemetry: [perf] work_samples=11999 p95_upper_us=1000 p99_upper_us=1000 phase_max_us=[1277, 701, 158, 151, 291, 482, 4182, 2820, 1196, 6725][0m
+[0;32mI (61947) imc: [rcu] max_reclaim_wait_us config=11 storage=8[0m
+[0;32mI (121951) imc: [main] uptime=120s heap=2045KB min=2039KB internal=55KB internal_min=54KB tick=24000[0m
+[0;32mI (121952) imc: [perf] main_loop period=5ms max_work=29352us deadline_miss=2[0m
+[0;32mI (121960) imc::telemetry: [perf] work_samples=12000 p95_upper_us=1000 p99_upper_us=1000 phase_max_us=[1042, 434, 157, 68, 200, 422, 4745, 62, 1139, 56][0m
+[0;32mI (121972) imc: [rcu] max_reclaim_wait_us config=11 storage=8[0m
+serial_end=2026-11-03T11:02:36.964876+00:00 sessions=1 reopen_errors=0
+serial_start=2026-11-03T11:13:59.957118+00:00 port=/dev/cu.usbserial-1430 baud=115200 duration=60s
+serial_connected n=1 at=2026-11-03T11:13:59.961685+00:00
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x1 (POWERON),boot:0x2b (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:2
+load:0x3fce2820,len:0x14f0
+load:0x403c8700,len:0xd24
+load:0x403cb700,len:0x2f48
+entry 0x403c8924
+I (29) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (29) boot: compile time Nov  3 2026 18:52:24
+I (30) boot: Multicore bootloader
+I (30) boot: chip revision: v0.2
+I (33) boot: efuse block revision: v1.3
+I (36) boot.esp32s3: Boot SPI Speed : 40MHz
+I (40) boot.esp32s3: SPI Mode       : DIO
+I (44) boot.esp32s3: SPI Flash Size : 8MB
+I (48) boot: Enabling RNG early entropy source...
+I (52) boot: Partition Table:
+I (55) boot: ## Label            Usage          Type ST Offset   Length
+I (61) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (67) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (74) boot:  2 otadata          OTA data         01 00 00010000 00002000
+I (81) boot:  3 nvs_keys         NVS keys         01 04 00017000 00001000
+I (87) boot:  4 holding          Unknown data     01 06 00018000 00008000
+I (94) boot:  5 factory          factory app      00 00 00020000 00240000
+I (100) boot:  6 ota_0            OTA app          00 10 00260000 00240000
+I (107) boot:  7 ota_1            OTA app          00 11 004a0000 00240000
+I (113) boot:  8 coredump         Unknown data     01 03 006e0000 00010000
+I (120) boot:  9 ble_mesh         WiFi data        01 02 006f0000 00010000
+I (126) boot: 10 storage          Unknown data     01 81 00700000 00100000
+I (133) boot: End of partition table
+I (136) boot: Defaulting to factory image
+I (140) esp_image: segment 0: paddr=00020020 vaddr=3c140020 size=5a354h (369492) map
+I (238) esp_image: segment 1: paddr=0007a37c vaddr=3fca3000 size=05c9ch ( 23708) load
+I (245) esp_image: segment 2: paddr=00080020 vaddr=42000020 size=133d78h (1260920) map
+I (555) esp_image: segment 3: paddr=001b3da0 vaddr=3fca8c9c size=00e24h (  3620) load
+I (556) esp_image: segment 4: paddr=001b4bcc vaddr=40378000 size=1afb4h (110516) load
+I (590) esp_image: segment 5: paddr=001cfb88 vaddr=50000000 size=00020h (    32) load
+I (601) boot: Loaded app from partition at offset 0x20000
+I (601) boot: Disabling RNG early entropy source...
+[0;32mI (612) esp_psram: Found 2MB PSRAM device[0m
+[0;32mI (612) esp_psram: Speed: 80MHz[0m
+[0;32mI (612) cpu_start: Multicore app[0m
+[0;32mI (807) esp_psram: SPI SRAM memory test OK[0m
+[0;32mI (815) cpu_start: GPIO 44 and 43 are used as console UART I/O pins[0m
+[0;32mI (816) cpu_start: Pro cpu start user code[0m
+[0;32mI (816) cpu_start: cpu freq: 240000000 Hz[0m
+[0;32mI (820) app_init: Application information:[0m
+[0;32mI (825) app_init: Project name:     libespidf[0m
+[0;32mI (830) app_init: App version:      2.7.0[0m
+[0;32mI (835) app_init: Compile time:     Nov  3 2026 18:51:47[0m
+[0;32mI (841) app_init: ELF file SHA256:  d11ecc473...[0m
+[0;32mI (846) app_init: ESP-IDF:          v5.5.4[0m
+[0;32mI (851) efuse_init: Min chip rev:     v0.0[0m
+[0;32mI (856) efuse_init: Max chip rev:     v0.99 [0m
+[0;32mI (861) efuse_init: Chip rev:         v0.2[0m
+[0;32mI (866) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (873) heap_init: At 3FCB0308 len 00039408 (229 KiB): RAM[0m
+[0;32mI (879) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM[0m
+[0;32mI (885) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM[0m
+[0;32mI (891) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM[0m
+[0;32mI (898) esp_psram: Adding pool of 2048K of PSRAM memory to heap allocator[0m
+[0;32mI (906) spi_flash: detected chip: winbond[0m
+[0;32mI (909) spi_flash: flash io: dio[0m
+[0;32mI (914) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (921) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (928) esp_core_dump_flash: Init core dump to flash[0m
+[0;32mI (934) esp_core_dump_flash: Found partition 'coredump' @ 6e0000 65536 bytes[0m
+D (941) esp_core_dump_flash: Blank core dump partition![0m
+[0;32mI (947) coexist: coex firmware version: 093e3d2[0m
+[0;32mI (952) coexist: coexist rom version e7ae62f[0m
+[0;32mI (957) main_task: Started on CPU0[0m
+[0;32mI (961) esp_psram: Reserving pool of 64K of internal memory for DMA/internal allocations[0m
+[0;32mI (970) main_task: Calling app_main()[0m
+[0;32mI (975) imc: ================================================[0m
+[0;32mI (980) imc: imc-controller v2.7.0[0m
+[0;32mI (984) imc: [build] id=f2267a17b308-dirty[0m
+[0;32mI (989) imc: Industrial Measurement Controller (IMC) starting...[0m
+[0;32mI (996) imc: ================================================[0m
+[0;32mI (1006) imc::hal::adc::adc_continuous: [adc] Continuous+DMA mode started: 4 ch, 1kHz total, Type2 12-bit[0m
+[0;32mI (1065) imc::hal: [hal] IO/LED board power enabled (gpio21 + gpio33 HIGH)[0m
+[0;32mI (1071) imc::hal::pca9555: [pca9555] worker initialized: DI=[64] DO=[66] (16DI/16DO; missing boards are degraded)[0m
+[0;32mI (1074) imc: [main] initializing NVS flash...[0m
+[0;32mI (1090) imc::device: [device] NVS namespace 'imc' opened[0m
+[0;32mI (1091) imc: [main] reset reason=1 (POWERON) previous=3 (SOFTWARE)[0m
+[0;32mI (1093) imc::rs485::dip: [dip] AD0=0 AD1=0 AD2=0 AD3=0 → address=0 (gpio 19/20/48/47)[0m
+[0;32mI (1101) imc: [main] starting device protocol store...[0m
+[0;32mI (1107) imc::device: [device] no active IMC blob, using defaults[0m
+[0;32mI (1114) imc::device: [device] nvs empty or all blobs corrupted, using defaults[0m
+[0;32mI (1122) imc::device: [device] dev_text blob not present, using empty[0m
+[0;32mI (1129) imc::device: [device] no valid dev_text blob, using empty[0m
+[0;32mI (1139) imc::device::holding_store: [holding] raw partition found: offset=0x18000 size=32KB[0m
+[0;33mW (1149) imc::device::holding_store: [holding] slot 1 invalid: magic=0xFFFFFFFF version=65535 words=65535 generation=4294967295 crc=0xFFFFFFFF/0x00000000[0m
+[0;32mI (1159) imc::device::holding_store: [holding] loaded raw slot 0 generation 1 (2048 words)[0m
+[0;32mI (1170) imc::device: [device] do_bits magic not found or wrong (0x0), default 0[0m
+[0;32mI (1176) imc::device: [device] DO bits loaded: 0x0000000000000000[0m
+[0;32mI (1183) imc::device: [device] proto loaded: 0 words, version=0x0000[0m
+[0;32mI (1190) imc::device: [device] cfg loaded: sn='IMC-FC012C0564BB' ip=192.168.51.226 mac=FC:01:2C:05:64:BB fw=0x010E[0m
+[0;32mI (1203) imc::device: [device] DeviceActor started (mailbox consumer thread)[0m
+[0;32mI (1209) imc: [main] device init ok[0m
+[0;32mI (1214) imc: [main] reset count=4 reason=1 (POWERON)[0m
+[0;32mI (1219) imc: [main] starting ethernet (W5500)...[0m
+[0;32mI (1224) imc::ethernet::w5500: [eth] initializing W5500 over SPI2 (MISO=11,MOSI=12,SCLK=10,CS=9,INT=13,RST=14)...[0m
+[0;32mI (1236) imc::ethernet::w5500: [eth] resetting W5500 via GPIO14...[0m
+[0;32mI (1294) imc::ethernet::w5500: [eth] SPI bus initialized (host=2, DMA=auto)[0m
+[0;32mI (1306) imc::ethernet::w5500: [eth] setting MAC: FC:01:2C:05:64:BB[0m
+[0;32mI (1308) esp_eth.netif.netif_glue: fc:01:2c:05:64:bb[0m
+[0;32mI (1308) esp_eth.netif.netif_glue: ethernet attached to netif[0m
+[0;32mI (1315) imc::ethernet::w5500: [eth] network config: dhcp=false ip=192.168.51.226 mask=255.255.255.0 gw=192.168.51.1 dns=192.168.1.1[0m
+[0;32mI (1328) imc::ethernet::w5500: [eth] static IP configured: 192.168.51.226 / 255.255.255.0 gw 192.168.51.1 dns 192.168.1.1[0m
+[0;32mI (1339) imc::ethernet::w5500: [eth] IP/ETH event handlers registered[0m
+[0;32mI (1356) imc::ethernet::w5500: [eth] W5500 driver installed and started, eth_handle=0x3fcd0238[0m
+[0;32mI (1357) imc::ethernet::w5500: [eth] heartbeat registered in main_loop (period=5s)[0m
+[0;32mI (1363) imc::ethernet::w5500: [eth] W5500 startup complete[0m
+[0;32mI (1369) imc: [main] starting ble gatt server...[0m
+[0;32mI (1375) imc::ble_at: [ble_at] service starting (uuid=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1384) imc::ble_at: [ble_at] initializing BT controller (BLE mode)[0m
+[0;32mI (1391) imc::ble_at: [ble_at] controller config magic=0x5a5aa5a5, version=0x02509280[0m
+[0;32mI (1399) BLE_INIT: BT controller compile version [b7de11e][0m
+[0;32mI (1405) BLE_INIT: Using main XTAL as clock source[0m
+[0;32mI (1412) BLE_INIT: Feature Config, ADV:1, BLE_50:1, DTM:1, SCAN:1, CCA:0, SMP:1, CONNECT:1[0m
+[0;32mI (1421) BLE_INIT: Bluetooth MAC: fc:01:2c:05:64:ba[0m
+[0;32mI (1428) phy_init: phy_version 711,97bcf0a2,Aug 25 2025,19:04:10[0m
+[0;32mI (1501) imc::ble_at: [ble_at] BLE device name set to 'Mesh'[0m
+[0;32mI (1501) imc::ble_at: [ble_at] BLE MAC = FC:01:2C:05:64:BA[0m
+[0;32mI (1503) imc::ble_at: [ble_at] ETH MAC = FC:01:2C:05:64:BB[0m
+[0;32mI (1509) imc::ble_at: [ble_at] local MTU set to 500[0m
+[0;32mI (1516) imc::ble_at: [ble_at] GATT app registered, gatts_if=3[0m
+[0;32mI (1521) imc::ble_at: [ble_at] REG_EVT status=0, app_id=1[0m
+[0;32mI (1527) imc::ble_at: [ble_at] calling create_attr_tab(gatts_if=3, n_attr=4)[0m
+[0;32mI (1535) imc::ble_at: [ble_at] create_attr_tab returned 0[0m
+[0;32mI (1543) imc::ble_at: [ble_at] GOT CREAT_ATTR_TAB_EVT[0m
+[0;32mI (1547) imc::ble_at: [ble_at] CREAT_ATTR_TAB_EVT status=0 num_handle=4 handles=0x3fcad402[0m
+[0;32mI (1556) imc::ble_at: [ble_at] attr_tab created (handles=4, svc=40, status=0)[0m
+[0;32mI (1563) imc::ble_at: [ble_at] about to call start_service(handle=40)[0m
+[0;32mI (1571) imc::ble_at: [ble_at] GATT service started (uuid=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1580) imc::ble_at: [ble_at] config_adv_data queued (name + UUID + flags)[0m
+[0;32mI (1591) imc::ble_at: [ble_at] ADV_DATA configured; starting advertising...[0m
+[0;32mI (1598) imc::ble_at: [ble_at] BLE advertising active (svc=4fafc201-1fb5-459e-8fcc-c5c9c331914b)[0m
+[0;32mI (1605) imc::ble_at: [ble_at] service startup queued (GATT callback registered, AT parser ready)[0m
+[0;32mI (1614) imc::ble_at: [ble_at] notification sender runs in main loop (no dedicated thread)[0m
+[0;32mI (1623) imc: [main] starting io scan task...[0m
+[0;32mI (1628) imc::io::di: [di] scan task registered in main_loop (period=20ms, channels=16 version F3)[0m
+[0;32mI (1638) imc::io::do_: [do] output task registered in main_loop (fallback=2000 ticks version F3)[0m
+[0;32mI (1647) imc: [main] starting ai/ao task...[0m
+[0;32mI (1652) imc::channel::ao: [ao] output task registered in main_loop (period=100ms)[0m
+[0;32mI (1660) imc::channel::ai: [ai] sample task registered in main_loop (period=100ms)[0m
+[0;32mI (1669) imc::channel::calib: [adc-calib] AI0 开始非阻塞 8 秒校准，通信服务继续启动[0m
+[0;32mI (1681) imc::udp_multicast: [udp-mcast] join group=239.0.0.1[0m
+[0;32mI (1686) imc::udp_multicast: [udp-mcast] joined via INADDR_ANY[0m
+[0;32mI (1691) imc::udp_multicast: [udp-mcast] receiver thread spawned[0m
+[0;32mI (1698) imc::udp_multicast: [udp-mcast] listening on port 5003, group 239.0.0.1[0m
+[0;33mW (1706) imc::udp_multicast: [udp-mcast] source IP filter is unconfigured; dropping all packets[0m
+[0;32mI (1716) imc::nfc: [nfc] background thread spawned (5s polling, bounded retry backoff)[0m
+[0;32mI (1725) imc::web: [http] web server started on port 80[0m
+[0;32mI (1730) imc::web: [http] listening on 0.0.0.0:80[0m
+[0;32mI (1735) imc: [main] registering modbus rtu...[0m
+[0;32mI (1741) imc::protocol: [protocol] registered: modbus-rtu[0m
+[0;32mI (1746) imc: [main] registering modbus tcp...[0m
+[0;32mI (1752) imc::protocol: [protocol] registered: modbus-tcp[0m
+[0;33mW (1759) imc::modbus::rtu_runtime: [modbus-rtu] RS485-3 runtime is implemented but disabled: UART0 is the active console[0m
+[0;32mI (1769) imc::protocol: [protocol] modbus-rtu started[0m
+[0;32mI (1776) imc::rs485::port: [rs485] opened uart2 @9600 bps, tx=42, rx=41, de=255[0m
+[0;32mI (1783) imc::modbus::rtu_runtime: [modbus-rtu] RS485-2 switched to Slave, addr=1, 9600bps[0m
+[0;32mI (1792) imc::modbus::tcp_server: [mb-tcp] bound :502[0m
+[0;32mI (1798) imc::rs485::port: [rs485] opened uart1 @9600 bps, tx=45, rx=46, de=7[0m
+[0;32mI (1805) imc::modbus::rtu_runtime: [modbus-rtu] RS485-1 switched to Master, addr=1, 9600bps[0m
+[0;32mI (1815) imc::modbus::tcp_server: [mb-tcp] bound :503[0m
+[0;32mI (1821) imc::modbus::tcp_server: [mb-tcp] bound :504[0m
+[0;32mI (1826) imc::modbus::tcp_server: [mb-tcp] bound :5002[0m
+[0;32mI (1832) imc::modbus::tcp_server: [mb-tcp] 4 ports, max 8 clients, main-loop polling[0m
+[0;32mI (1840) imc::protocol: [protocol] modbus-tcp started[0m
+[0;32mI (1847) imc::control_logic: [control] MCA table loaded: 0 IO records, 0 analog channels[0m
+[0;32mI (1855) imc: [main] entering main loop (period=5ms)[0m
+[0;32mI (1860) imc::health: === Task-Core Assignment (8 tasks) ===[0m
+[0;32mI (1867) imc::health:   [ 0] pca9555-i2c (max_stall=10)[0m
+[0;32mI (1872) imc::health:   [ 1] device-store (max_stall=3)[0m
+[0;32mI (1878) imc::health:   [ 2] udp-mcast (max_stall=30)[0m
+[0;32mI (1884) imc::health:   [ 3] nfc-st25 (max_stall=30)[0m
+[0;32mI (1890) imc::health:   [ 4] http-srv (max_stall=30)[0m
+[0;32mI (1895) imc::health:   [ 5] mb-rtu-port0 (max_stall=30)[0m
+[0;32mI (1901) imc::health:   [ 6] mb-rtu-port1 (max_stall=30)[0m
+[0;32mI (1907) imc::health:   [ 7] main (max_stall=3)[0m
+[0;32mI (1919) imc::ble_at: [ble_at] physical BT LED off[0m
+[0;32mI (3358) esp_netif_handlers: eth ip: 192.168.51.226, mask: 255.255.255.0, gw: 192.168.51.1[0m
+[0;32mI (3360) imc: [eth] IP assigned at uptime=2461ms (event dispatch=1ms): 192.168.51.226[0m
+[0;33mW (6964) imc::modbus::tcp_server: [mb-tcp] max connections reached; rejected=1 in interval[0m
+[0;32mI (9672) imc::channel::calib: [adc-calib] AI0 raw_min=2844 raw_max=2846 samples=154[0m
+[0;33mW (9673) imc::channel::calib: [adc-calib] AI0 无有效校准端点，保留默认标定[0m
+serial_end=2026-11-03T11:15:00.209627+00:00 sessions=1 reopen_errors=0

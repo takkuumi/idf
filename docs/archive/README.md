@@ -8,3 +8,7 @@
 - [`audits/`](audits/)：旧系统审计。
 - [`bugs/`](bugs/)：已经处理的问题报告。
 - [`reports/`](reports/)：旧版本修复和真机报告。
+- [`comm/`](comm/)：2026 年 7 月通信与架构阶段审计。
+- [`dev-guide-preproduction.md`](dev-guide-preproduction.md)：历史开发指南，不代表当前架构。
+- [`plan-history-2026-07.md`](plan-history-2026-07.md)：已完成阶段计划。
+- [`loop2-history-2026-07.md`](loop2-history-2026-07.md)：旧版持续集成日志；当前状态以 `docs/LOOP.md` 为准。

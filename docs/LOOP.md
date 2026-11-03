@@ -7,6 +7,7 @@
 - Cargo package、lockfile、ESP-IDF app 描述和发布清单统一为 `2.7.0`；工程标识为 `esp32s3-imc`，二进制为 `imc`。
 - 2.7.0 是全新生产基线：首次刷写必须全擦 Flash，不读取或迁移此前版本的 NVS、holding、协议 blob 和 DO 数据。
 - 系统配置使用 `imc` namespace、schema `0x0207` / magic `IMCF`；协议和 holding 使用新的 IMC 数据 magic。
+- DEFAULT/F3 统一为单组 PCA9555（16DI/16DO），F4 使用多组 PCA9555（48DI/48DO）；移除未使用的 MCP23017 驱动、硬件 I2C 封装和旧 IO 聚合器。
 - 发布包和全新安装说明见 `docs/releases/v2.7.0.md`。
 > 详细进度: `log/SUMMARY_2026-07-22.md`
 
@@ -61,7 +62,7 @@
 
 - 将 Cargo、lockfile 和 IDF app 描述版本统一为 2.3.1（Modbus 231 / 0x00E7）。
 - 纳入已完成主机、IDF engine 仿真及 F3 实机验证的 NVS blob 优化；硬件型号映射、分区、保存节流和 Q 点逻辑保持原实现。
-- 按既有发布脚本干净构建 DEFAULT/MCP23017、F3/PCA9555、F4/PCA9555，生成逐文件 SHA-256、manifest 和烧录段。
+- 按既有发布脚本干净构建 DEFAULT/F3 PCA9555 16点组、F4 PCA9555 48点组，生成逐文件 SHA-256、manifest 和烧录段。
 - 本轮设备操作限定为 F3 发布固件烧录和只读 UART/Modbus 复核；不登录 Web、不执行 Q 点写入、参数修改或额外重启验收。
 - 发布/设备结果记录在 `log/hardware/release-v2.3.1-2026-10-31.md`，原 2.3.0 产物保留。
 

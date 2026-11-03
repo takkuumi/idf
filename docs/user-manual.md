@@ -78,30 +78,25 @@
 | 项目 | Default | F3 | F4 |
 |------|---------|----|----|
 | **编译命令** | `cargo build` | `cargo build --features f3` | `cargo build --features f4` |
-| **DI 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
-| **DO 通道数** | 16（MCP23017） | 16（PCA9555） | 48（PCA9555） |
+| **DI/DO** | 16/16（PCA9555 单组） | 16/16（PCA9555 单组） | 48/48（PCA9555 多组） |
 | **AI 通道数** | 4 | 4 | 8 |
 | **AO 通道数** | 4 | 4 | 0 |
-| **MCP23017 数量** | 2 片 | 0 | 0 |
-| **PCA9555 数量** | 0 | 单组 | 多组 |
-| **I2C 总线** | 启用（GPIO21/33） | 软件 I2C（GPIO35/36、38/37） | 软件 I2C（GPIO35/36、38/37） |
-| **DI 寄存器范围** | 0x0000-0x0007 | 0x0000-0x000F | 0x0000-0x002F |
+| **IO/LED I2C** | 软件 I2C，GPIO35/36 与 38/37 | 同 Default | 同 Default |
+| **DI 寄存器范围** | 0x0000-0x000F | 0x0000-0x000F | 0x0000-0x002F |
 | **DO 寄存器范围** | 0x0000-0x000F | 0x0000-0x000F | 0x0000-0x002F |
 
-> **注意**：F4 不提供 AO，GPIO15～18 固定用于 AI4～AI7。Default/F3 的 AO 使用 GPIO15～18。
+F4 不提供 AO，GPIO15～18 固定用于 AI4～AI7。Default/F3 的 AO 使用 GPIO15～18。
 
-### 2.2 Default/F3/F4 IO 扩展地址分配
+### 2.2 PCA9555 地址分配
 
-| 版本 | 芯片 | I2C 地址 | A2/A1/A0 | 用途 |
-|------|------|---------|----------|------|
-| Default | MCP23017 | 0x20 | 0/0/0 | DI 0-15 |
-| Default | MCP23017 | 0x21 | 0/0/1 | DO 0-15 |
-| F3 | PCA9555 | 0x40/0x42 | — | DI/DO 0-15 |
-| F4 | PCA9555 | 0x40/0x44/0x42 | — | DI 0-47 |
-| F4 | PCA9555 | 0x48/0x4C/0x4E | — | DO 0-47 |
+| 版本 | 总线 | 地址 | 用途 |
+|------|------|------|------|
+| Default/F3 | IO | `0x40`, `0x42` | DI、DO |
+| Default/F3 | LED | `0x40`, `0x44`, `0x48` | DI 镜像、状态灯、DO 镜像 |
+| F4 | IO | `0x40/0x44/0x42`, `0x48/0x4C/0x4E` | 三组 DI、三组 DO |
+| F4 | LED | 对应镜像地址，状态器件 `0x46` | DI/DO 镜像及状态灯 |
 
-
-Default MCP23017 总线参数：I2C0，SDA=GPIO21，SCL=GPIO33，400kHz。F3/F4 PCA9555 使用软件 I2C：IO SDA/SCL=GPIO35/36，LED SDA/SCL=GPIO38/37。
+IO 总线：SDA=GPIO35、SCL=GPIO36；LED 总线：SDA=GPIO38、SCL=GPIO37。GPIO21/GPIO33 用于板卡电源使能，不承载 I2C。
 
 ---
 
@@ -130,8 +125,6 @@ Default MCP23017 总线参数：I2C0，SDA=GPIO21，SCL=GPIO33，400kHz。F3/F4 
 | **AI (F3)** | GPIO1/2/3/8 | AI0~AI3 | ADC1_CH0/1/2/7 |
 | **AI (F4)** | GPIO1/2/3/8/15/16/17/18 | AI0~AI7 | ADC1 前四路 + ADC2_CH4~7 |
 | **AO (Default/F3)** | GPIO15/16/17/18 | AO0~AO3 | F4 不启用，避免与 AI4~AI7 冲突 |
-| **I2C (仅 Default)** | GPIO21 | SDA | MCP23017 数据线 |
-| | GPIO33 | SCL | MCP23017 时钟线 |
 
 ### 3.2 ADC 通道映射
 
@@ -193,22 +186,14 @@ GPIO41 (RX)   ──────────── RO
 
 > **注意**：UART1 使用 GPIO7 作为 DE/RE；GPIO8 保留给 F3/F4 AI3，UART2 不使用 GPIO8 作为 DE/RE。旧固件没有 AO/PWM 输出实现。
 
-### 3.5 I2C 扩展接线（Default MCP23017 / F3-F4 PCA9555）
+### 3.5 PCA9555 软件 I2C 接线（所有变体）
 
-```
-Default: MCP23017 IO bus
-GPIO21 (SDA) ───────────── MCP23017 DI @ 0x20, DO @ 0x21
-GPIO33 (SCL) ───────────── (hardware I2C0)
-
-F3/F4: PCA9555 bit-banged buses
-GPIO35 (SDA), GPIO36 (SCL)  IO bus:  DI @ 0x40/0x44/0x42
-GPIO38 (SDA), GPIO37 (SCL)  LED bus: DI mirror, status, DO mirror
-                             DO @ 0x48/0x4C/0x4E; status @ 0x46 (F4)
+```text
+IO 总线:  GPIO35 (SDA), GPIO36 (SCL)  → PCA9555 DI/DO
+LED 总线: GPIO38 (SDA), GPIO37 (SCL)  → PCA9555 DI/DO 镜像及状态灯
 ```
 
-- I2C 频率 400kHz（Fast Mode）
-- Default 使用硬件 I2C；F3/F4 软件 I2C 采用板载上拉
-- 建议在 SDA/SCL 上各串接 100Ω 阻尼电阻
+DEFAULT/F3 采用一组 16DI/16DO PCA9555；F4 采用三组 48DI/48DO PCA9555。I2C 初始化和事务由软件 I2C worker 管理；扩展板未连接时系统仍可启动，DI/DO 会报告硬件不可用。
 
 ### 3.6 供电与接地
 
@@ -1111,16 +1096,16 @@ print('OTA upgrade done, device rebooting')
 
 **现象**：DI 全部读回 0 或 0xFFFF，DO 输出无效。
 
-I2C 控制器和引脚初始化失败仍会记录为硬件错误；但未插入 MCP23017/PCA9555
+I2C 控制器和引脚初始化失败仍会记录为硬件错误；但未插入 PCA9555
 扩展板、或扩展芯片上电后暂时 NACK 时，主系统会进入降级模式继续启动。此时
 Web/Modbus/以太网/BLE/RS485 仍可用，DI/DO 操作返回硬件不可用并在诊断中保留
 故障信息，不会把缺失板卡伪装成正常的全零输入。恢复板卡连接后重新上电，系统会再次初始化。
 
 **排查**：
-1. 检查 I2C 接线（SDA=GPIO21，SCL=GPIO33）
-2. 检查 MCP23017 地址引脚（A0/A1/A2）配置是否正确
-3. 检查上拉电阻（MCP23017 内部上拉已启用，外部可不接）
-4. 用 I2C 扫描工具检查设备是否在线
+1. 检查 IO 总线接线（SDA=GPIO35，SCL=GPIO36）与 LED 总线接线（SDA=GPIO38，SCL=GPIO37）
+2. 按 F16/F3 或 F4 板卡地址表检查 PCA9555 是否应答
+3. 检查总线上拉与板卡电源
+4. 查看 `[pca9555]` worker 和缺失芯片告警
 
 ### 8.2 日志解读
 

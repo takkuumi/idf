@@ -32,7 +32,7 @@ fn main() {
     if std::env::var("CARGO_FEATURE_WIFI").is_ok() {
         println!("cargo:rustc-cfg=feature_wifi");
     }
-    // DI/DO 业务能力；扩展芯片由 DEFAULT/MCP23017、F3/F4/PCA9555 决定。
+    // DI/DO 业务能力；所有硬件变体统一使用 PCA9555。
     if std::env::var("CARGO_FEATURE_IO_DI_DO").is_ok() {
         println!("cargo:rustc-cfg=feature_io_di_do");
     }

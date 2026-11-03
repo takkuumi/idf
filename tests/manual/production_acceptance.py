@@ -136,7 +136,11 @@ def poll_port(args, port: int, deadline: float, baseline_logic: list[int]) -> di
                     values = read_registers(sock, 1, fc, address, count)
                     if (fc, address) == (3, 2300) and values != baseline_logic:
                         raise ValueError("configuration table changed during read-only run")
-                    if (fc, address) == (4, 0x087E) and values[0] != args.expected_version:
+                    if (
+                        (fc, address) == (4, 0x087E)
+                        and args.expected_version is not None
+                        and values[0] != args.expected_version
+                    ):
                         raise ValueError(f"firmware changed: {values[0]:04x}")
                     if (fc, address) == (4, args.destination):
                         changes += last_result is not None and values != last_result
@@ -171,7 +175,12 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0)
     parser.add_argument("--destination", type=int, default=1)
     parser.add_argument("--count", type=int, default=2)
-    parser.add_argument("--expected-version", type=lambda text: int(text, 0), default=0x00E5)
+    parser.add_argument(
+        "--expected-version",
+        type=lambda text: int(text, 0),
+        default=None,
+        help="require this FC04 0x087E value; omit when the target firmware is not fixed",
+    )
     parser.add_argument("--reauth-on-session-replacement", action="store_true", help="record login replacement and reauthenticate; default remains strict")
     args = parser.parse_args()
     if args.duration <= 0 or args.interval < 0 or not 1 <= args.count <= 125 or not 0 <= args.destination <= 65536 - args.count:

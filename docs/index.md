@@ -18,10 +18,9 @@
 
 - [`ble/`](ble/)：BLE Android 协议、修复和兼容流程。
 - [`testing/`](testing/)：手持机和网络配置验证计划。
-- [`comm/`](comm/)：2026 年 7 月通信、架构及阶段审计记录。
 - [`system/`](system/)：系统设计专题和历史变更说明。
 - [`hardware/`](hardware/)：硬件识别、NFC/LoRa 接口和现场验收边界。
-- [`archive/`](archive/)：已被当前源码/LOOP 记录取代的旧报告。
+- [`archive/`](archive/)：已被当前源码/LOOP 记录取代的旧报告、开发计划、通信审计和旧版开发指南。
 - [`../tests/manual/`](../tests/manual/)：连接真实设备的手工测试工具。
 - [`../tests/modbus_tests.rs`](../tests/modbus_tests.rs)：Modbus 帧级集成测试。
 

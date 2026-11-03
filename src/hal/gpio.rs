@@ -8,8 +8,7 @@
 //!
 //! # 数字 IO (DI/DO) 归属
 //!
-//! 默认版本 DI/DO 由 [`crate::hal::io_ext`] 通过硬件 I2C + MCP23017 管理。
-//! F3/F4 版本由 [`crate::hal::pca9555`] 通过软件 I2C PCA9555 组管理。
+//! 所有变体 DI/DO 均由 [`crate::hal::pca9555`] 通过软件 I2C PCA9555 组管理。
 //!
 //! 上层通过 `crate::hal::Hal::dio()` trait object 统一访问, 无需关心底层硬件。
 //!
@@ -39,7 +38,7 @@ pub struct GpioBank {
 }
 
 impl GpioBank {
-    /// 初始化 GPIO 辅助引脚 (DI/DO 由 PCA9555 或 MCP23017 管理)
+    /// 初始化 GPIO 辅助引脚 (DI/DO 由 PCA9555 管理)
     pub fn init(
         eth_int_pin: u8,
         eth_rst_pin: u8,

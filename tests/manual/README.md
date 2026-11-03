@@ -30,7 +30,7 @@ HTTP 采样开销，不能当作精确电气延迟或触点反馈。异常/结�
 ```bash
 python3 tests/host/run_production_core.py
 GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/production_acceptance.py \
-  192.168.51.226 --duration 600 --expected-version 0x00E5
+  192.168.51.226 --duration 600 --expected-version 0x010E
 GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/configuration_acceptance.py \
   192.168.51.226 --apply --backup log/hardware/config-original.json
 GW_STABILITY_WEB_PASSWORD='<当前密码>' python3 tests/manual/test_udp_reconfiguration.py \
@@ -76,7 +76,7 @@ LE 镜像和 5 秒新鲜度；不能证明组播跨交换机、光口或环网�
 ## Modbus TCP 长时间只读浸泡
 
 ```bash
-python3 tests/manual/stability_soak.py 192.168.51.225 --duration 1800 --interval 1 --expected-version 0x00E5
+python3 tests/manual/stability_soak.py 192.168.51.225 --duration 1800 --interval 1 --expected-version 0x010E
 ```
 
 脚本在 502/503/504/5002 四个端口各保持一个连接，每秒读取 AI、AI 状态、校准保持区和
