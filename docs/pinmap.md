@@ -13,7 +13,7 @@ ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)，其中：
 - **GPIO0**：strapping（boot mode，需外部上拉）
 - **GPIO3**：strapping（JTAG source）
 - **GPIO45/46**：strapping（VDD_SPI / system freq）
-- **GPIO43/44**：UART0 默认 TX/RX（下载/日志）
+- **GPIO43/44**：UART0 TX/RX（ROM 下载 UART，板载 LoRa RXD/TXD 共用）
 - **GPIO19/20**：USB Serial/JTAG（可作普通 GPIO）
 
 ## 实际引脚分配（与 config.rs::pins 1:1 对应）
@@ -26,15 +26,16 @@ ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)，其中：
 | | GPIO9 | CS | 片选 |
 | | GPIO13 | INT | 中断，低有效 |
 | | GPIO14 | RST | 复位，低有效 |
-| **UART0 (下载/日志)** | GPIO43 | TX | 115200-N-8-1 |
-| | GPIO44 | RX | 与下载串口共用 |
+| **UART0 (ROM 下载 / F3 LoRa profile)** | GPIO43 | TX | 板载 E22 RXD；F3 `lora` profile 中作为第三路 RTU 逻辑端口 |
+| | GPIO44 | RX | 板载 E22 TXD；标准调试 profile 才将其用于运行期控制台 |
 | **UART1 (RS485 #0)** | GPIO45 | TX | RTU Master |
 | | GPIO46 | RX | |
-| | GPIO7 | DE/RE | 当前板级映射，高=发送 |
+| | GPIO7 | SDMMC0_DET_L | F3 接线表用途；不是 RS485 DE/RE |
 | **UART2 (RS485 #1)** | GPIO42 | TX | RTU Slave |
 | | GPIO41 | RX | |
 | | GPIO8 | F3/F4 AI3 | ADC1_CH7；UART2 不使用 RTS/DE |
-| **电源使能** | GPIO21 | LED_EN | 灯板电源 HIGH=上电 |
+| **板级控制** | GPIO21 | `LORA_RST` (F3 表网名) | E22-400T22D D 型接口没有独立 RESET 脚；实际网路用途/极性未确认，固件保留旧行为并启动拉高，不发送复位脉冲 |
+| **LoRa 模式控制** | GPIO26 | LORA_M0 | F3 表有标注，但当前 Quad Flash/PSRAM 占用，固件不驱动 |
 | | GPIO33 | RELAY_EN | 继电器板 JDQ_24V_EN |
 | **拨码开关** | GPIO19 | AD0 | RS485 地址码 |
 | | GPIO20 | AD1 | |
@@ -45,16 +46,15 @@ ESP32-S3 共 45 个 GPIO (GPIO0~GPIO48)，其中：
 | | GPIO36 | I2C_SCL | IO 总线时钟线 |
 | | GPIO38 | LED_SDA | LED 板 I2C SDA |
 | | GPIO37 | LED_SCL | LED 板 I2C SCL |
-| **光纤检测** | GPIO39 | FIB1 | 光纤检测输入 1，低电平有效 |
-| | GPIO40 | FIB2 | 光纤检测输入 2，低电平有效 |
+| **环网 PHY** | GPIO39 | PHY_INT1 | PHY 中断输入，不是链路状态输入 |
+| | GPIO40 | PHY_INT2 | PHY 中断输入，不是链路状态输入 |
 | **AI (Default/F3)** | GPIO1/2/3/8 | AI0~AI3 | ADC1_CH0/1/2/7，12-bit SAR ADC |
 | **AI (F4)** | GPIO1/2/3/8/15/16/17/18 | AI0~AI7 | ADC1_CH0/1/2/7 + ADC2_CH4/5/6/7 |
 | **AO (Default/F3)** | GPIO15/16/17/18 | AO0~AO3 | 5kHz, 12-bit LEDC；F4 禁用以释放 AI4-AI7 |
 
-F16/PCA9555 灯板的 FIB1、FIB2 指示灯由 LED 总线地址 `0x44` 的输出寄存器
-`0x02` 控制，低有效掩码分别为 `0xEF`（bit4）与 `0x7F`（bit7）。主循环每
-100ms 根据 GPIO39/40 检测输入同步实体灯，Web 使用相同的输入极性。它们表示
-硬件检测信号，不使用 RS485 的一秒通信时间窗，也不能单独证明环网冗余或业务转发正常。
+GPIO39/40 在 F3 接线表中是环网 PHY 中断脚，不能直接作为 FIB1/FIB2 链路状态。
+当前固件没有对应 PHY/环网驱动，因此不应将这两个脚的电平显示成光纤链路状态；
+FIB 状态需待 PHY 驱动读取真实链路寄存器后再提供。
 
 ### DI/DO 通道（所有变体均使用 PCA9555）
 
@@ -118,7 +118,7 @@ pub mod pins {
     pub const RS485_0_UART: u8 = 1;
     pub const RS485_0_TX: u8 = 45;
     pub const RS485_0_RX: u8 = 46;
-    pub const RS485_0_DE: u8 = 7;
+    pub const RS485_0_DE: u8 = 255; // F3 接线表未给独立 DE/RE；GPIO7 是 SDMMC0_DET_L
 
     // ---- RS485 #1 (UART2, 从站) ----
     pub const RS485_1_UART: u8 = 2;
@@ -126,8 +126,8 @@ pub mod pins {
     pub const RS485_1_RX: u8 = 41;
     pub const RS485_1_DE: u8 = 255; // 参考固件未使用 RTS/DE；GPIO8 是 AI3
 
-    // ---- 电源使能 ----
-    pub const POWER_LED_EN: u8 = 21;
+    // ---- 板级控制 ----
+    pub const LORA_BOARD_CTRL_PIN: u8 = 21;
     pub const POWER_RELAY_EN: u8 = 33;
 
     // ---- 拨码开关 (启动时读 RS485 地址) ----
@@ -141,9 +141,11 @@ pub mod pins {
     pub const NCA9555_LED_SDA: u8 = 38;
     pub const NCA9555_INT: u8 = 34;
 
-    // ---- 光纤检测 ----
-    pub const FIB1_PIN: u8 = 39;
-    pub const FIB2_PIN: u8 = 40;
+    // ---- 环网 PHY 中断；不是 FIB 链路状态输入 ----
+    pub const PHY_INT1_PIN: u8 = 39;
+    pub const PHY_INT2_PIN: u8 = 40;
+    pub const FIB1_PIN: u8 = 255;
+    pub const FIB2_PIN: u8 = 255;
 
     // ---- AI 6 路 (ADC1) ----
     pub const AI_ADC_UNIT: u8 = 1;
@@ -167,21 +169,21 @@ GPIO3  AI2           GPIO29 (Flash, 不可用)
 GPIO4  (未分配)      GPIO30 (Flash, 不可用)
 GPIO5  (未分配)      GPIO31 (Flash, 不可用)
 GPIO6  (未分配)      GPIO32 (Flash, 不可用)
-GPIO7  RS485_0 DE    GPIO33 RELAY_EN
+GPIO7  SDMMC_DET_L   GPIO33 RELAY_EN
 GPIO8  F3/F4 AI3     GPIO34 ESP_STOP/NCA9555_INT
 GPIO9  W5500 CS      GPIO35 NCA9555 I2C_SDA
 GPIO10 W5500 SCLK    GPIO36 NCA9555 I2C_SCL
 GPIO11 W5500 MISO    GPIO37 NCA9555 LED_SCL
 GPIO12 W5500 MOSI    GPIO38 NCA9555 LED_SDA
-GPIO13 W5500 INT     GPIO39 FIB1
-GPIO14 W5500 RST     GPIO40 FIB2
+GPIO13 W5500 INT     GPIO39 PHY_INT1
+GPIO14 W5500 RST     GPIO40 PHY_INT2
 GPIO15 AO0           GPIO41 RS485_1 RX
 GPIO16 AO1           GPIO42 RS485_1 TX
-GPIO17 AO2           GPIO43 UART0 TX (下载/日志)
-GPIO18 AO3           GPIO44 UART0 RX
+GPIO17 AO2           GPIO43 UART0 TX / LoRa_RXD
+GPIO18 AO3           GPIO44 UART0 RX / LoRa_TXD
 GPIO19 AD0           GPIO45 RS485_0 TX
 GPIO20 AD1           GPIO46 RS485_0 RX
-GPIO21 LED_EN        GPIO47 AD3
+GPIO21 LORA_RST      GPIO47 AD3
 GPIO22 (未分配)      GPIO48 AD2
 GPIO23 (未分配)      GPIO25 (未分配)
 ```
@@ -196,7 +198,7 @@ GPIO23 (未分配)      GPIO25 (未分配)
 | F3 | `f3` | 16 | 16 | 单组 |
 | F4 | `f4` | 48 | 48 | 多组 |
 
-DEFAULT/F3/F4 的 IO SDA/SCL 均为 GPIO35/36，LED SDA/SCL 均为 GPIO38/37。GPIO21/GPIO33 仅用于 LED 板和继电器板电源使能；不再作为硬件 I2C 引脚。
+DEFAULT/F3/F4 的 IO SDA/SCL 均为 GPIO35/36，LED SDA/SCL 均为 GPIO38/37。F3 的 GPIO21 网名为 `LORA_RST`，但 E22 D 型接口无独立 RESET；板级实际网路用途待图纸确认，固件维持旧启动拉高行为。GPIO33 为继电器板电源使能。
 
 扩展板可选：未插入或芯片暂时无应答时，系统保留网络、BLE、Web 和 RS485 启动；DI/DO 返回硬件不可用状态。
 
@@ -204,7 +206,8 @@ DEFAULT/F3/F4 的 IO SDA/SCL 均为 GPIO35/36，LED SDA/SCL 均为 GPIO38/37。G
 
 1. **避开 Flash/PSRAM 引脚**：GPIO26~32 不可用
 2. **strapping 引脚谨慎使用**：GPIO0/3/45/46（启动后可作普通 GPIO）
-3. **下载串口独占**：UART0 (GPIO43/44) 不可占用
+3. **UART0 复用须匹配构建 profile**：F3 `lora` profile 关闭 UART0 控制台并由 RTU runtime 独占；标准调试 profile 使用控制台，不能用于 LoRa 透传验收。ROM 下载发生在应用启动前
+4. **LoRa M0 暂不驱动**：F3 表中的 GPIO26 与当前 Quad Flash/PSRAM 保留区冲突，必须先完成模组/PCB 复用确认
 4. **W5500 SPI 用高位 GPIO**：避开 ADC1 和 strapping
 5. **PCA9555 软件 I2C**：不依赖硬件 I2C 外设，避免与 ESP-IDF HAL 冲突
 6. **AI 按芯片 ADC 映射**：F3 使用 ADC1 GPIO1/2/3/8；F4 额外使用 ADC2 GPIO15/16/17/18；UART1/UART2 仅使用 GPIO45/46/42/41

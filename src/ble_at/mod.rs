@@ -103,6 +103,10 @@ static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
 static BT_LED_APPLIED: AtomicU8 = AtomicU8::new(2);
 /// 每次连接/断线递增，防止 Bluedroid 复用 conn_id 后发送旧连接的排队响应。
 static CONNECTION_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// A connection callback only publishes the peer address; the main loop sends
+/// the GAP update outside the Bluedroid callback stack.
+static PENDING_CONN_PARAM_UPDATE: AtomicBool = AtomicBool::new(false);
+static REMOTE_BDA: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 
 /// TX Characteristic CCCD 使能标志 (主机写 0x0001 启用 notify)
 static TX_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -207,6 +211,20 @@ impl TxFrameRing {
 
 static BINARY_TX: Spin<TxFrameRing> = Spin::new(TxFrameRing::new());
 
+/// RF Mailbox 复用 BLE 二进制协议时的响应捕获器。
+/// Mailbox 没有 GATT 连接，不能把响应直接塞入 BLE TX 环；由 NFC 线程
+/// 临时打开捕获模式，复用同一套协议分发和回读校验逻辑。
+static MAILBOX_CAPTURE: AtomicBool = AtomicBool::new(false);
+static MAILBOX_RESPONSES: Spin<heapless::Vec<TxBleFrame, 4>> = Spin::new(heapless::Vec::new());
+/// A mailbox request that changes the network identity (IP/MAC) must reboot
+/// after the RF reader has received the success frame.  BLE keeps its legacy
+/// immediate reset path; the mailbox worker consumes this deferred marker.
+static MAILBOX_RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// BLE and RF Mailbox share the command dispatcher. Serialize dispatch so a
+/// response can never be captured by the wrong transport when both links are
+/// active at the same time.
+static PROTOCOL_DISPATCH_LOCK: Spin<()> = Spin::new(());
+
 const RX_FREE: u8 = 0;
 const RX_ASSEMBLING: u8 = 1;
 const RX_READY: u8 = 2;
@@ -252,6 +270,14 @@ static ADV_HEALTH: Spin<AdvertisingHealth> = Spin::new(AdvertisingHealth::new())
 static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
 /// LOOP15: GATT 服务是否已启动 (CREAT_ATTR_TAB_EVT 后 start_service 成功)
 static SVC_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// BLE connection interval units are 1.25 ms. 15..30 ms gives the Android
+// handheld a low-latency window without forcing a single interval on phones
+// that apply their own power/coexistence policy.
+const BLE_CONN_INT_MIN: u16 = 12;
+const BLE_CONN_INT_MAX: u16 = 24;
+const BLE_CONN_LATENCY: u16 = 0;
+const BLE_CONN_TIMEOUT: u16 = 400; // 4 s, in 10 ms units
 
 // ============================================================================
 // Bluedroid GATT C API 绑定
@@ -394,9 +420,10 @@ fn start_advertising() {
         return;
     }
     let mut adv_params = esp_idf_sys::esp_ble_adv_params_t {
-        // 160 ms；工业现场兼顾发现速度与空口占用。
-        adv_int_min: 0x0100,
-        adv_int_max: 0x0100,
+        // 20..40 ms: the standard fast discoverable window. The previous
+        // fixed 160 ms interval made handheld discovery noticeably slower.
+        adv_int_min: 0x0020,
+        adv_int_max: 0x0040,
         adv_type: esp_idf_sys::esp_ble_adv_type_t_ADV_TYPE_IND,
         own_addr_type: esp_idf_sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
         peer_addr: [0; 6],
@@ -561,6 +588,19 @@ unsafe extern "C" fn gap_event_cb(
             } else {
                 log::error!("[ble_at] advertising start failed: {}", status);
             }
+        }
+        esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT => {
+            if param.is_null() {
+                return;
+            }
+            let update = unsafe { (*param).update_conn_params };
+            log::info!(
+                "[ble_at] connection params status={} interval={}ms latency={} timeout={}ms",
+                update.status,
+                update.conn_int,
+                update.latency,
+                update.timeout.saturating_mul(10)
+            );
         }
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT => {
             if param.is_null() {
@@ -818,6 +858,11 @@ unsafe extern "C" fn gatts_event_cb(
             let p = unsafe { &(*param).connect };
             // LOOP8: 原子写入替代 Spin<Option>
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+            crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
+            for (slot, byte) in REMOTE_BDA.iter().zip(p.remote_bda.iter()) {
+                slot.store(*byte, Ordering::Relaxed);
+            }
+            PENDING_CONN_PARAM_UPDATE.store(true, Ordering::Release);
             CONN_ID.store(p.conn_id, Ordering::Release);
             GATTS_IF.store(gatts_if, Ordering::Release);
             NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
@@ -856,6 +901,8 @@ unsafe extern "C" fn gatts_event_cb(
             );
             CONN_ID.store(0xFFFF, Ordering::Release); // LOOP8: 原子 sentinel = None
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+            crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
+            PENDING_CONN_PARAM_UPDATE.store(false, Ordering::Release);
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
             NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
             GATT_CONGESTED.store(false, Ordering::Release);
@@ -1175,7 +1222,7 @@ fn maintain_advertising() {
         }
         AdvRecovery::Renew => {
             // IDF implements start_advertising with a stop/start internally.
-            // Renew once per idle minute, never once per main-loop tick.
+            // Renew every ten idle seconds, never once per main-loop tick.
             log::debug!("[ble_at] renewing idle advertising lease");
             start_advertising();
         }
@@ -1241,6 +1288,29 @@ pub fn process_tick(hal: &crate::hal::Hal) {
     let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
     if tx_handle == 0 {
         return;
+    }
+
+    if PENDING_CONN_PARAM_UPDATE.swap(false, Ordering::AcqRel) {
+        let bda = core::array::from_fn(|index| REMOTE_BDA[index].load(Ordering::Relaxed));
+        let mut params = esp_idf_sys::esp_ble_conn_update_params_t {
+            bda,
+            min_int: BLE_CONN_INT_MIN,
+            max_int: BLE_CONN_INT_MAX,
+            latency: BLE_CONN_LATENCY,
+            timeout: BLE_CONN_TIMEOUT,
+        };
+        let ret = unsafe { esp_idf_sys::esp_ble_gap_update_conn_params(&mut params) };
+        if ret == esp_idf_sys::ESP_OK {
+            log::info!(
+                "[ble_at] requested connection params interval={}..{}ms latency={} timeout={}ms",
+                BLE_CONN_INT_MIN as u32 * 5 / 4,
+                BLE_CONN_INT_MAX as u32 * 5 / 4,
+                BLE_CONN_LATENCY,
+                BLE_CONN_TIMEOUT * 10
+            );
+        } else {
+            log::warn!("[ble_at] connection params request failed: 0x{:x}", ret);
+        }
     }
 
     // GATT 回调投递的二进制请求在 main 任务处理，隔离 Bluedroid BTC 栈。
@@ -1385,13 +1455,33 @@ pub fn feed_data(data: &[u8]) {
 /// 输出用 BLE 帧格式包装 (与 metuory-wireless-management-app-1.0.78 一致):
 ///   tx_id(2 BE) | proto_id(2 BE) | length(2 BE) | unit(1) | func(1) | data(N) | crc(2)
 /// 其中 pdu_data = unit + func + body；CRC 只在完整 BLE 帧末尾出现一次。
-fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> bool {
-    let Some(response_pdu) = build_embedded_modbus_response(frame) else {
+fn handle_modbus_rtu(
+    frame: &[u8],
+    tx_id: u16,
+    proto_id: u16,
+    conn_id: u16,
+    session_epoch: u32,
+) -> bool {
+    let Some(response_pdu) = build_embedded_modbus_response_with_session(frame, session_epoch)
+    else {
         return false;
     };
     // 用 BLE 帧格式包装 (Android 期望)
     send_ble_frame(tx_id, proto_id, &response_pdu, conn_id);
     true
+}
+
+/// Request the reset appropriate for the active transport.  The RF mailbox
+/// has no GATT notification queue, so resetting from inside the dispatcher can
+/// drop the only success response before the phone reads it.
+fn request_config_reset() {
+    if MAILBOX_CAPTURE.load(Ordering::Acquire) {
+        MAILBOX_RESET_REQUESTED.store(true, Ordering::Release);
+    } else {
+        crate::bus::IO
+            .sys
+            .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
+    }
 }
 
 /// Execute the Modbus PDU carried by a BLE binary frame.
@@ -1404,6 +1494,13 @@ fn handle_modbus_rtu(frame: &[u8], tx_id: u16, proto_id: u16, conn_id: u16) -> b
 /// address/value or address/count contract and causes configuration writes to
 /// be reported as failed.
 fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>> {
+    build_embedded_modbus_response_with_session(frame, 0)
+}
+
+fn build_embedded_modbus_response_with_session(
+    frame: &[u8],
+    session_epoch: u32,
+) -> Option<heapless::Vec<u8, 256>> {
     let (&slave, rest) = frame.split_first()?;
     let (&func, pdu) = rest.split_first()?;
     let backend = crate::modbus::shared::BusBackend;
@@ -1429,9 +1526,7 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
             if written >= 2 && pdu_buf[0] == 0x10 {
                 match crate::device::persist_config_now() {
                     Ok(()) => {
-                        crate::bus::IO
-                            .sys
-                            .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
+                        request_config_reset();
                         written
                     }
                     Err(error) => {
@@ -1452,29 +1547,57 @@ fn build_embedded_modbus_response(frame: &[u8]) -> Option<heapless::Vec<u8, 256>
     } else if handheld_logic_write {
         let address = u16::from_be_bytes([pdu[0], pdu[1]]);
         let count = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
-        // The MCA BLE receive loop arms 0x55AA around every FC16 frame. Preserve
-        // that contract here so handheld B1/B3 configuration data reaches the
-        // durable holding store rather than only the RAM RCU snapshot.
-        crate::bus::backends::arm_logic_write();
-        let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
-        if written >= 2 && pdu_buf[0] == 0x10 {
-            let final_logic_block = is_final_handheld_logic_block(address, count);
-            if final_logic_block {
-                match crate::device::holding_store::save_to_nvs() {
-                    Ok(()) => written,
-                    Err(error) => {
-                        log::error!("[ble_at] handheld logic table persistence failed: {error}");
-                        pdu_buf[0] = 0x90;
-                        pdu_buf[1] = 0x04;
-                        2
-                    }
+        let mut values: heapless::Vec<u16, { crate::modbus::shared::MAX_REGS_PER_WRITE }> =
+            heapless::Vec::new();
+        for index in 0..count {
+            let offset = 5 + index * 2;
+            values
+                .push(u16::from_be_bytes([pdu[offset], pdu[offset + 1]]))
+                .ok()?;
+        }
+        if let Some(staged) = crate::ble_at::logic_handlers::stage_legacy_function_table_block(
+            session_epoch,
+            address,
+            &values,
+        ) {
+            match staged {
+                Ok(_) => {
+                    pdu_buf[0] = 0x10;
+                    pdu_buf[1..3].copy_from_slice(&address.to_be_bytes());
+                    pdu_buf[3..5].copy_from_slice(&(count as u16).to_be_bytes());
+                    5
                 }
-            } else {
-                written
+                Err(()) => {
+                    log::warn!("[ble_at] staged handheld function table block rejected");
+                    pdu_buf[0] = 0x90;
+                    pdu_buf[1] = 0x03;
+                    2
+                }
             }
         } else {
-            crate::bus::backends::disarm_logic_write();
-            written
+            crate::bus::backends::arm_logic_write();
+            let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+            if written >= 2 && pdu_buf[0] == 0x10 {
+                let final_logic_block = is_final_handheld_logic_block(address, count);
+                if final_logic_block {
+                    match crate::device::holding_store::save_to_nvs() {
+                        Ok(()) => written,
+                        Err(error) => {
+                            log::error!(
+                                "[ble_at] handheld logic table persistence failed: {error}"
+                            );
+                            pdu_buf[0] = 0x90;
+                            pdu_buf[1] = 0x04;
+                            2
+                        }
+                    }
+                } else {
+                    written
+                }
+            } else {
+                crate::bus::backends::disarm_logic_write();
+                written
+            }
         }
     } else {
         crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf)
@@ -1651,7 +1774,18 @@ fn process_binary_request_slot(index: u8, current_conn_id: u16) {
             }
             return;
         };
-        let _ = try_handle_binary_protocol(&frame, conn_id, 0);
+        // NFC configuration dispatch may wait for NVS acknowledgement. The
+        // main loop must keep servicing I/O rather than wait for that lock.
+        let Some(_dispatch) = PROTOCOL_DISPATCH_LOCK.try_lock() else {
+            drop(frame);
+            slot.state.store(RX_READY, Ordering::Release);
+            if !BINARY_REQUESTS.try_enqueue(index) {
+                CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+            }
+            return;
+        };
+        let _ = try_handle_binary_protocol(&frame, conn_id, epoch);
+        drop(_dispatch);
         drop(frame);
     } else {
         log::debug!("[ble_at] dropping stale request for conn_id={}", conn_id);
@@ -1734,7 +1868,7 @@ fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
     true
 }
 
-fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
+fn try_handle_binary_protocol(data: &[u8], conn_id: u16, session_epoch: u32) -> bool {
     // LOOP18: 零分配 hex 格式化, 避免 BTC 任务栈上累积 Vec<String>
     if data.len() > 20 {
         let mut hex = heapless::String::<64>::new();
@@ -1888,7 +2022,7 @@ fn try_handle_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool
     }
     // 其它 PDU: unit_id 字节作为 Modbus slave 地址, func+data 作为 Modbus PDU
     let pdu = &data[6..crc_begin]; // [unit][func][data...]
-    handle_modbus_rtu(pdu, tx_id, proto_id, conn_id)
+    handle_modbus_rtu(pdu, tx_id, proto_id, conn_id, session_epoch)
 }
 
 /// 用 BLE 帧格式包装并发送响应 (Android 期望格式)
@@ -2021,9 +2155,19 @@ fn handle_mca_custom_command(
     // 旧 MCA 手持机协议在修改网络参数或以太网 MAC 后会在应答发送完成
     // 后复位设备。通过 DeviceActor 统一落盘，只有配置成功持久化后才
     // 请求复位，避免手持机收到成功应答但重启后配置丢失。
-    if matches!(func, 0xC7 | 0xCD) && !crate::device::request_persist_config_and_reset() {
-        log::error!("[ble_at] MCA custom cmd 0x{func:02X}: config reset request rejected");
-        return false;
+    if matches!(func, 0xC7 | 0xCD) {
+        let persisted = if MAILBOX_CAPTURE.load(Ordering::Acquire) {
+            crate::device::persist_config_now().is_ok()
+        } else {
+            crate::device::request_persist_config_and_reset()
+        };
+        if !persisted {
+            log::error!("[ble_at] MCA custom cmd 0x{func:02X}: config reset request rejected");
+            return false;
+        }
+        if MAILBOX_CAPTURE.load(Ordering::Acquire) {
+            MAILBOX_RESET_REQUESTED.store(true, Ordering::Release);
+        }
     }
     send_ble_frame(tx_id, proto_id, &rsp, conn_id);
     true
@@ -2169,14 +2313,6 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             // 兼容旧固件行为：修改 MAC 地址后需要重启设备才能使 W5500 应用新配置
             // 参考 MCA_F16V2_1_F48_BLE/BleMsgDeal.cpp:535-538
             // 旧固件调用 save_config_to_file() 同步持久化后再设置 bIsRestart = true
-            if let Err(e) = crate::device::persist_config_now() {
-                log::error!("[ble_at] 0xC7: failed to persist config before reset: {e}");
-                return None;
-            }
-            crate::bus::IO
-                .sys
-                .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
-            log::info!("[ble_at] 0xC7: MAC address persisted, device will reset shortly");
         }
         0xC8 => {
             let value = crate::bus::backends::read_hold_reg(regs::HOLD_TCP_COM_BASE)?;
@@ -2253,14 +2389,6 @@ fn build_mca_custom_response(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 
             // 旧固件调用 save_config_to_file() 同步持久化后再设置 bIsRestart = true
             // 我们必须在设置重启标志前同步持久化，否则配置会丢失（DeviceActor idle
             // 检查间隔 1 秒，远大于主循环的 100ms 重启延迟）
-            if let Err(e) = crate::device::persist_config_now() {
-                log::error!("[ble_at] 0xCD: failed to persist config before reset: {e}");
-                return None;
-            }
-            crate::bus::IO
-                .sys
-                .request_reset(crate::bus::io_state::ResetSource::BLE_AT);
-            log::info!("[ble_at] 0xCD: IP/MASK/GW persisted, device will reset shortly");
         }
         0xCE => {
             let (ip, mask, gateway) = crate::bus::config_state::config_read_with(|state| {
@@ -3535,7 +3663,7 @@ pub fn send_di_status_report(conn_id: u16) {
     );
 }
 
-fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
+fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], conn_id: u16) {
     let Some(frame) = build_ble_frame(tx_id, proto_id, pdu_data) else {
         log::error!(
             "[ble_at] response exceeds TX frame capacity: {} bytes",
@@ -3552,6 +3680,16 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
         length,
         pdu_data.len()
     );
+    if conn_id == 0xFFFF && MAILBOX_CAPTURE.load(Ordering::Acquire) {
+        if MAILBOX_RESPONSES
+            .try_lock()
+            .is_some_and(|mut responses| responses.push(frame).is_ok())
+        {
+            return;
+        }
+        log::warn!("[ble_at] RF Mailbox response capture full");
+        return;
+    }
     // 放入二进制响应队列，由 main loop 按协商 MTU 分片发送。
     // 关键: 不在 GATT 回调中直接 send_indicate!
     let frame_len = frame.len();
@@ -3570,6 +3708,47 @@ fn send_ble_frame(tx_id: u16, proto_id: u16, pdu_data: &[u8], _conn_id: u16) {
             );
         }
     }
+}
+
+/// 通过 RF Mailbox 处理一个完整的 IMC BLE 二进制帧。
+/// 返回值是一个或多个完整 BLE 响应帧的串联字节；D3 等历史命令可能产生两帧。
+pub fn process_mailbox_binary(frame: &[u8]) -> Option<heapless::Vec<u8, 1024>> {
+    if frame.len() > BLE_BINARY_FRAME_MAX {
+        return None;
+    }
+    MAILBOX_RESET_REQUESTED.store(false, Ordering::Release);
+    if let Some(mut responses) = MAILBOX_RESPONSES.try_lock() {
+        responses.clear();
+    } else {
+        return None;
+    }
+    let _dispatch = PROTOCOL_DISPATCH_LOCK.lock();
+    MAILBOX_CAPTURE.store(true, Ordering::Release);
+    let handled = try_handle_binary_protocol(frame, 0xFFFF, 0);
+    MAILBOX_CAPTURE.store(false, Ordering::Release);
+    drop(_dispatch);
+    if !handled {
+        if let Some(mut responses) = MAILBOX_RESPONSES.try_lock() {
+            responses.clear();
+        }
+        return None;
+    }
+    let mut output = heapless::Vec::<u8, 1024>::new();
+    if let Some(mut responses) = MAILBOX_RESPONSES.try_lock() {
+        for response in responses.drain(..) {
+            if output.extend_from_slice(&response).is_err() {
+                return None;
+            }
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+/// Consume the deferred reset marker produced while dispatching one mailbox
+/// command.  The NFC worker calls this only after it has published the final
+/// response fragment and observed that RF consumed it.
+pub fn take_mailbox_reset_request() -> bool {
+    MAILBOX_RESET_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
 /// 构造完整 BLE 业务帧。容量检查先于任何写入，禁止产生部分帧。

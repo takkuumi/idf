@@ -82,13 +82,23 @@ build_variant() {
     echo ""
     echo "=== 完整编译 ${variant_upper} / v${VERSION} ==="
     cargo clean --target-dir "$target_dir"
+    local build_env=()
+    local feature_args=()
+    local manifest_features=("default" "$variant" "lora")
     if [[ "$variant" == default || "$variant" == f16 ]]; then
-        CARGO_TARGET_DIR="$target_dir" cargo build \
-            --release --locked --bin imc
+        :
+    elif [[ "$variant" == f3 ]]; then
+        # F3 的 GPIO43/44 UART0 承载 E22 透明 LoRa。F3 原理图的
+        # BCT4227 按 USB VBUS 硬件切换 USB-UART/LoRa；关闭应用 UART0 console
+        # 后由第三路 Modbus RTU worker 独占 UART0，避免日志变成 RF 数据。
+        build_env+=(ESP_IDF_SDKCONFIG_DEFAULTS="$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.lora.defaults")
+        feature_args+=(--features f3,lora)
+        manifest_features=("default" "f3" "lora")
     else
-        CARGO_TARGET_DIR="$target_dir" cargo build \
-            --release --locked --bin imc --features "$variant"
+        feature_args+=(--features "$variant")
     fi
+    env "${build_env[@]}" CARGO_TARGET_DIR="$target_dir" cargo build \
+        --release --locked --bin imc "${feature_args[@]}"
 
     local elf="$target_dir/xtensa-esp32s3-espidf/release/imc"
     if [[ ! -f "$elf" ]]; then
@@ -181,7 +191,7 @@ PY
         0x20000 "$app"
 
     cat > "$output_dir/flash-command.txt" <<EOF
-# 2.7.0 首个生产基线：必须全擦，不导入旧版本 NVS/holding 数据。先设置串口:
+# 全擦安装：清除设备配置和运行数据。升级已有设备前优先使用受支持的 OTA 路径。先设置串口:
 # export ESPFLASH_PORT=/dev/cu.usbserial-1430
 python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_PORT}" --baud 460800 erase_flash
 python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_PORT}" --baud 460800 write_flash \\
@@ -195,7 +205,7 @@ python3 -m esptool --chip esp32s3 --port "\${ESPFLASH_PORT:?请设置 ESPFLASH_P
 # python3 -m esptool --chip esp32s3 --port "\$ESPFLASH_PORT" write_flash 0x0 ${prefix}-factory-new-device.bin
 EOF
 
-    python3 - "$output_dir" "$variant" "$VERSION" "$GIT_COMMIT" "$GIT_DIRTY" <<'PY'
+python3 - "$output_dir" "$variant" "$VERSION" "$GIT_COMMIT" "$GIT_DIRTY" "${manifest_features[@]}" <<'PY'
 import hashlib
 import json
 import sys
@@ -205,6 +215,7 @@ from pathlib import Path
 out = Path(sys.argv[1])
 variant, version, commit = sys.argv[2:5]
 dirty = sys.argv[5] == "true"
+features = sys.argv[6:]
 prefix = f"imc-v{version}-{variant}"
 
 def sha256(path: Path) -> str:
@@ -242,7 +253,7 @@ manifest = {
         "imports_legacy_data": False,
     },
     "hardware_variant": variant.upper(),
-    "cargo_features": ["default", variant],
+    "cargo_features": features,
     "built_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "git": {"commit": commit, "dirty": dirty},
     "flash": {

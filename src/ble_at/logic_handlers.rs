@@ -12,11 +12,271 @@
 //! 配置存储: 每个设备类型 (sub-command 0x00-0x22) 的配置以 NVS blob 持久化.
 
 use heapless::Vec as HVec;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// 配置项 NVS 命名空间
 const NVS_NAMESPACE: &str = "logic_cfg";
 /// 配置有效标志字节
 const CFG_VALID_FLAG: u8 = 0x55;
+
+const LEGACY_TABLE_MAX_WORDS: usize = 1700;
+const LEGACY_TABLE_MAX_RECORDS: usize = 32;
+const LEGACY_TABLE_COVERAGE_BYTES: usize = LEGACY_TABLE_MAX_WORDS.div_ceil(8);
+const LEGACY_TABLE_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyTableWriteStatus {
+    Staged,
+    Committed,
+}
+
+struct LegacyTableStage {
+    session_epoch: u32,
+    header_words: usize,
+    terminal_word: usize,
+    baseline_crc32: u32,
+    words: HVec<u16, LEGACY_TABLE_MAX_WORDS>,
+    received: [u8; LEGACY_TABLE_COVERAGE_BYTES],
+    updated_at: Instant,
+}
+
+impl LegacyTableStage {
+    fn begin(session_epoch: u32, header: &[u16]) -> Result<Self, ()> {
+        if header.len() < 2 {
+            return Err(());
+        }
+        let count = usize::from(header[0]);
+        let header_words = count.checked_add(2).ok_or(())?;
+        if count > LEGACY_TABLE_MAX_RECORDS || header.len() != header_words {
+            return Err(());
+        }
+        let terminal_word = usize::from(header[count + 1]);
+        if terminal_word < header_words || terminal_word > LEGACY_TABLE_MAX_WORDS {
+            return Err(());
+        }
+        if count == 0 {
+            if terminal_word != 2 {
+                return Err(());
+            }
+        } else {
+            let mut expected = header_words;
+            for index in 0..count {
+                let start = usize::from(header[index + 1]);
+                let end = usize::from(header[index + 2]);
+                if start != expected || start >= end || end > terminal_word {
+                    return Err(());
+                }
+                expected = end;
+            }
+            if expected != terminal_word {
+                return Err(());
+            }
+        }
+        let mut words = HVec::new();
+        for _ in 0..terminal_word {
+            words.push(0).map_err(|_| ())?;
+        }
+        words[..header_words].copy_from_slice(header);
+        let mut stage = Self {
+            session_epoch,
+            header_words,
+            terminal_word,
+            baseline_crc32: 0,
+            words,
+            received: [0; LEGACY_TABLE_COVERAGE_BYTES],
+            updated_at: Instant::now(),
+        };
+        if terminal_word == header_words {
+            for index in 0..header_words {
+                stage.mark_received(index);
+            }
+        }
+        Ok(stage)
+    }
+
+    fn append(
+        &mut self,
+        session_epoch: u32,
+        start_word: usize,
+        values: &[u16],
+    ) -> Result<bool, ()> {
+        if self.session_epoch != session_epoch
+            || self.updated_at.elapsed() > LEGACY_TABLE_SESSION_TIMEOUT
+        {
+            return Err(());
+        }
+        let end_word = start_word.checked_add(values.len()).ok_or(())?;
+        if values.is_empty()
+            || start_word < self.header_words
+            || end_word > self.terminal_word
+            || end_word <= start_word
+        {
+            return Err(());
+        }
+        for (offset, &value) in values.iter().enumerate() {
+            let index = start_word + offset;
+            if self.is_received(index) && self.words[index] != value {
+                return Err(());
+            }
+            self.words[index] = value;
+            self.mark_received(index);
+        }
+        self.updated_at = Instant::now();
+        Ok((self.header_words..self.terminal_word).all(|index| self.is_received(index)))
+    }
+
+    fn mark_received(&mut self, index: usize) {
+        self.received[index / 8] |= 1 << (index % 8);
+    }
+
+    fn is_received(&self, index: usize) -> bool {
+        self.received[index / 8] & (1 << (index % 8)) != 0
+    }
+}
+
+static LEGACY_TABLE_STAGE: LazyLock<Mutex<Option<LegacyTableStage>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Stage the handheld B1/B3 FC16 table in RAM. Only the final contiguous table
+/// is published to the live RCU snapshot and A/B flash slot; interrupted or
+/// malformed uploads leave the currently active table untouched.
+pub fn stage_legacy_function_table_block(
+    session_epoch: u32,
+    address: u16,
+    values: &[u16],
+) -> Option<Result<LegacyTableWriteStatus, ()>> {
+    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    let mut state = LEGACY_TABLE_STAGE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if address == base {
+        let stage = LegacyTableStage::begin(session_epoch, values).and_then(|mut stage| {
+            stage.baseline_crc32 = active_function_table_crc32()?;
+            Ok(stage)
+        });
+        return Some(match stage {
+            Ok(stage) if stage.header_words == stage.terminal_word => {
+                let committed = commit_legacy_function_table(&stage.words, stage.baseline_crc32);
+                if committed.is_ok() {
+                    *state = None;
+                    Ok(LegacyTableWriteStatus::Committed)
+                } else {
+                    *state = Some(stage);
+                    Err(())
+                }
+            }
+            Ok(stage) => {
+                *state = Some(stage);
+                Ok(LegacyTableWriteStatus::Staged)
+            }
+            Err(()) => {
+                *state = None;
+                Err(())
+            }
+        });
+    }
+    let table_end = crate::config::regs::HOLD_USER_BASE;
+    if address < base || address >= table_end {
+        return None;
+    }
+    let Some(stage) = state.as_mut() else {
+        // A data block without its B1 offset map must never be written into
+        // the active function table as an ordinary FC16 operation.
+        return Some(Err(()));
+    };
+    let start_word = usize::from(address.saturating_sub(base));
+    match stage.append(session_epoch, start_word, values) {
+        Ok(false) => Some(Ok(LegacyTableWriteStatus::Staged)),
+        Ok(true) => {
+            let committed = commit_legacy_function_table(&stage.words, stage.baseline_crc32);
+            if committed.is_ok() {
+                *state = None;
+                Some(Ok(LegacyTableWriteStatus::Committed))
+            } else {
+                Some(Err(()))
+            }
+        }
+        Err(()) => {
+            *state = None;
+            Some(Err(()))
+        }
+    }
+}
+
+pub fn cancel_staged_legacy_function_table() {
+    *LEGACY_TABLE_STAGE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn active_function_table_crc32() -> Result<u32, ()> {
+    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    let offset = usize::from(base - crate::config::regs::HOLD_PXX_BASE);
+    crate::bus::storage_state::storage_read_with(|storage| {
+        let words = &storage.holding_buf[offset..offset + LEGACY_TABLE_MAX_WORDS];
+        let mut crc = !0u32;
+        for word in words {
+            for byte in word.to_le_bytes() {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+        }
+        Some(!crc)
+    })
+    .flatten()
+    .ok_or(())
+}
+
+fn commit_legacy_function_table(words: &[u16], expected_baseline_crc32: u32) -> Result<(), ()> {
+    crate::modbus::rtu_master::validate_staged_logic_table(words).map_err(|error| {
+        log::warn!("[logic_cfg] staged handheld table failed runtime validation: {error}");
+    })?;
+    if active_function_table_crc32()? != expected_baseline_crc32 {
+        log::warn!(
+            "[logic_cfg] staged handheld table rejected after concurrent active-table change"
+        );
+        return Err(());
+    }
+    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    let previous = crate::bus::storage_state::storage_read_with(|storage| {
+        let offset = usize::from(base - crate::config::regs::HOLD_PXX_BASE);
+        let mut words: HVec<u16, LEGACY_TABLE_MAX_WORDS> = HVec::new();
+        words
+            .extend_from_slice(&storage.holding_buf[offset..offset + LEGACY_TABLE_MAX_WORDS])
+            .ok()?;
+        Some(words)
+    })
+    .flatten()
+    .ok_or(())?;
+    crate::bus::backends::arm_logic_write();
+    if !crate::bus::backends::write_hold_regs(base, words) {
+        crate::bus::backends::disarm_logic_write();
+        return Err(());
+    }
+    if let Err(error) = crate::device::holding_store::save_to_nvs() {
+        log::error!("[logic_cfg] staged handheld table persist failed: {error}");
+        // Keep the previous active runtime table and leave its snapshot dirty
+        // for the normal actor retry path if flash remains unavailable.
+        crate::bus::backends::arm_logic_write();
+        if !crate::bus::backends::write_hold_regs(base, &previous) {
+            crate::bus::backends::disarm_logic_write();
+            log::error!("[logic_cfg] staged table rollback to previous runtime state failed");
+        } else if let Err(rollback_error) = crate::device::holding_store::save_to_nvs() {
+            log::error!(
+                "[logic_cfg] previous table rollback persist retry failed: {rollback_error}"
+            );
+        }
+        return Err(());
+    }
+    Ok(())
+}
 
 /// 设备功能子命令定义 (对齐参考固件 PROTOCOL_CONFIG_*)
 /// 0x00-0x22: 35 种设备类型的配置写入/读取
@@ -159,22 +419,24 @@ fn store_config(sub: u8, data: &[u8]) -> bool {
 }
 
 /// Store the legacy device-function table in the same PRegBuf window used by
-/// the handheld B1/B3 commands.  The old MCA 0xD0 packet is little-endian and
-/// each record includes its one-byte length at the first byte of the record.
+/// the handheld B1/B3 commands. Only the D0 aggregate count is little-endian;
+/// each record has a one-byte transport length followed by big-endian fields.
+/// Holding uses relative word offsets and excludes the transport length.
 fn store_device_function_config(data: &[u8]) -> bool {
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
     if data.len() < 2 {
         return false;
     }
     let count = u16::from_le_bytes([data[0], data[1]]) as usize;
-    if count == 0 || count > 255 {
+    if count > 32 {
         return false;
     }
     // PRegBuf layout: count, `count` record pointers, then one terminal offset.
     // `parse_poll_table` reads the terminal offset at base + count + 1, so the
     // first record must start after all count + 2 header words.
     let table_words = count + 2;
-    if table_words >= crate::config::regs::HOLD_PXX_COUNT {
+    let max_words = usize::from(crate::config::regs::HOLD_USER_BASE - base);
+    if table_words > max_words {
         return false;
     }
     let mut words: heapless::Vec<u16, 2048> = heapless::Vec::new();
@@ -189,23 +451,22 @@ fn store_device_function_config(data: &[u8]) -> bool {
             return false;
         };
         let len = len_byte as usize;
-        if len == 0 || pos + len > data.len() {
+        // All supported record fields occupy complete registers. Reject a
+        // truncated header or odd field payload instead of shifting a pad byte
+        // into the following record.
+        if len < 9 || !(len - 1).is_multiple_of(2) || pos + len > data.len() {
             return false;
         }
-        if data_word >= crate::config::regs::HOLD_PXX_COUNT {
+        if data_word >= max_words {
             return false;
         }
-        let pointer = base as usize + data_word;
-        if pointer > u16::MAX as usize {
-            return false;
-        }
-        words[index + 1] = pointer as u16;
-        let record = &data[pos..pos + len];
+        words[index + 1] = data_word as u16;
+        let record = &data[pos + 1..pos + len];
         for chunk in record.chunks(2) {
-            if words.len() >= crate::config::regs::HOLD_PXX_COUNT {
+            if words.len() >= max_words {
                 return false;
             }
-            let value = u16::from_le_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]);
+            let value = u16::from_be_bytes([chunk[0], chunk[1]]);
             if words.push(value).is_err() {
                 return false;
             }
@@ -216,7 +477,7 @@ fn store_device_function_config(data: &[u8]) -> bool {
     // This offset bounds the final variable-length record and is mandatory for
     // the runtime parser. Without it, the runtime treats the config as corrupt
     // after reboot even though the raw words were persisted successfully.
-    if data_word > u16::MAX as usize || data_word >= crate::config::regs::HOLD_PXX_COUNT {
+    if pos != data.len() || data_word > max_words {
         return false;
     }
     words[count + 1] = data_word as u16;
@@ -290,26 +551,36 @@ fn load_rs485_config(sub: u8) -> Option<HVec<u8, 256>> {
 fn load_device_function_config() -> Option<HVec<u8, 256>> {
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
     let count = crate::bus::backends::read_hold_reg(base)? as usize;
-    if count == 0 || count > 255 {
+    if count > 32 {
+        return None;
+    }
+    let terminal = crate::bus::backends::read_hold_reg(base + count as u16 + 1)?;
+    if terminal < (count + 2) as u16
+        || base.checked_add(terminal)? > crate::config::regs::HOLD_USER_BASE
+        || (count == 0 && terminal != 2)
+    {
         return None;
     }
     let mut out = HVec::new();
     out.extend_from_slice(&(count as u16).to_le_bytes()).ok()?;
+    let mut expected_start = (count + 2) as u16;
     for index in 0..count {
-        let pointer = crate::bus::backends::read_hold_reg(base + 1 + index as u16)?;
-        let len = (crate::bus::backends::read_hold_reg(pointer)? & 0xff) as usize;
-        if len == 0 || out.len() + len > 254 {
+        let offset = crate::bus::backends::read_hold_reg(base + 1 + index as u16)?;
+        let end = crate::bus::backends::read_hold_reg(base + 2 + index as u16)?;
+        if offset != expected_start || offset >= end || end > terminal {
             return None;
         }
-        for byte_index in 0..len {
-            let word = crate::bus::backends::read_hold_reg(pointer + (byte_index / 2) as u16)?;
-            out.push(if byte_index % 2 == 0 {
-                word as u8
-            } else {
-                (word >> 8) as u8
-            })
-            .ok()?;
+        let len = usize::from(end - offset) * 2;
+        // Large tables are read using FC03 blocks, not a truncated D1 response.
+        if !(8..=254).contains(&len) || out.len() + len + 1 > 254 {
+            return None;
         }
+        out.push((len + 1) as u8).ok()?;
+        for word_index in offset..end {
+            let word = crate::bus::backends::read_hold_reg(base + word_index)?;
+            out.extend_from_slice(&word.to_be_bytes()).ok()?;
+        }
+        expected_start = end;
     }
     Some(out)
 }
@@ -449,6 +720,7 @@ pub fn handle_logic_retrieve(data: &[u8]) -> Option<heapless::Vec<u8, 256>> {
 /// 对齐参考固件 vDeleteAllLogic: 清除所有配置文件.
 pub fn handle_delete_config() -> Option<heapless::Vec<u8, 256>> {
     log::info!("[logic_cfg] D2 DELETE_CONFIG: clearing all configs");
+    cancel_staged_legacy_function_table();
     let success = delete_all_configs();
     if success {
         Some(build_ack(0xD2, 0x00, 0x00))
@@ -549,15 +821,52 @@ pub fn dispatch_logic_cmd(func: u8, data: &[u8]) -> Option<heapless::Vec<u8, 256
 #[cfg(test)]
 mod tests {
     use super::{
-        SUB_RS485_01, handle_logic_config, handle_logic_retrieve, load_device_function_config,
-        store_device_function_config,
+        LegacyTableStage, SUB_RS485_01, handle_logic_config, handle_logic_retrieve,
+        load_device_function_config, store_device_function_config,
     };
 
     #[test]
+    fn staged_legacy_table_waits_for_every_word_before_publish() {
+        let header = [2, 4, 6, 8];
+        let mut stage = LegacyTableStage::begin(77, &header).expect("valid B1 header");
+        assert_eq!(stage.append(77, 4, &[0x0102, 0x0304]).unwrap(), false);
+        assert_eq!(stage.append(77, 6, &[0x0506, 0x0708]).unwrap(), true);
+        assert_eq!(
+            stage.words.as_slice(),
+            &[2, 4, 6, 8, 0x0102, 0x0304, 0x0506, 0x0708]
+        );
+    }
+
+    #[test]
+    fn staged_legacy_table_rejects_out_of_order_pointers_and_foreign_connection() {
+        assert!(LegacyTableStage::begin(77, &[2, 5, 6, 8]).is_err());
+        let mut stage = LegacyTableStage::begin(77, &[1, 3, 5]).expect("valid table");
+        assert!(stage.append(88, 3, &[0x0102, 0x0304]).is_err());
+        assert!(stage.append(77, 5, &[0x0102]).is_err());
+    }
+
+    #[test]
+    fn staged_legacy_table_accepts_identical_retry_and_rejects_conflicting_retry() {
+        let mut stage = LegacyTableStage::begin(77, &[1, 3, 5]).expect("valid header");
+        assert!(!stage.append(77, 3, &[0x1234, 0x5678]).unwrap());
+        assert!(!stage.append(77, 3, &[0x1234]).unwrap());
+        assert!(stage.append(77, 3, &[0xffff]).is_err());
+    }
+
+    #[test]
+    fn empty_legacy_table_header_is_a_complete_transaction() {
+        let stage = LegacyTableStage::begin(77, &[0, 2]).expect("empty table");
+        assert_eq!(stage.header_words, stage.terminal_word);
+        assert!(LegacyTableStage::begin(77, &[0, 0]).is_err());
+    }
+
+    #[test]
     fn device_function_table_round_trips_through_preg() {
-        // count=1, record length=3, record bytes include the length byte as
-        // required by the legacy 0xD0/0xD1 protocol.
-        let packet = [1, 0, 3, 0x11, 0x22];
+        // One actual analog record: D0 count + transport length + BE fields.
+        // Storage must remove the length prefix and use runtime-relative offsets.
+        let packet = [
+            1, 0, 23, 0, 3, 0, 0, 0, 0, 0, 0, 12, 1, 0, 0, 0, 0, 0, 0, 15, 255, 0, 0, 0, 0,
+        ];
         assert!(store_device_function_config(&packet));
         let loaded = load_device_function_config().expect("stored table must load");
         assert_eq!(loaded.as_slice(), packet);

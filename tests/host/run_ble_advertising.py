@@ -73,6 +73,7 @@ mod esp_idf_sys {
     pub const esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT: i32 = 1;
     pub const esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_START_COMPLETE_EVT: i32 = 2;
     pub const esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT: i32 = 3;
+    pub const esp_gap_ble_cb_event_t_ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT: i32 = 4;
     pub struct esp_ble_adv_params_t {
         pub adv_int_min: u16, pub adv_int_max: u16, pub adv_type: i32,
         pub own_addr_type: i32, pub peer_addr: [u8;6], pub peer_addr_type: i32,
@@ -86,8 +87,12 @@ mod esp_idf_sys {
         pub service_uuid_len: u16, pub p_service_uuid: *mut u8, pub flag: u8,
     }
     #[derive(Clone, Copy)] pub struct Completion { pub status: i32 }
+    #[derive(Clone, Copy, Default)] pub struct ConnectionUpdate {
+        pub status: i32, pub conn_int: u16, pub latency: u16, pub timeout: u16,
+    }
     pub struct esp_ble_gap_cb_param_t {
         pub adv_data_cmpl: Completion, pub adv_start_cmpl: Completion, pub adv_stop_cmpl: Completion,
+        pub update_conn_params: ConnectionUpdate,
     }
     fn result(kind: u8) -> i32 {
         assert!(ADV_HEALTH.try_lock().is_some(), "SDK called while holding health lock");
@@ -114,7 +119,7 @@ mod esp_idf_sys {
     }
     pub unsafe fn esp_ble_gap_start_advertising(params: *mut esp_ble_adv_params_t) -> i32 {
         let params = unsafe { &*params };
-        assert_eq!((params.adv_int_min, params.adv_int_max, params.channel_map), (0x100,0x100,7));
+        assert_eq!((params.adv_int_min, params.adv_int_max, params.channel_map), (0x20,0x40,7));
         assert_eq!((params.adv_type,params.own_addr_type,params.peer_addr_type,params.adv_filter_policy), (0,0,0,0));
         assert_eq!(params.peer_addr,[0;6]);
         STARTS.fetch_add(1, Ordering::Relaxed);
@@ -143,22 +148,31 @@ fn reset() {
 }
 fn event(kind: i32, status: i32) {
     let c=esp_idf_sys::Completion{status};
-    let mut p=esp_idf_sys::esp_ble_gap_cb_param_t{adv_data_cmpl:c,adv_start_cmpl:c,adv_stop_cmpl:c};
+    let mut p=esp_idf_sys::esp_ble_gap_cb_param_t{adv_data_cmpl:c,adv_start_cmpl:c,adv_stop_cmpl:c,update_conn_params:esp_idf_sys::ConnectionUpdate::default()};
     unsafe { gap_event_cb(kind,&mut p); }
 }
 fn running() { reset(); start_advertising(); event(2,0); }
 fn poll(now: u32) { at(now); maintain_advertising(); }
+#[test] fn test_connection_update_callback_preserves_advertising_health() {
+    running();
+    unsafe { gap_event_cb(4,std::ptr::null_mut()); }
+    event(4,0);
+    assert!(ADV_HEALTH.lock().active());
+    assert_eq!(STARTS.load(Ordering::SeqCst),1);
+    assert_eq!(STOPS.load(Ordering::SeqCst),0);
+    assert_eq!(CONFIGS.load(Ordering::SeqCst),0);
+}
 #[test] fn test_real_paths_recover_silent_stop_despite_active_flag() {
     running(); CONTROLLER_ACTIVE.store(false,Ordering::SeqCst);
-    poll(60_099); assert_eq!(STARTS.load(Ordering::SeqCst),1);
-    poll(60_100); assert_eq!(STARTS.load(Ordering::SeqCst),2);
+    poll(10_099); assert_eq!(STARTS.load(Ordering::SeqCst),1);
+    poll(10_100); assert_eq!(STARTS.load(Ordering::SeqCst),2);
     assert!(CONTROLLER_ACTIVE.load(Ordering::SeqCst));
-    event(2,0); poll(60_110); assert_eq!(STARTS.load(Ordering::SeqCst),2);
+    event(2,0); poll(10_110); assert_eq!(STARTS.load(Ordering::SeqCst),2);
 }
 #[test] fn test_real_paths_connected_and_rename_deferred_until_disconnect() {
     running(); CONN_ID.store(0,Ordering::SeqCst); advertising_connected();
     *ID.lock()="12345678".into(); PENDING_GAP_NAME_UPDATE.store(true,Ordering::SeqCst);
-    poll(120_100); assert_eq!(STARTS.load(Ordering::SeqCst),1);
+    poll(20_100); assert_eq!(STARTS.load(Ordering::SeqCst),1);
     assert_eq!(CONFIGS.load(Ordering::SeqCst),0); assert_eq!(NAMES.load(Ordering::SeqCst),0);
     CONN_ID.store(0xFFFF,Ordering::SeqCst); advertising_disconnected();
     poll(120_110); assert_eq!(&*AIR_NAME.lock(),"M12345678");
@@ -176,9 +190,9 @@ fn poll(now: u32) { at(now); maintain_advertising(); }
     event(1,0); event(2,0); assert_eq!(STARTS.load(Ordering::SeqCst),2);
 }
 #[test] fn test_real_paths_failed_renewal_uses_backoff() {
-    running(); FAIL_NEXT.store(3,Ordering::SeqCst); poll(60_100);
-    assert!(!ADV_HEALTH.lock().active()); poll(65_099); assert_eq!(CONFIGS.load(Ordering::SeqCst),0);
-    poll(65_100); assert_eq!(CONFIGS.load(Ordering::SeqCst),1);
+    running(); FAIL_NEXT.store(3,Ordering::SeqCst); poll(10_100);
+    assert!(!ADV_HEALTH.lock().active()); poll(15_099); assert_eq!(CONFIGS.load(Ordering::SeqCst),0);
+    poll(15_100); assert_eq!(CONFIGS.load(Ordering::SeqCst),1);
     event(1,0); event(2,0); assert!(ADV_HEALTH.lock().active());
 }
 #[test] fn test_real_paths_rename_waits_for_stop_callback_and_latest_name() {
@@ -204,12 +218,12 @@ fn poll(now: u32) { at(now); maintain_advertising(); }
     assert_eq!(CONFIGS.load(Ordering::SeqCst),1);
 }
 #[test] fn test_real_paths_no_maintenance_before_service_ready() {
-    reset(); SVC_STARTED.store(false,Ordering::SeqCst); poll(120_100);
+    reset(); SVC_STARTED.store(false,Ordering::SeqCst); poll(20_100);
     assert_eq!(STARTS.load(Ordering::SeqCst),0); assert_eq!(CONFIGS.load(Ordering::SeqCst),0);
 }
 #[test] fn test_real_paths_ordinary_disconnect_resumes_without_rename() {
     running(); CONN_ID.store(0,Ordering::SeqCst); advertising_connected();
-    poll(120_000); assert_eq!(STARTS.load(Ordering::SeqCst),1);
+    poll(20_000); assert_eq!(STARTS.load(Ordering::SeqCst),1);
     CONN_ID.store(0xFFFF,Ordering::SeqCst); advertising_disconnected(); event(2,0);
     assert_eq!(STARTS.load(Ordering::SeqCst),2);
     assert_eq!(STOPS.load(Ordering::SeqCst),0);

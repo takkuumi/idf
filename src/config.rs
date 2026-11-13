@@ -36,7 +36,7 @@ pub const BLE_PROCESS_PERIOD_MS: u64 = 10;
 // GPIO0:    strapping (boot mode, 需外部上拉)
 // GPIO3:    strapping (JTAG source)
 // GPIO45/46: strapping (VDD_SPI / system freq)
-// GPIO43/44: UART0 默认 TX/RX (下载/日志)
+// GPIO43/44: UART0 TX/RX (ROM 下载 UART 与板载 LoRa 串口共用)
 //
 // 引脚分配来源: LILYGO T-ETH-Lite-ESP32-S3 原理图 + 参考固件 utilities.h
 // ----------------------------------------------------------------------------
@@ -59,8 +59,9 @@ pub mod pins {
     pub const RS485_0_UART: u8 = 1; // UART1
     pub const RS485_0_TX: u8 = 45;
     pub const RS485_0_RX: u8 = 46;
-    // 项目板级映射：UART1 的 RS485-1 DE/RE 共控脚为 GPIO7。
-    pub const RS485_0_DE: u8 = 7;
+    // F3-GPIO.xlsx 将 GPIO7 标为 SDMMC0_DET_L，没有独立 RS485 DE/RE 网络。
+    // UART1 只使用 TX/RX；255 表示不配置 RTS/DE，避免占用 SD 检测脚。
+    pub const RS485_0_DE: u8 = 255;
 
     // ---- RS485 #1 (Modbus RTU, UART2) ----
     // 引脚来自参考固件: rs485_2.begin(baud, cfg, 41, 42) → RX=41, TX=42
@@ -70,20 +71,22 @@ pub mod pins {
     // 参考固件仅配置 UART2 TX/RX，没有 RTS/DE 输出；GPIO8 是 F3 AI3。
     pub const RS485_1_DE: u8 = 255;
 
-    // ---- RS485 #2 (第 3 端口, UART0, 对齐参考固件 RS485-3) ----
-    // 参考固件: rs485_3 使用 Serial (UART0), 默认 9600 8N1.
-    // 注意: UART0 与 USB CDC/JTAG 控制台复用, 启用 RS485-2 将失去调试串口.
-    // 默认不启动; 如需使用, 在 config::modbus::rtu_port2::ENABLED 设为 true.
-    // 引脚: UART0 默认 TX=GPIO43, RX=GPIO44, 无硬件 DE 控制 (软件模拟或外接 MAX485)
-    pub const RS485_2_UART: u8 = 0; // UART0 (与 USB CDC 复用)
+    // ---- UART0 (ROM 下载 UART / 运行期 LoRa 串口共用) ----
+    // F3 原理图的 BCT4227 以 USB VBUS 在 USB-UART 与板载 LoRa 之间硬件切换，
+    // F3 LoRa profile 关闭 UART0 console，由统一 per-port RTU runtime 独占。
+    pub const RS485_2_UART: u8 = 0; // UART0
     pub const RS485_2_TX: u8 = 43;
     pub const RS485_2_RX: u8 = 44;
     pub const RS485_2_DE: u8 = 255; // 255 = 无 DE 引脚 (不使用 RTS 自动控制)
+    // F3 原理图将 LORA_M0 标在 SPICS1 网络 (GPIO26)，与 Quad Flash/PSRAM 复用；
+    // 固件不驱动 M0，模块由硬件保持透明模式。
+    pub const LORA_M0_PIN: u8 = 255;
 
-    // ---- 电源使能引脚 (开机时需拉高) ----
-    // GPIO21: 灯板电源使能 (HIGH=上电)
+    // ---- 板级控制引脚 ----
+    // F3-GPIO.xlsx 网名为 LORA_RST；E22-400T22D D 型接口无独立 RESET 脚。
+    // 保留旧固件启动拉高行为，但不将其当作模块复位控制，直到原理图确认此网用途。
+    pub const LORA_BOARD_CTRL_PIN: u8 = 21;
     // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
-    pub const POWER_LED_EN: u8 = 21;
     pub const POWER_RELAY_EN: u8 = 33;
 
     // ---- RS485 地址码输入 (拨码开关, 启动时读取) ----
@@ -100,10 +103,13 @@ pub mod pins {
     pub const NCA9555_LED_SDA: u8 = 38;
     pub const NCA9555_INT: u8 = 34; // 与 ESP_STOP_PIN 共用 GPIO34
 
-    // ---- 光纤检测输入 ----
-    // 参考固件: FIB1=digitalRead(39), FIB2=digitalRead(40)
-    pub const FIB1_PIN: u8 = 39;
-    pub const FIB2_PIN: u8 = 40;
+    // ---- 环网 PHY 中断网络 ----
+    // F3-GPIO.xlsx: GPIO39/40 = PHY_INT1/PHY_INT2。当前固件没有环网交换
+    // 芯片驱动，不得将这两个中断脚伪装为 FIB1/FIB2 用户状态输入。
+    pub const PHY_INT1_PIN: u8 = 39;
+    pub const PHY_INT2_PIN: u8 = 40;
+    pub const FIB1_PIN: u8 = 255;
+    pub const FIB2_PIN: u8 = 255;
 
     // ---- AI 模拟输入 (ESP32-S3 ADC, 12-bit SAR ADC) ----
     // F3: GPIO1/2/3/8 = ADC1_CH0/1/2/7。
@@ -249,11 +255,11 @@ pub mod modbus {
         pub const DATA_BITS: u8 = 8;
     }
 
-    /// RTU 第 3 端口参数 (RS485-3, UART0, 对齐参考固件)
-    /// 默认仅从站监听模式; UART0 与 USB CDC/JTAG 复用, 启用将失去调试串口.
-    /// 由 `ENABLED` 控制是否启动 (默认 false, 需手动启用).
+    /// `lora` 编译能力默认启用，但 UART0 第 3 RTU 逻辑端口只对 F3 生效。
+    /// F3 发布配置须叠加 `sdkconfig.lora.defaults` 关闭 UART0 控制台，避免日志混入
+    /// 板载 E22 透明数据；`rtu_runtime` 按已保存的 Master/Slave 配置运行。
     pub mod rtu_port2 {
-        pub const ENABLED: bool = false; // 默认禁用 (UART0 与 USB 串口复用)
+        pub const ENABLED: bool = cfg!(all(feature = "f3", feature = "lora"));
         pub const BAUD: u32 = 9600;
         pub const ADDR: u8 = 1;
         pub const PARITY: char = 'N';
@@ -275,6 +281,12 @@ pub mod modbus {
         /// 默认 4 端口 (对齐参考固件 ext_tcp_port1..4 = {502,503,504,5002}).
         /// 运行时端口可由 Modbus 写 HOLD_TCP_COM_BASE..3 (2243-2246) 动态修改.
         pub const PORTS: &[u16] = &[502, 503, 504, 5002];
+        /// 全局 Modbus TCP 长连接上限。四个监听端口共享该上限。
+        ///
+        /// 四个监听端口合计的 Modbus TCP 客户端上限。
+        /// 20 个 LwIP socket 还要为四个 listener、Web、UDP 和系统 socket
+        /// 留出余量；不能只调高会话数而忽略 LwIP TCP 控制块上限。
+        /// 满载时只回收断开或首包超时的未验证连接，不抢占已验证会话。
         pub const MAX_CONNECTIONS: usize = 8;
         /// 已建立连接的空闲回收时间。原 2 秒“读超时”不能直接当连接空闲超时，
         /// 否则常见 PLC/SCADA 长连接在两次轮询间就被服务端主动断开。
@@ -448,6 +460,12 @@ pub mod regs {
     pub const HOLD_SENSOR_MAX_BASE: u16 = 2288;
     // 设备功能配置 (2300+)
     pub const HOLD_DEVICE_CONFIG: u16 = 2300;
+    // AO 工业扩展区 (FC03/FC06/FC16，工程量 0..10000，4 路)
+    // 不占用旧 MCA 配置区和用户结果区，供 Web/BLE/PLC 统一控制 AO。
+    pub const HOLD_AO_BASE: u16 = 300;
+    pub const HOLD_AO_COUNT: u16 = 4;
+    pub const HOLD_AO_END: u16 = HOLD_AO_BASE + HOLD_AO_COUNT - 1;
+
     // 用户自定义区 (4000-4223 = 224 words)
     pub const HOLD_USER_BASE: u16 = 4000;
     pub const HOLD_USER_COUNT: u16 = 224;
@@ -664,5 +682,19 @@ mod tests {
         assert_eq!(MAIN_LOOP_PERIOD_MS, 5);
         assert_eq!(BLE_PROCESS_PERIOD_MS, 10);
         assert_eq!(BLE_PROCESS_PERIOD_MS % MAIN_LOOP_PERIOD_MS, 0);
+    }
+
+    #[test]
+    fn test_f3_uart_and_lora_pin_contract() {
+        assert_eq!(pins::RS485_0_UART, 1);
+        assert_eq!((pins::RS485_0_TX, pins::RS485_0_RX), (45, 46));
+        assert_eq!(pins::RS485_0_DE, u8::MAX);
+        assert_eq!(pins::RS485_1_UART, 2);
+        assert_eq!((pins::RS485_1_TX, pins::RS485_1_RX), (42, 41));
+        assert_eq!((pins::RS485_2_TX, pins::RS485_2_RX), (43, 44));
+        assert_eq!(pins::LORA_BOARD_CTRL_PIN, 21);
+        assert_eq!(pins::LORA_M0_PIN, u8::MAX);
+        assert_eq!((pins::PHY_INT1_PIN, pins::PHY_INT2_PIN), (39, 40));
+        assert_eq!((pins::FIB1_PIN, pins::FIB2_PIN), (u8::MAX, u8::MAX));
     }
 }

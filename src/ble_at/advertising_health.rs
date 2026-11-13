@@ -4,7 +4,10 @@
 //! callback is therefore a lease, not proof that advertising stays on forever.
 //! Renew only while disconnected; the SDK restart has a brief on-air gap.
 
-pub(super) const RENEW_INTERVAL_MS: u32 = 60_000;
+/// A successful start callback is only a lease.  A silent controller stop has
+/// no GAP callback, so schedule a renewal attempt within ten idle seconds
+/// instead of waiting a full minute. Radio discovery still depends on the scanner.
+pub(super) const RENEW_INTERVAL_MS: u32 = 10_000;
 pub(super) const RETRY_INTERVAL_MS: u32 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,16 +152,16 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_active_flag_is_renewed_at_sixty_seconds() {
+    fn test_stale_active_flag_is_renewed_within_ten_seconds() {
         let mut health = running(1_600);
-        assert_eq!(health.recovery(61_599, true, false, false), Recovery::None);
+        assert_eq!(health.recovery(11_599, true, false, false), Recovery::None);
         // Simulate a silent controller stop: no callback changes active=true.
         assert!(health.active());
-        assert_eq!(health.recovery(61_600, true, false, false), Recovery::Renew);
-        assert!(health.begin(Operation::Start, 61_600));
-        assert_eq!(health.recovery(61_610, true, false, false), Recovery::None);
-        assert!(health.complete(Operation::Start, true, 61_620));
-        assert_eq!(health.recovery(121_619, true, false, false), Recovery::None);
+        assert_eq!(health.recovery(11_600, true, false, false), Recovery::Renew);
+        assert!(health.begin(Operation::Start, 11_600));
+        assert_eq!(health.recovery(11_610, true, false, false), Recovery::None);
+        assert!(health.complete(Operation::Start, true, 11_620));
+        assert_eq!(health.recovery(21_619, true, false, false), Recovery::None);
     }
 
     #[test]
@@ -230,8 +233,8 @@ mod tests {
     #[test]
     fn test_timers_survive_millisecond_wrap() {
         let mut health = running(u32::MAX - 1_000);
-        assert_eq!(health.recovery(58_998, true, false, false), Recovery::None);
-        assert_eq!(health.recovery(58_999, true, false, false), Recovery::Renew);
+        assert_eq!(health.recovery(8_998, true, false, false), Recovery::None);
+        assert_eq!(health.recovery(8_999, true, false, false), Recovery::Renew);
         assert!(health.begin(Operation::Configure, u32::MAX - 100));
         assert_eq!(health.recovery(4_898, true, false, false), Recovery::None);
         assert_eq!(health.recovery(4_899, true, false, false), Recovery::Retry);

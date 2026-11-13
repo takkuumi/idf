@@ -32,8 +32,12 @@ const MAX_REQUESTS_PER_TICK: usize = 1;
 const MAX_TCP_WORK_US: u64 = 1_500;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
-/// P0-3: 连接速率限制 - 每秒最多10次新连接（防止SYN flood）
-const MAX_CONN_PER_SECOND: u32 = 10;
+/// 正常 PLC/Poll 重连保护。8 个固定会话槽位已限制资源，
+/// 这里限制 accept 工作量，不把正常短时重连误判为攻击；它不是 SYN 防火墙。
+const MAX_CONN_PER_SECOND: u32 = 64;
+/// 新建连接必须在绝对期限内发出首个完整 Modbus 请求；零字节/滴流不能长期占槽。
+/// 首帧验证后仍使用原有 120 秒 idle 策略，不因新客户端接入而抢占 PLC 长连接。
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LISTENER_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const LISTENER_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -57,6 +61,7 @@ struct Client {
     last_activity: Instant,
     partial_frame_started: Option<Instant>,
     tx_started: Option<Instant>,
+    first_request_deadline: Option<Instant>,
 }
 
 const CLIENT_STATE_ALLOCATION_BYTES: usize = std::mem::size_of::<Client>() * cfg::MAX_CONNECTIONS;
@@ -77,6 +82,7 @@ impl Client {
             // TCP_KEEP* 细项，不能因此拒绝一个本可正常服务的客户端。
             log::warn!("[mb-tcp] keepalive setup for {peer} incomplete: {error}");
         }
+        let connected_at = Instant::now();
         Ok(Self {
             id,
             listener_port,
@@ -88,9 +94,10 @@ impl Client {
             tx: [0; MAX_ADU_SIZE],
             tx_len: 0,
             tx_sent: 0,
-            last_activity: Instant::now(),
+            last_activity: connected_at,
             partial_frame_started: None,
             tx_started: None,
+            first_request_deadline: Some(connected_at + FIRST_REQUEST_TIMEOUT),
         })
     }
 
@@ -163,7 +170,7 @@ impl Client {
             return false;
         }
         if self.is_timed_out() {
-            log::debug!("[mb-tcp] conn_id={} idle timeout", self.id);
+            log::debug!("[mb-tcp] conn_id={} connection deadline expired", self.id);
             return false;
         }
         true
@@ -174,6 +181,12 @@ impl Client {
     }
 
     fn is_timed_out_at(&self, now: Instant) -> bool {
+        if self
+            .first_request_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return true;
+        }
         client_timed_out_at(
             now,
             self.partial_frame_started,
@@ -233,6 +246,7 @@ impl Client {
             Some(n) => n,
             None => return false,
         };
+        self.first_request_deadline = None;
         self.tx_len = response_len;
         self.tx_sent = 0;
         self.tx_started = Some(Instant::now());
@@ -323,7 +337,7 @@ struct TcpServerState {
     listener_rebind_due: Option<Instant>,
     next_reject_log: Instant,
     rejected_connections: u32,
-    // P0-3: 连接速率限制 + 黑名单
+    // 连接速率限制，保护 accept 路径但不影响正常重连。
     conn_rate_window: Instant,
     conn_rate_count: u32,
     conn_established_total: u32,
@@ -420,10 +434,7 @@ pub fn tick_tcp_server() {
                 }
             }
             if state.listeners.len() != state.active_ports.len()
-                || state
-                    .listeners
-                    .iter()
-                    .any(|listener| !matches!(listener.take_error(), Ok(None)))
+                || state.listeners.iter().any(listener_has_fatal_error)
             {
                 schedule_listener_recovery(state, now);
             }
@@ -657,7 +668,7 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
         return true;
     }
 
-    // P0-3: 检查连接速率限制（每秒最多10次新连接）
+    // 检查连接速率限制；这是洪泛保护，不是业务连接数限制。
     if now.duration_since(state.conn_rate_window) >= Duration::from_secs(1) {
         state.conn_rate_window = now;
         state.conn_rate_count = 0;
@@ -670,7 +681,7 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
             break;
         }
 
-        // P0-3: 速率限制检查
+        // 速率限制检查
         if state.conn_rate_count >= MAX_CONN_PER_SECOND {
             if now >= state.next_reject_log {
                 log::warn!(
@@ -684,19 +695,49 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
 
         let index = (state.listener_cursor + offset) % listener_count;
         match state.listeners[index].accept() {
-            Ok((stream, _peer)) if state.clients.len() >= cfg::MAX_CONNECTIONS => {
-                state.rejected_connections = state.rejected_connections.saturating_add(1);
-                if now >= state.next_reject_log {
-                    log::warn!(
-                        "[mb-tcp] max connections reached; rejected={} in interval",
-                        state.rejected_connections
+            Ok((stream, peer)) if state.clients.len() >= cfg::MAX_CONNECTIONS => {
+                // Reclaim a disconnected peer or an expired, unverified socket.
+                // Never displace a confirmed Modbus long connection to admit
+                // a new peer.
+                let listener_port = state.active_ports[index];
+                if let Some(candidate_index) = admission_reclaim_candidate(state, now) {
+                    let client = state.clients.swap_remove(candidate_index);
+                    state.conn_closed_total = state.conn_closed_total.saturating_add(1);
+                    CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
+                    log::info!(
+                        "[mb-tcp] reclaimed stale conn_id={} from {} for new peer {} (active={})",
+                        client.id,
+                        client.peer,
+                        peer,
+                        state.clients.len()
                     );
-                    state.rejected_connections = 0;
-                    state.next_reject_log = now + REJECT_LOG_INTERVAL;
+                    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                    match Client::new(id, listener_port, index, peer, stream) {
+                        Ok(client) => {
+                            state.clients.push(client);
+                            state.conn_established_total =
+                                state.conn_established_total.saturating_add(1);
+                            CONN_COUNT.store(state.clients.len() as u32, Ordering::Relaxed);
+                        }
+                        Err(error) => log::warn!("[mb-tcp] configure {peer}: {error}"),
+                    }
+                    accepted += 1;
+                    state.conn_rate_count += 1;
+                } else {
+                    state.rejected_connections = state.rejected_connections.saturating_add(1);
+                    if now >= state.next_reject_log {
+                        log::warn!(
+                            "[mb-tcp] max connections reached; rejected={} active={} (no reclaimable sessions)",
+                            state.rejected_connections,
+                            state.clients.len()
+                        );
+                        state.rejected_connections = 0;
+                        state.next_reject_log = now + REJECT_LOG_INTERVAL;
+                    }
+                    drop(stream);
+                    accepted += 1;
+                    state.conn_rate_count += 1;
                 }
-                drop(stream);
-                accepted += 1;
-                state.conn_rate_count += 1;
             }
             Ok((stream, peer)) => {
                 accepted += 1;
@@ -718,6 +759,13 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(ref e) if transient_accept_error(e) => {
+                // ENOBUFS/ECONNABORTED are transient under a short connection
+                // burst. Rebinding all four listeners here creates a larger
+                // outage and can make a recoverable Poll retry look like a
+                // device-wide TCP failure.
+                log::debug!("[mb-tcp] transient accept pressure: {e}");
+            }
             Err(e) => {
                 log::warn!("[mb-tcp] accept: {e}");
                 faulted = true;
@@ -726,6 +774,73 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
     }
     state.listener_cursor = (state.listener_cursor + 1) % listener_count;
     faulted
+}
+
+fn transient_accept_error(error: &std::io::Error) -> bool {
+    // ESP-IDF uses newlib errno values (ECONNABORTED=113, ETIMEDOUT=116),
+    // which differ from Linux. Use the target SDK constants, never literals.
+    error.raw_os_error().is_some_and(|code| {
+        [
+            esp_idf_sys::EAGAIN,
+            esp_idf_sys::ENOMEM,
+            esp_idf_sys::ENFILE,
+            esp_idf_sys::EMFILE,
+            esp_idf_sys::ECONNABORTED,
+            esp_idf_sys::ECONNRESET,
+            esp_idf_sys::ENOBUFS,
+            esp_idf_sys::ETIMEDOUT,
+            esp_idf_sys::EHOSTUNREACH,
+        ]
+        .iter()
+        .any(|&transient| code == transient as i32)
+    })
+}
+
+fn listener_has_fatal_error(listener: &TcpListener) -> bool {
+    match listener.take_error() {
+        Ok(None) => false,
+        Ok(Some(error)) | Err(error) => !transient_accept_error(&error),
+    }
+}
+
+/// Reclaim only a disconnected peer with no pending transaction, or an
+/// unverified connection whose absolute first-request deadline has expired.
+/// A confirmed Modbus long connection is never displaced just for being idle.
+fn admission_reclaim_candidate(state: &TcpServerState, now: Instant) -> Option<usize> {
+    state
+        .clients
+        .iter()
+        .enumerate()
+        .find_map(|(index, client)| {
+            (client_is_admission_reclaimable(client, now) || client_peer_closed(client))
+                .then_some(index)
+        })
+}
+
+fn client_peer_closed(client: &Client) -> bool {
+    // TCP half-close is legal: the peer may still be waiting for its response.
+    if client.rx_len != 0 || client.partial_frame_started.is_some() || client.tx_len != 0 {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match client.stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+        ),
+    }
+}
+
+fn client_is_admission_reclaimable(client: &Client, now: Instant) -> bool {
+    client
+        .first_request_deadline
+        .is_some_and(|deadline| now >= deadline)
 }
 
 fn build_response(
@@ -766,6 +881,51 @@ mod tests {
         assert!(cfg::PARTIAL_FRAME_TIMEOUT_MS < cfg::IDLE_TIMEOUT_MS);
         assert!(cfg::KEEPALIVE_COUNT > 0);
         assert!(CLIENT_STATE_ALLOCATION_BYTES > 4096);
+    }
+
+    #[test]
+    fn test_admission_reclaim_preserves_verified_long_connections() {
+        let now = Instant::now();
+        let stream = TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| TcpStream::connect(listener.local_addr()?))
+            .unwrap();
+        let mut client = Client {
+            id: 1,
+            listener_port: 502,
+            initial_slot: 0,
+            peer: "127.0.0.1:1234".parse().unwrap(),
+            stream,
+            rx: [0; MAX_ADU_SIZE],
+            rx_len: 0,
+            tx: [0; MAX_ADU_SIZE],
+            tx_len: 0,
+            tx_sent: 0,
+            last_activity: now,
+            partial_frame_started: None,
+            tx_started: None,
+            first_request_deadline: Some(now + FIRST_REQUEST_TIMEOUT),
+        };
+        assert!(!client_is_admission_reclaimable(
+            &client,
+            now + FIRST_REQUEST_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(client_is_admission_reclaimable(
+            &client,
+            now + FIRST_REQUEST_TIMEOUT
+        ));
+        // Partial bytes cannot renew the first-request absolute deadline.
+        client.rx_len = 1;
+        client.last_activity = now + FIRST_REQUEST_TIMEOUT;
+        assert!(client_is_admission_reclaimable(
+            &client,
+            now + FIRST_REQUEST_TIMEOUT
+        ));
+        // A validated Modbus client keeps the normal long-connection policy.
+        client.first_request_deadline = None;
+        assert!(!client_is_admission_reclaimable(
+            &client,
+            now + Duration::from_secs(60)
+        ));
     }
 
     #[test]

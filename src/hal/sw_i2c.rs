@@ -1,9 +1,8 @@
-//! Software I2C (bit-banged) — exactly matching reference firmware nca9555.cpp.
+//! Software I2C (bit-banged) for the PCA9555 and ST25DV buses.
 //!
-//! Key difference from standard I2C: uses push-pull OUTPUT mode on SDA
-//! (not open-drain), switching to INPUT mode only when reading.
-//! This matches the Arduino `pinMode(pin, OUTPUT)` / `pinMode(pin, INPUT)`
-//! pattern used in the reference firmware.
+//! Both lines use open-drain input/output mode as required by I2C. Writing a
+//! HIGH releases the wire to its external pull-up; the controller never drives
+//! a HIGH level against a target ACK or another open-drain device.
 //!
 //! # Bus wiring
 //! - IO bus:  SDA=GPIO35, SCL=GPIO36 (DI chip 0x40, DO chip 0x42)
@@ -39,15 +38,15 @@ impl SwI2c {
         };
         this.acquire_bus();
 
-        // Configure both pins as push-pull OUTPUT initially
-        // Matching reference: pinMode(pin, OUTPUT)
+        // Configure both pins as open-drain input/output. The ST25DV data
+        // sheet requires an open-drain SDA and bus controller on SCL.
         let ret = unsafe {
             // SAFETY: sda/scl 来自 config.rs::pins 编译期常量, 与其它驱动互斥.
             // mask 是 u64 GPIO 位掩码, cfg 是栈局部 &, 无别名访问, 调用后立即 ret 检查.
             let mask = (1u64 << sda) | (1u64 << scl);
             let cfg = esp_idf_sys::gpio_config_t {
                 pin_bit_mask: mask,
-                mode: esp_idf_sys::gpio_mode_t_GPIO_MODE_OUTPUT, // push-pull, not open-drain!
+                mode: esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT_OUTPUT_OD,
                 pull_up_en: 0u32,
                 pull_down_en: 0u32,
                 intr_type: 0,
@@ -117,6 +116,20 @@ impl SwI2c {
         }
     }
 
+    /// Sample the released bus lines without changing their output state.
+    /// Useful for distinguishing a floating/stuck bus from an absent target.
+    pub fn line_levels(&self) -> (bool, bool) {
+        self.acquire_bus();
+        let levels = unsafe {
+            (
+                esp_idf_sys::gpio_get_level(self.sda) != 0,
+                esp_idf_sys::gpio_get_level(self.scl) != 0,
+            )
+        };
+        self.release_bus();
+        levels
+    }
+
     fn delay_half(&self) {
         // SAFETY: ets_delay_us 是 ROM 提供的 CPU 空转, 无内存访问, 无副作用.
         unsafe { esp_idf_sys::ets_delay_us(T_HALF_US) };
@@ -144,10 +157,13 @@ impl SwI2c {
         unsafe { esp_idf_sys::gpio_set_level(self.scl, high as u32) };
     }
 
-    /// Set SDA as push-pull OUTPUT (matching `IIC_SDA_set_output()`)
+    /// Set SDA as open-drain output. HIGH releases the line to its pull-up.
     fn sda_set_output(&self) {
         unsafe {
-            esp_idf_sys::gpio_set_direction(self.sda, esp_idf_sys::gpio_mode_t_GPIO_MODE_OUTPUT);
+            esp_idf_sys::gpio_set_direction(
+                self.sda,
+                esp_idf_sys::gpio_mode_t_GPIO_MODE_INPUT_OUTPUT_OD,
+            );
         }
     }
 

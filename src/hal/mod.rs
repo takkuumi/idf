@@ -28,7 +28,7 @@ pub mod ledc;
 /// PCA9555 IO 扩展芯片驱动
 pub mod pca9555;
 pub mod pins;
-/// Software I2C bit-bang (LOOP12: 任何 feature 下都需保留, 因为 NFC ST25DV64KC
+/// Software I2C bit-bang (LOOP12: 任何 feature 下都需保留, 因为 NFC ST25DV16KC
 /// 通过 bit-bang 访问 LED/IO 总线引脚, 不依赖硬件 I2C0).
 pub mod sw_i2c;
 pub mod uart;
@@ -42,12 +42,10 @@ pub use pca9555::Pca9555Duo;
 pub use pins::HalPins;
 pub use uart::UartPort;
 
-/// Legacy FIB1/FIB2 detection inputs are active-low (GPIO39/GPIO40).
-/// Shared by the physical indicators and Web; this is an input status,
-/// not a test of optical payload delivery or ring redundancy.
-pub fn fiber_status() -> [bool; 2] {
-    [crate::config::pins::FIB1_PIN, crate::config::pins::FIB2_PIN]
-        .map(|pin| unsafe { esp_idf_sys::gpio_get_level(pin as esp_idf_sys::gpio_num_t) } == 0)
+/// FIB1/FIB2 link state is unavailable until the ring PHY driver is implemented.
+/// GPIO39/40 are PHY interrupt lines, not direct link-state inputs.
+pub fn fiber_status() -> [Option<bool>; 2] {
+    [None, None]
 }
 
 /// 硬件抽象总句柄
@@ -82,37 +80,20 @@ impl Hal {
         // GPIO 仅管理辅助引脚 (ETH_INT, ETH_RST, RS485_DE)
         let gpio = GpioBank::init(pins.eth_int, pins.eth_rst, pins.rs485_de, None)?;
 
-        // 原 MCA 在 setup() 中将 GPIO39/40 配置为普通输入后再读取光纤检测状态。
-        // 该配置属于硬件初始化职责，不能放到 Web 请求热路径中反复执行。
-        {
-            use esp_idf_sys::{gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_INPUT};
-            let cfg = gpio_config_t {
-                pin_bit_mask: (1u64 << crate::config::pins::FIB1_PIN)
-                    | (1u64 << crate::config::pins::FIB2_PIN),
-                mode: gpio_mode_t_GPIO_MODE_INPUT,
-                pull_up_en: 0,
-                pull_down_en: 0,
-                intr_type: 0,
-            };
-            let ret = unsafe { gpio_config(&cfg) };
-            if ret != 0 {
-                return Err(AppError::Io(format!(
-                    "fiber input gpio config: esp_err=0x{ret:08X}"
-                )));
-            }
-        }
-
-        // 先给 PCA9555 IO/LED 板供电，再初始化软件 I2C
-        // GPIO21: 灯板电源使能 (HIGH=上电)
+        // GPIO21 在 F3 接线表中标为 LORA_RST；确认的 E22 D 型接口没有独立 RESET 脚。
+        // 保留旧固件拉高电平，但不对其执行复位脉冲，板级实际用途仍待原理图核对。
         // GPIO33: 继电器板 JDQ_24V_EN (HIGH=上电)
         {
             use esp_idf_sys::{
                 gpio_config, gpio_config_t, gpio_mode_t_GPIO_MODE_OUTPUT, gpio_set_level,
             };
             for &pwr_pin in &[
-                crate::config::pins::POWER_LED_EN,
+                crate::config::pins::LORA_BOARD_CTRL_PIN,
                 crate::config::pins::POWER_RELAY_EN,
             ] {
+                if pwr_pin == u8::MAX {
+                    continue;
+                }
                 let cfg = gpio_config_t {
                     pin_bit_mask: 1u64 << (pwr_pin as u64),
                     mode: gpio_mode_t_GPIO_MODE_OUTPUT,
@@ -126,9 +107,11 @@ impl Hal {
                         "power_en gpio{pwr_pin} config: esp_err=0x{ret:08X}"
                     )));
                 }
-                unsafe { gpio_set_level(pwr_pin as i32, 1) }; // HIGH = 上电
+                unsafe { gpio_set_level(pwr_pin as i32, 1) }; // preserve board-control / power-enable high state
             }
-            log::info!("[hal] IO/LED board power enabled (gpio21 + gpio33 HIGH)");
+            log::info!(
+                "[hal] board control released (gpio21=board-control HIGH, gpio33=RELAY_EN HIGH)"
+            );
         }
 
         // 初始化 PCA9555 多芯片 IO + LED 组

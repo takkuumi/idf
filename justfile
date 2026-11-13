@@ -211,6 +211,14 @@ rebuild-sys:
 test-compile:
     cargo test --bin imc --no-run
 
+# 验证 D0 保存、D1 回读与运行时解析使用相同的寄存器布局（主机，无硬件写入）
+test-function-contract:
+    python3 tests/host/run_function_table_contract.py
+
+# 验证 2300+ IO 控制表解析与 Holding 写入值到 Q 点命令的映射
+test-control-logic:
+    python3 tests/host/run_control_logic_parser.py
+
 # ───── 15. 显示烧录环境变量与工具版本 ─────
 diag:
     #!/usr/bin/env bash
@@ -232,7 +240,7 @@ diag:
     echo "$PATH" | tr ':' '\n' | grep -c esp-elf | xargs echo "  匹配数:"
 
 publish:
-    scp -r ./release/* ling@takumi.eu.org:/Users/ling/Workspace/lik/系统固件
+    scp -r ./release/* ling@takumi.eu.org:/Users/ling/Workspace/lik/imc
 
 # just flash — 烧 Debug 固件（按提示手动 BOOT+RST）
 # just flash-monitor — 烧完直接看日志（Ctrl+R 复位，Ctrl+C 退出）

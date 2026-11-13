@@ -1,0 +1,6 @@
+{"time": "2026-11-12T13:37:45.345361+08:00", "event": "open", "dtr": false, "rts": false, "note": "hold port open and allow boot settling"}
+{"time": "2026-11-12T13:38:04.467689+08:00", "event": "settle", "seconds": 15, "rx_hex": "408a4e299e0108e78f02e56dc66dc60afd", "rx_text": "@\ufffdN)\ufffd\u0001\b\ufffd\u0002\ufffdm\ufffdm\ufffd\n\ufffd"}
+{"time": "2026-11-12T13:38:04.491701+08:00", "event": "network_precheck", "hex": "0404010e0615"}
+{"time": "2026-11-12T13:38:04.502365+08:00", "event": "tx_fc04", "hex": "0104087e000213b3", "read_only": true}
+{"time": "2026-11-12T13:38:06.574734+08:00", "event": "rx", "hex": "010404010e061559d4", "valid_modbus_response": true, "valid_crc": true}
+{"time": "2026-11-12T13:38:06.576165+08:00", "event": "close"}

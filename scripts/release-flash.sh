@@ -220,7 +220,7 @@ if ! printf '%s\n' "$FLASH_OUTPUT" | grep -Eiq '8MB|8388608'; then
     exit 1
 fi
 
-echo "=== 全擦 Flash（2.7.0 首个生产基线，不导入旧版本数据） ==="
+echo "=== 全擦 Flash（将清除设备配置和运行数据） ==="
 python3 -m esptool "${COMMON_ARGS[@]}" --after no_reset erase_flash
 
 echo "=== 开始刷入 ${VARIANT_UPPER} v${VERSION}（完整写入生产镜像） ==="

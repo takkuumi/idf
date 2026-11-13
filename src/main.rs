@@ -242,12 +242,11 @@ fn main() -> AppResult<()> {
         }
     }
 
-    // 8.3 启动 NFC ST25DV64KC 配置备份/恢复 (对齐参考固件 RFID_Init)
-    // 后台线程每 5s 检测标签, 检测到即执行一次同步 (备份或恢复).
-    // 启动失败仅记日志, 不阻断主流程.
+    // 8.3 启动 ST25DV16KC NDEF/配置备份与 RF Mailbox/FTM 业务通道。
+    // 标签缺席或 NFC 初始化失败不阻断主流程。
     {
         if let Err(e) = nfc::start() {
-            log::warn!("[main] NFC ST25DV64KC start failed: {}", e);
+            log::warn!("[main] NFC ST25DV16KC start failed: {}", e);
         }
     }
 
@@ -359,13 +358,13 @@ fn main_loop(
                 crate::channel::ai::tick_ai_sample(&hal);
                 crate::channel::ao::tick_ao_output(&hal);
             });
-            // Publish RS485 activity and active-low fiber detection together.
             // F3/F4 only submit atomic LED targets here; the worker owns I2C.
+            // Unknown fiber state leaves its indicator inactive until a PHY driver exists.
             {
                 let stats = &crate::modbus::shared::RS485_STATS;
                 if let Err(error) = hal.set_port_leds(
                     [stats.port_active(0), stats.port_active(1)],
-                    crate::hal::fiber_status(),
+                    crate::hal::fiber_status().map(|link| link.unwrap_or(false)),
                 ) && port_led_warn_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
                 {
                     port_led_warn_at = Some(std::time::Instant::now());

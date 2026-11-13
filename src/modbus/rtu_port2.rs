@@ -1,11 +1,16 @@
-//! Modbus RTU 第 3 端口从站 (RS485-3, UART0)
+//! Modbus RTU 第 3 逻辑端口从站 (UART0 / 板载 E22 透明透传)
 //!
-//! 对齐参考固件 MCA_F16V2_1_F48_BLE 的 RS485-3 (Serial/UART0):
+//! `RS485-3` 是沿用的配置与协议端口名称；F3 LoRa profile 下，UART0
+//! 直接连接板载 E22，由 E22 透明传输 Modbus RTU 字节流，不代表 UART0
+//! 物理接了 RS485 收发器。
+//!
+//! 对齐参考固件 MCA_F16V2_1_F48_BLE 的第三路串口配置 (Serial/UART0):
 //! - 默认 9600 8N1, 从站监听模式
 //! - 与 RS485 #1 (rtu_slave.rs) 共享同一 Modbus 后端, 仅 UART 不同
-//! - UART0 与 USB CDC/JTAG 复用, 启用后失去调试串口
+//! - 板级 BCT4227 根据 USB VBUS 将 UART0 路由到 USB-UART 或板载 E22
+//! - LoRa build profile 关闭控制台，防止日志进入空中数据流
 //!
-//! 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动 (默认 false).
+//! 通过 `lora` Cargo feature 启用，并配套 `sdkconfig.lora.defaults`。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +51,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
             let mut buf = [0u8; 256];
             loop {
                 TASK_HB.tick();
-                // LOOP15: 必须周期喂 WDT — UART0 可能与其他任务共享, port.read 期间也须被保护
+                // LOOP15: UART0 可能与其它任务共享, port.read 期间也须被保护
                 health::feed_wdt();
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,

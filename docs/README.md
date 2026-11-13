@@ -7,13 +7,14 @@
 ## 硬件
 - **MCU**: ESP32-S3R2 (Xtensa LX7 双核 240MHz, 512KB 物理 SRAM, **2MB Quad PSRAM**, 8MB Flash)
 - **以太网**: W5500 over SPI3
-- **RS485 #0 (主)**: UART1，TX=GPIO45，RX=GPIO46，DE/RE=GPIO7
+- **RS485 #0 (主)**: UART1，TX=GPIO45，RX=GPIO46；GPIO7 是 SDMMC0_DET_L，不接 DE/RE
 - **RS485 #1 (从)**: UART2，TX=GPIO42，RX=GPIO41（GPIO8 保留为 F3/F4 AI3）
 - **DI/DO**: Default/F3 使用 PCA9555（16DI/16DO），F4 使用多片 PCA9555（48DI/48DO）；软件 I2C：IO=GPIO35/36，LED=GPIO38/37
 - **AI**: Default/F3 GPIO1/2/3/8 (ADC1_CH0/1/2/7)；F4 再增加 GPIO15/16/17/18 (ADC2_CH4/5/6/7)
 - **AO**: F3/Default 可用 LEDC GPIO15-18；F4 无 AO，GPIO15-18 全部保留给 AI4-AI7
-- **电源使能**: GPIO21 (LED), GPIO33 (RELAY)
-- **NFC**: 板载 ST25DV，经软件 I2C 访问；LoRa 硬件尚未在当前工程中确认或实现。
+- **板级控制**: GPIO21 标注 LORA_RST；因 E22 D 型接口无独立 RESET 脚，板级网络实际用途/极性待电路图确认，固件保持启动拉高，GPIO33=JDQ_24V_EN
+- **UART0 / LoRa**: GPIO43/44 是 ROM 下载 UART，同时接板载 E22 RXD/TXD。F3 `lora` profile 关闭 UART0 控制台，由 RTU runtime 按第三端口配置承载 Modbus RTU 透明数据；普通调试 profile 保留 UART0 控制台，不能用于 LoRa 收发验收。
+- **NFC**: 可选焊接 ST25DV，经软件 I2C 访问；未焊接时固件降级运行。
 
 详细引脚分配见 [引脚映射](pinmap.md)
 

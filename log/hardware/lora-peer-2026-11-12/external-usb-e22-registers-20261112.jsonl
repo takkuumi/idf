@@ -1,0 +1,5 @@
+{"time": "2026-11-12T13:57:00.849485+08:00", "event": "open_and_drain", "port": "/dev/cu.usbserial-1430", "baud": 9600, "pretest_bytes": "292588a9e0ce1894849d088e4c39a63987fd"}
+{"time": "2026-11-12T13:57:01.115082+08:00", "event": "exchange", "name": "FC03_RS485_CONFIG", "request_hex": "010308a6000fe78d", "response_hex": "01031e40010001000003e8001440000001000003e8001440000001000003e800146ad7", "crc_valid": true, "expected_length": 35, "actual_length": 35, "detail": "[16385, 1, 0, 1000, 20, 16384, 1, 0, 1000, 20, 16384, 1, 0, 1000, 20]", "elapsed_ms": 265.22}
+{"time": "2026-11-12T13:57:01.402491+08:00", "event": "exchange", "name": "FC04_FW_VERSION", "request_hex": "0104087e000213b3", "response_hex": "010404010e061559d4", "crc_valid": true, "expected_length": 9, "actual_length": 9, "detail": "[270, 1557]", "elapsed_ms": 85.83}
+{"time": "2026-11-12T13:57:01.687586+08:00", "event": "exchange", "name": "FC04_RS4853_ERRORS", "request_hex": "0104088400023382", "response_hex": "01040400000000fb84", "crc_valid": true, "expected_length": 9, "actual_length": 9, "detail": "[0, 0]", "elapsed_ms": 84.54}
+{"time": "2026-11-12T13:57:01.894130+08:00", "event": "close"}

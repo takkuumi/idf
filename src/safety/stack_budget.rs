@@ -14,7 +14,10 @@ pub const MODBUS_RTU_PORT2: usize = 8 * KIB;
 pub const MODBUS_RTU_MASTER: usize = MODBUS_RTU_PORT0;
 pub const MODBUS_RTU_SLAVE: usize = MODBUS_RTU_PORT1;
 pub const UDP_MULTICAST: usize = 4 * KIB;
-pub const NFC: usize = 6 * KIB;
+// NFC's startup subscribes its pthread to the ESP task watchdog. The nested
+// ESP-IDF registration path overflowed the original 6 KiB stack on F3, so
+// reserve 10 KiB for NFC initialization and RF mailbox processing.
+pub const NFC: usize = 10 * KIB;
 pub const HTTP: usize = 10 * KIB;
 pub const PCA9555_I2C: usize = 6 * KIB;
 pub const WIFI_HEARTBEAT: usize = 6 * KIB;
@@ -55,8 +58,8 @@ mod tests {
 
     #[test]
     fn test_all_user_stacks_stay_within_internal_sram_budget() {
-        assert_eq!(DEFAULT_USER_STACK_TOTAL, 86 * KIB);
-        assert_eq!(ALL_USER_STACK_TOTAL, 100 * KIB);
+        assert_eq!(DEFAULT_USER_STACK_TOTAL, 90 * KIB);
+        assert_eq!(ALL_USER_STACK_TOTAL, 104 * KIB);
         assert_eq!(KNOWN_SYSTEM_STACK_TOTAL, 36 * KIB);
         assert!(ALL_USER_STACK_TOTAL <= USER_STACK_BUDGET_LIMIT);
     }

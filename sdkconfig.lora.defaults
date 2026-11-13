@@ -1,0 +1,10 @@
+# Profile for the F3 board's transparent EBYTE E22 UART.
+# GPIO43/44 cannot be the ESP-IDF console while carrying transparent RF data.
+# GPIO19/20 are used by the F3 RS485 address DIP, so USB Serial/JTAG cannot be
+# selected as the application console on this board. Keep app and bootloader
+# logs off UART0; Modbus TCP/Web/BLE and coredump remain the diagnostic paths.
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_UART=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

@@ -43,9 +43,9 @@ pub struct HalPins {
     pub spi_cs: u8,
 
     // ---- UART (3 路) ----
-    /// UART0 TX (下载/日志, 通常 GPIO43)
+    /// UART0 TX (下载/日志与 LoRa 串口复用, GPIO43)
     pub uart0_tx: u8,
-    /// UART0 RX (下载/日志, 通常 GPIO44)
+    /// UART0 RX (下载/日志与 LoRa 串口复用, GPIO44)
     pub uart0_rx: u8,
     /// UART1 TX (RS485 #0 主站)
     pub uart1_tx: u8,
@@ -83,9 +83,9 @@ impl HalPins {
             spi_sclk: cfg::ETH_SPI_SCLK,
             spi_cs: cfg::ETH_SPI_CS,
 
-            // UART0: 下载/日志 (ESP32-S3 默认 GPIO43/44)
-            uart0_tx: 43,
-            uart0_rx: 44,
+            // UART0: ROM 下载与板载 LoRa 串口复用
+            uart0_tx: cfg::RS485_2_TX,
+            uart0_rx: cfg::RS485_2_RX,
             // UART1: RS485 #0 (主站)
             uart1_tx: cfg::RS485_0_TX,
             uart1_rx: cfg::RS485_0_RX,

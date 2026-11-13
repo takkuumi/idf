@@ -130,10 +130,10 @@ impl Rs485Config {
         })
     }
 
-    /// 构造 RS485 #2 (第 3 端口 = UART0, 对齐参考固件 RS485-3)
+    /// 构造第 3 RTU 逻辑端口 (UART0, 沿用协议配置名 RS485-3)
     ///
-    /// 默认 9600 8N1, 仅从站监听模式. UART0 与 USB CDC/JTAG 复用,
-    /// 启用后将失去调试串口; 由 `config::modbus::rtu_port2::ENABLED` 控制是否启动.
+    /// 参数取自 RS485-3 保存配置。F3 LoRa profile 中物理 UART0 接板载 E22，
+    /// 由统一 RTU runtime 独占；逻辑端口名不代表物理接口上存在 RS485 收发器。
     pub fn from_rtu_port2() -> Self {
         Self::from_port(2).unwrap_or_else(|| {
             log::error!(

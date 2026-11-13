@@ -366,8 +366,16 @@ fn parse_table(words: &[u16]) -> LogicTable {
             continue;
         };
         let [cw_bytes, cw_count] = cw_header.to_be_bytes();
-        let cw_words = (usize::from(cw_bytes).saturating_add(1)) / 2;
-        if cw_words == 0 || cw_count < 2 {
+        // Tauri/sys-cmi normalizes a zero-width legacy field to the canonical
+        // two-byte control/feedback address width when serializing. Some saved
+        // tables still carry the legacy 0-byte marker, but the two addresses
+        // are present as one holding word each. Treat that marker as one word
+        // here instead of discarding the entire IO record.
+        let cw_words = match cw_bytes {
+            0 | 2 => 1,
+            _ => continue,
+        };
+        if cw_count < 2 {
             continue;
         }
         let control_words_start = cw_header_addr + 1;
@@ -766,6 +774,49 @@ mod tests {
         let command = command_for_logic(&logic, 17, 7).unwrap();
         assert_eq!(command.q_scope, (1u64 << 2) | (1u64 << 5));
         assert_eq!(command.q_mask, (1u64 << 2) | (1u64 << 5));
+    }
+
+    #[test]
+    fn parse_io_control_address_width_zero_compatibly_and_match_q6_q7() {
+        // Match the actual tool/device table shape: control address 3,
+        // feedback address 4, control value 5, outputs Q6 and Q7.
+        for address_header in [0x0002, 0x0202] {
+            let mut record = vec![0u16; 24];
+            record[0] = 1; // IO logic attribute
+            record[4] = 0x0402; // two Q points, four bytes each
+            record[6] = 6;
+            record[8] = 7;
+            record[9] = 0x0400; // no I points
+            record[10] = address_header;
+            record[11] = 3; // control address
+            record[12] = 4; // feedback address
+            record[13] = 0x0C01; // one F3 control, twelve bytes
+            record[14] = 5; // control value
+            record[15] = 9; // feedback value
+            record[17] = 0x0060; // physical Q6 and Q7 bits
+
+            let table_index = usize::from(CONFIG_BASE - HOLDING_BASE);
+            let start_offset = 3usize;
+            let end_offset = start_offset + record.len();
+            let mut words = vec![0u16; table_index + end_offset];
+            words[table_index] = 1;
+            words[table_index + 1] = start_offset as u16;
+            words[table_index + 2] = end_offset as u16;
+            words[table_index + start_offset..table_index + end_offset].copy_from_slice(&record);
+
+            let table = parse_table(&words);
+            assert_eq!(table.entries.len(), 1, "header={address_header:#06x}");
+            let command = command_for_logic(&table.entries[0], 3, 5)
+                .expect("control address/value should produce an output command");
+            assert_eq!(command.q_scope, (1 << 5) | (1 << 6));
+            assert_eq!(command.q_mask, (1 << 5) | (1 << 6));
+            assert_eq!(feedback_from_table(&table, 4, 0, 0), None);
+            assert_eq!(
+                feedback_from_table(&table, 4, 0, command.q_mask),
+                Some(9),
+                "feedback address/value should reflect the configured Q state"
+            );
+        }
     }
 
     #[test]

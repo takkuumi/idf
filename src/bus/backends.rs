@@ -611,6 +611,13 @@ fn read_hold_reg_from_snapshots(
     {
         return Some(value);
     }
+    if (regs::HOLD_AO_BASE..=regs::HOLD_AO_END).contains(&addr) {
+        return Some(
+            crate::bus::IO
+                .ao
+                .get_scaled((addr - regs::HOLD_AO_BASE) as usize),
+        );
+    }
     // 原 C++ FC03 先匹配 PCtrlBuf，0..127 即使也属于 PMntrBuf，仍返回控制字；
     // PMntrBuf 的权威读取功能码是 FC04。
     // 运行时联动会直接更新该快照，未更新时返回持久化值。
@@ -1298,6 +1305,7 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
 #[inline]
 fn is_writable_hold_reg(addr: u16) -> bool {
     (0..regs::CONTROL_WORD_COUNT).contains(&addr)
+        || (regs::HOLD_AO_BASE..=regs::HOLD_AO_END).contains(&addr)
         || (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr)
         || (regs::HOLD_CFG_BASE..=regs::HOLD_CFG_END).contains(&addr)
         || (regs::CONTROL_PLC_BASE..=regs::CONTROL_PLC_END).contains(&addr)
@@ -1322,6 +1330,16 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         return true;
     }
 
+    if (regs::HOLD_AO_BASE..=regs::HOLD_AO_END).contains(&addr) {
+        if value > 10_000 {
+            return false;
+        }
+        crate::bus::IO
+            .ao
+            .set_scaled((addr - regs::HOLD_AO_BASE) as usize, value);
+        crate::bus::send_event(crate::bus::IoEvent::AoUpdated);
+        return true;
+    }
     // 原 C++ PCtrlBuf (FC06/FC16 地址 0..299)。写入后保留在独立快照，
     // 使旧客户端的控制字和重启恢复行为一致；具体 Q/I 联动由组态解析器消费。
     if addr < regs::CONTROL_WORD_COUNT {
@@ -1736,4 +1754,13 @@ fn storage_modify_holding_raw_locked<F: FnOnce(&mut [u16])>(f: F) {
     f(Arc::make_mut(&mut snap.holding_buf));
     sync_proto_status(&mut snap);
     STORAGE.write(snap);
+}
+
+#[cfg(test)]
+mod ao_extension_tests {
+    #[test]
+    fn ao_extension_constants_are_stable() {
+        assert_eq!(crate::config::regs::HOLD_AO_BASE, 300);
+        assert_eq!(crate::config::regs::HOLD_AO_END, 303);
+    }
 }

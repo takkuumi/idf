@@ -1,6 +1,6 @@
 # ESP32-S3R2 工业网关 用户手册
 
-> 固件版本：v2.7.0 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产审计版（2026-11-02）
+> 固件版本：v2.8.0 ｜ 硬件平台：ESP32-S3R2 ｜ 文档版本：生产发布版（2026-11-13）
 >
 > 适用硬件版本：Default / F3 / F4（详见第 2 章）
 
@@ -24,6 +24,22 @@
 ---
 
 ## 1. 产品概述
+
+### 1.4 Flutter 手持机界面布局对照
+
+Flutter App 的功能呈现以旧手持机 `metuory-wireless-management-app-1.0.78` 为交互基准。源码核对的旧版层级为：
+
+1. **底部一级导航**：`首页`、`设备`、`我的`；
+2. **首页**：顶部轮播区域；其下为设备名称、MAC、IP；再以四列图标网格显示已配置的设备功能。点选功能图标后进入对应功能详情；
+3. **设备页**：显示已连接设备与设备信息入口。进入设备详情后，通过顶部 `设备状态`、`设备配置` 两个页签切换；
+4. **设备状态**：按当前功能展示背景/状态图、控制项、状态项和 AI/RS485/IO 变量；
+5. **设备配置**：设备身份和通信配置按纵向列表呈现；
+6. **执行组态**：顶部是功能名称选择网格，中间是当前类型编辑内容，底部固定 `新增`、`保存`；
+7. **我的**：账号、厂商介绍、使用说明、设备日志、授权和版本信息。旧版文件导入导出不属于此页的上述菜单项。
+
+**本次审计结论（2026-11-08）**：当前 Flutter 已有对应业务能力，但呈现层级尚未对齐。Flutter 使用 `概览 / I/O / RS485 / 组态 / 更多` 一级导航；概览同时承载连接/设备摘要、功能入口和 AI 数据，设备配置又分散在设置、文件等页面。这与旧版 `首页 / 设备 / 我的` 主导航及设备详情二级页签不同。macOS 本轮真实 BLE 集成只读验证了发现、连接、I/O 读取、进入组态页和断开；没有验证首页视觉/布局等价，也没有在真实设备上编辑保存组态，不能据此标记 UI 对齐完成。
+
+后续重排前应先按上述结构逐页映射旧功能，避免把旧手持机的二级功能任意提升为一级入口；完成后需单独验收手机窄屏的首页功能网格、设备状态/配置切换、功能详情和组态编辑闭环。未经确认前只记录差异，不继续改动 UI 结构。
 
 ### 1.1 硬件规格
 
@@ -112,8 +128,8 @@ IO 总线：SDA=GPIO35、SCL=GPIO36；LED 总线：SDA=GPIO38、SCL=GPIO37。GPI
 | | GPIO9 | CS | W5500 SPI 片选 |
 | | GPIO13 | INT | W5500 中断（低有效） |
 | | GPIO14 | RST | W5500 复位（低有效，50ms 脉冲） |
-| **UART0 (下载/日志)** | GPIO43 | TX | 115200-N-8-1 |
-| | GPIO44 | RX | 与下载串口共用 |
+| **UART0 (ROM 下载 / F3 LoRa profile)** | GPIO43 | TX | ROM 下载阶段使用；LoRa profile 接板载 E22 RXD |
+| | GPIO44 | RX | LoRa profile 接板载 E22 TXD；标准调试 profile 可用于运行期控制台 |
 | **UART1 (RS485 #0)** | GPIO45 | TX | RTU Master，9600bps |
 | | GPIO46 | RX | |
 | **UART2 (RS485 #1)** | GPIO42 | TX | RTU Slave，9600bps，地址 1 |
@@ -184,7 +200,7 @@ GPIO41 (RX)   ──────────── RO
                           GND ────  RS485 GND
 ```
 
-> **注意**：UART1 使用 GPIO7 作为 DE/RE；GPIO8 保留给 F3/F4 AI3，UART2 不使用 GPIO8 作为 DE/RE。旧固件没有 AO/PWM 输出实现。
+> **注意**：F3 接线表没有为 UART1 提供独立 DE/RE，GPIO7 是 `SDMMC0_DET_L`；GPIO8 保留给 F3/F4 AI3，UART2 不使用 GPIO8 作为 DE/RE。旧固件没有 AO/PWM 输出实现。
 
 ### 3.5 PCA9555 软件 I2C 接线（所有变体）
 
@@ -212,12 +228,12 @@ GPIO3  AI2 (ADC1_2)  GPIO35 F3/F4 I2C SDA
 GPIO4  未复用          GPIO36 F3/F4 I2C SCL
 GPIO5  未复用          GPIO37 LED I2C SCL
 GPIO6  未复用          GPIO38 LED I2C SDA
-GPIO7  RS485_0 DE     GPIO39 FIB1 输入
-GPIO8  F3/F4 AI3     GPIO40 FIB2 输入
+GPIO7  SDMMC_DET_L    GPIO39 PHY_INT1
+GPIO8  F3/F4 AI3     GPIO40 PHY_INT2
 GPIO9  W5500 CS      GPIO41 RS485_1 RX (UART2)
 GPIO10 W5500 SCLK    GPIO42 RS485_1 TX (UART2)
-GPIO11 W5500 MISO    GPIO43 UART0 TX (下载/日志)
-GPIO12 W5500 MOSI    GPIO44 UART0 RX
+GPIO11 W5500 MISO    GPIO43 UART0 TX / LoRa_RXD
+GPIO12 W5500 MOSI    GPIO44 UART0 RX / LoRa_TXD
 GPIO13 W5500 INT     GPIO45 RS485_0 TX (strapping)
 GPIO14 W5500 RST     GPIO46 RS485_0 RX (strapping)
 GPIO15 AO0/F4 AI4    GPIO47 AD3
@@ -225,7 +241,7 @@ GPIO16 AO1/F4 AI5    GPIO48 AD2
 GPIO17 AO2/F4 AI6    GPIO22 未分配
 GPIO18 AO3/F4 AI7    GPIO23 未分配
 GPIO19 AD0 (USB Serial/JTAG)  GPIO25 未分配
-GPIO20 AD1 (USB Serial/JTAG)  GPIO21 LED_EN / Default I2C SDA
+GPIO20 AD1 (USB Serial/JTAG)  GPIO21 LORA_RST
 ```
 
 ---
@@ -1029,7 +1045,7 @@ print('OTA upgrade done, device rebooting')
 
 **排查**：
 1. 检查供电电压是否稳定（5V DC，纹波 ≤ 100mV）
-2. 用串口工具连接 UART0（GPIO43/44，115200-8-N-1），查看启动日志
+2. 标准调试 profile 可用 UART0（GPIO43/44，115200-8-N-1）读取启动日志；F3 LoRa profile 关闭 UART0 应用和 bootloader 控制台，以免日志进入 E22 透明数据通道，此 profile 需通过 Web/BLE/Modbus TCP 查看运行状态
 3. 检查复位计数（启动日志 `[main] reset reason=X, count=N`）
 4. 若 `count` 快速递增，可能为 panic 复位，查看 backtrace
 
@@ -1205,7 +1221,7 @@ xtensa-esp32s3-elf-addr2line -e target/xtensa-esp32s3-espidf/release/imc 0x42012
 | [ESP-BLE-Mesh App](https://www.espressif.com/) | BLE Mesh 配网（iOS/Android） |
 | [nRF Mesh](https://www.nordicsemi.com/Products/Development-tools/nrf-mesh) | BLE Mesh 配网（跨平台） |
 | [nRF Connect for Mobile](https://www.nordicsemi.com/) | BLE GATT 调试（写 AT 命令） |
-| `minicom` / `screen` | 串口监控（UART0 日志） |
+| `minicom` / `screen` | 标准调试 profile 串口监控（UART0 日志） |
 | `xtensa-esp32s3-elf-addr2line` | 解析 panic backtrace |
 
 ### 8.5 联系技术支持
@@ -1215,7 +1231,7 @@ xtensa-esp32s3-elf-addr2line -e target/xtensa-esp32s3-espidf/release/imc 0x42012
 1. 设备 SN（`AT+CFGSN` 或 Modbus 0x0200）
 2. 固件版本（`AT+VERSION` 或 Modbus 0x0100）
 3. 硬件版本（Default / F3 / F4）
-4. 完整启动日志（串口 UART0 输出）
+4. 完整启动日志（标准调试 profile 使用 UART0；F3 LoRa profile 从 Web/BLE/Modbus TCP 获取诊断信息）
 5. 复位原因（Modbus 0x0104）和复位计数（Modbus 0x0102）
 6. 任务健康位图（Modbus 0x0105，若有任务停滞）
 7. 复现步骤（如有）

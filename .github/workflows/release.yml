@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing version tag to publish, for example v2.7.0"
+        description: "Existing version tag to publish, for example v2.8.0"
         required: true
         type: string
 
@@ -62,8 +62,13 @@ jobs:
           cargo test --locked --bin imc --no-run
           cargo clippy --locked --bin imc -- -D warnings
           cargo clippy --locked --bin imc --features f3 -- -D warnings
+          ESP_IDF_SDKCONFIG_DEFAULTS="$GITHUB_WORKSPACE/sdkconfig.defaults;$GITHUB_WORKSPACE/sdkconfig.lora.defaults" cargo clippy --locked --bin imc --features f3,lora --target-dir target/check-f3-lora -- -D warnings
           cargo clippy --locked --bin imc --features f4 -- -D warnings
           python3 tests/host/run_production_core.py
+          python3 tests/host/run_nfc_mailbox.py
+          python3 tests/host/run_ble_dispatch.py
+          python3 tests/host/run_function_table_contract.py
+          python3 tests/host/run_control_logic_parser.py
 
       - name: Build all production variants
         run: OVERWRITE_RELEASE=1 ./scripts/release.sh all

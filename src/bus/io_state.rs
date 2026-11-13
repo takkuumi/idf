@@ -58,6 +58,7 @@ impl ResetSource {
     pub const MODBUS: Self = Self(0xC3);
     pub const WEB: Self = Self(0xD4);
     pub const WEB_CONFIG_SAVED: Self = Self(0xE5);
+    pub const NFC: Self = Self(0xF6);
 
     #[inline(never)]
     pub fn as_str(self) -> &'static str {
@@ -70,7 +71,7 @@ impl ResetSource {
         // atomic byte boundary and must be accepted identically on Xtensa and
         // host builds; avoiding pattern alternation also makes the wire values
         // obvious in disassembly and review.
-        raw == 0xA1 || raw == 0xB2 || raw == 0xC3 || raw == 0xD4 || raw == 0xE5
+        raw == 0xA1 || raw == 0xB2 || raw == 0xC3 || raw == 0xD4 || raw == 0xE5 || raw == 0xF6
     }
 
     #[inline(never)]
@@ -85,6 +86,8 @@ impl ResetSource {
             "web"
         } else if raw == 0xE5 {
             "web-config-saved"
+        } else if raw == 0xF6 {
+            "nfc"
         } else {
             "invalid"
         }
@@ -356,6 +359,7 @@ mod tests {
             (ResetSource::MODBUS, "modbus"),
             (ResetSource::WEB, "web"),
             (ResetSource::WEB_CONFIG_SAVED, "web-config-saved"),
+            (ResetSource::NFC, "nfc"),
         ] {
             assert!(ResetSource::is_valid(source.0));
             assert_eq!(ResetSource::label(source.0), label);

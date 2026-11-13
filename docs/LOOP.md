@@ -1,6 +1,58 @@
 # 系统持续开发集成 (LOOP.md)
 
-> 最后更新: 2026-11-03 (2.7.0 首个生产基线)
+> 最后更新: 2026-11-13 (IO 组态控制/反馈兼容修复)
+
+
+## v2.8.0 生产发布候选（2026-11-13）
+
+- [x] Cargo、lockfile、ESP-IDF app 版本统一为 2.8.0；`lora` 编译能力纳入默认 features，UART0 LoRa RTU 端口仅在 F3 启用，F3 发行配置关闭 UART0 控制台。
+- [x] Modbus TCP 单一连接复用、四端口轮询、未验证会话绝对期限和瞬时 accept 错误分类完成主机测试；BLE 广播静默状态自愈通过状态机回归。
+- [x] 真实 F3 TCP 验证四端口各 20/20 单连接 FC03；8 个未验证连接等待 11 秒后新连接恢复成功。详情见 `docs/testing/tcp-ble-connection-acceptance-2026-11-13.md`。
+- [ ] 2.8.0 release profile 三变体打包、镜像哈希和启动版本复核完成后，更新本项为封板状态。
+- 生产包说明：`docs/releases/v2.8.0.md`。
+
+## Tauri IO 控制组态表头兼容修复（2026-11-13）
+
+- [x] Tauri/sys-cmi 解码允许旧 IO 控制地址宽度 `0`，固定读取控制/反馈两个 Holding 字；固件曾把该宽度算为 0 个字并静默跳过整条 IO 记录。
+- [x] 固件将历史宽度 `0` 按 2 字节地址解释；规范宽度 `2` 保持原语义，其它宽度拒绝。
+- [x] 配置工具写入前把宽度归一为 2；`sys-cmi` 序列化回归固定断言表头 `0x0202`、地址 `[3,4]`、控制/反馈值 `[5,9]` 和 Q 位图 `0x0060`。
+- [x] 固件主机回归覆盖当前场景：控制地址 3 + 值 5 生成 Q6/Q7 位图 `0x0060`；地址 4 在输出未匹配时不返回反馈、匹配后返回配置的反馈值 9。
+- [x] 旧 C++ 固件同样将 0 字节宽度按零个寄存器推进，导致后续字段错位；手持机写入标准 2 字节头可正常工作。当前 Tauri 源码已归一化；设备实际构建仍需核验是否包含该改动。
+- [x] 2026-11-13 F3 实机完整刷入并核对：当前现场表头 `0x0002`、地址 3/4、控制值 5、Q6/Q7 均可解析；直接 FC06 写 3=5 后约 100ms Q6/Q7 置位，Holding 4 反馈随状态变化；随后已恢复 3=0、Q6/Q7=关。
+- [ ] 用户 Poll 的持续写入流未在刷机后捕获，需确认 Poll 目标 IP/端口和零基地址；不能把未连接 Poll 时的静态状态视为固件失败。
+- 记录：`log/unit/io-control-2026-11-13/README.md`。
+
+## 组态保存与运行时契约修复（2026-11-11）
+
+- 实际主机复现：修复前 D0 ACK、D1 回读都成功，但 RS485 业务解析报 `unordered logic offsets`。
+- 修正 D0/D1 与 2300+ 运行表的相对偏移、记录边界和大小端转换；显式空表可往返，非法数据写入前拒绝。
+- 新增实际生产代码契约检查并接入 CI/发布门槛；6 项检查与生产核心 28 项通过，Default/F3/F4 检查和 F3 测试目标编译通过。
+- 固件 D0/D1 修复与 App B1/B3 20+ 条软件写入路径已完成源码实现；真实设备持久化、掉电/断链和执行结果尚未验收。
+- 详见 `docs/testing/function-table-contract-2026-11-11.md`。
+
+## Flutter 手持机布局对齐审计（2026-11-08）
+
+- [x] 只读核对旧手持机 XML/Java：底部 `首页/设备/我的`；首页轮播、设备名称/MAC/IP、四列功能图标；设备详情 `设备状态/设备配置`；组态顶部功能名网格和底部新增/保存。
+- [x] 对照本轮 macOS 真实 BLE 集成日志及 Flutter 当前结构：设备发现、连接、I/O 读取、进入组态和断开通过；该流程没有验证首页布局等价，也没有执行真实组态写入。
+- [ ] Flutter 当前 `概览/I/O/RS485/组态/更多` 一级导航及设备摘要、功能入口、实时 AI 混排与旧版信息层级不同；尚未完成布局对齐，不能按“功能已接入”推断 UI 已一致。
+- [ ] 后续 UI 重排需先逐项映射旧版 `首页/设备/我的` 和设备二级页签，保留业务协议与已验收交互；本轮仅更新用户指南和任务记录，未改 UI 代码，待确认改动范围后实施。
+
+## 2026-11-08 NFC 总线诊断与 App Mailbox 状态机
+
+- [x] App 将 ST25DV RF Mailbox 的写入、消费轮询、响应读取和分片重组抽为
+  `NfcMailboxExchange`；Android NFC-V 与 iOS Core NFC 共用该状态机。
+- [x] Flutter 假 transceiver 覆盖单帧、双向多片、设备拒绝、响应超时和会话失效；全量
+  测试 75 项通过，`flutter analyze` 无问题，macOS/iOS Simulator Debug 构建通过。
+- [x] 固件增加无 ACK 后的 SDA/SCL 释放电平诊断；F3/F4 `cargo check` 通过。
+- [x] 诊断版本已刷入真实 F3；GPIO38/37 与 GPIO35/36 均记录 `SDA=1 SCL=1` 但无
+  `0x57/0x56` ACK。启动、BLE、以太网、Web、Modbus 和主循环正常，日志见
+  `log/hardware/nfc/st25dv16kc-f3-line-level-2026-11-08.log`。
+- [x] 当前 F3 板确认未焊接 ST25DV；GPIO38/37、GPIO35/36 与 E0 两种系统地址均无
+  ACK 属于预期硬件缺失。固件无 NFC 时保持 Idle、主服务继续运行并按退避低频探测。
+- [ ] 后续焊接 ST25DV 的板卡仍需执行 I²C 身份、FTM/Mailbox、手机射频和掉场验收。
+- [x] 新增板级排查清单 `docs/hardware/nfc-st25dv16kc-bringup-checklist.md`，将
+  VCC、实际 SDA/SCL 网络、上拉和 ACK 波形测量顺序固定下来；避免对共享 PCA9555
+  总线继续做未知地址盲扫。
 
 ## 2.7.0 首个生产基线（2026-11-03）
 
@@ -106,13 +158,11 @@
 - 120s 真实结果流：239 样本、0 错误、215 次变化；并行 TCP 四端口 480/480 通过。180s 串口无非计划重启，PCA9555 指示灯输出成功写入，Web 状态与之相符。
 - 记录及边界：`log/hardware/rs485-real-acceptance-2026-10-30.md`；不将本次通过扩展为所有端口/错帧/断线/慢速设备均已验收。
 
-## LOOP45 光纤检测实体灯遗漏修复（2026-10-30）
+## LOOP45 光纤检测实体灯调查修正（2026-10-30）
 
-- FIB1/FIB2 对应 GPIO39/40 低有效检测输入。修复前 Web 有状态、实体灯未更新；已对照旧固件实际代码补齐 F16 的 `0xEF/0x7F` 灯位。
-- HAL 统一输入语义，主循环 100ms 将光纤与 RS485 四灯合并更新，缓存去重且保留 BT/PWR/RUN/ERR；不增线程或持久化写入。
-- 默认/F3/F4 编译、测试目标编译及 Release 构建通过；纯灯位主机单测 4/4 通过，已完整刷入设备。
-- Web 与实际灯驱动写入均为 FIB1=0/FIB2=0；真实 RS485 回归 120/120，90s 串口无重连错误。尚未做真实光纤输入插拔及灯珠视觉确认。
-- 记录：`log/hardware/fiber-led-acceptance-2026-10-30.md`。
+- F3-GPIO.xlsx 复核确认 GPIO39/40 是环网 PHY_INT1/PHY_INT2，不是 FIB1/FIB2 用户输入；旧记录把它们当作光纤输入的结论作废。
+- 当前固件没有对应环网 PHY 驱动，HAL 不再读取 GPIO39/40，也不把它们映射为 Web/实体灯的链路状态；状态应显示为未知/不可用，不能伪装成已检测的光纤状态。
+- 只有在确认环网芯片型号、链路寄存器和中断语义后，才能实现真实 FIB 状态和灯控验收。
 
 ## LOOP40 手持机组态逻辑掉电丢失修复（2026-10-29）
 
@@ -268,7 +318,7 @@
 ## LOOP29 实机纠偏（2026-08-13）
 
 - 真实设备旧分区表只有 `factory@0x10000`，没有 `ota_0/ota_1`，Web OTA 因此返回 500；新布局保留旧 `nvs@0x9000`，增加 `factory/ota_0/ota_1` 和 `otadata`。
-- 板载 NFC 实测 `IC_REF=0x26`、`MEM_SIZE=0x01FF`、`BLOCK=0x03`，器件为 ST25DV16KC（2KB），原 C++ 也以 `0x07FF` 为末地址。LOOP12 的 64KC/`0x1FFF` 扩容结论错误并已撤销，快照严格恢复为 `0x0120..0x07FF`、1760 字节、880 words。
+- 历史记录将 NFC `IC_REF=0x26` 误判为 ST25DV16KC；按 ST 官方 DS13519 Rev.8 表 84，ST25DV16KC-IE 的正确 `IC_REF=0x51`，表 80/82 为 `MEM_SIZE=0x01FF`、`BLK_SIZE=0x03`。用户确认实装料号为 ST25DV16KC-IE6T3，驱动现在以三项签名识别。EEPROM 末地址仍为 `0x07FF`，兼容快照严格是 `0x0120..0x07FF`、1760 字节、880 words；历史 `0x26` 不再作为有效芯片证据。后续对照发现软件 I²C 旧代码用推挽驱动，违背 ST25DV 数据手册的开漏总线要求；已改为开漏 GPIO 模式，板上外部上拉仍待电气测量。
 - NFC 线程保留已探测的 I2C 实例；空快照只完整读取和记录一次，配置变更、显式备份/恢复仍立即执行，通信错误按 30/120/300 秒退避。
 - 截至本记录，编译与短期实机 Web/Modbus/OTA 轮换曾通过；2026-08-13 当前串口未连接，新的兼容 NVS 分区迁移尚待设备重新接入后完成最终烧录与 OTA 闭环复测。
 
@@ -1204,3 +1254,86 @@ just test-compile    # 仅编译测试 binary
 - 固件升至 v2.2.8，完整 factory 布局刷写；bootloader、partition、otadata、app 分段均通过回读校验，NVS/holding 保留。app SHA-256: `5754f7ad6bf583c776f4f58b65d5f059c91426386195cb9940a38c4405e89655`，Modbus FW version=`0x00E4`。
 - 真实设备慢滴送 HTTP header/body 分别在 8.09s/8.03s 断开；之后 Web 返回 HTTP 200、Modbus 四端口恢复。此前错误的长测 UART `busy` 由遗留 espflash monitor 占用造成，已停止并重连采集器。
 - v2.2.8 的 Modbus/Web/UART 72 小时计时分别于 `14:25:26Z`、`14:25:50Z`、`14:26:20Z` 启动；仍在运行，未完成，不计为通过。当前实时日志分别是 `v2.2.8-soak-modbus-72h-2026-10-28.log`、`v2.2.8-soak-web-72h-2026-10-28.log`、`v2.2.8-soak-serial-72h-2026-10-28.log`。
+
+## ST25DV16KC 严格核验续测（2026-11-08）
+
+- 对照 ST DS13519 Rev.8 表 17、19–21、80、82、84 与附录 B.3.2 核对 FTM、Mailbox、芯片身份和 I²C 顺序。
+- FTM 读回现在验证 `MB_MODE` 与 `MB_WDG` 两者；临时停用/恢复 Mailbox 使用同一状态设置器并读回确认，失败会返回错误。
+- `try_init` 区分 GPIO 初始化失败、系统地址无 ACK、身份错误和签名读取失败；按 DS13519 表 91 增加 `I2C_CFG.E0` 两种地址只读候选（系统 0x57/0x56，数据 0x53/0x52），发现后全程沿用。真实 F3 刷入后两组候选总线的四个候选地址均无 ACK，排除 E0 位不匹配；仍需确认供电、PCB 连线或被配置的 I2C_DEVICE_CODE。
+- Host NFC 回归增至 8 项，含 E0 地址计算向量；串口采样 `log/hardware/nfc/st25dv16kc-f3-e0-probe-2026-11-08.log`。
+- F3/F4 `cargo check`、Host NFC 8 项、格式与 diff 检查通过；设备启动健康观察超过 120 秒。四个默认设备码/E0 系统地址均无 ST25DV I²C 应答，所以尚无实体芯片 Mailbox/手机 RF 往返证据。
+- 串口采样：`log/hardware/nfc/st25dv16kc-f3-e0-probe-2026-11-08.log`；早期默认 E0 探测记录为 `log/hardware/nfc/st25dv16kc-f3-probe-2026-11-08.log`。
+
+
+### 旧固件 NFC 初始化逻辑纠偏（2026-11-08）
+
+- 旧 `RFID_Init` 顺序是 GPIO38/37 `tag.begin(Wire)`，失败后切 GPIO35/36 并调用 `tag.begin()`。对旧仓库 ELF 反汇编可见 SparkFun `isConnected()` 只调用 `Wire.beginTransmission(87)`（7 位 `0x57`）和 `endTransmission()`，将 ACK 转为 `begin()` 的 bool 结果；它不读芯片身份，也不探测其他地址。
+- 旧回退判断写成 `if (tag.begin() == 0)`，逻辑与 API 语义相反：GPIO35/36 成功反而返回失败，GPIO35/36 失败却打印“35 System Init done!”并继续做后续读写。`setup()` 中首次 `RFID_Init(0)` 的返回值还被忽略。
+- 因此旧固件只依赖 `0x57` 有 ACK，既没有 E0 地址回退，也没有健壮的“38 失败后可靠回退 35”；旧版日志 `IC_REF=0x26` 不能证明识别到当前确认的 ST25DV16KC-IE6T3。
+
+
+## NFC 实板接入与 K/KC 代际修复（2026-11-11）
+
+- 用户接入 NFC 后，串口在 GPIO38/37 读到 `IC_REF=0x26`。纠正此前“该值必为旧日志错误”的推断：ST DS10925/AN5633 确认 K 代值为 0x26，KC 代为 0x51。
+- 仅接受两代的完整 2-KiB 签名（MEM_SIZE=0x01FF、BLK_SIZE=0x03），并分别配置 K 的 MB_WDG 0x000E 与 KC 的 FTM bits3:1；禁止将 KC I2C_CFG 当看门狗写入。
+- 修复 Mailbox 使能/读取错误被忽略、MCU 重启残留消息与手机离场应答占满问题。每片应答等待上限 10 秒，超时清理并退避重探测；保留已持久化配置的重启应用策略。
+- 主机用例提取生产驱动方法，在寄存器模型中测试 K/KC 分支、VCC 前提、读写失败、读回不一致和 1000 次空闲轮询不新增 EEPROM 写入。
+- 实机最终结果和日志路径在本轮硬件验收记录中单独列出；软件通过不能代替手机 RF 往返与真实配置落盘验收。
+
+- BLE 主循环取得协议分发锁改为 try_lock：NFC 等待持久化时，保留 RX_READY 槽并重排队，不阻塞 I/O；新增 5 项生产函数提取测试（锁忙、帧忙、队列满、过期连接、非法槽）。直接请求会终止旧的 NFC 分片组装，防止跨请求拼接。
+- 修复旧 BLE 主机 harness 未跟进连接参数回调/广播参数导致无法执行的问题；仅同步测试桩，未在本轮调整 BLE 广播参数。NFC/分发测试纳入 CI 与发布检查。
+
+- 最终 NFC Host 17 项、BLE/NFC 分发 5 项、BLE 广播 22 项通过；另已执行生产核心 27 项与 IO 双型号 16 项。F3/F4/无 BLE RTU cargo check、F3 Clippy -D warnings 通过。检查 K 代 ES0616 第 6.1/6.3 节并对长度提前释放/写后忙 NACK 增加两项真实生产方法测试。
+
+## 2026-11-12 组态/RS485 协议审计
+
+- [x] 修复 D1 有效 payload 以 `0x84` 起始时被误判为空；只有精确三字节未配置应答可跳过。
+- [x] 批量组态读取改为整批成功后换缓存；失败时保留上次有效状态并报告错误。
+- [x] 设备文本完整分块、校验后才替换缓存，并绑定连接会话。
+- [x] 移除 RS485 数据页中错误的 D0/D1 原始编辑器；0x20/0x21 是物理串口十字节参数，串口设置仍走专用设置命令。
+- [x] 执行组态 20+ 记录 B1/B3 分块写入及回读已接入 App；固件端以会话代次暂存、完整性/运行时解析校验后一次发布持久化，并有并发旧表检测和失败回滚。
+- [ ] B1/B3 真实 BLE/NFC 写入、Flash 失败、断链/掉电中途、重连重试和重启后运行测试仍未执行；文本表与 holding 分属持久对象，需专项验证写入中断窗口。
+- 详见 `docs/testing/function-table-contract-2026-11-11.md`。
+- [ ] 真实设备 BLE/NFC 与 RS485 物理总线回归仍需硬件验收；自动化测试不替代此项。
+- 证据：`log/unit/logic-read-2026-11-12/README.md`；LoRa 型号资料核对：`docs/hardware/e22-400t22d-v2-review.md`。
+
+
+## 2026-11-12 B1/B3 大表软件路径
+
+- [x] 旧手持机动态 tx id 已核实；固件依据 2300+ 表头/寄存器地址识别 B1/B3，不硬编码动态事务号，也不混用 ATT `conn_id/trans_id`。连接代次用于隔离断连重连。
+- [x] 固件暂存完整表、校验所有偏移/数据块、实际运行时 poll parser 和活动表 CRC32；全部到齐后一次发布，A/B 持久化失败恢复原活动表。host 生产核心 28 项与函数表契约 6 项通过；Default/F3/F4 check、F3 clippy 和 test `--no-run` 通过。
+- [x] Flutter 20 条有效模拟量记录 B1/B3 Mock 写入、分块回读通过；Flutter 全量 208 项、macOS 原生 UI Review、Debug 构建通过。
+- [ ] 尚未刷入真实设备；文本与 holding 两个持久对象之间的突然掉电窗口、真实 BLE/NFC 分片、Flash 失败、重启执行未验收。
+- 详细记录：`docs/testing/function-table-contract-2026-11-11.md`；App 证据：`../imc-app/docs/testing/ui-ux-2026-11-12/README.md`。
+
+
+## 2026-11-12 F3 实机启动与 BLE 只读
+
+- [x] F3 2.7.0 使用 `espflash --no-skip` 显式 bootloader/partition/factory 刷入，应用占 factory 77.25%，保留 NVS/holding。
+- [x] 启动：BLE 广播、NFC Mailbox、Web :80、Modbus TCP :502/:503/:504/:5002、RS485-1/2 正常；60 秒健康日志 low stack=0，最低栈 2224B，最高任务使用 69%。
+- [x] App 真实 BLE 只读闭环：Mesh RSSI -66 dBm，Q/I/AI、组态分区、设备文本、固件日志读取和断开通过；未执行写操作。
+- [ ] 启动期间 RS485-1 现有主站组态持续报告 `fc=04 declared=16 expected=4 frame=8`，需接真实从站/组态专项排查。NFC 手机射频、大表真实写入、掉电和重启执行仍未验收。
+- 证据：`log/hardware/stability/f3-2.7.0-b1b3-boot-2026-11-12.md`、`log/hardware/ble/app-real-readonly-2026-11-12.md`。
+
+## 2026-11-12：E22 LoRa 对端串口探测
+
+- 新枚举串口 `/dev/cu.usbserial-14210`（CH340）；手册只读寄存器查询 `C1 00 09` 和只读 AT 型号/固件查询各等待 2.5 秒，均无响应。
+- 设备端 `/dev/cu.usbserial-1430` 与新增串口同时监听 35 秒：设备日志 14,752 字节；外接端 0 字节。设备报告 UART0 控制台占用 GPIO43/44、RS485-3/LoRa UART runtime 禁用，当前固件不具备有效的 LoRa 端到端测试路径。
+- 新控制台采集中观察到启动 `POWERON`、reset count=24；启动是否由 USB-UART 控制线导致无法确认。本轮之后停止开关设备控制台口。
+- 无 `PANIC` / WDT 证据；本轮没有刷机、修改配置或写 LoRa 参数。双向 RF 收发仍未验收通过。
+- 完整证据及 SHA-256：`log/hardware/lora-peer-2026-11-12/README.md`。
+
+## 2026-11-12：F3 透明 LoRa UART0 profile
+
+- 按用户提供 F3 BCT4227 原理图更正 UART0 路由判断：VBUS 控制 USB-UART/LoRa 硬件切换；无需 app-side USB 检测。
+- 新增 `lora` feature + `sdkconfig.lora.defaults`；LoRa F3 构建关闭 UART0/bootloader console log，并允许统一 per-port RTU runtime 独占 UART0 第三逻辑端口。标准默认/F4 profile 不变。
+- F3 LoRa Release 编译通过，sdkconfig 实际产物验证 console none / BLE / W5500；app image 1,826,608 字节，esptool 4.7.0 在 0x20000 写入并 readback digest 验证通过；重启后 Modbus TCP FC04 固件寄存器仍可读。
+- 对端 LoRa CH340 串口未枚举，故没有 RF 双向帧证据；不将设备网络响应当作 LoRa 收发通过。详细记录在 `docs/hardware/lora-analysis.md`。
+
+## 2026-11-12：F3 UART0 RTU 运行时统一与镜像体积评估
+
+- [x] 移除单独的 `rtu_port2` 从站 worker，UART0 第三逻辑端口统一走 per-port `rtu_runtime`，按保存的 Master/Slave 配置执行；新增默认 Slave 与保存 Master 配置契约测试。
+- [x] GPIO21 网名 `LORA_RST` 不再被注释/文档断言为 E22 复位脚。E22-400T22D D 型接口无独立 RESET；保留旧启动拉高，不发复位脉冲。
+- [x] 修正 host BLE/NFC contention 测试桩把 session epoch 误断言为 transaction=0 的问题，当前生产逻辑 5 项竞争测试通过。
+- [x] 修正 release manifest 的实际 feature 记录：F3 应包含 `lora`。
+- [x] `opt-level=3/s/z` 同功能 F3 LoRa app image 对比见 `docs/testing/firmware-image-size-2026-11-12.md`；生产仍用 `3`，等待真实设备性能对照后再选 `s/z`。

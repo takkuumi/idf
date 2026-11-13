@@ -1,6 +1,6 @@
 [package]
 name = "esp32s3-imc"
-version = "2.7.0"
+version = "2.8.0"
 edition = "2024"
 authors = ["idf"]
 description = "ESP32-S3R2 工业测控器：以太网 W5500 + BLE + IO + AI/AO + RS485 + Modbus"
@@ -26,7 +26,7 @@ codegen-units = 1
 panic = "abort"
 
 [features]
-default = ["ble-at", "adc-continuous", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do"]
+default = ["ble-at", "adc-continuous", "ethernet-w5500", "modbus-rtu", "modbus-tcp", "ai-ao", "io-di-do", "lora"]
 adc-continuous = []
 wifi = []
 ble-at = []
@@ -37,6 +37,7 @@ ai-ao = []
 io-di-do = []
 f3 = ["io-di-do"]
 f4 = ["io-di-do"]
+lora = []
 
 [dependencies]
 esp-idf-sys = { version = "0.38", features = ["binstart"] }

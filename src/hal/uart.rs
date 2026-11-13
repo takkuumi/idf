@@ -7,7 +7,7 @@
 //! # 设计原因
 //!
 //! ESP32-S3 有 3 个 UART (UART0/1/2)：
-//!   - UART0: 下载/日志 (TX=43, RX=44)
+//!   - UART0: 下载/日志与 LoRa 外部串口复用 (TX=43, RX=44)
 //!   - UART1: RS485 #0 (Modbus 主站)
 //!   - UART2: RS485 #1 (Modbus 从站)
 // 把 UART 实例化推迟到 RS485 模块可避免与 `EspSerial` 等高层封装冲突。
@@ -34,9 +34,9 @@ pub struct UartConfig {
 /// 仅持有 uart0/uart1/uart2 的引脚号和默认配置参数，不持有任何驱动句柄。
 /// RS485 模块在 init 时通过 `hal.uart.uart1_tx` 等字段读取所需信息。
 pub struct UartPort {
-    /// UART0 TX 引脚 (下载/日志, 通常 GPIO43)
+    /// UART0 TX 引脚 (下载/日志与 LoRa 复用, GPIO43)
     pub uart0_tx: u8,
-    /// UART0 RX 引脚 (下载/日志, 通常 GPIO44)
+    /// UART0 RX 引脚 (下载/日志与 LoRa 复用, GPIO44)
     pub uart0_rx: u8,
     /// RS485 #0 (UART1) TX 引脚
     pub uart1_tx: u8,
@@ -46,7 +46,7 @@ pub struct UartPort {
     pub uart2_tx: u8,
     /// RS485 #1 (UART2) RX 引脚
     pub uart2_rx: u8,
-    /// UART0 默认配置 (下载/日志, 115200-N-8-1)
+    /// UART0 默认配置 (下载/日志；LoRa 模式需切换到外部模块波特率)
     pub uart0_cfg: UartConfig,
     /// UART1 (RS485 #0, Modbus 主站) 默认配置
     pub uart1_cfg: UartConfig,

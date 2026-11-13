@@ -1,0 +1,6 @@
+{"time": "2026-11-12T13:28:25.169030+08:00", "event": "open", "port": "/dev/cu.usbserial-1430", "baud": 9600, "dtr": false, "rts": false}
+{"time": "2026-11-12T13:28:25.223060+08:00", "event": "pre_tx_drain", "hex": "9cad882901e580828cca4a4aa639a6390d89", "text": "\ufffd\ufffd\ufffd)\u0001\u5002\ufffd\ufffdJJ\ufffd9\ufffd9\r\ufffd"}
+{"time": "2026-11-12T13:28:25.234293+08:00", "event": "tx_modbus_fc04", "hex": "0104087e000213b3", "description": "unit=1 FC04 register 0x087e quantity=2; read-only"}
+{"time": "2026-11-12T13:28:27.264157+08:00", "event": "rx", "hex": "", "text": "", "expected_prefix": "01 04 04 01 0e 06 15"}
+{"time": "2026-11-12T13:28:27.264345+08:00", "event": "result", "rtu_response_valid": false, "response_length": 0, "crc_valid": false}
+{"time": "2026-11-12T13:28:27.266984+08:00", "event": "close"}

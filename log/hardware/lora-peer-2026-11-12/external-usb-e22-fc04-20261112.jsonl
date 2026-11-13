@@ -1,0 +1,9 @@
+{"time": "2026-11-12T13:44:39.113675+08:00", "event": "open", "port": "/dev/cu.usbserial-1430", "baud": 9600, "dtr": false, "rts": false}
+{"time": "2026-11-12T13:44:40.159858+08:00", "event": "passive_listen", "seconds": 1, "rx_hex": "9c25882901e58082849d088e4c39a6390d89"}
+{"time": "2026-11-12T13:44:40.171249+08:00", "event": "tx", "register": "0x87e", "quantity": 2, "frame_hex": "0104087e000213b3", "elapsed_ms": 0}
+{"time": "2026-11-12T13:44:42.213950+08:00", "event": "rx", "register": "0x87e", "quantity": 2, "rx_hex": "010404010e061559d4", "rx_len": 9, "valid_modbus_response": true, "crc_valid": true, "elapsed_ms": 2053.73}
+{"time": "2026-11-12T13:44:42.528141+08:00", "event": "tx", "register": "0x8a6", "quantity": 15, "frame_hex": "010408a6000f524d", "elapsed_ms": 0}
+{"time": "2026-11-12T13:44:44.537247+08:00", "event": "rx", "register": "0x8a6", "quantity": 15, "rx_hex": "018402c2c1", "rx_len": 5, "valid_modbus_response": false, "crc_valid": false, "elapsed_ms": 2020.14}
+{"time": "2026-11-12T13:44:44.852083+08:00", "event": "tx", "register": "0x884", "quantity": 2, "frame_hex": "0104088400023382", "elapsed_ms": 0}
+{"time": "2026-11-12T13:44:46.872286+08:00", "event": "rx", "register": "0x884", "quantity": 2, "rx_hex": "01040400000000fb84", "rx_len": 9, "valid_modbus_response": true, "crc_valid": true, "elapsed_ms": 2031.25}
+{"time": "2026-11-12T13:44:47.177370+08:00", "event": "close"}

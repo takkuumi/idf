@@ -116,7 +116,7 @@ fn configured_runtime_poll_table() -> Result<heapless::Vec<rtu_master::PollItem,
     let (active, skipped) = filter_disabled_port3(configured, enabled)?;
     if skipped != 0 && !DISABLED_PORT3_CONFIG_WARNED.swap(true, Ordering::AcqRel) {
         log::warn!(
-            "[modbus-rtu] skipped {skipped} RS485-3 poll items: UART0 runtime is disabled to retain the console"
+            "[modbus-rtu] skipped {skipped} RS485-3/LoRa poll items: runtime is disabled by build profile"
         );
     }
     Ok(active)
@@ -184,9 +184,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
     if crate::config::modbus::rtu_port2::ENABLED {
         spawn_port(2)?;
     } else {
-        log::warn!(
-            "[modbus-rtu] RS485-3 runtime is implemented but disabled: UART0 is the active console"
-        );
+        log::warn!("[modbus-rtu] RS485-3/LoRa runtime is disabled by build profile");
     }
     STARTED.store(true, Ordering::Release);
     Ok(())

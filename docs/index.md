@@ -10,6 +10,7 @@
 - [用户手册](user-manual.md)
 - [引脚映射](pinmap.md) · [内存布局](MEMORY_LAYOUT.md)
 - [双光纤调查与验收边界](hardware/fiber-analysis.md)
+- [NFC K/KC 驱动与芯片依据](hardware/nfc-st25dv16kc.md) · [2026-11-11 实板验证](testing/nfc-hardware-verification-2026-11-11.md)
 - [验证说明](verification.md) · [持续集成记录](LOOP.md)
 - [2026-10-30 生产核查](testing/production-audit-2026-10-30.md)
 - [当前待办](todo.md)
@@ -29,3 +30,7 @@
 日志文件按 `log/` 下的 BLE、硬件、Modbus、性能和压力测试目录分类。该目录受
 `.gitignore` 限制，大部分现场日志不进入版本控制；交付所需的重要结果应同步写入
 本目录的验证文档或 LOOP 记录。
+
+## 发布
+
+- [IMC v2.8.0 生产发布说明](releases/v2.8.0.md)

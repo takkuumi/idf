@@ -1624,6 +1624,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     let fiber = crate::hal::fiber_status();
     // 与原 MCA `states_led[0..7]` 字段保持相同的顺序: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2.
     // 485 状态与原 MCA 一样表示最近一次有效通信脉冲；累计错误只在诊断页显示。
+    let fiber1 = fiber[0].map_or("null", |active| if active { "1" } else { "0" });
+    let fiber2 = fiber[1].map_or("null", |active| if active { "1" } else { "0" });
     let state_data = format!(
         r#""state_addr_0":1,"state_addr_1":{},"state_addr_2":{},"state_addr_3":{},"state_addr_4":{},"state_addr_5":{},"state_addr_6":{},"state_addr_7":{}"#,
         (IO.sys.get_uptime() & 1) as u8,
@@ -1631,8 +1633,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         ethernet_link as u8,
         crate::modbus::shared::RS485_STATS.master_active() as u8,
         crate::modbus::shared::RS485_STATS.slave_active() as u8,
-        fiber[0] as u8,
-        fiber[1] as u8,
+        fiber1,
+        fiber2,
     );
 
     // DI/DO 状态数组 (对齐参考固件: di_addr_0..15, do_addr_0..15)

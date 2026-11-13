@@ -1,0 +1,6 @@
+{"time": "2026-11-12T10:26:18.969079+08:00", "event": "open", "port": "/dev/cu.usbserial-14210", "baud": 9600, "dtr": false, "rts": false}
+{"time": "2026-11-12T10:26:19.972398+08:00", "event": "passive", "rx_hex": "", "rx_text": "b''"}
+{"time": "2026-11-12T10:26:22.481906+08:00", "event": "readonly_query", "query": "registers_00_08", "tx_hex": "c10009", "rx_hex": "", "rx_text": "b''", "elapsed_ms": 2509.21}
+{"time": "2026-11-12T10:26:25.011446+08:00", "event": "readonly_query", "query": "device_type", "tx_hex": "41542b444556545950453d3f0d0a", "rx_hex": "", "rx_text": "b''", "elapsed_ms": 2529.3}
+{"time": "2026-11-12T10:26:27.532975+08:00", "event": "readonly_query", "query": "firmware_version", "tx_hex": "41542b4657434f44453d3f0d0a", "rx_hex": "", "rx_text": "b''", "elapsed_ms": 2521.08}
+{"time": "2026-11-12T10:26:27.539712+08:00", "event": "close"}

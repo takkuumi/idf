@@ -45,6 +45,7 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
 .led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
 .led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.led.unknown{background:transparent;border:1px solid #77808b}
 .led.do-off{background:#4a4a4a}.led.do-on{background:var(--red);box-shadow:0 0 6px var(--red)}
 .tgl{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
 .tgl input{display:none}.tgl .slider{position:absolute;inset:0;background:#4a4a4a;border-radius:10px;cursor:pointer;transition:.2s}
@@ -492,8 +493,9 @@ async function pollIO() {
     // 原 MAC 页面固定显示 8 个状态灯: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2。
     const stateNames = ['PWR', 'RUN', 'BT', 'LAN', '485_1', '485_2', 'FIB1', 'FIB2'];
     $('#state_list').innerHTML = stateNames.map((name, i) => {
-      const on = d.state_data && d.state_data['state_addr_' + i];
-      return `<div class="io-item"><span class="led ${on ? 'on' : ''}"></span><span>${name}</span></div>`;
+      const state = d.state_data && d.state_data['state_addr_' + i];
+      const unavailable = (i === 6 || i === 7) && state == null;
+      return `<div class="io-item"><span class="led ${unavailable ? 'unknown' : state ? 'on' : ''}"></span><span>${unavailable ? name + ' N/A' : name}</span></div>`;
     }).join('');
 
     // DI

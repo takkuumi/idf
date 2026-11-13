@@ -182,24 +182,40 @@ pub(crate) fn clear_result(item: PollItem) {
     }
 }
 
-fn holding_word(words: &[u16], addr: u16) -> Option<u16> {
-    let index = addr.checked_sub(crate::config::regs::HOLD_PXX_BASE)? as usize;
+fn holding_word_at(words: &[u16], addr: u16, holding_base: u16) -> Option<u16> {
+    let index = addr.checked_sub(holding_base)? as usize;
     words.get(index).copied()
+}
+
+fn holding_word(words: &[u16], addr: u16) -> Option<u16> {
+    holding_word_at(words, addr, crate::config::regs::HOLD_PXX_BASE)
 }
 
 /// 解析 `sys-cmi::logic::write_logics` 与原 C++ `MODMRTU_Poll` 共用的布局。
 fn parse_poll_table(
     words: &[u16],
 ) -> Result<heapless::Vec<PollItem, MAX_POLL_ITEMS>, &'static str> {
-    let base = crate::config::regs::HOLD_DEVICE_CONFIG;
-    let logic_count = holding_word(words, base).ok_or("missing logic count")? as usize;
+    parse_poll_table_at(
+        words,
+        crate::config::regs::HOLD_PXX_BASE,
+        crate::config::regs::HOLD_DEVICE_CONFIG,
+        crate::config::regs::HOLD_USER_BASE,
+    )
+}
+
+fn parse_poll_table_at(
+    words: &[u16],
+    holding_base: u16,
+    base: u16,
+    user_base: u16,
+) -> Result<heapless::Vec<PollItem, MAX_POLL_ITEMS>, &'static str> {
+    let read = |address| holding_word_at(words, address, holding_base);
+    let logic_count = read(base).ok_or("missing logic count")? as usize;
     let mut items = heapless::Vec::new();
     if logic_count == 0 {
         return Ok(items);
     }
-    let available_words = words
-        .len()
-        .saturating_sub((base - crate::config::regs::HOLD_PXX_BASE) as usize);
+    let available_words = words.len().saturating_sub((base - holding_base) as usize);
     if logic_count > u16::MAX as usize - 2 || logic_count + 2 > available_words {
         return Err("logic offset table too large");
     }
@@ -207,17 +223,17 @@ fn parse_poll_table(
     let total_offset_addr = base
         .checked_add(logic_count as u16 + 1)
         .ok_or("logic offset overflow")?;
-    let total_offset = holding_word(words, total_offset_addr).ok_or("missing logic end offset")?;
+    let total_offset = read(total_offset_addr).ok_or("missing logic end offset")?;
     let total_end = base.checked_add(total_offset).ok_or("logic end overflow")?;
-    if total_offset < logic_count as u16 + 2 || total_end > crate::config::regs::HOLD_USER_BASE {
+    if total_offset < logic_count as u16 + 2 || total_end > user_base {
         return Err("invalid logic end offset");
     }
 
     for logic_index in 0..logic_count {
         let offset_addr = base + 1 + logic_index as u16;
-        let start_offset = holding_word(words, offset_addr).ok_or("missing logic offset")?;
+        let start_offset = read(offset_addr).ok_or("missing logic offset")?;
         let end_offset = if logic_index + 1 < logic_count {
-            holding_word(words, offset_addr + 1).ok_or("missing next logic offset")?
+            read(offset_addr + 1).ok_or("missing next logic offset")?
         } else {
             total_offset
         };
@@ -232,17 +248,15 @@ fn parse_poll_table(
             return Err("truncated logic header");
         }
 
-        let attribute = (holding_word(words, start).ok_or("missing logic attribute")? & 0xff) as u8;
+        let attribute = (read(start).ok_or("missing logic attribute")? & 0xff) as u8;
         if attribute != 2 && attribute != 4 {
             continue;
         }
-        let [port, slave] = holding_word(words, start + 4)
-            .ok_or("missing port/slave")?
-            .to_be_bytes();
+        let [port, slave] = read(start + 4).ok_or("missing port/slave")?.to_be_bytes();
         if !(1..=3).contains(&port) || !(1..=247).contains(&slave) {
             return Err("invalid port or slave id");
         }
-        let [function_bytes, function_count] = holding_word(words, start + 5)
+        let [function_bytes, function_count] = read(start + 5)
             .ok_or("missing function header")?
             .to_be_bytes();
         // 参考固件和 sys-cmi 都把 function_bytes 定义为功能码、从机地址、
@@ -256,14 +270,14 @@ fn parse_poll_table(
             if cursor.checked_add(4).is_none_or(|next| next > end) {
                 return Err("truncated function");
             }
-            let func_word = holding_word(words, cursor).ok_or("missing function code")?;
+            let func_word = read(cursor).ok_or("missing function code")?;
             let func = u8::try_from(func_word).map_err(|_| "invalid function code")?;
             if !(1..=4).contains(&func) {
                 return Err("unsupported read function");
             }
-            let start_addr = holding_word(words, cursor + 1).ok_or("missing slave address")?;
-            let dest_reg = holding_word(words, cursor + 2).ok_or("missing master address")?;
-            let [register_bytes, register_count] = holding_word(words, cursor + 3)
+            let start_addr = read(cursor + 1).ok_or("missing slave address")?;
+            let dest_reg = read(cursor + 2).ok_or("missing master address")?;
+            let [register_bytes, register_count] = read(cursor + 3)
                 .ok_or("missing register header")?
                 .to_be_bytes();
             if register_bytes == 0 || !register_bytes.is_multiple_of(2) || register_count == 0 {
@@ -310,6 +324,22 @@ fn parse_poll_table(
         }
     }
     Ok(items)
+}
+
+pub(crate) fn validate_staged_logic_table(
+    words: &[u16],
+) -> Result<PollConfigSummary, &'static str> {
+    let items = parse_poll_table_at(
+        words,
+        0,
+        0,
+        crate::config::regs::HOLD_USER_BASE - crate::config::regs::HOLD_DEVICE_CONFIG,
+    )?;
+    Ok(PollConfigSummary {
+        logic_count: words.first().copied().ok_or("missing logic count")? as usize,
+        poll_item_count: items.len(),
+        active_port_item_count: items.iter().filter(|item| item.port == 1).count(),
+    })
 }
 
 pub(crate) fn validate_poll_config(words: &[u16]) -> Result<PollConfigSummary, &'static str> {
@@ -705,6 +735,19 @@ mod tests {
         words[index(logic + 32)] = 110;
         words[index(logic + 33)] = 4147;
         words
+    }
+
+    #[test]
+    fn test_staged_table_validator_uses_table_relative_offsets() {
+        let full = configured_words();
+        let offset = usize::from(
+            crate::config::regs::HOLD_DEVICE_CONFIG - crate::config::regs::HOLD_PXX_BASE,
+        );
+        let staged = &full[offset..offset + 37];
+        let summary = validate_staged_logic_table(staged).expect("valid staged table");
+        assert_eq!(summary.logic_count, 1);
+        assert_eq!(summary.poll_item_count, 4);
+        assert_eq!(summary.active_port_item_count, 4);
     }
 
     #[test]
