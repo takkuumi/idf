@@ -30,6 +30,12 @@ fn rtu_silence_us(baud: u32) -> u32 {
     38_500_000u32 / baud.max(1)
 }
 
+#[inline]
+fn rtu_silence_timeout_ms(baud: u32) -> u64 {
+    let tick_ms = u64::from(portTICK_PERIOD_MS.max(1));
+    u64::from(rtu_silence_us(baud)).div_ceil(tick_ms) * tick_ms
+}
+
 /// TX_DONE 超时保护余量，不是固定发送延迟。
 /// 按两个字符时间覆盖 ISR/调度抖动和 UART FSM 状态更新；低速率保留
 /// 足够余量，高速率缩短超时上限。正常发送通常提前返回，并非每帧固定等待该余量。
@@ -211,23 +217,31 @@ impl Rs485Port {
         first_byte_timeout_ms: u64,
         frame_timeout_ms: u64,
     ) -> AppResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let port = self.cfg.uart_port as uart_port_t;
         let mut total = 0usize;
         let first_deadline =
             std::time::Instant::now() + Duration::from_millis(first_byte_timeout_ms.max(1));
 
-        // 第一阶段: 等待首字节 (利用硬件 RX 帧间隔检测尽早返回)
+        // 第一阶段: 只请求 1 字节，等待首字节。
+        // uart_read_bytes 会尝试满足调用方要求的整个长度。若请求 buf.len()
+        // (从站传入 256)，一个 8 字节请求虽然已完整进入 ring buffer，函数仍
+        // 会继续等到 250ms 超时才返回不足量，导致 PLC 必须把轮询间隔设很大。
+        // 单字节请求在数据可用时立即返回，后续由 3.5 字符间隔逻辑收齐整帧。
         while total == 0 && std::time::Instant::now() < first_deadline {
             let remaining_ms = first_deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
                 .max(1)
                 .min(RX_TIMEOUT_MS as u128) as u64;
+            let mut first_byte = [0u8; 1];
             let n = unsafe {
                 uart_read_bytes(
                     port,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len() as u32,
+                    first_byte.as_mut_ptr() as *mut _,
+                    1,
                     ms_to_ticks(remaining_ms),
                 )
             };
@@ -235,7 +249,8 @@ impl Rs485Port {
                 return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
             }
             if n > 0 {
-                total = n as usize;
+                buf[0] = first_byte[0];
+                total = 1;
             }
         }
 
@@ -248,44 +263,35 @@ impl Rs485Port {
         let frame_deadline =
             std::time::Instant::now() + Duration::from_millis(frame_timeout_ms.max(1));
 
-        // 第二阶段: 帧间静默判断
-        // 3.5 字符时间 = 38.5 bits / 波特率, 最小 1ms 保证实时性
-        let silence_us = rtu_silence_us(self.cfg.baud);
-        let silence_ms: u64 = std::cmp::max(silence_us / 1000, 1) as u64;
-        let silence_dur = Duration::from_millis(silence_ms);
+        // 第二阶段: 帧间静默判断。不要用 sleep + get_buffered_data_len
+        // 判断帧结束：UART 驱动按 FIFO/RX timeout 事件分段投递 ring buffer，
+        // 两个事件之间的短暂空窗会被误判为完整帧，低速 PLC 随后收到短帧
+        // 或 CRC 错误，只能把下一轮间隔拉到约 200ms 才偶尔成功。
+        // 逐字节读取并使用 3.5 字符作为 inter-byte timeout，可跨越事件分段，
+        // 真正静默后立即返回，不增加固定等待。
+        // 3.5 字符时间 = 38.5 bits / 波特率。向上取整到 FreeRTOS tick，
+        // 不能早于 RTU 帧间静默边界结束接收。
+        let silence_ms = rtu_silence_timeout_ms(self.cfg.baud);
 
         while total < buf.len() && std::time::Instant::now() < frame_deadline {
-            // 短暂静默等待 (模拟 3.5 字符时间间隔)
-            std::thread::sleep(silence_dur);
-
-            // 检查 RX FIFO 中是否还有待读取数据 (使用标准 ESP-IDF API)
-            let mut buffered: usize = 0;
-            check(
-                unsafe { uart_get_buffered_data_len(port, &mut buffered) },
-                "uart_get_buffered_data_len",
-            )?;
-            if buffered == 0 {
-                // 静默超时, 帧结束
-                break;
-            }
-
-            // 读取剩余数据 (立即返回, 不再阻塞等待)
+            let mut byte = [0u8; 1];
             let n = unsafe {
                 uart_read_bytes(
                     port,
-                    buf[total..].as_mut_ptr() as *mut _,
-                    (buf.len() - total) as u32,
-                    1, // 1 tick: 立即返回已有数据
+                    byte.as_mut_ptr() as *mut _,
+                    1,
+                    ms_to_ticks(silence_ms),
                 )
             };
             if n < 0 {
                 return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
             }
-            if n > 0 {
-                total += n as usize;
-            } else {
+            if n == 0 {
+                // 3.5 字符静默，完整帧已经接收。
                 break;
             }
+            buf[total] = byte[0];
+            total += 1;
         }
 
         Ok(total)
@@ -345,6 +351,17 @@ mod tests {
         assert_eq!(rtu_silence_us(9600), 4010);
         assert_eq!(rtu_silence_us(19200), 2005);
         assert_eq!(rtu_silence_us(115200), 334);
+    }
+
+    #[test]
+    fn test_rtu_silence_timeout_rounds_up_to_scheduler_tick() {
+        let tick_ms = u64::from(portTICK_PERIOD_MS.max(1));
+        for baud in [1200, 9600, 19200, 115200, 921_600] {
+            let timeout_ms = rtu_silence_timeout_ms(baud);
+            assert!(timeout_ms >= u64::from(rtu_silence_us(baud)).div_ceil(tick_ms));
+            assert_eq!(timeout_ms % tick_ms, 0);
+        }
+        assert_eq!(rtu_silence_timeout_ms(9600), 5);
     }
 
     #[test]

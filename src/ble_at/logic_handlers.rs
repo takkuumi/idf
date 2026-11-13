@@ -31,6 +31,20 @@ pub enum LegacyTableWriteStatus {
     Committed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyTableCommitError {
+    InvalidTable,
+    IncompleteTransfer,
+    WrongSession,
+    TimedOut,
+    InvalidRange,
+    ConflictingRetry,
+    BlockTooLarge,
+    BaselineChanged,
+    HoldingWrite,
+    Persist,
+}
+
 struct LegacyTableStage {
     session_epoch: u32,
     header_words: usize,
@@ -51,7 +65,13 @@ impl LegacyTableStage {
         if count > LEGACY_TABLE_MAX_RECORDS || header.len() != header_words {
             return Err(());
         }
-        let terminal_word = usize::from(header[count + 1]);
+        let terminal_word = if count == 0 && header[1] == 0 {
+            // Stock Android's empty-table builder leaves its terminal word zero.
+            // Normalize that explicit clear to the runtime's canonical [0,2].
+            2
+        } else {
+            usize::from(header[count + 1])
+        };
         if terminal_word < header_words || terminal_word > LEGACY_TABLE_MAX_WORDS {
             return Err(());
         }
@@ -78,6 +98,7 @@ impl LegacyTableStage {
             words.push(0).map_err(|_| ())?;
         }
         words[..header_words].copy_from_slice(header);
+        words[count + 1] = terminal_word as u16;
         let mut stage = Self {
             session_epoch,
             header_words,
@@ -100,24 +121,27 @@ impl LegacyTableStage {
         session_epoch: u32,
         start_word: usize,
         values: &[u16],
-    ) -> Result<bool, ()> {
-        if self.session_epoch != session_epoch
-            || self.updated_at.elapsed() > LEGACY_TABLE_SESSION_TIMEOUT
-        {
-            return Err(());
+    ) -> Result<bool, LegacyTableCommitError> {
+        if self.session_epoch != session_epoch {
+            return Err(LegacyTableCommitError::WrongSession);
         }
-        let end_word = start_word.checked_add(values.len()).ok_or(())?;
+        if self.updated_at.elapsed() > LEGACY_TABLE_SESSION_TIMEOUT {
+            return Err(LegacyTableCommitError::TimedOut);
+        }
+        let end_word = start_word
+            .checked_add(values.len())
+            .ok_or(LegacyTableCommitError::InvalidRange)?;
         if values.is_empty()
             || start_word < self.header_words
             || end_word > self.terminal_word
             || end_word <= start_word
         {
-            return Err(());
+            return Err(LegacyTableCommitError::InvalidRange);
         }
         for (offset, &value) in values.iter().enumerate() {
             let index = start_word + offset;
             if self.is_received(index) && self.words[index] != value {
-                return Err(());
+                return Err(LegacyTableCommitError::ConflictingRetry);
             }
             self.words[index] = value;
             self.mark_received(index);
@@ -145,34 +169,48 @@ pub fn stage_legacy_function_table_block(
     session_epoch: u32,
     address: u16,
     values: &[u16],
-) -> Option<Result<LegacyTableWriteStatus, ()>> {
+) -> Option<Result<LegacyTableWriteStatus, LegacyTableCommitError>> {
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
+    if values.len() > crate::modbus::shared::MAX_REGS_PER_WRITE {
+        return Some(Err(LegacyTableCommitError::BlockTooLarge));
+    }
     let mut state = LEGACY_TABLE_STAGE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if address == base {
-        let stage = LegacyTableStage::begin(session_epoch, values).and_then(|mut stage| {
-            stage.baseline_crc32 = active_function_table_crc32()?;
-            Ok(stage)
-        });
+        let stage = LegacyTableStage::begin(session_epoch, values)
+            .map_err(|_| LegacyTableCommitError::InvalidTable)
+            .and_then(|mut stage| {
+                stage.baseline_crc32 = active_function_table_crc32()
+                    .map_err(|_| LegacyTableCommitError::HoldingWrite)?;
+                Ok(stage)
+            });
         return Some(match stage {
             Ok(stage) if stage.header_words == stage.terminal_word => {
                 let committed = commit_legacy_function_table(&stage.words, stage.baseline_crc32);
-                if committed.is_ok() {
-                    *state = None;
-                    Ok(LegacyTableWriteStatus::Committed)
-                } else {
-                    *state = Some(stage);
-                    Err(())
+                match committed {
+                    Ok(()) => {
+                        *state = None;
+                        Ok(LegacyTableWriteStatus::Committed)
+                    }
+                    Err(error) => {
+                        *state = Some(stage);
+                        Err(error)
+                    }
                 }
             }
             Ok(stage) => {
                 *state = Some(stage);
                 Ok(LegacyTableWriteStatus::Staged)
             }
-            Err(()) => {
+            Err(error) => {
+                log::warn!(
+                    "[logic_cfg] handheld table header rejected (epoch={}, words={}, error={error:?})",
+                    session_epoch,
+                    values.len()
+                );
                 *state = None;
-                Err(())
+                Err(error)
             }
         });
     }
@@ -183,23 +221,41 @@ pub fn stage_legacy_function_table_block(
     let Some(stage) = state.as_mut() else {
         // A data block without its B1 offset map must never be written into
         // the active function table as an ordinary FC16 operation.
-        return Some(Err(()));
+        return Some(Err(LegacyTableCommitError::IncompleteTransfer));
     };
     let start_word = usize::from(address.saturating_sub(base));
     match stage.append(session_epoch, start_word, values) {
         Ok(false) => Some(Ok(LegacyTableWriteStatus::Staged)),
         Ok(true) => {
+            log::info!(
+                "[logic_cfg] handheld table complete (epoch={}, start={}, words={}, terminal={})",
+                session_epoch,
+                start_word,
+                values.len(),
+                stage.terminal_word
+            );
             let committed = commit_legacy_function_table(&stage.words, stage.baseline_crc32);
-            if committed.is_ok() {
-                *state = None;
-                Some(Ok(LegacyTableWriteStatus::Committed))
-            } else {
-                Some(Err(()))
+            match committed {
+                Ok(()) => {
+                    *state = None;
+                    Some(Ok(LegacyTableWriteStatus::Committed))
+                }
+                Err(error) => Some(Err(error)),
             }
         }
-        Err(()) => {
+        Err(error) => {
+            log::warn!(
+                "[logic_cfg] handheld table block rejected (epoch={}, start={}, words={}, staged_epoch={}, header={}, terminal={}, age_ms={}, error={error:?})",
+                session_epoch,
+                start_word,
+                values.len(),
+                stage.session_epoch,
+                stage.header_words,
+                stage.terminal_word,
+                stage.updated_at.elapsed().as_millis()
+            );
             *state = None;
-            Some(Err(()))
+            Some(Err(error))
         }
     }
 }
@@ -234,15 +290,21 @@ fn active_function_table_crc32() -> Result<u32, ()> {
     .ok_or(())
 }
 
-fn commit_legacy_function_table(words: &[u16], expected_baseline_crc32: u32) -> Result<(), ()> {
+fn commit_legacy_function_table(
+    words: &[u16],
+    expected_baseline_crc32: u32,
+) -> Result<(), LegacyTableCommitError> {
     crate::modbus::rtu_master::validate_staged_logic_table(words).map_err(|error| {
         log::warn!("[logic_cfg] staged handheld table failed runtime validation: {error}");
+        LegacyTableCommitError::InvalidTable
     })?;
-    if active_function_table_crc32()? != expected_baseline_crc32 {
+    let actual_baseline_crc32 =
+        active_function_table_crc32().map_err(|_| LegacyTableCommitError::BaselineChanged)?;
+    if actual_baseline_crc32 != expected_baseline_crc32 {
         log::warn!(
-            "[logic_cfg] staged handheld table rejected after concurrent active-table change"
+            "[logic_cfg] staged handheld table baseline changed: expected={expected_baseline_crc32:08X} actual={actual_baseline_crc32:08X}"
         );
-        return Err(());
+        return Err(LegacyTableCommitError::BaselineChanged);
     }
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
     let previous = crate::bus::storage_state::storage_read_with(|storage| {
@@ -254,11 +316,16 @@ fn commit_legacy_function_table(words: &[u16], expected_baseline_crc32: u32) -> 
         Some(words)
     })
     .flatten()
-    .ok_or(())?;
+    .ok_or(LegacyTableCommitError::HoldingWrite)?;
     crate::bus::backends::arm_logic_write();
     if !crate::bus::backends::write_hold_regs(base, words) {
         crate::bus::backends::disarm_logic_write();
-        return Err(());
+        log::error!(
+            "[logic_cfg] staged handheld table holding write rejected (base={}, words={})",
+            base,
+            words.len()
+        );
+        return Err(LegacyTableCommitError::HoldingWrite);
     }
     if let Err(error) = crate::device::holding_store::save_to_nvs() {
         log::error!("[logic_cfg] staged handheld table persist failed: {error}");
@@ -273,7 +340,7 @@ fn commit_legacy_function_table(words: &[u16], expected_baseline_crc32: u32) -> 
                 "[logic_cfg] previous table rollback persist retry failed: {rollback_error}"
             );
         }
-        return Err(());
+        return Err(LegacyTableCommitError::Persist);
     }
     Ok(())
 }
@@ -857,7 +924,9 @@ mod tests {
     fn empty_legacy_table_header_is_a_complete_transaction() {
         let stage = LegacyTableStage::begin(77, &[0, 2]).expect("empty table");
         assert_eq!(stage.header_words, stage.terminal_word);
-        assert!(LegacyTableStage::begin(77, &[0, 0]).is_err());
+        let stock = LegacyTableStage::begin(77, &[0, 0]).expect("stock Android empty table");
+        assert_eq!(stock.words.as_slice(), &[0, 2]);
+        assert!(LegacyTableStage::begin(77, &[0, 3]).is_err());
     }
 
     #[test]

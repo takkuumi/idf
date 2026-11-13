@@ -28,11 +28,16 @@ impl<T> Spin<T> {
     fn lock(&self) -> MutexGuard<'_,T> { self.0.lock().unwrap() }
     fn try_lock(&self) -> Option<MutexGuard<'_,T>> { self.0.try_lock().ok() }
 }
+mod config { pub mod regs {
+    pub const HOLD_DEVICE_CONFIG:u16=2300; pub const HOLD_USER_BASE:u16=4000;
+    pub const DEVICE_TEXT_BASE:u16=5000; pub const DEVICE_TEXT_END:u16=6999;
+} }
+const REQUEST:[u8;17]=[0,1,0,0,0,9,1,0x10,0x08,0xFF,0,1,2,0,0,0,0];
 const RX_FREE: u8 = 0;
 const RX_READY: u8 = 2;
 const RX_PROCESSING: u8 = 3;
-struct Slot { state: AtomicU8, frame: Spin<[u8;2]>, conn_id: AtomicU16, epoch: AtomicU32 }
-static BINARY_RX_SLOTS: [Slot;1] = [Slot { state: AtomicU8::new(RX_FREE), frame: Spin::new([1,2]),
+struct Slot { state: AtomicU8, frame: Spin<[u8;17]>, conn_id: AtomicU16, epoch: AtomicU32 }
+static BINARY_RX_SLOTS: [Slot;1] = [Slot { state: AtomicU8::new(RX_FREE), frame: Spin::new(REQUEST),
     conn_id: AtomicU16::new(7), epoch: AtomicU32::new(4) }];
 static CONNECTION_EPOCH: AtomicU32 = AtomicU32::new(4);
 static PROTOCOL_DISPATCH_LOCK: Spin<()> = Spin::new(());
@@ -46,8 +51,8 @@ impl Queue {
     }
 }
 static BINARY_REQUESTS: Queue = Queue { entries: Mutex::new(Vec::new()), reject: AtomicBool::new(false) };
-fn try_handle_binary_protocol(frame: &[u8;2], conn_id: u16, session_epoch: u32) -> bool {
-    assert_eq!(frame, &[1,2]); assert_eq!(conn_id,7); assert_eq!(session_epoch,4);
+fn try_handle_binary_protocol(frame: &[u8;17], conn_id: u16, session_epoch: u32) -> bool {
+    assert_eq!(frame, &REQUEST); assert_eq!(conn_id,7); assert_eq!(session_epoch,4);
     assert!(PROTOCOL_DISPATCH_LOCK.try_lock().is_none());
     HANDLED.fetch_add(1,Ordering::Relaxed); true
 }
@@ -64,6 +69,7 @@ fn reset() {
     BINARY_REQUESTS.reject.store(false,Ordering::Release);
     BINARY_REQUESTS.entries.lock().unwrap().clear();
     HANDLED.store(0,Ordering::Release);
+    *BINARY_RX_SLOTS[0].frame.lock()=REQUEST;
 }
 #[test] fn test_nfc_lock_busy_requeues_without_waiting_or_dispatching() {
     reset();
@@ -102,6 +108,33 @@ fn reset() {
     assert_eq!(HANDLED.load(Ordering::Acquire),0);
     assert!(BINARY_REQUESTS.entries.lock().unwrap().is_empty());
 }
+#[test] fn test_disconnected_drain_processes_completed_frame() {
+    reset(); CONNECTION_EPOCH.store(5,Ordering::Release);
+    process_binary_request_slot(0,0xFFFF);
+    assert_eq!(HANDLED.load(Ordering::Acquire),1);
+    assert_eq!(BINARY_RX_SLOTS[0].state.load(Ordering::Acquire),RX_FREE);
+}
+#[test] fn test_disconnected_drain_requeues_when_dispatch_is_busy() {
+    reset(); CONNECTION_EPOCH.store(5,Ordering::Release);
+    let _nfc = PROTOCOL_DISPATCH_LOCK.lock();
+    process_binary_request_slot(0,0xFFFF);
+    assert_eq!(HANDLED.load(Ordering::Acquire),0);
+    assert_eq!(BINARY_RX_SLOTS[0].state.load(Ordering::Acquire),RX_READY);
+    assert_eq!(*BINARY_REQUESTS.entries.lock().unwrap(),vec![0]);
+}
+#[test] fn test_disconnected_drain_never_executes_output_controls() {
+    reset(); CONNECTION_EPOCH.store(5,Ordering::Release);
+    BINARY_RX_SLOTS[0].frame.lock()[7]=0x05;
+    process_binary_request_slot(0,0xFFFF);
+    assert_eq!(HANDLED.load(Ordering::Acquire),0);
+    assert_eq!(BINARY_RX_SLOTS[0].state.load(Ordering::Acquire),RX_FREE);
+}
+#[test] fn test_disconnected_drain_never_replays_an_older_session() {
+    reset(); CONNECTION_EPOCH.store(7,Ordering::Release);
+    process_binary_request_slot(0,0xFFFF);
+    assert_eq!(HANDLED.load(Ordering::Acquire),0);
+    assert_eq!(BINARY_RX_SLOTS[0].state.load(Ordering::Acquire),RX_FREE);
+}
 #[test] fn test_invalid_or_not_ready_slot_is_ignored() {
     reset(); BINARY_RX_SLOTS[0].state.store(RX_FREE,Ordering::Release);
     process_binary_request_slot(0,7); process_binary_request_slot(255,7);
@@ -113,7 +146,7 @@ fn reset() {
 
 def main() -> None:
     production = (ROOT / 'src/ble_at/mod.rs').read_text()
-    source = HARNESS + '\n' + item(production, 'fn process_binary_request_slot(')
+    source = HARNESS + '\n' + item(production, 'fn is_durable_configuration_frame(') + '\n' + item(production, 'fn process_binary_request_slot(')
     with tempfile.TemporaryDirectory(prefix='imc-ble-dispatch-') as directory:
         root = Path(directory)
         (root / 'tests.rs').write_text(source)

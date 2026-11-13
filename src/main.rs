@@ -466,6 +466,12 @@ fn main_loop(
             if reset_request == 0 {
                 // No reset requested.
             } else if crate::bus::io_state::ResetSource::is_valid(reset_request) {
+                // Serialize the full reset path with every RCU-backed
+                // configuration/holding mutation. This waits for a write that
+                // already entered, then prevents a new one from racing the
+                // final persistence snapshot while we drain peripherals.
+                let _configuration_write_barrier =
+                    crate::bus::backends::configuration_write_guard();
                 if let Err(error) = device::flush_pending_before_reset() {
                     log::error!(
                         "[main] planned reset cancelled: pending configuration could not be saved: {error}"

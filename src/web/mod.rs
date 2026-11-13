@@ -192,6 +192,10 @@ fn save_web_system_info(info: &WebSystemInfo) -> bool {
     let Some(blob) = encode_web_system_info(info) else {
         return false;
     };
+    // Keep this independent Web/NVS object inside the same reset write barrier
+    // as SystemConfig/holding. Otherwise it could become dirty after the main
+    // loop's final flush and be lost when the planned reset follows.
+    let _configuration_guard = crate::bus::backends::configuration_write_guard();
     let Ok(mut cached) = WEB_SYSTEM_INFO_CACHE.lock() else {
         return false;
     };
@@ -1041,11 +1045,10 @@ fn handle_update_system_info(stream: &mut TcpStream, req: &HttpRequest) -> std::
     }
     if let Some(addressinfo) = addressinfo.as_ref() {
         let name_bytes = addressinfo.as_bytes();
-        crate::bus::backends::config_modify(|cfg| {
+        crate::bus::backends::config_modify_persistent(|cfg| {
             cfg.name.fill(0);
             cfg.name[..name_bytes.len()].copy_from_slice(name_bytes);
         });
-        crate::device::request_persist_config();
     }
     if crate::device::await_pending_persistence().is_err() {
         return send_json(
@@ -1225,7 +1228,7 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
         );
     }
 
-    crate::bus::backends::config_modify(|cfg| {
+    crate::bus::backends::config_modify_persistent(|cfg| {
         if let Some((ip, mask, gw, dns)) = network {
             cfg.ip = ip;
             cfg.mask = mask;
@@ -1273,12 +1276,10 @@ fn handle_update_network_config(stream: &mut TcpStream, req: &HttpRequest) -> st
     }
 
     // 网络参数在下次启动时生效，避免活动 netif 热重配拖垮 TCP。
-    crate::device::request_persist_config();
     if ble_name.is_some() {
         // Keep the legacy D98..D101 holding window coherent with the
         // structured SystemConfig value. Older Modbus/PC clients read this
         // window directly, while BLE and FC04 use the structured field.
-        crate::bus::backends::sync_ble_name_holding();
         #[cfg(feature = "ble-at")]
         crate::ble_at::notify_ble_name_changed();
     }
@@ -1460,7 +1461,7 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
             &json_response("updateportconfig", "0x01000003"),
         );
     }
-    crate::bus::backends::config_modify(|cfg| {
+    crate::bus::backends::config_modify_persistent(|cfg| {
         cfg.rs485[index].baudrate = baud;
         cfg.rs485[index].mode = legacy_to_internal_port_mode(mode);
         cfg.rs485[index].slave_addr = slave_addr as u8;
@@ -1482,7 +1483,6 @@ fn handle_update_port_config(stream: &mut TcpStream, req: &HttpRequest) -> std::
         interval
     );
 
-    crate::device::request_persist_config();
     if crate::device::await_pending_persistence().is_err() {
         return send_json(
             stream,
@@ -1778,7 +1778,7 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
     if name_bytes.len() > 8 || name_bytes.contains(&0) {
         return send_json(stream, 200, &json_response("updatebleconfig", "0x01000004"));
     }
-    crate::bus::backends::config_modify(|cfg| {
+    crate::bus::backends::config_modify_persistent(|cfg| {
         for b in &mut cfg.ble_name {
             *b = 0;
         }
@@ -1788,8 +1788,6 @@ fn handle_update_ble_config(stream: &mut TcpStream, req: &HttpRequest) -> std::i
     log::debug!("[http] update BLE name: {:?}", name);
     // The legacy Modbus/PC window (D98..D101) is an externally visible alias
     // of SystemConfig::ble_name. Keep it synchronized for every Web write.
-    crate::bus::backends::sync_ble_name_holding();
-    crate::device::request_persist_config();
     // GAP 名称立即更新；配置快照由 DeviceActor 合并落盘。
     #[cfg(feature = "ble-at")]
     crate::ble_at::notify_ble_name_changed();

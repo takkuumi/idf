@@ -118,6 +118,12 @@ pub fn disarm_logic_write() {
 
 #[inline]
 fn rcu_write_guard() -> MutexGuard<'static, ()> {
+    configuration_write_guard()
+}
+
+/// Shared serialization point for RCU configuration writes and other
+/// user-visible configuration state that must be quiescent during reset.
+pub(crate) fn configuration_write_guard() -> MutexGuard<'static, ()> {
     RCU_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1106,9 +1112,7 @@ pub fn write_hold_reg(addr: u16, value: u16) -> bool {
         write_hold_reg_locked(addr, value)
     };
     if written && (regs::DEVICE_TEXT_BASE..=regs::DEVICE_TEXT_END).contains(&addr) {
-        // 文本可能由多个 FC06 分片组成；只标记 dirty，由 DeviceActor 合并后
-        // 一次擦写并校验，避免每个字符都触发 4KB NVS 擦写。
-        crate::device::request_save_device_text();
+        crate::device::ensure_device_text_persist_worker();
     }
     if written && is_ble_name_hold_addr(addr) {
         notify_ble_name_changed();
@@ -1150,8 +1154,10 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
             }
             sync_proto_status(&mut snap);
             STORAGE.write(snap);
+            // Publish dirty before releasing the reset barrier lock.
+            crate::device::mark_device_text_dirty();
         }
-        crate::device::request_save_device_text();
+        crate::device::ensure_device_text_persist_worker();
         return true;
     }
 
@@ -1265,18 +1271,30 @@ pub fn write_hold_regs(addr: u16, values: &[u16]) -> bool {
                 if multicast_changed {
                     super::storage_state::mark_holding_dirty();
                 }
+                if ble_name_changed {
+                    // This must be published before releasing RCU_WRITE_LOCK.
+                    // A reset barrier takes the same lock and must observe the
+                    // dirty bit before it snapshots holding_buf for NVS.
+                    super::storage_state::mark_holding_dirty();
+                }
+            }
+            if request_config_persist {
+                // Keep the dirty publication in the same critical section as
+                // the CONFIG snapshot update. Otherwise a reset can acquire
+                // the barrier between the RCU publish and this atomic store,
+                // conclude that no config save is pending, and restart with
+                // the new value only in RAM.
+                crate::device::request_persist_config();
             }
         }
         if request_runtime_apply {
-            crate::device::request_apply_config();
-        } else if request_config_persist {
-            crate::device::request_persist_config();
+            #[cfg(feature = "ethernet-w5500")]
+            crate::ethernet::w5500::request_reconfigure();
         }
         if ble_name_changed {
             // Keep the legacy raw image durable as well as the structured
             // SystemConfig field. This is needed by old FC03 readers and by
             // the upgrade reconciliation path on the next boot.
-            super::storage_state::mark_holding_dirty();
             notify_ble_name_changed();
         }
         return true;
@@ -1363,8 +1381,8 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
         }
         sync_proto_status(&mut snap);
         STORAGE.write(snap);
-        // 触发设备文本 NVS 持久化 (Android 写入后立即落盘, 复位保留)
-        crate::device::request_save_device_text();
+        // Publish the dirty marker before releasing the reset write barrier.
+        crate::device::mark_device_text_dirty();
         return true;
     }
     // 2. HOLD_CFG_BASE..=HOLD_CFG_END: CFG + holding_buf
@@ -1526,6 +1544,7 @@ fn write_hold_reg_locked(addr: u16, value: u16) -> bool {
 /// (详见 docs/LOOP.md LOOP13 章节). notify 内部是 AtomicBool::store(true) 幂等.
 pub fn write_coil(addr: u16, value: bool) -> bool {
     if (regs::COIL_DO_BASE..regs::COIL_DO_END).contains(&addr) {
+        let _guard = configuration_write_guard();
         let ch = (addr - regs::COIL_DO_BASE) as usize;
         super::io_global::IO.do_.set_bit(ch, value);
         #[cfg(any(feature = "io-di-do", feature = "f3", feature = "f4"))]
@@ -1589,6 +1608,7 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
     }
     let end_exclusive = addr as u32 + count as u32;
     if addr >= regs::COIL_DO_BASE && end_exclusive <= regs::COIL_DO_END as u32 {
+        let _guard = configuration_write_guard();
         let start = (addr - regs::COIL_DO_BASE) as usize;
         let mut mask = 0u64;
         let mut value = 0u64;
@@ -1676,6 +1696,74 @@ pub fn write_coils(addr: u16, count: u16, packed_values: &[u8]) -> bool {
 /// 多写者并发安全: 通过 RCU_WRITE_LOCK 串行化 RMW.
 pub fn config_modify<F: FnOnce(&mut SystemConfig)>(f: F) {
     config_modify_with_result(|cfg| f(cfg));
+}
+
+/// Atomically update a persistent SystemConfig value and publish its dirty
+/// marker under the reset write barrier. BLE-name writes also mirror the legacy
+/// holding alias in this same transaction.
+pub fn config_modify_persistent<F: FnOnce(&mut SystemConfig)>(f: F) {
+    let _guard = rcu_write_guard();
+    let mut cs = config_clone();
+    let previous_ble_name = cs.cfg.ble_name;
+    f(&mut cs.cfg);
+    let ble_name_changed = previous_ble_name != cs.cfg.ble_name;
+    if ble_name_changed {
+        let mut holding = storage_clone();
+        mirror_ble_name_to_holding_locked(&cs.cfg, &mut holding);
+        sync_proto_status(&mut holding);
+        STORAGE.write(holding);
+        super::storage_state::mark_holding_dirty();
+    }
+    super::config_state::CONFIG.write(cs);
+    crate::device::request_persist_config();
+}
+
+/// Write a structured configuration register with the same validation,
+/// persistence and runtime-apply semantics as the Modbus holding path.
+pub fn write_config_reg(addr: u16, value: u16) -> WriteResult {
+    let result = {
+        let _guard = rcu_write_guard();
+        let mut cs = config_clone();
+        let result = cs.cfg.write_reg(addr, value);
+        if matches!(result, WriteResult::InvalidValue)
+            || !crate::device::system_config::valid_tcp_ports(&cs.cfg.tcp_ports)
+        {
+            return WriteResult::InvalidValue;
+        }
+        if matches!(result, WriteResult::Reset) {
+            cs.cfg = SystemConfig::defaults_with_hardware_sn();
+        } else if matches!(result, WriteResult::Apply) {
+            cs.cfg.cfg_version = cs.cfg.cfg_version.wrapping_add(1);
+        }
+        if !matches!(result, WriteResult::NotFound) {
+            super::config_state::CONFIG.write(cs);
+        }
+        if matches!(
+            result,
+            WriteResult::Persist | WriteResult::Apply | WriteResult::Reset
+        ) {
+            crate::device::request_persist_config();
+        }
+        if is_ble_name_hold_addr(addr) && !matches!(result, WriteResult::NotFound) {
+            let cfg = super::config_state::config_read().map(|snapshot| snapshot.cfg.clone());
+            if let Some(cfg) = cfg {
+                let mut holding = storage_clone();
+                mirror_ble_name_to_holding_locked(&cfg, &mut holding);
+                sync_proto_status(&mut holding);
+                STORAGE.write(holding);
+                super::storage_state::mark_holding_dirty();
+            }
+        }
+        result
+    };
+    if matches!(result, WriteResult::Apply | WriteResult::Reset) {
+        #[cfg(feature = "ethernet-w5500")]
+        crate::ethernet::w5500::request_reconfigure();
+    }
+    if is_ble_name_hold_addr(addr) && !matches!(result, WriteResult::NotFound) {
+        notify_ble_name_changed();
+    }
+    result
 }
 
 /// 同 `config_modify`, 但把 closure 的返回值传出 (用于 AT 命令需要拿到

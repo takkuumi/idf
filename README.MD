@@ -1,7 +1,7 @@
 # 工业测控器 IMC 固件
 
 Rust + ESP-IDF v5.5.4，面向 W5500、BLE 手持机配置、Modbus RTU/TCP、IO 和模拟量。
-当前生产版本为 **2.10.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
+当前生产版本为 **3.1.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
 出厂网络为 `192.168.1.200 / 255.255.255.0`，网关与 DNS 为 `192.168.1.1`；
 2.7.0 是首个生产数据基线；v2.10.0 沿用该版存储格式，可从 v2.7.0 保留配置升级。开发版本首次切换仍须全擦 Flash。
 DEFAULT/F3 使用 PCA9555（16DI/16DO），F4 使用多片 PCA9555（48DI/48DO）。三者共用软件 I2C IO/LED 总线引脚。
@@ -23,7 +23,7 @@ cargo build --locked --release --bin imc
 - [文档索引](docs/index.md) · [项目与硬件概览](docs/README.md)
 - [架构](docs/architecture.md) · [寄存器/引脚](docs/pinmap.md)
 - [当前生产核查](docs/testing/production-audit-2026-10-30.md) · [验收清单](docs/verification.md)
-- [v2.10.0 发布说明](docs/releases/v2.10.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
+- [v3.1.0 发布说明](docs/releases/v3.1.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
 - [台架测试工具](tests/manual/README.md) · [主机核心测试](tests/host/run_production_core.py)
 
 `log/` 存现场记录；多数原始日志被 Git 忽略，重要结论必须同步到 `docs/`。

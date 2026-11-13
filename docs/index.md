@@ -33,4 +33,6 @@
 
 ## 发布
 
+- [IMC v3.1.0 生产发布说明](releases/v3.1.0.md)
+- [IMC v3.0.0 发布说明](releases/v3.0.0.md)
 - [IMC v2.10.0 生产发布说明](releases/v2.10.0.md)

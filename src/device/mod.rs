@@ -819,6 +819,11 @@ pub fn request_persist_config_and_reset() -> bool {
 /// 持久化并通知需要运行时重配的外设。普通 SN/位置/RS485 数据落盘不得扰动网络。
 pub fn request_apply_config() {
     request_persist_config();
+    request_runtime_config_apply();
+}
+
+/// Notify hardware that already-persisted runtime configuration should apply.
+pub fn request_runtime_config_apply() {
     #[cfg(feature = "ethernet-w5500")]
     crate::ethernet::w5500::request_reconfigure();
 }
@@ -1229,10 +1234,24 @@ fn persist_device_text_blob(blob: &[u8]) -> AppResult<()> {
 /// 标记设备文本区需要持久化。DeviceActor 会合并连续分片并在空闲时重试，
 /// 不改变 MCA 的单 blob 文本布局。
 pub fn request_save_device_text() {
+    mark_device_text_dirty();
+    ensure_device_text_persist_worker();
+}
+
+/// Publish the text dirty state while the caller still holds the shared
+/// configuration write barrier. The follow-up worker check is separate so a
+/// reset cannot slip between the RAM snapshot and this marker.
+pub(crate) fn mark_device_text_dirty() {
     DEVICE_TEXT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Perform the boot-time fallback after a caller has released the write
+/// barrier. Once the actor is running, its normal idle loop consumes the flag.
+pub(crate) fn ensure_device_text_persist_worker() {
     // 初始化资源不足时 actor 可能尚未启动；此时至少同步尝试一次，避免
     // “写成功但永远没有消费者”导致重启后丢失。actor 启动后 dirty 仍会重试。
-    if !actor_is_started()
+    if DEVICE_TEXT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+        && !actor_is_started()
         && let Err(error) = persist_device_text_now()
     {
         log::warn!("[device] dev_text actor unavailable; sync persist deferred: {error}");

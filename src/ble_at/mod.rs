@@ -412,7 +412,10 @@ fn advertising_now_ms() -> u32 {
 }
 
 fn begin_advertising_operation(operation: AdvOperation) -> bool {
-    if BLE_SHUTTING_DOWN.load(Ordering::Acquire) || CONN_ID.load(Ordering::Acquire) != 0xFFFF {
+    if BLE_SHUTTING_DOWN.load(Ordering::Acquire)
+        || CONNECTION_BUFFERS_DIRTY.load(Ordering::Acquire)
+        || CONN_ID.load(Ordering::Acquire) != 0xFFFF
+    {
         return false;
     }
     ADV_HEALTH.lock().begin(operation, advertising_now_ms())
@@ -759,6 +762,20 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).write };
+            if BLE_SHUTTING_DOWN.load(Ordering::Acquire) {
+                if p.need_rsp {
+                    let _ = unsafe {
+                        esp_idf_sys::esp_ble_gatts_send_response(
+                            gatts_if,
+                            p.conn_id,
+                            p.trans_id,
+                            esp_idf_sys::esp_gatt_status_t_ESP_GATT_BUSY,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
+                return;
+            }
 
             // LOOP8: HANDLE_TABLE 改为 AtomicU16 数组, 用 load 直接读
             let cccd_handle = HANDLE_TABLE[IDX_CHAR_CCCD].load(Ordering::Acquire);
@@ -861,8 +878,11 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).connect };
-            if BLE_SHUTTING_DOWN.load(Ordering::Acquire) {
-                let ret = unsafe { esp_idf_sys::esp_ble_gatts_close(gatts_if, p.conn_id) };
+            if BLE_SHUTTING_DOWN.load(Ordering::Acquire)
+                || CONNECTION_BUFFERS_DIRTY.load(Ordering::Acquire)
+            {
+                let mut bda = p.remote_bda;
+                let ret = unsafe { esp_idf_sys::esp_ble_gap_disconnect(bda.as_mut_ptr()) };
                 if ret != esp_idf_sys::ESP_OK {
                     log::warn!("[ble_at] late reset connection close failed: 0x{:x}", ret);
                 }
@@ -870,7 +890,6 @@ unsafe extern "C" fn gatts_event_cb(
             }
             // LOOP8: 原子写入替代 Spin<Option>
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
-            crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
             for (slot, byte) in REMOTE_BDA.iter().zip(p.remote_bda.iter()) {
                 slot.store(*byte, Ordering::Relaxed);
             }
@@ -911,9 +930,22 @@ unsafe extern "C" fn gatts_event_cb(
                 p.conn_id,
                 p.reason
             );
+            // Bluedroid may deliver a late DISCONNECT for an older link after a
+            // new link has already been accepted. Never let that stale event
+            // tear down the new session or invalidate its pending config frames.
+            let current_conn_id = CONN_ID.load(Ordering::Acquire);
+            if current_conn_id == 0xFFFF || current_conn_id != p.conn_id {
+                log::warn!(
+                    "[ble_at] ignoring stale disconnect conn_id={} current={}",
+                    p.conn_id,
+                    current_conn_id
+                );
+                return;
+            }
             CONN_ID.store(0xFFFF, Ordering::Release); // LOOP8: 原子 sentinel = None
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
-            crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
+            // The main loop drains completed protocol requests before it drops
+            // any incomplete staged configuration.
             PENDING_CONN_PARAM_UPDATE.store(false, Ordering::Release);
             TX_NOTIFY_ENABLED.store(false, Ordering::SeqCst);
             NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
@@ -1157,39 +1189,56 @@ pub fn start() -> AppResult<()> {
     Ok(())
 }
 
-/// Stop BLE activity before a planned software reset.
-///
-/// `esp_restart()` does not guarantee that Bluedroid will emit a GATT
-/// disconnect callback before the controller is reset.  The old path therefore
-/// left the connection state and the active-low BT LED latched until the next
-/// boot's I2C worker happened to overwrite it.  Publish the disconnected state
-/// synchronously, request a controller-side close/advertising stop, and enqueue
-/// the LED transition while the main loop still owns the HAL.
+/// Drain queued notifications, close the physical BLE link and confirm the
+/// disconnect callback before the controller is reset. Keep the connection ID
+/// valid until the callback arrives; clearing it first only changed the LED
+/// and software bookkeeping, without confirming that the peer was notified.
 pub fn prepare_for_reset(hal: &crate::hal::Hal) {
     BLE_SHUTTING_DOWN.store(true, Ordering::Release);
-    let conn_id = CONN_ID.swap(0xFFFF, Ordering::AcqRel);
+    let conn_id = CONN_ID.load(Ordering::Acquire);
     let gatts_if = GATTS_IF.load(Ordering::Acquire);
-    CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    if conn_id != 0xFFFF && gatts_if != 0xFF {
+        let tx_handle = HANDLE_TABLE[IDX_CHAR_VALUE].load(Ordering::Acquire);
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < drain_deadline {
+            if BINARY_TX.try_lock().is_some_and(|queue| queue.len == 0) {
+                break;
+            }
+            send_next_notification(gatts_if, conn_id, tx_handle);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Notifications have no ATT confirmation. Give the controller time to
+        // put the final accepted response on air before initiating link close.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut bda =
+            core::array::from_fn::<_, 6, _>(|index| REMOTE_BDA[index].load(Ordering::Relaxed));
+        let ret = unsafe { esp_idf_sys::esp_ble_gap_disconnect(bda.as_mut_ptr()) };
+        if ret != esp_idf_sys::ESP_OK {
+            log::warn!(
+                "[ble_at] reset physical disconnect request failed: 0x{:x}",
+                ret
+            );
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while CONN_ID.load(Ordering::Acquire) != 0xFFFF && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            log::info!(
+                "[ble_at] reset physical disconnect confirmed={}",
+                CONN_ID.load(Ordering::Acquire) == 0xFFFF
+            );
+        }
+    }
+    if CONN_ID.swap(0xFFFF, Ordering::AcqRel) != 0xFFFF {
+        CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
     PENDING_CONN_PARAM_UPDATE.store(false, Ordering::Release);
     TX_NOTIFY_ENABLED.store(false, Ordering::Release);
     GATT_CONGESTED.store(false, Ordering::Release);
     NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
     CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
     crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
-
-    if conn_id != 0xFFFF && gatts_if != 0xFF {
-        let ret = unsafe {
-            esp_idf_sys::esp_ble_gatts_close(gatts_if as esp_idf_sys::esp_gatt_if_t, conn_id)
-        };
-        if ret != esp_idf_sys::ESP_OK {
-            log::warn!("[ble_at] reset GATT close failed: 0x{:x}", ret);
-        } else {
-            log::info!(
-                "[ble_at] reset GATT connection close requested (conn_id={})",
-                conn_id
-            );
-        }
-    }
 
     let adv_ret = unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() };
     if adv_ret != esp_idf_sys::ESP_OK && adv_ret != esp_idf_sys::ESP_ERR_INVALID_STATE {
@@ -1198,12 +1247,10 @@ pub fn prepare_for_reset(hal: &crate::hal::Hal) {
     ADV_HEALTH.lock().force_inactive(advertising_now_ms());
     ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
     PENDING_GAP_NAME_UPDATE.store(false, Ordering::Release);
-
     if let Err(error) = hal.set_bt_led(false) {
         log::warn!("[ble_at] reset BT LED off request failed: {error}");
     } else {
         BT_LED_APPLIED.store(0, Ordering::Release);
-        log::info!("[ble_at] reset cleanup: BT LED off requested");
     }
 }
 
@@ -1327,20 +1374,50 @@ pub fn process_tick(hal: &crate::hal::Hal) {
     }
     maintain_advertising();
     if CONNECTION_BUFFERS_DIRTY.swap(false, Ordering::AcqRel) {
-        let tx_cleared = BINARY_TX.try_lock().is_some_and(|mut tx| {
-            tx.clear();
-            true
-        });
-        let slots_cleared = clear_binary_rx_slots();
-        let text_cleared = RX_BUFFER.try_lock().is_some_and(|mut rx| {
-            rx.clear();
-            true
-        });
-        if tx_cleared && slots_cleared && text_cleared {
-            log::debug!("[ble_at] stale connection buffers cleared");
-        } else {
-            // 清理由 main-loop 延期重试，绝不等待 BLE 回调释放短临界区。
+        if CONN_ID.load(Ordering::Acquire) != 0xFFFF {
+            // A new link raced with cleanup from the previous one. Preserve its
+            // queues and retry stale-session cleanup after this link closes.
             CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+        } else {
+            // A completed GATT write is owned by the firmware once it enters the
+            // request queue. Drain completed requests before clearing a disconnected
+            // session so an immediate handheld disconnect cannot drop the final
+            // configuration block before it reaches RAM and flash.
+            if CONN_ID.load(Ordering::Acquire) == 0xFFFF {
+                let queued_requests = BINARY_REQUESTS.len();
+                for _ in 0..queued_requests {
+                    let Some(slot_index) = BINARY_REQUESTS.dequeue() else {
+                        break;
+                    };
+                    process_binary_request_slot(slot_index, 0xFFFF);
+                }
+            }
+            let requests_pending = !BINARY_REQUESTS.is_empty();
+            if !requests_pending && CONN_ID.load(Ordering::Acquire) == 0xFFFF {
+                crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
+            }
+            let tx_cleared = BINARY_TX.try_lock().is_some_and(|mut tx| {
+                tx.clear();
+                true
+            });
+            // Keep complete requests queued while the protocol dispatch lock is
+            // busy. Clearing the slots here would lose the accepted transaction.
+            let slots_cleared = if requests_pending {
+                false
+            } else {
+                clear_binary_rx_slots()
+            };
+            let text_cleared = RX_BUFFER.try_lock().is_some_and(|mut rx| {
+                rx.clear();
+                true
+            });
+            if tx_cleared && slots_cleared && text_cleared {
+                log::debug!("[ble_at] stale connection buffers cleared");
+                advertising_disconnected();
+            } else {
+                // 清理由 main-loop 延期重试，绝不等待 BLE 回调释放短临界区。
+                CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+            }
         }
     }
     // LOOP8: 原子读取替代 Spin lock — 真无锁
@@ -1611,9 +1688,37 @@ fn build_embedded_modbus_response_with_session(
             pdu_buf[1] = 0x03; // Illegal data value
             2
         }
+    } else if func == 0x10
+        && pdu.len() >= 7
+        && (crate::config::regs::DEVICE_TEXT_BASE..=crate::config::regs::DEVICE_TEXT_END)
+            .contains(&u16::from_be_bytes([pdu[0], pdu[1]]))
+    {
+        let written = crate::modbus::shared::handle_pdu(&backend, func, pdu, &mut pdu_buf);
+        if written >= 2 && pdu_buf[0] == 0x10 {
+            let address = u16::from_be_bytes([pdu[0], pdu[1]]);
+            let count = usize::from(u16::from_be_bytes([pdu[2], pdu[3]]));
+            if handheld_text_write_is_final(address, count)
+                && let Err(error) = crate::device::persist_device_text_now()
+            {
+                log::error!("[ble_at] final handheld text persist failed: {error}");
+                pdu_buf[0] = 0x90;
+                pdu_buf[1] = 0x04;
+                2
+            } else {
+                written
+            }
+        } else {
+            written
+        }
     } else if handheld_logic_write {
         let address = u16::from_be_bytes([pdu[0], pdu[1]]);
         let count = u16::from_be_bytes([pdu[2], pdu[3]]) as usize;
+        log::info!(
+            "[ble_at] handheld logic block addr={} count={} bytes={} staged=true",
+            address,
+            count,
+            pdu.len()
+        );
         let mut values: heapless::Vec<u16, { crate::modbus::shared::MAX_REGS_PER_WRITE }> =
             heapless::Vec::new();
         for index in 0..count {
@@ -1634,10 +1739,25 @@ fn build_embedded_modbus_response_with_session(
                     pdu_buf[3..5].copy_from_slice(&(count as u16).to_be_bytes());
                     5
                 }
-                Err(()) => {
-                    log::warn!("[ble_at] staged handheld function table block rejected");
+                Err(error) => {
+                    log::warn!("[ble_at] staged handheld function table block rejected: {error:?}");
                     pdu_buf[0] = 0x90;
-                    pdu_buf[1] = 0x03;
+                    pdu_buf[1] = match error {
+                        crate::ble_at::logic_handlers::LegacyTableCommitError::InvalidTable
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::BlockTooLarge => {
+                            0x03
+                        }
+                        crate::ble_at::logic_handlers::LegacyTableCommitError::IncompleteTransfer
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::WrongSession
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::TimedOut
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::InvalidRange
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::ConflictingRetry
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::BaselineChanged => {
+                            0x06
+                        }
+                        crate::ble_at::logic_handlers::LegacyTableCommitError::HoldingWrite => 0x02,
+                        crate::ble_at::logic_handlers::LegacyTableCommitError::Persist => 0x04,
+                    };
                     2
                 }
             }
@@ -1673,6 +1793,33 @@ fn build_embedded_modbus_response_with_session(
     response.push(slave).ok()?;
     response.extend_from_slice(&pdu_buf[..pdu_len]).ok()?;
     Some(response)
+}
+
+/// The stock handheld sends a two-word text header at 5000, then data
+/// beginning at 5002. Its last success ACK must include verified NVS commit.
+fn handheld_text_write_is_final(address: u16, count: usize) -> bool {
+    crate::bus::storage_state::storage_read_with(|storage| {
+        let Some(&data_bytes) = storage.device_text.get(1) else {
+            return false;
+        };
+        text_write_reaches_end(address, count, data_bytes)
+    })
+    .unwrap_or(false)
+}
+
+fn text_write_reaches_end(address: u16, count: usize, data_bytes: u16) -> bool {
+    use crate::config::regs;
+    let base = usize::from(regs::DEVICE_TEXT_BASE);
+    let data_start = base + 2;
+    let declared_end = data_start + usize::from(data_bytes).div_ceil(2);
+    let start = usize::from(address);
+    count != 0
+        && declared_end <= usize::from(regs::DEVICE_TEXT_END) + 1
+        && if data_bytes == 0 {
+            start == base && count == 2
+        } else {
+            start >= data_start && start + count == declared_end
+        }
 }
 
 /// Returns true when a handheld FC16 block completes the variable-length
@@ -1820,6 +1967,21 @@ fn clear_binary_rx_slots() -> bool {
     cleared
 }
 
+/// Only accepted function-table/text writes may finish after a link closes.
+/// Never execute a queued DO command or restart from a disconnected session.
+fn is_durable_configuration_frame(frame: &[u8]) -> bool {
+    use crate::config::regs;
+    if frame.len() < 13 || !matches!(frame[7], 0x10 | 0xB3 | 0xB5 | 0xB7) {
+        return false;
+    }
+    let address = u16::from_be_bytes([frame[8], frame[9]]);
+    let count = u16::from_be_bytes([frame[10], frame[11]]);
+    let end = u32::from(address) + u32::from(count);
+    count != 0
+        && ((address >= regs::HOLD_DEVICE_CONFIG && end <= u32::from(regs::HOLD_USER_BASE))
+            || (address >= regs::DEVICE_TEXT_BASE && end <= u32::from(regs::DEVICE_TEXT_END) + 1))
+}
+
 fn process_binary_request_slot(index: u8, current_conn_id: u16) {
     let Some(slot) = BINARY_RX_SLOTS.get(index as usize) else {
         return;
@@ -1833,7 +1995,11 @@ fn process_binary_request_slot(index: u8, current_conn_id: u16) {
     }
     let conn_id = slot.conn_id.load(Ordering::Acquire);
     let epoch = slot.epoch.load(Ordering::Acquire);
-    if conn_id == current_conn_id && epoch == CONNECTION_EPOCH.load(Ordering::Acquire) {
+    let disconnected_drain = current_conn_id == 0xFFFF
+        && epoch.wrapping_add(1) == CONNECTION_EPOCH.load(Ordering::Acquire);
+    if (conn_id == current_conn_id && epoch == CONNECTION_EPOCH.load(Ordering::Acquire))
+        || disconnected_drain
+    {
         let Some(frame) = slot.frame.try_lock() else {
             slot.state.store(RX_READY, Ordering::Release);
             if !BINARY_REQUESTS.try_enqueue(index) {
@@ -1841,6 +2007,13 @@ fn process_binary_request_slot(index: u8, current_conn_id: u16) {
             }
             return;
         };
+        if disconnected_drain && !is_durable_configuration_frame(&frame[..]) {
+            drop(frame);
+            if !release_binary_rx_slot(index) {
+                CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+            }
+            return;
+        }
         // NFC configuration dispatch may wait for NVS acknowledgement. The
         // main loop must keep servicing I/O rather than wait for that lock.
         let Some(_dispatch) = PROTOCOL_DISPATCH_LOCK.try_lock() else {
@@ -2170,6 +2343,16 @@ fn handle_handheld_config_text(
             if !written {
                 return false;
             }
+            if matches!(func, 0xB5 | 0xB7)
+                && handheld_text_write_is_final(write_addr, count)
+                && let Err(error) = crate::device::persist_device_text_now()
+            {
+                log::error!("[ble_at] final handheld text persist failed: {error}");
+                rsp[1] = func | 0x80;
+                let _ = rsp.push(0x04);
+                send_ble_frame(tx_id, proto_id, &rsp, conn_id);
+                return true;
+            }
             // Android parses every write response as the standard Modbus
             // address/count echo (the old MCA did the same).  Returning only
             // [unit, func] made the handheld report a silent failed save even
@@ -2282,12 +2465,10 @@ fn write_ble_name_bytes(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > 8 {
         return false;
     }
-    crate::bus::backends::config_modify(|cfg| {
+    crate::bus::backends::config_modify_persistent(|cfg| {
         cfg.ble_name.fill(0);
         cfg.ble_name[..bytes.len()].copy_from_slice(bytes);
     });
-    crate::bus::backends::sync_ble_name_holding();
-    crate::device::request_persist_config();
     notify_ble_name_changed();
     true
 }
@@ -4054,6 +4235,31 @@ mod tests {
         assert_eq!(BLE_BINARY_FRAME_MAX, 512);
         assert_eq!(BLE_TX_SLOT_COUNT * BLE_TX_FRAME_MAX, 2176);
         assert_eq!(BLE_RX_SLOT_COUNT, 4);
+    }
+
+    #[test]
+    fn test_handheld_text_final_chunk_requires_declared_complete_range() {
+        assert!(text_write_reaches_end(5002, 2, 2));
+        assert!(text_write_reaches_end(5000, 2, 0));
+        assert!(!text_write_reaches_end(5002, 1, 2));
+        assert!(!text_write_reaches_end(5001, 3, 2));
+        assert!(!text_write_reaches_end(5002, 3, 2));
+    }
+
+    #[test]
+    fn test_disconnected_frames_only_allow_persistent_configuration() {
+        let mut frame = [0u8; 13];
+        frame[4..6].copy_from_slice(&7u16.to_be_bytes());
+        frame[6] = 1;
+        frame[7] = 0x10;
+        frame[8..10].copy_from_slice(&2300u16.to_be_bytes());
+        frame[10..12].copy_from_slice(&1u16.to_be_bytes());
+        assert!(is_durable_configuration_frame(&frame));
+        frame[7] = 0x05;
+        assert!(!is_durable_configuration_frame(&frame));
+        frame[7] = 0x10;
+        frame[8..10].copy_from_slice(&0x0400u16.to_be_bytes());
+        assert!(!is_durable_configuration_frame(&frame));
     }
 
     #[test]

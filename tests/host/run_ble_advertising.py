@@ -266,6 +266,7 @@ static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
 static SVC_STARTED: AtomicBool = AtomicBool::new(false);
 static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
 static BLE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static CONNECTION_BUFFERS_DIRTY: AtomicBool = AtomicBool::new(false);
 static PENDING_GAP_NAME_UPDATE: AtomicBool = AtomicBool::new(false);
 const SERVICE_UUID: &str = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 '''
