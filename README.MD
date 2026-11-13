@@ -1,9 +1,9 @@
 # 工业测控器 IMC 固件
 
 Rust + ESP-IDF v5.5.4，面向 W5500、BLE 手持机配置、Modbus RTU/TCP、IO 和模拟量。
-当前生产版本为 **2.8.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
+当前生产版本为 **2.9.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
 出厂网络为 `192.168.1.200 / 255.255.255.0`，网关与 DNS 为 `192.168.1.1`；
-2.7.0 是首个生产数据基线；v2.8.0 沿用该版存储格式，可从 v2.7.0 保留配置升级。开发版本首次切换仍须全擦 Flash。
+2.7.0 是首个生产数据基线；v2.9.0 沿用该版存储格式，可从 v2.7.0 保留配置升级。开发版本首次切换仍须全擦 Flash。
 DEFAULT/F3 使用 PCA9555（16DI/16DO），F4 使用多片 PCA9555（48DI/48DO）。三者共用软件 I2C IO/LED 总线引脚。
 
 ## 开发与验证
@@ -23,7 +23,7 @@ cargo build --locked --release --bin imc
 - [文档索引](docs/index.md) · [项目与硬件概览](docs/README.md)
 - [架构](docs/architecture.md) · [寄存器/引脚](docs/pinmap.md)
 - [当前生产核查](docs/testing/production-audit-2026-10-30.md) · [验收清单](docs/verification.md)
-- [v2.8.0 发布说明](docs/releases/v2.8.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
+- [v2.9.0 发布说明](docs/releases/v2.9.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
 - [台架测试工具](tests/manual/README.md) · [主机核心测试](tests/host/run_production_core.py)
 
 `log/` 存现场记录；多数原始日志被 Git 忽略，重要结论必须同步到 `docs/`。
@@ -33,7 +33,7 @@ cargo build --locked --release --bin imc
 ## 交付范围
 
 当前默认路径是 BLE GATT、W5500、Modbus RTU 主/从站及 TCP、IO、AI/AO、配置保存和 OTA。
-LoRa、透明转发、Wi-Fi 自动故障切换、BLE Mesh 业务和双光口冗余不作为已完成能力。
+LoRa 透明转发已纳入 F3 生产构建；Wi-Fi 自动故障切换、BLE Mesh 业务和双光口冗余不作为默认生产能力。
 所有硬件功能和 7×24 运行结论以对应镜像、硬件、负载和实测记录为准。
 
 

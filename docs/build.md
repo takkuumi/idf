@@ -373,7 +373,7 @@ cargo build --release --features f4
 ./scripts/release-flash.sh f3 --skip-build
 ```
 
-发布脚本校验版本、提交、四段地址和 SHA-256。首次从开发固件切换到生产基线时先全擦，再写入四段镜像；从 v2.7.0 升级到 v2.8.0 可通过 OTA 保留配置；
+发布脚本校验版本、提交、四段地址和 SHA-256。首次从开发固件切换到生产基线时先全擦，再写入四段镜像；从 v2.7.0 升级到 v2.9.0 可通过 OTA 保留配置；
 `factory-new-device.bin` 合并镜像只用于新设备或明确允许清除配置的场景。
 
 ### 开发构建
