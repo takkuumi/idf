@@ -82,7 +82,7 @@ build_variant() {
     echo ""
     echo "=== 完整编译 ${variant_upper} / v${VERSION} ==="
     cargo clean --target-dir "$target_dir"
-    local manifest_features=("default" "$variant" "lora")
+    local manifest_features=("default" "lora")
     if [[ "$variant" == default || "$variant" == f16 ]]; then
         :
     elif [[ "$variant" == f3 ]]; then
@@ -246,11 +246,13 @@ manifest = {
     "package_name": "esp32s3-imc",
     "product": "industrial-measurement-controller",
     "firmware_version": version,
-    "data_baseline": "fresh-install-2.7.0",
-    "old_version_data_compatible": False,
+    "data_baseline": "2.7.0",
+    "old_version_data_compatible": True,
+    "compatible_source_versions": ["2.7.0"],
     "installation": {
-        "requires_erase_flash": True,
-        "imports_legacy_data": False,
+        "factory_image_requires_erase_flash": True,
+        "ota_upgrade_supported_from": ["2.7.0"],
+        "imports_pre_2.7.0_data": False,
     },
     "hardware_variant": variant.upper(),
     "cargo_features": features,
