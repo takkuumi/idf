@@ -90,6 +90,8 @@ build_variant() {
         # BCT4227 按 USB VBUS 硬件切换 USB-UART/LoRa；关闭应用 UART0 console
         # 后由第三路 Modbus RTU worker 独占 UART0，避免日志变成 RF 数据。
         manifest_features=("default" "f3" "lora")
+    else
+        manifest_features+=("$variant")
     fi
     if [[ "$variant" == f3 ]]; then
         ESP_IDF_SDKCONFIG_DEFAULTS="$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.lora.defaults" \
