@@ -82,7 +82,6 @@ build_variant() {
     echo ""
     echo "=== 完整编译 ${variant_upper} / v${VERSION} ==="
     cargo clean --target-dir "$target_dir"
-    local build_env=()
     local feature_args=()
     local manifest_features=("default" "$variant" "lora")
     if [[ "$variant" == default || "$variant" == f16 ]]; then
@@ -91,14 +90,17 @@ build_variant() {
         # F3 的 GPIO43/44 UART0 承载 E22 透明 LoRa。F3 原理图的
         # BCT4227 按 USB VBUS 硬件切换 USB-UART/LoRa；关闭应用 UART0 console
         # 后由第三路 Modbus RTU worker 独占 UART0，避免日志变成 RF 数据。
-        build_env+=(ESP_IDF_SDKCONFIG_DEFAULTS="$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.lora.defaults")
         feature_args+=(--features f3,lora)
         manifest_features=("default" "f3" "lora")
     else
         feature_args+=(--features "$variant")
     fi
-    env "${build_env[@]}" CARGO_TARGET_DIR="$target_dir" cargo build \
-        --release --locked --bin imc "${feature_args[@]}"
+    if [[ "$variant" == f3 ]]; then
+        ESP_IDF_SDKCONFIG_DEFAULTS="$ROOT_DIR/sdkconfig.defaults;$ROOT_DIR/sdkconfig.lora.defaults" \
+            CARGO_TARGET_DIR="$target_dir" cargo build --release --locked --bin imc "${feature_args[@]}"
+    else
+        CARGO_TARGET_DIR="$target_dir" cargo build --release --locked --bin imc "${feature_args[@]}"
+    fi
 
     local elf="$target_dir/xtensa-esp32s3-espidf/release/imc"
     if [[ ! -f "$elf" ]]; then
