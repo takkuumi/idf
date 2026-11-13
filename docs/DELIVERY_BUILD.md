@@ -1,6 +1,6 @@
 # 固件编译与客户交付指南
 
-> 适用产品：ESP32-S3 IMC 工业测控器固件 v2.9.0
+> 适用产品：ESP32-S3 IMC 工业测控器固件 v2.10.0
 >
 > 适用硬件：ESP32-S3 rev 0.2、8MB Flash、2MB PSRAM
 >
@@ -10,7 +10,7 @@
 
 - 客户不接触 Rust ELF、源码、`partitions.csv` 或命令行构建环境。
 - 首次烧录包必须包含 Bootloader、编译后的分区表和 factory 应用镜像。
-- v2.7.0 是首个生产数据基线。v2.9.0 沿用该 schema，可从 v2.7.0 保留配置升级；从早期开发固件首次切换必须全擦 Flash。
+- v2.7.0 是首个生产数据基线。v2.10.0 沿用该 schema，可从 v2.7.0 保留配置升级；从早期开发固件首次切换必须全擦 Flash。
 - Flash 参数固定为 **DIO / 40MHz / 8MB**，禁止使用 QIO / 80MHz。
 - 每个交付包必须附版本说明和 SHA-256 校验文件。
 - 发布前必须完成真实设备烧录、启动、TCP、BLE、Web 和 OTA 回归。
@@ -137,7 +137,7 @@ imc-ota.bin       Web 系统维护页面上传，不指定 Flash 地址
 建议目录结构：
 
 ```text
-imc-v2.9.0-<commit>/
+imc-v2.10.0-<commit>/
 ├── flash-download-tool/
 │   ├── bootloader.bin
 │   ├── partition-table.bin
@@ -152,7 +152,7 @@ imc-v2.9.0-<commit>/
 在项目根目录执行以下命令可生成基础交付目录：
 
 ```bash
-release_id="imc-v2.9.0-$(git rev-parse --short HEAD)"
+release_id="imc-v2.10.0-$(git rev-parse --short HEAD)"
 
 mkdir -p "$release_id/flash-download-tool" "$release_id/ota"
 cp target/xtensa-esp32s3-espidf/release/bootloader.bin \
@@ -252,9 +252,9 @@ BAUD: 460800
 
 ### 10.3 全新生产安装
 
-v2.7.0 是首个生产数据基线。v2.9.0 与其使用相同存储 schema，从 v2.7.0 升级可以保留设备配置；从更早的开发固件首次安装时，必须在 Flash Download Tool 执行 `ERASE`，再写入完整的 bootloader、partition table、otadata 和 factory 镜像。该操作会清除设备全部运行数据。
+v2.7.0 是首个生产数据基线。v2.10.0 与其使用相同存储 schema，从 v2.7.0 升级可以保留设备配置；从更早的开发固件首次安装时，必须在 Flash Download Tool 执行 `ERASE`，再写入完整的 bootloader、partition table、otadata 和 factory 镜像。该操作会清除设备全部运行数据。
 
-项目脚本 `just release-flash <default|f3|f4>` 会检查 ESP32-S3 和 8MB Flash，然后执行全擦和镜像回读校验。v2.9.0 与 v2.7.0 的 schema 一致，可按 OTA 指南升级并保留配置。任何未来 schema 变更都必须先实现并验收迁移。
+项目脚本 `just release-flash <default|f3|f4>` 会检查 ESP32-S3 和 8MB Flash，然后执行全擦和镜像回读校验。v2.10.0 与 v2.7.0 的 schema 一致，可按 OTA 指南升级并保留配置。任何未来 schema 变更都必须先实现并验收迁移。
 
 ## 11. 连接失败处理
 

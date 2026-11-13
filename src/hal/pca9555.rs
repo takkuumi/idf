@@ -873,6 +873,47 @@ impl DigitalIo for Pca9555Duo {
 }
 
 impl Pca9555Duo {
+    /// Queue a safe state for the external IO expander before reset. The I2C
+    /// worker owns the physical bus; this method only updates its bounded
+    /// command/state queues and never performs a competing transaction.
+    pub fn prepare_for_reset(&self) -> bool {
+        let safe_command = {
+            let mut queue = self
+                .worker
+                .outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let command = queue.replace_pending_for_reset(0);
+            self.worker.do_desired.store_bits(0);
+            command
+        };
+        if let Err(error) = self.set_bt_led(false) {
+            log::warn!("[pca9555] reset BT LED clear request failed: {error}");
+        }
+        if let Err(error) = self.set_port_leds([false; 2], [false; 2]) {
+            log::warn!("[pca9555] reset port LED clear request failed: {error}");
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            let confirmed = self.worker.do_readback_valid.load(Ordering::Acquire)
+                && self.worker.do_confirmed_generation.load(Ordering::Acquire)
+                    == safe_command.generation
+                && self
+                    .worker
+                    .do_hardware
+                    .try_load_bits(8)
+                    .is_some_and(|bits| bits == 0);
+            if confirmed {
+                log::info!("[pca9555] reset safe state confirmed: all DO off");
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        log::warn!("[pca9555] reset safe DO state not confirmed before deadline");
+        false
+    }
+
     fn submit_output(&self, update: impl FnOnce(u64) -> u64) -> AppResult<()> {
         let mut queue = match self.worker.outputs.try_lock() {
             Ok(queue) => queue,

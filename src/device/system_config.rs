@@ -267,24 +267,39 @@ impl SystemConfig {
         cfg
     }
 
-    /// 从 Cargo.toml 解析固件版本 → u16
-    /// Android 端 fwVersionBytesToStr 期望格式: fw = main*100 + sub*10 + tail
-    ///   main = fw/100, sub = (fw%100)/10, tail = fw%10
-    ///   "2.2.1" → 221, "3.3.1" → 331
-    /// Cargo.toml "2.2.21" → 2*100 + 2*10 + 21 = 221 ✓
-    ///           "0.1.0"  → 0*100 + 1*10 + 0 = 10  → 显示 "0.1.0"
-    /// 注意: Cargo 版本最多 3 段数字, 这里只取前 3 段
+    /// Encode the firmware version for the legacy two-register protocol.
+    ///
+    /// Old versions use `major*100 + minor*10 + patch` because the handheld
+    /// historically decoded three single decimal digits. That representation
+    /// cannot represent `2.10.0` without turning it into `3.0.0`, so extended
+    /// versions use a tagged BCD-like form: `0xF000 | major<<8 | minor<<4 | patch`.
+    /// Old values remain byte-for-byte compatible; new clients can distinguish
+    /// the `0xF` tag and decode all three nibbles without ambiguity.
     pub fn fw_version_from_cargo() -> u16 {
         let v = env!("CARGO_PKG_VERSION");
         let mut parts = v.split('.');
-        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        major
-            .saturating_mul(100)
-            .saturating_add(minor.saturating_mul(10))
-            .saturating_add(patch)
-            .min(u16::MAX as u32) as u16
+        let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        Self::encode_fw_version(major, minor, patch)
+    }
+
+    pub fn encode_fw_version(major: u32, minor: u32, patch: u32) -> u16 {
+        if major <= 9 && minor <= 9 && patch <= 9 {
+            return (major * 100 + minor * 10 + patch) as u16;
+        }
+        if major <= 15 && minor <= 15 && patch <= 15 {
+            return 0xF000 | ((major as u16) << 8) | ((minor as u16) << 4) | patch as u16;
+        }
+        u16::MAX
+    }
+
+    pub fn decode_fw_version(code: u16) -> (u16, u16, u16) {
+        if code & 0xF000 == 0xF000 {
+            (((code >> 8) & 0x0F), ((code >> 4) & 0x0F), code & 0x0F)
+        } else {
+            (code / 100, (code % 100) / 10, code % 10)
+        }
     }
 
     /// 从 Cargo.toml 解析固件日期码 → u16 (默认 MM.DD 编码: MMDD)
@@ -1524,6 +1539,19 @@ mod tests {
     }
 
     /// INREG_AI_COUNT 必须跟随 F-version (F16=4 / F48=8, 与 MCA REG_AMAX 对齐)
+    #[test]
+    fn test_extended_fw_version_encoding_preserves_2_10_0() {
+        let code = SystemConfig::encode_fw_version(2, 10, 0);
+        assert_eq!(code, 0xF2A0);
+        assert_eq!(SystemConfig::decode_fw_version(code), (2, 10, 0));
+        assert_eq!(SystemConfig::decode_fw_version(221), (2, 2, 1));
+    }
+
+    #[test]
+    fn test_extended_fw_version_rejects_unrepresentable_segments() {
+        assert_eq!(SystemConfig::encode_fw_version(16, 0, 0), u16::MAX);
+    }
+
     #[test]
     fn test_inreg_ai_count_matches_hw_version() {
         // 物理采 6 路 (ADC1_CH0..5), 但 Modbus 报告值跟随 hw_version

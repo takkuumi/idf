@@ -3,11 +3,11 @@ name: IMC Release
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing version tag to publish, for example v2.9.0"
+        description: "Existing version tag to publish, for example v2.10.0"
         required: true
         type: string
 
@@ -64,6 +64,7 @@ jobs:
           cargo clippy --locked --bin imc --features f3 -- -D warnings
           ESP_IDF_SDKCONFIG_DEFAULTS="$GITHUB_WORKSPACE/sdkconfig.defaults;$GITHUB_WORKSPACE/sdkconfig.lora.defaults" cargo clippy --locked --bin imc --features f3,lora --target-dir target/check-f3-lora -- -D warnings
           cargo clippy --locked --bin imc --features f4 -- -D warnings
+          python3 tests/host/run_fw_version_encoding.py
           python3 tests/host/run_production_core.py
           python3 tests/host/run_nfc_mailbox.py
           python3 tests/host/run_ble_dispatch.py

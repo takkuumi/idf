@@ -268,6 +268,9 @@ static CONNECTION_BUFFERS_DIRTY: AtomicBool = AtomicBool::new(false);
 static ADV_HEALTH: Spin<AdvertisingHealth> = Spin::new(AdvertisingHealth::new());
 /// 改名时只停止一次广播，等待 STOP_COMPLETE 后重建 ADV data。
 static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
+/// Prevent late disconnect/GAP callbacks from restarting radio activity while
+/// the main loop is draining peripherals for a planned reset.
+static BLE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// LOOP15: GATT 服务是否已启动 (CREAT_ATTR_TAB_EVT 后 start_service 成功)
 static SVC_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -409,7 +412,7 @@ fn advertising_now_ms() -> u32 {
 }
 
 fn begin_advertising_operation(operation: AdvOperation) -> bool {
-    if CONN_ID.load(Ordering::Acquire) != 0xFFFF {
+    if BLE_SHUTTING_DOWN.load(Ordering::Acquire) || CONN_ID.load(Ordering::Acquire) != 0xFFFF {
         return false;
     }
     ADV_HEALTH.lock().begin(operation, advertising_now_ms())
@@ -464,7 +467,9 @@ fn advertising_connected() {
 
 fn advertising_disconnected() {
     ADV_HEALTH.lock().connected(advertising_now_ms());
-    if !PENDING_GAP_NAME_UPDATE.load(Ordering::Acquire) {
+    if !BLE_SHUTTING_DOWN.load(Ordering::Acquire)
+        && !PENDING_GAP_NAME_UPDATE.load(Ordering::Acquire)
+    {
         start_advertising();
     }
 }
@@ -856,6 +861,13 @@ unsafe extern "C" fn gatts_event_cb(
                 return;
             }
             let p = unsafe { &(*param).connect };
+            if BLE_SHUTTING_DOWN.load(Ordering::Acquire) {
+                let ret = unsafe { esp_idf_sys::esp_ble_gatts_close(gatts_if, p.conn_id) };
+                if ret != esp_idf_sys::ESP_OK {
+                    log::warn!("[ble_at] late reset connection close failed: 0x{:x}", ret);
+                }
+                return;
+            }
             // LOOP8: 原子写入替代 Spin<Option>
             CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
             crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
@@ -1006,6 +1018,7 @@ fn controller_config() -> esp_idf_sys::esp_bt_controller_config_t {
 }
 
 pub fn start() -> AppResult<()> {
+    BLE_SHUTTING_DOWN.store(false, Ordering::Release);
     log::info!("[ble_at] service starting (uuid={})", SERVICE_UUID);
     log::info!("[ble_at] initializing BT controller (BLE mode)");
 
@@ -1144,10 +1157,61 @@ pub fn start() -> AppResult<()> {
     Ok(())
 }
 
+/// Stop BLE activity before a planned software reset.
+///
+/// `esp_restart()` does not guarantee that Bluedroid will emit a GATT
+/// disconnect callback before the controller is reset.  The old path therefore
+/// left the connection state and the active-low BT LED latched until the next
+/// boot's I2C worker happened to overwrite it.  Publish the disconnected state
+/// synchronously, request a controller-side close/advertising stop, and enqueue
+/// the LED transition while the main loop still owns the HAL.
+pub fn prepare_for_reset(hal: &crate::hal::Hal) {
+    BLE_SHUTTING_DOWN.store(true, Ordering::Release);
+    let conn_id = CONN_ID.swap(0xFFFF, Ordering::AcqRel);
+    let gatts_if = GATTS_IF.load(Ordering::Acquire);
+    CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    PENDING_CONN_PARAM_UPDATE.store(false, Ordering::Release);
+    TX_NOTIFY_ENABLED.store(false, Ordering::Release);
+    GATT_CONGESTED.store(false, Ordering::Release);
+    NEGOTIATED_MTU.store(BLE_ATT_MTU_MIN, Ordering::Release);
+    CONNECTION_BUFFERS_DIRTY.store(true, Ordering::Release);
+    crate::ble_at::logic_handlers::cancel_staged_legacy_function_table();
+
+    if conn_id != 0xFFFF && gatts_if != 0xFF {
+        let ret = unsafe {
+            esp_idf_sys::esp_ble_gatts_close(gatts_if as esp_idf_sys::esp_gatt_if_t, conn_id)
+        };
+        if ret != esp_idf_sys::ESP_OK {
+            log::warn!("[ble_at] reset GATT close failed: 0x{:x}", ret);
+        } else {
+            log::info!(
+                "[ble_at] reset GATT connection close requested (conn_id={})",
+                conn_id
+            );
+        }
+    }
+
+    let adv_ret = unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() };
+    if adv_ret != esp_idf_sys::ESP_OK && adv_ret != esp_idf_sys::ESP_ERR_INVALID_STATE {
+        log::warn!("[ble_at] reset advertising stop failed: 0x{:x}", adv_ret);
+    }
+    ADV_HEALTH.lock().force_inactive(advertising_now_ms());
+    ADV_RECONFIGURE_PENDING.store(false, Ordering::Release);
+    PENDING_GAP_NAME_UPDATE.store(false, Ordering::Release);
+
+    if let Err(error) = hal.set_bt_led(false) {
+        log::warn!("[ble_at] reset BT LED off request failed: {error}");
+    } else {
+        BT_LED_APPLIED.store(0, Ordering::Release);
+        log::info!("[ble_at] reset cleanup: BT LED off requested");
+    }
+}
+
 /// Apply the latest name only between GAP operations and while disconnected.
 /// Connected clients keep their link; disconnect schedules the pending rename.
 pub fn update_gap_device_name() {
-    if CONN_ID.load(Ordering::Acquire) != 0xFFFF
+    if BLE_SHUTTING_DOWN.load(Ordering::Acquire)
+        || CONN_ID.load(Ordering::Acquire) != 0xFFFF
         || !SVC_STARTED.load(Ordering::Acquire)
         || !ADV_HEALTH.lock().can_update_name(advertising_now_ms())
     {
@@ -1202,6 +1266,9 @@ pub fn update_gap_device_name() {
 }
 
 fn maintain_advertising() {
+    if BLE_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
     let now_ms = advertising_now_ms();
     let connected = CONN_ID.load(Ordering::Acquire) != 0xFFFF;
     let recovery = ADV_HEALTH.lock().recovery(
@@ -2560,9 +2627,9 @@ fn handle_ble_android_read_command(
                     log::debug!(
                         "[ble_at] READ_FW_VERSION: fw=0x{:04X} ({}.{}.{}) dt=0x{:04X} ({})",
                         fw,
-                        fw / 100,
-                        (fw % 100) / 10,
-                        fw % 10,
+                        crate::device::system_config::SystemConfig::decode_fw_version(fw).0,
+                        crate::device::system_config::SystemConfig::decode_fw_version(fw).1,
+                        crate::device::system_config::SystemConfig::decode_fw_version(fw).2,
                         dt,
                         dt
                     );

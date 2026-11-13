@@ -261,6 +261,7 @@ pub fn start(hal: Arc<Hal>, sys_loop: EspSystemEventLoop) -> AppResult<()> {
 
     ETH_NETIF.store(netif, Ordering::Release);
     ETH_HANDLE.store(eth_handle, Ordering::Release);
+    ETH_PHY.store(phy, Ordering::Release);
     ETH_STARTED.store(true, Ordering::Release);
     resources.committed = true;
 
@@ -559,10 +560,45 @@ static ETH_LINK_UP: AtomicBool = AtomicBool::new(true);
 static ETH_STARTED: AtomicBool = AtomicBool::new(false);
 static ETH_NETIF: AtomicPtr<esp_idf_sys::esp_netif_obj> = AtomicPtr::new(std::ptr::null_mut());
 static ETH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ETH_PHY: AtomicPtr<esp_idf_sys::esp_eth_phy_t> = AtomicPtr::new(std::ptr::null_mut());
 static NET_RECONFIG_REQUEST_MS: AtomicU32 = AtomicU32::new(0);
 
 pub fn is_started() -> bool {
     ETH_STARTED.load(Ordering::Acquire)
+}
+
+/// Stop the W5500 and its PHY before a planned software reset.
+///
+/// The reset path used to jump straight to `esp_restart`, leaving the W5500
+/// poll timer, link state and SPI socket active until the chip reset sequence
+/// caught up. `esp_eth_stop` performs the driver-level MAC/PHY shutdown and
+/// posts the normal netif STOP event. The PHY is explicitly powered down so
+/// its physical link LEDs cannot remain latched across the MCU software reset.
+pub fn prepare_for_reset() {
+    let handle = ETH_HANDLE.load(Ordering::Acquire) as esp_idf_sys::esp_eth_handle_t;
+    let was_started = ETH_STARTED.swap(false, Ordering::AcqRel);
+    ETH_LINK_UP.store(false, Ordering::Release);
+    NET_RECONFIG_REQUEST_MS.store(0, Ordering::Release);
+    if was_started && !handle.is_null() {
+        let ret = unsafe { esp_idf_sys::esp_eth_stop(handle) };
+        if ret != esp_idf_sys::ESP_OK && ret != esp_idf_sys::ESP_ERR_INVALID_STATE {
+            log::warn!("[eth] reset driver stop failed: esp_err=0x{:08X}", ret);
+        } else {
+            log::info!("[eth] reset cleanup: W5500 driver stop requested");
+        }
+    }
+    let phy = ETH_PHY.load(Ordering::Acquire);
+    if !phy.is_null() {
+        let pwrctl = unsafe { (*phy).pwrctl };
+        if let Some(pwrctl) = pwrctl {
+            let ret = unsafe { pwrctl(phy, false) };
+            if ret != esp_idf_sys::ESP_OK {
+                log::warn!("[eth] reset PHY power-down failed: esp_err=0x{:08X}", ret);
+            } else {
+                log::info!("[eth] reset cleanup: W5500 PHY powered down");
+            }
+        }
+    }
 }
 
 /// 请求在 main_loop 中重新应用网络参数。500ms 去抖保证 FC=16/BLE 分片批量写完后

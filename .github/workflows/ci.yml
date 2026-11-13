@@ -37,6 +37,8 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
+      - name: Run firmware version encoding tests
+        run: python3 tests/host/run_fw_version_encoding.py
       - name: Run production core tests
         run: python3 tests/host/run_production_core.py
       - name: Run TCP scheduler tests

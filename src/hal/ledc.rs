@@ -155,6 +155,18 @@ impl LedcHandle {
         !cfg!(feature = "f4")
     }
 
+    /// Stop externally visible AO output before a planned reset.
+    pub fn prepare_for_reset(&self) {
+        if !self.is_available() {
+            return;
+        }
+        for idx in 0..AO_CHANNEL_COUNT {
+            if let Err(error) = self.set_duty(idx, 0) {
+                log::warn!("[ao] reset output ch{idx} clear failed: {error}");
+            }
+        }
+    }
+
     /// 设置 AO 通道 idx (0..4) 的占空比。
     ///
     /// `duty` 范围 0..=2^resolution_bits-1 (12-bit 即 0..=4095)。

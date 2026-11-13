@@ -477,7 +477,15 @@ fn main_loop(
                         "[main] planned reset requested by {}",
                         crate::bus::io_state::ResetSource::label(reset_request)
                     );
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Complete asynchronous peripheral shutdown while the main
+                    // task still owns the HAL. This prevents stale BLE state and
+                    // leaves W5500/link state down before the ROM reset sequence.
+                    #[cfg(feature = "ble-at")]
+                    crate::ble_at::prepare_for_reset(&hal);
+                    #[cfg(feature = "ethernet-w5500")]
+                    crate::ethernet::w5500::prepare_for_reset();
+                    hal.prepare_for_reset();
+                    std::thread::sleep(Duration::from_millis(150));
                     unsafe { esp_idf_sys::esp_restart() };
                 }
             } else {

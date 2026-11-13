@@ -3,13 +3,14 @@
 > 最后更新: 2026-11-13 (IO 组态控制/反馈兼容修复)
 
 
-## v2.9.0 生产发布候选（2026-11-13）
+## v2.10.0 生产发布候选（2026-11-13）
 
-- [x] Cargo、lockfile、ESP-IDF app 版本统一为 2.9.0；`lora` 编译能力纳入默认 features，UART0 LoRa RTU 端口仅在 F3 启用，F3 发行配置关闭 UART0 控制台。
+- [x] Cargo、lockfile、ESP-IDF app 版本统一为 2.10.0；`lora` 编译能力纳入默认 features，UART0 LoRa RTU 端口仅在 F3 启用，F3 发行配置关闭 UART0 控制台。
 - [x] Modbus TCP 单一连接复用、四端口轮询、未验证会话绝对期限和瞬时 accept 错误分类完成主机测试；BLE 广播静默状态自愈通过状态机回归。
+- [x] 复位外设收尾覆盖 BLE、W5500 PHY、PCA9555 DO/指示灯、RS485 DE 和 LEDC AO；扩展版本编码兼容 2.10.0，并完成主机回归。
 - [x] 真实 F3 TCP 验证四端口各 20/20 单连接 FC03；8 个未验证连接等待 11 秒后新连接恢复成功。详情见 `docs/testing/tcp-ble-connection-acceptance-2026-11-13.md`。
-- [ ] 2.9.0 release profile 三变体打包、镜像哈希和启动版本复核完成后，更新本项为封板状态。
-- 生产包说明：`docs/releases/v2.9.0.md`。
+- [ ] 2.10.0 release profile 三变体打包、镜像哈希和启动版本复核完成后，更新本项为封板状态。
+- 生产包说明：`docs/releases/v2.10.0.md`。
 
 ## Tauri IO 控制组态表头兼容修复（2026-11-13）
 

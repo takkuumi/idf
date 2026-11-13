@@ -63,6 +63,16 @@ pub struct Hal {
 }
 
 impl Hal {
+    /// Stop all externally visible outputs before a planned software reset.
+    /// Network/BLE teardown is handled by their modules; this covers GPIO,
+    /// RS485 direction, PCA9555 DO/LED state and LEDC AO outputs.
+    pub fn prepare_for_reset(&self) -> bool {
+        self.gpio.prepare_for_reset();
+        let outputs_safe = self.pca9555.prepare_for_reset();
+        self.ledc.prepare_for_reset();
+        outputs_safe
+    }
+
     pub fn init(peripherals: Peripherals) -> AppResult<Self> {
         let pins = HalPins::split(peripherals.pins)?;
         let uart = UartPort::init(

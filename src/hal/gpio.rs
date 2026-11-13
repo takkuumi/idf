@@ -120,6 +120,20 @@ impl GpioBank {
         }
     }
 
+    /// Put externally visible GPIO controls into their reset-safe state.
+    /// RS485 DE must be low before the UART task is torn down; otherwise a
+    /// half-duplex transceiver can hold the bus in transmit mode during boot.
+    pub fn prepare_for_reset(&self) {
+        for index in 0..self.rs485_de.len() {
+            self.rs485_set_tx(index, false);
+        }
+        if let Some(mut led) = self.run_led.try_lock()
+            && let Some(led) = led.as_mut()
+        {
+            let _ = led.set_low();
+        }
+    }
+
     /// W5500 硬件复位 (低脉冲 50ms)
     pub fn eth_reset_pulse(&self) {
         if let Some(mut pin) = self.eth_rst.try_lock() {

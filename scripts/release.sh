@@ -36,8 +36,8 @@ PY
 
 VERSION="$(read_version Cargo.toml)"
 SDK_VERSION="$(sed -n 's/^CONFIG_APP_PROJECT_VER="\([^"]*\)"$/\1/p' sdkconfig.defaults)"
-if [[ ! "$VERSION" =~ ^[0-9]\.[0-9]\.[0-9]$ ]]; then
-    echo "错误: Cargo.toml 版本 ${VERSION} 不满足设备协议的 X.Y.Z 单数字约束" >&2
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误: Cargo.toml 版本 ${VERSION} 不满足 X.Y.Z 格式" >&2
     exit 1
 fi
 if [[ "$SDK_VERSION" != "$VERSION" ]]; then

@@ -71,6 +71,20 @@ impl OutputQueue {
         }
     }
 
+    /// Replace every queued edge with one explicit safe target during planned
+    /// reset. Normal operation remains FIFO; only reset may discard outputs.
+    pub fn replace_pending_for_reset(&mut self, bits: u64) -> OutputCommand {
+        let command = OutputCommand {
+            generation: self.latest.generation.wrapping_add(1),
+            bits,
+        };
+        self.commands[0] = command;
+        self.head = 0;
+        self.len = 1;
+        self.latest = command;
+        command
+    }
+
     pub fn front(&self) -> Option<OutputCommand> {
         (self.len != 0).then(|| self.commands[self.head])
     }
@@ -138,6 +152,21 @@ mod tests {
         }
         assert_eq!(queue.len(), 0);
         assert!(queue.submit(1));
+    }
+
+    #[test]
+    fn test_planned_reset_replaces_pending_edges_with_safe_off() {
+        let mut queue = OutputQueue::new();
+        assert!(queue.submit(1));
+        assert!(queue.submit(0));
+        assert!(queue.submit(2));
+        let safe = queue.replace_pending_for_reset(0);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front(), Some(safe));
+        assert_eq!(safe.bits, 0);
+        assert_eq!(queue.latest(), safe);
+        assert!(queue.confirm(safe));
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]

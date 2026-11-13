@@ -234,20 +234,19 @@ panic = "abort"        # panic 直接 abort (省 unwind 表)
 
 ### 正式版本发布（F3 + F4）
 
-发布前先显式设置版本并提交。设备协议使用三位十进制版本编码，因此
-`major/minor/patch` 每段必须是 `0-9` 的单个数字：
+发布前先显式设置版本并提交。设备协议对旧版单数字段保持三位十进制编码；从 v2.10.0 起，多数字段使用扩展标记编码，因此版本段可以是多位数字：
 
 ```bash
-just set-version 2.2.2
+just set-version 2.10.0
 git add Cargo.toml Cargo.lock sdkconfig.defaults
-git commit -m "chore(build): bump firmware version to 2.2.2"
+git commit -m "release: bump firmware version to 2.10.0"
 just release
 ```
 
 `just release` 会从干净的构建目录完整编译 F3、F4 两个硬件版本，输出到：
 
 ```text
-release/v2.2.2/
+release/v2.10.0/
 ├── f3/
 │   ├── flash/                  # 四个独立烧录段
 │   ├── imc-v2.2.2-f3-factory-new-device.bin
@@ -373,7 +372,7 @@ cargo build --release --features f4
 ./scripts/release-flash.sh f3 --skip-build
 ```
 
-发布脚本校验版本、提交、四段地址和 SHA-256。首次从开发固件切换到生产基线时先全擦，再写入四段镜像；从 v2.7.0 升级到 v2.9.0 可通过 OTA 保留配置；
+发布脚本校验版本、提交、四段地址和 SHA-256。首次从开发固件切换到生产基线时先全擦，再写入四段镜像；从 v2.7.0 升级到 v2.10.0 可通过 OTA 保留配置；
 `factory-new-device.bin` 合并镜像只用于新设备或明确允许清除配置的场景。
 
 ### 开发构建

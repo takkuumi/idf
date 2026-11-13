@@ -1677,9 +1677,9 @@ fn write_ndef_records_unprotected(dev: &St25dv) -> Result<(), ()> {
         write!(
             version,
             "V{}.{}.{}.{}",
-            cfg.fw_version / 100,
-            (cfg.fw_version % 100) / 10,
-            cfg.fw_version % 10,
+            crate::device::system_config::SystemConfig::decode_fw_version(cfg.fw_version).0,
+            crate::device::system_config::SystemConfig::decode_fw_version(cfg.fw_version).1,
+            crate::device::system_config::SystemConfig::decode_fw_version(cfg.fw_version).2,
             cfg.fw_date
         )
         .map_err(|_| ())?;

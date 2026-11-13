@@ -143,7 +143,7 @@ fn reset() {
     for count in [&STARTS,&STOPS,&CONFIGS,&NAMES] { count.store(0,Ordering::SeqCst); }
     FAIL_NEXT.store(0,Ordering::SeqCst); CONN_ID.store(0xFFFF,Ordering::SeqCst);
     SVC_STARTED.store(true,Ordering::SeqCst); ADV_RECONFIGURE_PENDING.store(false,Ordering::SeqCst);
-    PENDING_GAP_NAME_UPDATE.store(false,Ordering::SeqCst); CONTROLLER_ACTIVE.store(false,Ordering::SeqCst);
+    PENDING_GAP_NAME_UPDATE.store(false,Ordering::SeqCst); BLE_SHUTTING_DOWN.store(false,Ordering::SeqCst); CONTROLLER_ACTIVE.store(false,Ordering::SeqCst);
     *ID.lock() = "Mesh".into(); *AIR_NAME.lock() = "Mesh".into(); at(100);
 }
 fn event(kind: i32, status: i32) {
@@ -230,6 +230,14 @@ fn poll(now: u32) { at(now); maintain_advertising(); }
     assert_eq!(CONFIGS.load(Ordering::SeqCst),0);
     assert_eq!(NAMES.load(Ordering::SeqCst),0);
 }
+#[test] fn test_disconnect_during_planned_reset_does_not_restart_air() {
+    running();
+    BLE_SHUTTING_DOWN.store(true,Ordering::SeqCst);
+    CONN_ID.store(0,Ordering::SeqCst);
+    advertising_disconnected();
+    assert_eq!(STARTS.load(Ordering::SeqCst),1);
+    assert!(!ADV_HEALTH.lock().active());
+}
 #[test] fn test_real_paths_null_and_failure_callbacks_remain_recoverable() {
     reset(); config_adv_data(); unsafe { gap_event_cb(1,std::ptr::null_mut()); }
     poll(5_100); assert_eq!(CONFIGS.load(Ordering::SeqCst),2); event(1,1);
@@ -257,6 +265,7 @@ static ADV_HEALTH: Spin<AdvertisingHealth> = Spin::new(AdvertisingHealth::new())
 static CONN_ID: AtomicU16 = AtomicU16::new(0xFFFF);
 static SVC_STARTED: AtomicBool = AtomicBool::new(false);
 static ADV_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
+static BLE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static PENDING_GAP_NAME_UPDATE: AtomicBool = AtomicBool::new(false);
 const SERVICE_UUID: &str = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 '''

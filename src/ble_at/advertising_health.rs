@@ -93,6 +93,16 @@ impl AdvertisingHealth {
         self.retry_backoff = false;
     }
 
+    /// Invalidate the lease synchronously when the whole controller is about
+    /// to reset; no late GAP callback may make the old lease look active.
+    pub(super) fn force_inactive(&mut self, now_ms: u32) {
+        self.active = false;
+        self.pending = None;
+        self.last_attempt_ms = now_ms;
+        self.last_confirmed_ms = now_ms;
+        self.retry_backoff = false;
+    }
+
     /// A stop callback without a matching stop request means the controller
     /// stopped advertising on its own. Drop the stale lease immediately so
     /// the caller can restart while the device is still disconnected.
@@ -162,6 +172,16 @@ mod tests {
         assert_eq!(health.recovery(11_610, true, false, false), Recovery::None);
         assert!(health.complete(Operation::Start, true, 11_620));
         assert_eq!(health.recovery(21_619, true, false, false), Recovery::None);
+    }
+
+    #[test]
+    fn test_force_inactive_clears_pending_lease() {
+        let mut health = running(100);
+        assert!(health.begin(Operation::Stop, 200));
+        health.force_inactive(201);
+        assert!(!health.active());
+        assert!(!health.busy());
+        assert_eq!(health.recovery(5_200, true, false, false), Recovery::None);
     }
 
     #[test]
