@@ -17,6 +17,10 @@ box-shadow:0 8px 32px rgba(0,0,0,.4)}
 .field input{width:100%;padding:10px 12px;background:#141920;border:1px solid #2a3340;
 border-radius:6px;color:#e0e0e0;font-size:14px;outline:none;transition:border .2s}
 .field input:focus{border-color:#4a9eff}
+.password-wrap{position:relative}
+.password-wrap input{padding-right:66px}
+.password-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);min-height:32px;padding:4px 8px;border:0;border-radius:4px;background:transparent;color:#73b5ff;font:inherit;font-size:12px;cursor:pointer}
+.password-toggle:focus-visible{outline:2px solid #4a9eff;outline-offset:1px}
 .btn{width:100%;padding:11px;background:linear-gradient(135deg,#2a7fff,#1a6adf);
 border:none;border-radius:6px;color:#fff;font-size:14px;font-weight:600;cursor:pointer;
 transition:opacity .2s}
@@ -31,12 +35,21 @@ transition:opacity .2s}
   <p class="sub">{{MANUFACTURER}}</p>
   <form id="f">
     <div class="field"><label>用户名</label><input id="u" name="username" value="admin" autocomplete="username"></div>
-    <div class="field"><label>密码</label><input id="p" name="pwd" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="p">密码</label><div class="password-wrap"><input id="p" name="pwd" type="password" autocomplete="current-password"><button class="password-toggle" id="pwd_toggle" type="button" aria-label="显示密码" aria-controls="p" aria-pressed="false">显示</button></div></div>
     <button class="btn" type="submit">登 录</button>
   </form>
   <div class="error" id="err"></div>
 </div>
 <script>
+document.getElementById('pwd_toggle').onclick=()=>{
+  const input=document.getElementById('p');
+  const button=document.getElementById('pwd_toggle');
+  const visible=input.type==='password';
+  input.type=visible?'text':'password';
+  button.textContent=visible?'隐藏':'显示';
+  button.setAttribute('aria-label',visible?'隐藏密码':'显示密码');
+  button.setAttribute('aria-pressed',String(visible));
+};
 document.getElementById('f').onsubmit=async e=>{
   e.preventDefault();
   const err=document.getElementById('err');

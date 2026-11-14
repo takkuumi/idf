@@ -213,15 +213,15 @@ pub mod hw_version {
 pub mod ai_calib {
     /// ADC 满量程 (12-bit)
     pub const ADC_MAX: u32 = 4095;
-    /// 4mA 对应的 scaled 值 (mA*1000)
+    /// 电流量单位常量 (µA)，不是 IO.ai.scaled 的单位
     pub const MA_MIN: u32 = 4000;
-    /// 20mA 对应的 scaled 值 (mA*1000)
+    /// 电流量上限 (µA)，不是 IO.ai.scaled 的单位
     pub const MA_MAX: u32 = 20000;
 
     /// ADC 自动校准参考值 (对齐参考固件 SENSOR_MIN/SENSOR_MAX)
-    /// 4mA 对应的 ADC 原始值 (理论值, 校准窗口判定基准)
+    /// 归一化满量程端 ADC 参考值 (scaled=4095，非实测电流标定)
     pub const SENSOR_MIN: u16 = 605;
-    /// 20mA 对应的 ADC 原始值 (理论值, 校准窗口判定基准)
+    /// 归一化零点端 ADC 参考值 (scaled=0，非实测电流标定)
     pub const SENSOR_MAX: u16 = 3016;
     /// 校准窗口时长 (ms) — 对齐参考固件 millis() < 8000
     pub const CALIB_WINDOW_MS: u64 = 8000;

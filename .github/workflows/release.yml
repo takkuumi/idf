@@ -69,6 +69,9 @@ jobs:
           python3 tests/host/run_nfc_mailbox.py
           python3 tests/host/run_ble_dispatch.py
           python3 tests/host/run_function_table_contract.py
+          python3 tests/host/run_legacy_table_stage.py
+          python3 tests/host/run_ble_request_slots.py
+          python3 tests/host/run_ai_transfer.py
           python3 tests/host/run_control_logic_parser.py
 
       - name: Build all production variants

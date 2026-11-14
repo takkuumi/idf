@@ -33,6 +33,8 @@
 
 ## 发布
 
+- [IMC v3.2.0 发布说明](releases/v3.2.0.md) · [实机验收](testing/v3.2.0-real-device-acceptance-2026-11-14.md)
+
 - [IMC v3.1.0 生产发布说明](releases/v3.1.0.md)
 - [IMC v3.0.0 发布说明](releases/v3.0.0.md)
 - [IMC v2.10.0 生产发布说明](releases/v2.10.0.md)

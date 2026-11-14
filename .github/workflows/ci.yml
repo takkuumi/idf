@@ -49,8 +49,14 @@ jobs:
         run: python3 tests/host/run_ble_advertising.py
       - name: Run BLE and NFC dispatch contention tests
         run: python3 tests/host/run_ble_dispatch.py
+      - name: Run AI conversion and moving average checks
+        run: python3 tests/host/run_ai_transfer.py
       - name: Run function table runtime contract checks
         run: python3 tests/host/run_function_table_contract.py
+      - name: Run bounded legacy table staging tests
+        run: python3 tests/host/run_legacy_table_stage.py
+      - name: Run complete BLE request slot scheduling tests
+        run: python3 tests/host/run_ble_request_slots.py
       - name: Run IO control logic parser checks
         run: python3 tests/host/run_control_logic_parser.py
       - name: Run NFC driver and mailbox tests

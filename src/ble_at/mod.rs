@@ -42,13 +42,14 @@ pub mod handlers;
 pub mod logic_handlers;
 pub mod ota_handlers;
 pub mod parser;
+mod request_slots;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use std::sync::LazyLock;
 
 use crate::config::regs;
-use crate::sync::{MpscRing, Spin};
+use crate::sync::Spin;
 
 use crate::error::AppResult;
 use crate::modbus::shared::modbus_crc16;
@@ -252,7 +253,8 @@ static BINARY_RX_SLOTS: [BinaryRxSlot; BLE_RX_SLOT_COUNT] =
     [const { BinaryRxSlot::new() }; BLE_RX_SLOT_COUNT];
 static ACTIVE_RX_SLOT: AtomicU8 = AtomicU8::new(BLE_SLOT_NONE);
 /// 队列只传递静态槽索引，完整帧所有权留在槽中，不复制512B请求对象。
-static BINARY_REQUESTS: MpscRing<u8, 5> = MpscRing::new();
+static BINARY_REQUESTS: request_slots::RequestSlots<BLE_RX_SLOT_COUNT> =
+    request_slots::RequestSlots::new();
 /// ATT 默认 MTU 为 23；notification value 最多为协商 MTU - opcode/handle 3 字节。
 const BLE_ATT_MTU_MIN: u16 = 23;
 const BLE_LOCAL_MTU: u16 = 500;
@@ -1756,7 +1758,8 @@ fn build_embedded_modbus_response_with_session(
                             0x06
                         }
                         crate::ble_at::logic_handlers::LegacyTableCommitError::HoldingWrite => 0x02,
-                        crate::ble_at::logic_handlers::LegacyTableCommitError::Persist => 0x04,
+                        crate::ble_at::logic_handlers::LegacyTableCommitError::Persist
+                        | crate::ble_at::logic_handlers::LegacyTableCommitError::NoMemory => 0x04,
                     };
                     2
                 }
@@ -2100,8 +2103,8 @@ fn try_feed_binary_protocol(data: &[u8], conn_id: u16, _trans_id: u32) -> bool {
     drop(rx);
     ACTIVE_RX_SLOT.store(BLE_SLOT_NONE, Ordering::Release);
     slot.state.store(RX_READY, Ordering::Release);
-    if !BINARY_REQUESTS.try_enqueue(index) {
-        log::warn!("[ble_at] binary request queue full, dropping frame");
+    if !BINARY_REQUESTS.enqueue_new(index) {
+        log::error!("[ble_at] invalid completed binary RX slot index");
         BINARY_TX_DROPS.fetch_add(1, Ordering::Relaxed);
         release_binary_rx_slot(index);
     }

@@ -24,10 +24,10 @@ background:#141920;border:1px solid var(--border);border-radius:7px}
 border:1px solid transparent;border-radius:5px;transition:.2s;display:flex;align-items:center;justify-content:center}
 .tab:hover{color:var(--text);background:#1c232c}
 .tab.active{color:#fff;background:#253548;border-color:#3c5b7d}
-.card{background:linear-gradient(145deg,rgba(31,40,50,.96),rgba(24,29,36,.96));border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin-bottom:12px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+.card{background:linear-gradient(145deg,rgba(31,40,50,.96),rgba(24,29,36,.96));border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:16px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
 .card h2{font-size:14px;font-weight:600;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
-.row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
-.field label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+.row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
+.field label{display:block;font-size:12px;color:var(--dim);margin-bottom:6px}
 .field input,.field select{width:100%;padding:8px 10px;background:#141920;border:1px solid var(--border);
 border-radius:5px;color:var(--text);font-size:13px;outline:none}
 .field input:not(:disabled),.field select:not(:disabled){background:#101820;border-color:#455568}
@@ -42,15 +42,18 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
 .btn:disabled{cursor:not-allowed;opacity:.65}.btn.busy{padding-left:34px}.btn.busy:before{content:"";position:absolute;left:14px;top:50%;width:12px;height:12px;margin-top:-7px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .di-list,.do-list,.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
-.io-item{display:flex;align-items:center;gap:8px;padding:8px;background:#141920;border-radius:6px;font-size:12px}
-.led{width:10px;height:10px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
+.io-item{display:flex;align-items:center;gap:10px;padding:10px;background:#141920;border-radius:6px;font-size:12px}
+.led{width:14px;height:14px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
 .led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.di-list .led{width:18px;height:18px}
+.di-list .led.on{box-shadow:none}
 .led.unknown{background:transparent;border:1px solid #77808b}
 .led.do-off{background:#4a4a4a}.led.do-on{background:var(--red);box-shadow:0 0 6px var(--red)}
 .tgl{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
 .tgl input{display:none}.tgl .slider{position:absolute;inset:0;background:#4a4a4a;border-radius:10px;cursor:pointer;transition:.2s}
 .tgl .slider:before{content:"";position:absolute;width:16px;height:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:.2s}
 .tgl input:checked+.slider{background:var(--green)}.tgl input:checked+.slider:before{transform:translateX(16px)}
+.ai-note{font-size:12px;color:var(--dim);margin-bottom:12px}
 .ai-item{display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;background:#141920;border-radius:6px;font-size:13px}
 .ai-bar{flex:1;height:6px;background:#2a3340;border-radius:3px;overflow:hidden}
 .ai-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:3px;transition:width .3s}
@@ -58,9 +61,9 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .ai-val.invalid{color:var(--dim);font-size:14px}
 .ai-ma{font-size:11px;color:var(--dim);min-width:72px}
 .nav{display:flex;gap:10px;margin-top:14px}
-.port-card{padding:14px 0;border-bottom:1px solid var(--border)}
-.port-card:first-of-type{padding-top:0}.port-card:last-of-type{border-bottom:0;padding-bottom:0}
-.port-card h3{font-size:13px;color:var(--accent);margin-bottom:10px}
+.port-card{padding:18px;background:#141920;border:1px solid var(--border);border-radius:8px;margin-bottom:16px}
+.port-card:last-child{margin-bottom:0}
+.port-card h3{font-size:13px;color:var(--accent);margin-bottom:14px}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:6px;font-size:13px;
 transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 .toast.show{transform:translateY(0);opacity:1}
@@ -122,6 +125,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     </div>
     <div class="card">
       <h2>模拟输入 (AI)</h2>
+      <p class="ai-note">归一化值 0–4095，非 mA。单端标定保留已存端点，另一端使用默认参考。</p>
       <div id="ai_list"></div>
     </div>
     <div class="card">
@@ -280,6 +284,25 @@ async function runAction(id, busyLabel, task) {
   }
 }
 
+let sessionExpired = false;
+let pollTimer, statusTimer, nfcStatusTimer;
+function handleSessionExpiry(status, responseUrl) {
+  const loginResponse = responseUrl && new URL(responseUrl, location.href).pathname === '/login';
+  if (status !== 401 && status !== 403 && !loginResponse) return false;
+  if (!sessionExpired) {
+    sessionExpired = true;
+    [pollTimer, statusTimer, nfcStatusTimer].forEach(clearInterval);
+    location.replace('/login');
+  }
+  return true;
+}
+async function apiFetch(url, options) {
+  if (sessionExpired) throw new Error('登录已失效');
+  const response = await fetch(url, { ...options, cache: 'no-store' });
+  if (handleSessionExpiry(response.status, response.url)) throw new Error('登录已失效');
+  return response;
+}
+
 function apiError(code, fallback) {
   const errors = {
     '0x01000001': '缺少必要参数',
@@ -300,7 +323,7 @@ function saveError(area, error) {
 // Load system info
 async function loadSysInfo() {
   try {
-    const r = await fetch('/getsysteminfo');
+    const r = await apiFetch('/getsysteminfo');
     const j = await r.json();
     if (j.data) {
       for (const key of ['devicename', 'manufacturer', 'model', 'version']) {
@@ -318,7 +341,7 @@ async function loadSysInfo() {
 // Load network config
 async function loadNet() {
   try {
-    const r = await fetch('/getnetworkconfig');
+    const r = await apiFetch('/getnetworkconfig');
     const j = await r.json();
     if (j.data) {
       $('#n_ip').value = j.data.ip || '';
@@ -344,7 +367,7 @@ async function saveNetwork(restartAfter = false) {
       gateway: $('#n_gw').value,
       dns: $('#n_dns').value
     });
-    const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
+    const r = await apiFetch('/updatenetworkconfig', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') throw new Error(apiError(j.code, '网络参数保存失败'));
     if (restartAfter) {
@@ -364,7 +387,7 @@ async function saveIdentity() {
       sn: $('#n_sn').value,
       bloothaddress: $('#n_ble').value
     });
-    const r = await fetch('/updatenetworkconfig', { method: 'POST', body: fd });
+    const r = await apiFetch('/updatenetworkconfig', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') throw new Error(apiError(j.code, '设备基本信息保存失败'));
     toast('设备基本信息已保存', true);
@@ -380,7 +403,7 @@ async function saveSystemInfo() {
       manufacturer: $('#s_manufacturer').value,
       model: $('#s_model').value
     });
-    const r = await fetch('/updatesysteminfoconfig', { method: 'POST', body: fd });
+    const r = await apiFetch('/updatesysteminfoconfig', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') throw new Error(apiError(j.code, '系统信息保存失败'));
     toast('系统信息已保存', true);
@@ -391,7 +414,7 @@ async function saveSystemInfo() {
 // Load RS485 port config — 与原 C++ WebIndex 的 9 个参数完全对应
 async function loadPorts() {
   try {
-    const r = await fetch('/getportconfig');
+    const r = await apiFetch('/getportconfig');
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
@@ -458,7 +481,7 @@ async function savePorts(restartAfter = false) {
         responeinteval: $(`#p_timeout_${i}`).value,
         tti: $(`#p_tti_${i}`).value,
       });
-      const response = await fetch('/updateportconfig', { method: 'POST', body: fd });
+      const response = await apiFetch('/updateportconfig', { method: 'POST', body: fd });
       const result = await response.json();
       if (result.code !== '0') throw new Error(`端口${i+1}: ${result.code}`);
     }
@@ -473,10 +496,9 @@ async function savePorts(restartAfter = false) {
 }
 
 // Poll IO data
-let pollTimer;
 async function pollIO() {
   try {
-    const r = await fetch('/getiodata');
+    const r = await apiFetch('/getiodata');
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
@@ -533,12 +555,12 @@ async function pollIO() {
       keys.forEach(k => {
         const n = k.replace('ai_addr_', '');
         const v = d.ai_data[k];
-        const min = Number((d.ai_data_min || {})[`ai_addr_min_${n}`] || 0);
-        const max = Number((d.ai_data_max || {})[`ai_addr_max_${n}`] || 0);
-        const calibrated = min > 0 && max > min;
-        const pct = Math.min(100, (v / 4095) * 100);
+        const calibration = (d.ai_effective || {})[k] || {};
+        const calibrated = calibration.source && calibration.source !== 'default';
+        const pct = Math.max(0, Math.min(100, (v / 4095) * 100));
         const value = v;
-        const state = calibrated ? '校准量/4095' : '默认标定/待校准';
+        const states = { full: '双端标定/4095', zero: '零点标定/4095', span: '满量程标定/4095' };
+        const state = states[calibration.source] || '默认参考/4095';
         aiHtml += `<div class="ai-item"><span style="min-width:32px;font-size:12px;color:var(--dim)">AI${n}</span>
           <div class="ai-bar"><i style="width:${pct}%"></i></div>
           <span class="ai-val${calibrated ? '' : ' invalid'}">${value}</span>
@@ -552,7 +574,7 @@ async function pollIO() {
 // Poll system status
 async function pollStatus() {
   try {
-    const r = await fetch('/getsystemstatus');
+    const r = await apiFetch('/getsystemstatus');
     const j = await r.json();
     if (!j.data) return;
     const d = j.data;
@@ -583,7 +605,7 @@ async function pollStatus() {
 async function toggleDO(addr, val) {
   try {
     const fd = new URLSearchParams({ type:'iocontrol', addr: addr, value: val ? 1 : 0 });
-    const r = await fetch('/iocontrol', { method: 'POST', body: fd });
+    const r = await apiFetch('/iocontrol', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code !== '0') { toast('控制失败: ' + j.code, false); }
     else { toast('控制指令已接收，请查看输出确认状态', true); await pollIO(); }
@@ -597,7 +619,7 @@ async function changePwd() {
   if (!opwd || !npwd) { toast('请填写旧密码和新密码', false); return; }
   return runAction('password_save_btn', '提交中', async () => { try {
     const fd = new URLSearchParams({ opwd, npwd });
-    const r = await fetch('/updatepwd', { method: 'POST', body: fd });
+    const r = await apiFetch('/updatepwd', { method: 'POST', body: fd });
     const j = await r.json();
     if (j.code === '0') {
       toast('密码已修改，即将退出登录', true);
@@ -610,7 +632,7 @@ async function changePwd() {
 
 async function pollNfcStatus() {
   try {
-    const r = await fetch('/getnfcstatus');
+    const r = await apiFetch('/getnfcstatus');
     const j = await r.json();
     if (!j.data) return;
     $('#nfc_started').textContent = j.data.started ? '已启动' : '未启动';
@@ -620,7 +642,7 @@ async function pollNfcStatus() {
 
 async function nfcBackup() {
   return runAction('nfc_backup_btn', '备份中', async () => { try {
-    const r = await fetch('/nfcbackup', { method: 'POST' });
+    const r = await apiFetch('/nfcbackup', { method: 'POST' });
     const j = await r.json();
     toast(j.code === '0' ? 'NFC 备份请求已提交' : 'NFC 备份失败: ' + j.code, j.code === '0');
     setTimeout(pollNfcStatus, 5500);
@@ -630,7 +652,7 @@ async function nfcBackup() {
 async function nfcRestore() {
   if (!confirm('确认用 NFC 快照覆盖当前设备配置?')) return;
   return runAction('nfc_restore_btn', '恢复中', async () => { try {
-    const r = await fetch('/nfcrestore', { method: 'POST' });
+    const r = await apiFetch('/nfcrestore', { method: 'POST' });
     const j = await r.json();
     toast(j.code === '0' ? 'NFC 恢复请求已提交' : 'NFC 恢复失败: ' + j.code, j.code === '0');
     setTimeout(pollNfcStatus, 5500);
@@ -647,7 +669,7 @@ async function rebootDevice(buttonId = 'reboot_btn', afterConfigSave = false) {
   button.textContent = '正在提交';
   try {
     const body = afterConfigSave ? new URLSearchParams({ after_config_save: '1' }) : undefined;
-    const r = await fetch('/reboot', { method: 'POST', body });
+    const r = await apiFetch('/reboot', { method: 'POST', body });
     const j = await r.json();
     if (j.code !== '0') throw new Error(apiError(j.code, '重启请求失败'));
     clearInterval(pollTimer);
@@ -698,6 +720,7 @@ async function uploadOta() {
     }
   };
   xhr.onload = () => {
+    if (handleSessionExpiry(xhr.status, xhr.responseURL)) return;
     try {
       const j = JSON.parse(xhr.responseText);
       if (j.code === '0') {
@@ -733,8 +756,8 @@ loadPorts();
 pollIO();
 pollTimer = setInterval(pollIO, 1500);
 pollStatus();
-const statusTimer = setInterval(pollStatus, 2000);
+statusTimer = setInterval(pollStatus, 2000);
 pollNfcStatus();
-const nfcStatusTimer = setInterval(pollNfcStatus, 5000);
+nfcStatusTimer = setInterval(pollNfcStatus, 5000);
 </script>
 </body></html>

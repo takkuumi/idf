@@ -43,6 +43,7 @@ pub enum LegacyTableCommitError {
     BaselineChanged,
     HoldingWrite,
     Persist,
+    NoMemory,
 }
 
 struct LegacyTableStage {
@@ -50,20 +51,25 @@ struct LegacyTableStage {
     header_words: usize,
     terminal_word: usize,
     baseline_crc32: u32,
-    words: HVec<u16, LEGACY_TABLE_MAX_WORDS>,
+    // Only one upload can be staged. Allocate its validated, bounded buffer
+    // once with a fallible reserve instead of copying 3.4 KiB values through
+    // every Result/Option on the main/NFC task stack.
+    words: std::vec::Vec<u16>,
     received: [u8; LEGACY_TABLE_COVERAGE_BYTES],
     updated_at: Instant,
 }
 
 impl LegacyTableStage {
-    fn begin(session_epoch: u32, header: &[u16]) -> Result<Self, ()> {
+    fn begin(session_epoch: u32, header: &[u16]) -> Result<Self, LegacyTableCommitError> {
         if header.len() < 2 {
-            return Err(());
+            return Err(LegacyTableCommitError::InvalidTable);
         }
         let count = usize::from(header[0]);
-        let header_words = count.checked_add(2).ok_or(())?;
+        let header_words = count
+            .checked_add(2)
+            .ok_or(LegacyTableCommitError::InvalidTable)?;
         if count > LEGACY_TABLE_MAX_RECORDS || header.len() != header_words {
-            return Err(());
+            return Err(LegacyTableCommitError::InvalidTable);
         }
         let terminal_word = if count == 0 && header[1] == 0 {
             // Stock Android's empty-table builder leaves its terminal word zero.
@@ -73,11 +79,11 @@ impl LegacyTableStage {
             usize::from(header[count + 1])
         };
         if terminal_word < header_words || terminal_word > LEGACY_TABLE_MAX_WORDS {
-            return Err(());
+            return Err(LegacyTableCommitError::InvalidTable);
         }
         if count == 0 {
             if terminal_word != 2 {
-                return Err(());
+                return Err(LegacyTableCommitError::InvalidTable);
             }
         } else {
             let mut expected = header_words;
@@ -85,18 +91,19 @@ impl LegacyTableStage {
                 let start = usize::from(header[index + 1]);
                 let end = usize::from(header[index + 2]);
                 if start != expected || start >= end || end > terminal_word {
-                    return Err(());
+                    return Err(LegacyTableCommitError::InvalidTable);
                 }
                 expected = end;
             }
             if expected != terminal_word {
-                return Err(());
+                return Err(LegacyTableCommitError::InvalidTable);
             }
         }
-        let mut words = HVec::new();
-        for _ in 0..terminal_word {
-            words.push(0).map_err(|_| ())?;
-        }
+        let mut words = std::vec::Vec::new();
+        words
+            .try_reserve_exact(terminal_word)
+            .map_err(|_| LegacyTableCommitError::NoMemory)?;
+        words.resize(terminal_word, 0);
         words[..header_words].copy_from_slice(header);
         words[count + 1] = terminal_word as u16;
         let mut stage = Self {
@@ -178,13 +185,11 @@ pub fn stage_legacy_function_table_block(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if address == base {
-        let stage = LegacyTableStage::begin(session_epoch, values)
-            .map_err(|_| LegacyTableCommitError::InvalidTable)
-            .and_then(|mut stage| {
-                stage.baseline_crc32 = active_function_table_crc32()
-                    .map_err(|_| LegacyTableCommitError::HoldingWrite)?;
-                Ok(stage)
-            });
+        let stage = LegacyTableStage::begin(session_epoch, values).and_then(|mut stage| {
+            stage.baseline_crc32 =
+                active_function_table_crc32().map_err(|_| LegacyTableCommitError::HoldingWrite)?;
+            Ok(stage)
+        });
         return Some(match stage {
             Ok(stage) if stage.header_words == stage.terminal_word => {
                 let committed = commit_legacy_function_table(&stage.words, stage.baseline_crc32);
@@ -307,16 +312,16 @@ fn commit_legacy_function_table(
         return Err(LegacyTableCommitError::BaselineChanged);
     }
     let base = crate::config::regs::HOLD_DEVICE_CONFIG;
-    let previous = crate::bus::storage_state::storage_read_with(|storage| {
-        let offset = usize::from(base - crate::config::regs::HOLD_PXX_BASE);
-        let mut words: HVec<u16, LEGACY_TABLE_MAX_WORDS> = HVec::new();
-        words
-            .extend_from_slice(&storage.holding_buf[offset..offset + LEGACY_TABLE_MAX_WORDS])
-            .ok()?;
-        Some(words)
-    })
-    .flatten()
-    .ok_or(LegacyTableCommitError::HoldingWrite)?;
+    // Retain the immutable RCU snapshot for rollback. A full heapless table
+    // returned by value previously added multiple 3.4 KiB copies to this call
+    // chain, overflowing the production main task during the final BLE block.
+    let previous =
+        crate::bus::storage_state::storage_read().ok_or(LegacyTableCommitError::HoldingWrite)?;
+    let offset = usize::from(base - crate::config::regs::HOLD_PXX_BASE);
+    let previous_words = previous
+        .holding_buf
+        .get(offset..offset + LEGACY_TABLE_MAX_WORDS)
+        .ok_or(LegacyTableCommitError::HoldingWrite)?;
     crate::bus::backends::arm_logic_write();
     if !crate::bus::backends::write_hold_regs(base, words) {
         crate::bus::backends::disarm_logic_write();
@@ -332,7 +337,7 @@ fn commit_legacy_function_table(
         // Keep the previous active runtime table and leave its snapshot dirty
         // for the normal actor retry path if flash remains unavailable.
         crate::bus::backends::arm_logic_write();
-        if !crate::bus::backends::write_hold_regs(base, &previous) {
+        if !crate::bus::backends::write_hold_regs(base, previous_words) {
             crate::bus::backends::disarm_logic_write();
             log::error!("[logic_cfg] staged table rollback to previous runtime state failed");
         } else if let Err(rollback_error) = crate::device::holding_store::save_to_nvs() {
@@ -914,7 +919,8 @@ mod tests {
 
     #[test]
     fn staged_legacy_table_accepts_identical_retry_and_rejects_conflicting_retry() {
-        let mut stage = LegacyTableStage::begin(77, &[1, 3, 5]).expect("valid header");
+        let mut stage = LegacyTableStage::begin(77, &[1, 3, 6])
+            .expect("valid header with a pending final word");
         assert!(!stage.append(77, 3, &[0x1234, 0x5678]).unwrap());
         assert!(!stage.append(77, 3, &[0x1234]).unwrap());
         assert!(stage.append(77, 3, &[0xffff]).is_err());
@@ -927,6 +933,34 @@ mod tests {
         let stock = LegacyTableStage::begin(77, &[0, 0]).expect("stock Android empty table");
         assert_eq!(stock.words.as_slice(), &[0, 2]);
         assert!(LegacyTableStage::begin(77, &[0, 3]).is_err());
+    }
+
+    #[test]
+    fn test_staged_table_metadata_does_not_embed_the_upload_payload() {
+        assert!(
+            core::mem::size_of::<LegacyTableStage>() <= 512,
+            "stage metadata must fit the bounded task stack; payload belongs in its fallible buffer"
+        );
+    }
+
+    #[test]
+    fn test_staged_table_maximum_payload_is_bounded() {
+        let mut stage = LegacyTableStage::begin(77, &[1, 3, 1700]).expect("maximum valid table");
+        assert_eq!(stage.words.len(), 1700);
+        for offset in (3..1700).step_by(123) {
+            let count = (1700 - offset).min(123);
+            let complete = stage.append(77, offset, &vec![0x1234; count]).unwrap();
+            assert_eq!(complete, offset + count == 1700);
+        }
+        assert!(LegacyTableStage::begin(77, &[1, 3, 1701]).is_err());
+    }
+
+    #[test]
+    fn test_staged_table_timeout_preserves_the_pending_words() {
+        let mut stage = LegacyTableStage::begin(77, &[1, 3, 5]).expect("valid table");
+        stage.updated_at = std::time::Instant::now() - std::time::Duration::from_secs(16);
+        assert!(stage.append(77, 3, &[0x1234]).is_err());
+        assert_eq!(stage.words[3], 0);
     }
 
     #[test]

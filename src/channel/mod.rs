@@ -1,6 +1,6 @@
 //! AI/AO 通道管理
 //!
-//! - AI：6 路 12-bit ADC，可配置采样周期、滑动平均
+//! - AI：F3/Default 四路、F4 八路 12-bit ADC，100ms 采样及滑动平均
 //! - AO：4 路 LEDC PWM 输出，经 RC 滤波成模拟量
 //!
 //! 启动入口：[`start`]
@@ -13,6 +13,7 @@ use crate::error::AppResult;
 use crate::hal::Hal;
 
 pub mod ai;
+pub(crate) mod ai_transfer;
 pub mod ao;
 pub mod calib;
 pub mod calibration_window;

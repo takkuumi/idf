@@ -1661,16 +1661,22 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     // AI 值
     let ai_count = crate::config::hw_version::AI_COUNT;
     let mut ai_data = String::new();
+    let mut ai_raw = String::new();
+    let mut ai_effective = String::new();
     let mut ai_max = String::new();
     let mut ai_min = String::new();
     for i in 0..ai_count {
         if i > 0 {
             ai_data.push(',');
+            ai_raw.push(',');
+            ai_effective.push(',');
             ai_max.push(',');
             ai_min.push(',');
         }
         let val = crate::bus::backends::read_input_reg(regs::INREG_AI_BASE + i).unwrap_or(0);
         ai_data.push_str(&format!("\"ai_addr_{}\":{}", i, val));
+        let raw = crate::bus::IO.ai.get_raw(usize::from(i));
+        ai_raw.push_str(&format!("\"ai_addr_{}\":{}", i, raw));
         // C++ 在 getiodata 同时返回 ai_data_max / ai_data_min (校准值), 来自 holding_buf 2288+/2280+
         let max_v =
             crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MAX_BASE + i).unwrap_or(0);
@@ -1678,6 +1684,18 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
             crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MIN_BASE + i).unwrap_or(0);
         ai_max.push_str(&format!("\"ai_addr_max_{}\":{}", i, max_v));
         ai_min.push_str(&format!("\"ai_addr_min_{}\":{}", i, min_v));
+        let (effective_min, effective_max) =
+            crate::channel::ai_transfer::effective_calibration(min_v, max_v);
+        let source = match (min_v == effective_min, max_v == effective_max) {
+            (true, true) => "full",
+            (false, true) if min_v == 0 => "zero",
+            (true, false) if max_v == 0 => "span",
+            _ => "default",
+        };
+        ai_effective.push_str(&format!(
+            "\"ai_addr_{}\":{{\"min\":{},\"max\":{},\"source\":\"{}\"}}",
+            i, effective_min, effective_max, source
+        ));
     }
 
     #[cfg(any(feature = "f3", feature = "f4"))]
@@ -1693,8 +1711,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         crate::bus::storage_state::STORAGE.max_reclaim_wait_us()
     );
     let json = format!(
-        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}},"diagnostics":{}}}}}"#,
-        state_data, di_data, do_data, ai_data, ai_max, ai_min, diagnostics,
+        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_raw":{{{}}},"ai_effective":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}},"diagnostics":{}}}}}"#,
+        state_data, di_data, do_data, ai_data, ai_raw, ai_effective, ai_max, ai_min, diagnostics,
     );
     send_json(stream, 200, &json)
 }
@@ -2376,7 +2394,7 @@ mod tests {
         assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"n_mac\""));
         assert!(pages::INDEX_HTML.contains("onclick=\"saveNetwork()\""));
         assert!(pages::INDEX_HTML.contains("onclick=\"saveIdentity()\""));
-        assert!(pages::INDEX_HTML.contains("未校准/无输入"));
+        assert!(pages::INDEX_HTML.contains("归一化值 0–4095"));
         assert!(pages::INDEX_HTML.contains("ai_data_min"));
         assert!(pages::INDEX_HTML.contains("网络参数已保存，重启设备后生效"));
         assert!(pages::INDEX_HTML.contains("设备基本信息已保存"));

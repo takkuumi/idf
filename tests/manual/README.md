@@ -161,3 +161,20 @@ python3 tests/manual/test_ble_network_config.py --write-ip 192.168.51.220
 脚本读取现有掩码和网关并原样保留，用户确认目标 IP 后才写入。网关会复位，脚本
 等待 BLE 重新广播、重新连接并读取验证。只在可通过 BLE 找回设备、且目标 IP 属于
 现场网段时执行。
+
+
+## 3.2.0 Web 会话 / AI 诊断验收
+
+- `ai_idle_acceptance.py HOST --out DIR --samples 120 --verify`：只读原始 ADC、归一化值与标定端点，逐项复算；不自动写零点。通过 `GW_STABILITY_WEB_PASSWORD` 提供凭证，凭证不会写入日志。
+- `web_session_acceptance.py --host HOST --fixtures AI_DIR --out DIR`：需要 Playwright 和本机 Chrome。先用实际嵌入 HTML 在本地 HTTP 测试服务覆盖所有 API、401/403/301、网络失败及 OTA XHR，再用实机验证新登录替换旧会话后自动退出。OTA 用例仅在本地测试服务执行，不向设备上传测试文件。
+- `ble_device_acceptance.py --mac MAC --expected-version 3.2.0 --out DIR`：混合读取；`--persistence` 临时修改位置后复位验证并恢复；`--logic-roundtrip --logic-repeats N` 重传原组态，覆盖最后 ATT 写入立即断线。两种写测试都会实际落盘，只限独占台架。
+- `tcp_connection_acceptance.py HOST --expected-version 320 --out DIR`：四端口只读连接回收与建连读取。
+- `web_identity_persistence.py HOST --apply --out DIR`：原串口参数保存回读、Web 显示名复位持久化和原配置恢复。
+
+同一设备只有一个 Web 会话；浏览器验收与 Web 压测应顺序执行，不能相互替换会话。读压力结束后再执行带复位的持久化用例。
+
+
+## LoRa 透明 RTU 对端
+
+`lora_rtu_acceptance.py --port <外置USB-E22> --host <设备IP> --count 100 --out DIR`
+仅发送 FC01/02/03/04 只读帧，核对版本、MAC、组态及长文本与同设备 TCP 基线；保留失败、原始帧和首字节/完整帧时延。不能填板上下载串口后宣称无线通过。脚本不会修改无线模式、波特率、配置或 Q 点；连续三次无首字节将终止并报告失败。
