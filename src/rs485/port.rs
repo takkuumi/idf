@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::error::{AppError, AppResult};
 use crate::rs485::config::Rs485Config;
+use crate::rs485::framing::{self, Direction, ReadPlan};
 
 const RX_BUF_SIZE: i32 = 256;
 // One maximum 256-byte RTU frame plus driver item metadata fits without
@@ -53,6 +54,11 @@ pub struct Rs485Port {
 }
 
 impl Rs485Port {
+    /// True only for the F3 LoRa UART0 transport. Other UARTs retain wired RTU framing.
+    pub(crate) const fn uses_radio_framing(&self) -> bool {
+        cfg!(all(feature = "f3", feature = "lora")) && self.cfg.uart_port == 0
+    }
+
     /// 打开一路 RS485
     pub fn open(cfg: &Rs485Config) -> AppResult<Self> {
         // 1. 配置 UART 参数
@@ -190,8 +196,21 @@ impl Rs485Port {
         )?;
         self.write(request)?;
         let mut buf = [0u8; 256];
-        let n =
-            self.read_with_first_byte_timeout(&mut buf, first_byte_timeout_ms, frame_timeout_ms)?;
+        let effective_frame_timeout = if self.uses_radio_framing() {
+            frame_timeout_ms.max(framing::RADIO_FRAME_TIMEOUT_MS)
+        } else {
+            frame_timeout_ms
+        };
+        let n = if self.uses_radio_framing() {
+            self.read_length_framed(
+                &mut buf,
+                first_byte_timeout_ms,
+                effective_frame_timeout,
+                Direction::Response,
+            )?
+        } else {
+            self.read_with_first_byte_timeout(&mut buf, first_byte_timeout_ms, frame_timeout_ms)?
+        };
         let mut out = heapless::Vec::new();
         out.extend_from_slice(&buf[..n])
             .map_err(|_| AppError::Rs485("response too long".into()))?;
@@ -239,7 +258,131 @@ impl Rs485Port {
     ///   - 115200bps: ≈ 0.33ms (最小限制 1ms, 保证实际可行)
     pub fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> AppResult<usize> {
         let frame_ms = self.transaction_timeout_ms(0, buf.len(), timeout_ms);
-        self.read_with_first_byte_timeout(buf, timeout_ms, frame_ms)
+        if self.uses_radio_framing() {
+            self.read_length_framed(
+                buf,
+                timeout_ms,
+                frame_ms.max(framing::RADIO_FRAME_TIMEOUT_MS),
+                Direction::Request,
+            )
+        } else {
+            self.read_with_first_byte_timeout(buf, timeout_ms, frame_ms)
+        }
+    }
+
+    /// UART0 carries E22 transparent-radio packets, whose inter-packet gaps do
+    /// not mark an RTU frame boundary. Read supported Modbus frames to their
+    /// declared length; keep wired UARTs on the standard t3.5 path above.
+    fn read_length_framed(
+        &mut self,
+        buf: &mut [u8],
+        first_byte_timeout_ms: u64,
+        frame_timeout_ms: u64,
+        direction: Direction,
+    ) -> AppResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let port = self.cfg.uart_port as uart_port_t;
+        let first_deadline =
+            std::time::Instant::now() + Duration::from_millis(first_byte_timeout_ms.max(1));
+        let mut total = 0usize;
+        let mut byte = [0u8; 1];
+        while total == 0 && std::time::Instant::now() < first_deadline {
+            crate::health::feed_wdt();
+            let remaining_ms = first_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .max(1)
+                .min(RX_TIMEOUT_MS as u128) as u64;
+            let n = unsafe {
+                uart_read_bytes(
+                    port,
+                    byte.as_mut_ptr() as *mut _,
+                    1,
+                    ms_to_ticks(remaining_ms),
+                )
+            };
+            if n < 0 {
+                return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
+            }
+            if n > 0 {
+                buf[0] = byte[0];
+                total = 1;
+            }
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+
+        let frame_started = std::time::Instant::now();
+        let frame_deadline = frame_started + Duration::from_millis(frame_timeout_ms.max(1));
+        loop {
+            crate::health::feed_wdt();
+            match framing::read_plan(&buf[..total], direction, buf.len()) {
+                ReadPlan::Complete => break,
+                ReadPlan::NeedBytes(missing) => {
+                    let remaining_ms = frame_deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    if remaining_ms == 0 {
+                        break;
+                    }
+                    let requested = missing.min(buf.len() - total);
+                    let wait_ms = framing::RADIO_PACKET_GAP_TIMEOUT_MS
+                        .min(remaining_ms)
+                        .max(1);
+                    let n = unsafe {
+                        uart_read_bytes(
+                            port,
+                            buf[total..total + requested].as_mut_ptr() as *mut _,
+                            requested as u32,
+                            ms_to_ticks(wait_ms),
+                        )
+                    };
+                    if n < 0 {
+                        return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    total += n as usize;
+                }
+                ReadPlan::GapDelimited => {
+                    while total < buf.len() {
+                        let remaining =
+                            frame_deadline.saturating_duration_since(std::time::Instant::now());
+                        let wait_ticks = super::timing::inter_byte_wait_ticks(
+                            self.cfg.baud,
+                            remaining.as_micros().min(u128::from(u64::MAX)) as u64,
+                            u64::from(portTICK_PERIOD_MS.max(1)),
+                        );
+                        if wait_ticks == 0 {
+                            break;
+                        }
+                        let n = unsafe {
+                            uart_read_bytes(
+                                port,
+                                buf[total..].as_mut_ptr() as *mut _,
+                                1,
+                                wait_ticks,
+                            )
+                        };
+                        if n < 0 {
+                            return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
+                        }
+                        if n == 0 {
+                            break;
+                        }
+                        total += n as usize;
+                    }
+                    break;
+                }
+            }
+        }
+        super::diagnostics::rx(self.cfg.uart_port, total, frame_started.elapsed());
+        Ok(total)
     }
 
     /// 先快速等待首字节，收到后再开启完整帧超时预算。

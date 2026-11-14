@@ -16,6 +16,7 @@ pub use port::Rs485Port;
 pub mod config;
 pub mod diagnostics;
 pub mod dip;
+pub(crate) mod framing;
 pub mod port;
 pub(crate) mod timing;
 

@@ -8,9 +8,11 @@ from run_production_core import item
 ROOT=Path(__file__).resolve().parents[2]
 s=(ROOT/'src/hal/pca9555.rs').read_text()
 functions='\n'.join(item(s,'fn '+name+'(') for name in (
-    'bit_reverse','worker_sample_di','worker_write_do','worker_read_do'))
+    'bit_reverse','decode_di_bank_legacy','decode_di_bank_f4','decode_di_bank',
+    'encode_do_bank','decode_do_bank','worker_sample_di','worker_write_do','worker_read_do'))
 submission = item(s, 'fn submit_output(')
 for chips,di,do in ((1,[0x40],[0x42]),(3,[0x40,0x44,0x42],[0x48,0x4c,0x4e])):
+ expected_di_bank = '0x0101'
  source='''
 #![allow(dead_code)]
 use std::cell::{RefCell,Cell};
@@ -86,14 +88,54 @@ fn test_led_bus_failure_cannot_invalidate_input_sample() {
  let io=BusI2c::new(); let led=BusI2c::new(); led.fail.set(true);
  for &addr in DI_IO_ADDRS {io.data.borrow_mut().insert((addr,REG_INPUT_0),[0xfe,0x7f]);}
  let (bits,_)=worker_sample_di(&io).unwrap();
- for i in 0..MAX_CHIPS {assert_eq!((bits>>(i*16))&0xffff,0x0101);}
+ for i in 0..MAX_CHIPS {assert_eq!((bits>>(i*16))&0xffff,'''+expected_di_bank+''');}
  assert!(led.write_regs2(0x40,REG_OUTPUT_0,[0;2]).is_err());
  assert_eq!(worker_sample_di(&io).unwrap().0,bits);
  io.fail.set(true); assert!(worker_sample_di(&io).is_err());
 }
+#[test]
+fn test_all_di_pins_map_to_logical_point_order() {
+ let io=BusI2c::new();
+ for &addr in DI_IO_ADDRS {io.data.borrow_mut().insert((addr,REG_INPUT_0),[0xff;2]);}
+ for bank in 0..MAX_CHIPS {
+  for port in 0..2 {
+   for pin in 0..8 {
+    for &addr in DI_IO_ADDRS {io.data.borrow_mut().insert((addr,REG_INPUT_0),[0xff;2]);}
+    let addr=DI_IO_ADDRS[bank];
+    let mut raw=[0xff;2]; raw[port] &= !(1 << pin);
+    io.data.borrow_mut().insert((addr,REG_INPUT_0),raw);
+    let expected_point=bank*16 + if port==0 {
+     pin
+    } else {
+     8 + (7-pin)
+    };
+    assert_eq!(worker_sample_di(&io).unwrap().0,1u64<<expected_point,
+     "bank={bank}, port={port}, pin={pin}, expected point={}",expected_point+1);
+   }
+  }
+ }
+}
+#[test]
+fn test_all_do_pins_map_to_legacy_port_order() {
+ for pin in 0..16 {
+  let logical=1u16<<pin;
+  let raw=encode_do_bank(logical);
+  let expected=if cfg!(feature="f4") {
+   if pin<8 { [1u8<<pin,0] } else { [0,1u8<<(15-pin)] }
+  } else {
+   if pin<8 { [1u8<<(7-pin),0] } else { [0,1u8<<(15-pin)] }
+  };
+  assert_eq!(raw,expected,"pin={}",pin+1);
+  assert_eq!(decode_do_bank(raw),logical,"pin={}",pin+1);
+ }
+}
 '''
  with tempfile.TemporaryDirectory(prefix='gateway-io-transactions-') as directory:
   p=Path(directory);(p/'tests.rs').write_text(source)
-  subprocess.run(['rustc','+stable','--edition=2024','--test',str(p/'tests.rs'),'-o',str(p/'tests')],check=True)
+  command=['rustc','+stable','--edition=2024','--test']
+  if chips == 3:
+   command += ['--cfg', 'feature="f4"']
+  command += [str(p/'tests.rs'),'-o',str(p/'tests')]
+  subprocess.run(command,check=True)
   print(f'Actual PCA helpers: {chips} chip bank(s)',flush=True)
   subprocess.run([str(p/'tests')],check=True,timeout=30)

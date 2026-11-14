@@ -29,6 +29,15 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 const MAX_POLL_ITEMS: usize = 64;
 const FIRST_BYTE_TIMEOUT_MS: u64 = 250;
+const RADIO_FIRST_BYTE_TIMEOUT_MS: u64 = 2_500;
+
+fn response_first_byte_timeout_ms(is_radio: bool, configured_timeout_ms: u64) -> u64 {
+    if is_radio {
+        RADIO_FIRST_BYTE_TIMEOUT_MS
+    } else {
+        configured_timeout_ms.clamp(1, FIRST_BYTE_TIMEOUT_MS)
+    }
+}
 const RETRY_BACKOFF_MS: u64 = 50;
 const POLL_ROUND_BUDGET_MS: u64 = 5_000;
 const MONITOR_RESULT_COUNT: usize = crate::config::regs::MONITOR_PLC_COUNT as usize;
@@ -503,7 +512,8 @@ fn poll_once(port: &mut Rs485Port, item: PollItem, timeout_ms: u64) -> AppResult
     let req = build_request(item);
     let response_len = expected_response_len(item);
     let frame_timeout_ms = port.transaction_timeout_ms(req.len(), response_len, timeout_ms);
-    let first_byte_timeout_ms = timeout_ms.clamp(1, FIRST_BYTE_TIMEOUT_MS);
+    let first_byte_timeout_ms =
+        response_first_byte_timeout_ms(port.uses_radio_framing(), timeout_ms);
     let resp =
         match port.send_recv_with_first_byte_timeout(&req, first_byte_timeout_ms, frame_timeout_ms)
         {
@@ -824,6 +834,24 @@ mod tests {
     fn test_no_device_first_byte_budget_is_shorter_than_frame_budget() {
         assert!(FIRST_BYTE_TIMEOUT_MS < POLL_ROUND_BUDGET_MS);
         assert_eq!(RETRY_BACKOFF_MS, 50);
+    }
+
+    #[test]
+    fn test_lora_first_byte_budget_covers_measured_transparent_link_latency() {
+        assert_eq!(response_first_byte_timeout_ms(false, 100), 100);
+        assert_eq!(
+            response_first_byte_timeout_ms(false, 2_000),
+            FIRST_BYTE_TIMEOUT_MS
+        );
+        assert_eq!(
+            response_first_byte_timeout_ms(true, 100),
+            RADIO_FIRST_BYTE_TIMEOUT_MS
+        );
+        assert_eq!(
+            response_first_byte_timeout_ms(true, 5_000),
+            RADIO_FIRST_BYTE_TIMEOUT_MS
+        );
+        assert!(RADIO_FIRST_BYTE_TIMEOUT_MS < POLL_ROUND_BUDGET_MS);
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! ## Data transforms (matching reference firmware)
 //! - DO IO: `bit_reverse(byte)` — EXchg_ByteHl
 //! - DO LED: `!byte` — inverted (low-active)
-//! - DI read: `!raw` — inverted (active-low input)
+//! - DI read: active-low inversion plus board-specific pin ordering
 //! - DI LED: `raw` — direct (low-active LED, 0=input-active=LED-ON)
 
 use crate::error::{AppError, AppResult};
@@ -552,26 +552,72 @@ fn publish_do_readback(state: &Pca9555WorkerState, bits: u64) {
     state.do_readback_valid.store(true, Ordering::SeqCst);
 }
 
+/// Decode the legacy F3/Default PCA9555 input bank.
+fn decode_di_bank_legacy(raw: [u8; 2]) -> u16 {
+    u16::from(raw[0] ^ 0xFF) | (u16::from(bit_reverse(raw[1]) ^ 0xFF) << 8)
+}
+
+/// Decode one F4 PCA9555 input bank into logical I-point order.
+///
+/// The legacy F48 firmware does not use one transform for both ports:
+/// P0 is wired in logical bit order and only active-low inverted; P1 is
+/// wired in reverse bit order and therefore also needs `bit_reverse`.
+/// Applying the P1 transform to P0 makes I1..I8, I17..I24 and I33..I40
+/// appear reversed.
+fn decode_di_bank_f4(raw: [u8; 2]) -> u16 {
+    u16::from(raw[0] ^ 0xFF) | (u16::from(bit_reverse(raw[1]) ^ 0xFF) << 8)
+}
+
+fn decode_di_bank(raw: [u8; 2]) -> u16 {
+    if cfg!(feature = "f4") {
+        decode_di_bank_f4(raw)
+    } else {
+        decode_di_bank_legacy(raw)
+    }
+}
+
 fn worker_sample_di(io_bus: &BusI2c) -> AppResult<(u64, [[u8; 2]; MAX_CHIPS])> {
     let mut result = 0u64;
     let mut samples = [[0; 2]; MAX_CHIPS];
     for (index, &addr) in DI_IO_ADDRS.iter().enumerate() {
         let raw = io_bus.read_regs2(addr, REG_INPUT_0)?;
         samples[index] = raw;
-        let bits = u64::from(!raw[0]) | (u64::from(bit_reverse(raw[1]) ^ 0xFF) << 8);
-        result |= bits << (index * 16);
+        result |= u64::from(decode_di_bank(raw)) << (index * 16);
     }
     Ok((result, samples))
 }
 
+/// Encode/decode one output bank using the board-specific legacy wiring.
+/// F48 has logical P0; F16/F3 retain their legacy reversal on both ports.
+fn encode_do_bank(logical: u16) -> [u8; 2] {
+    #[cfg(feature = "f4")]
+    {
+        [logical as u8, bit_reverse((logical >> 8) as u8)]
+    }
+    #[cfg(not(feature = "f4"))]
+    {
+        [
+            bit_reverse(logical as u8),
+            bit_reverse((logical >> 8) as u8),
+        ]
+    }
+}
+
+fn decode_do_bank(raw: [u8; 2]) -> u16 {
+    #[cfg(feature = "f4")]
+    {
+        u16::from(raw[0]) | (u16::from(bit_reverse(raw[1])) << 8)
+    }
+    #[cfg(not(feature = "f4"))]
+    {
+        u16::from(bit_reverse(raw[0])) | (u16::from(bit_reverse(raw[1])) << 8)
+    }
+}
+
 fn worker_write_do(io_bus: &BusI2c, value: u64) -> AppResult<()> {
     for (i, &addr) in DO_IO_ADDRS.iter().enumerate() {
-        let raw = (value >> (i * 16)) as u16;
-        io_bus.write_regs2(
-            addr,
-            REG_OUTPUT_0,
-            [bit_reverse(raw as u8), bit_reverse((raw >> 8) as u8)],
-        )?;
+        let raw = encode_do_bank((value >> (i * 16)) as u16);
+        io_bus.write_regs2(addr, REG_OUTPUT_0, raw)?;
     }
     Ok(())
 }
@@ -580,8 +626,7 @@ fn worker_read_do(io_bus: &BusI2c) -> AppResult<u64> {
     let mut result = 0u64;
     for (i, &addr) in DO_IO_ADDRS.iter().enumerate() {
         let raw = io_bus.read_regs2(addr, REG_OUTPUT_0)?;
-        result |= u64::from(bit_reverse(raw[0])) << (i * 16);
-        result |= u64::from(bit_reverse(raw[1])) << (i * 16 + 8);
+        result |= u64::from(decode_do_bank(raw)) << (i * 16);
     }
     Ok(result)
 }
@@ -965,6 +1010,46 @@ mod tests {
         assert_eq!(DO_IO_ADDRS, &[0x48, 0x4C, 0x4E]);
         assert_eq!(crate::config::hw_version::DI_COUNT, 48);
         assert_eq!(crate::config::hw_version::DO_COUNT, 48);
+    }
+
+    #[test]
+    fn test_f4_di_bank_matches_legacy_p0_p1_wiring() {
+        // Active-low inputs: P0.0 is I1, P0.7 is I8; P1.0 is I16,
+        // P1.7 is I9. Only P1 is bit-reversed by the old F48 firmware.
+        assert_eq!(decode_di_bank_f4([0xFE, 0xFF]), 0x0001);
+        assert_eq!(decode_di_bank_f4([0x7F, 0xFF]), 0x0080);
+        assert_eq!(decode_di_bank_f4([0xFF, 0xFE]), 0x8000);
+        assert_eq!(decode_di_bank_f4([0xFF, 0x7F]), 0x0100);
+    }
+
+    #[test]
+    #[cfg(feature = "f4")]
+    fn test_f4_do_bank_matches_legacy_p0_p1_wiring() {
+        // Q1/Q8 and Q9/Q16 must retain ascending logical order at the
+        // physical P0/P1 ports; the second port is the only reversal.
+        assert_eq!(encode_do_bank(0x0001), [0x01, 0x00]);
+        assert_eq!(encode_do_bank(0x0080), [0x80, 0x00]);
+        assert_eq!(encode_do_bank(0x0100), [0x00, 0x80]);
+        assert_eq!(encode_do_bank(0x8000), [0x00, 0x01]);
+        for value in [0x0001, 0x0080, 0x0100, 0x8000, 0xA581] {
+            assert_eq!(decode_do_bank(encode_do_bank(value)), value);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "f4"))]
+    fn test_f3_do_bank_preserves_legacy_reversal_on_both_ports() {
+        assert_eq!(encode_do_bank(0x0001), [0x80, 0x00]);
+        assert_eq!(encode_do_bank(0x0080), [0x01, 0x00]);
+        assert_eq!(encode_do_bank(0x0100), [0x00, 0x80]);
+        for value in [0x0001, 0x0080, 0x0100, 0x8000, 0xA581] {
+            assert_eq!(decode_do_bank(encode_do_bank(value)), value);
+        }
+    }
+
+    #[test]
+    fn test_f3_di_bank_keeps_legacy_port_order() {
+        assert_eq!(decode_di_bank_legacy([0xFE, 0x7F]), 0x0101);
     }
 
     #[test]

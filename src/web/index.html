@@ -41,7 +41,10 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .btn-w{background:var(--amber);color:#1a1a1a}.btn-w:hover{opacity:.85}
 .btn-d{background:#2a3340;color:var(--text)}.btn-d:hover{background:#3a4350}
 .btn:disabled{cursor:not-allowed;opacity:.65}.btn.busy{padding-left:34px}.btn.busy:before{content:"";position:absolute;left:14px;top:50%;width:12px;height:12px;margin-top:-7px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-.di-list,.do-list,.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
+.di-list,.do-list{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:8px}
+.state-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px}
+.io-quality{margin:12px 0 0;color:var(--dim);font-size:11px;line-height:1.4}
+.io-quality.is-warning{color:var(--amber)}.io-quality.is-error{color:var(--red)}
 .io-item{display:flex;align-items:center;gap:10px;padding:10px;background:#141920;border-radius:6px;font-size:12px}
 .led{width:14px;height:14px;border-radius:50%;background:#2a3340;flex-shrink:0;transition:.15s}
 .led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
@@ -53,7 +56,6 @@ border:1px dashed #3a4652;border-radius:5px;color:#aab6c1;font-size:13px;overflo
 .tgl input{display:none}.tgl .slider{position:absolute;inset:0;background:#4a4a4a;border-radius:10px;cursor:pointer;transition:.2s}
 .tgl .slider:before{content:"";position:absolute;width:16px;height:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:.2s}
 .tgl input:checked+.slider{background:var(--green)}.tgl input:checked+.slider:before{transform:translateX(16px)}
-.ai-note{font-size:12px;color:var(--dim);margin-bottom:12px}
 .ai-item{display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:6px;background:#141920;border-radius:6px;font-size:13px}
 .ai-bar{flex:1;height:6px;background:#2a3340;border-radius:3px;overflow:hidden}
 .ai-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:3px;transition:width .3s}
@@ -71,9 +73,11 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
 .toast.err{background:#3d1a1a;color:var(--red);border:1px solid #5c2a2a}
 .ota-bar{height:8px;background:#2a3340;border-radius:4px;margin:10px 0;overflow:hidden}
 .ota-bar i{display:block;height:100%;background:var(--accent);border-radius:4px;width:0;transition:width .3s}
+@media(max-width:900px){.di-list,.do-list{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:640px){
   .top{padding:12px}.top h1{font-size:14px}.top .ver{display:none}.wrap{padding:10px}
   .row{grid-template-columns:1fr}.tabs{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .di-list,.do-list{grid-template-columns:repeat(2,minmax(0,1fr))}
   .card{padding:15px}.nav{flex-wrap:wrap}.nav .btn{flex:1;min-width:130px}
 }
 .hidden{display:none}
@@ -106,7 +110,7 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
       <h2>系统信息</h2>
       <div class="row">
         <div class="field"><label>设备名称</label><output class="read-value" id="info_devicename"></output></div>
-        <div class="field"><label>制造商</label><output class="read-value" id="info_manufacturer"></output></div>
+        <div class="field" id="info_manufacturer_field"><label>制造商</label><output class="read-value" id="info_manufacturer"></output></div>
         <div class="field"><label>型号</label><output class="read-value" id="info_model"></output></div>
         <div class="field"><label>固件版本</label><output class="read-value" id="info_version"></output></div>
       </div>
@@ -117,15 +121,14 @@ transform:translateY(80px);opacity:0;transition:.3s;z-index:100}
     </div>
     <div class="card">
       <h2>数字输入 (DI)</h2>
-      <div class="di-list" id="di_list"></div><p id="di_quality" class="hint" role="status"></p>
+      <div class="di-list" id="di_list"></div><p id="di_quality" class="io-quality" role="status"></p>
     </div>
     <div class="card">
       <h2>数字输出 (DO)</h2>
-      <div class="do-list" id="do_list"></div><p id="do_quality" class="hint" role="status"></p>
+      <div class="do-list" id="do_list"></div><p id="do_quality" class="io-quality" role="status"></p>
     </div>
     <div class="card">
       <h2>模拟输入 (AI)</h2>
-      <p class="ai-note">归一化值 0–4095，非 mA。单端标定保留已存端点，另一端使用默认参考。</p>
       <div id="ai_list"></div>
     </div>
     <div class="card">
@@ -329,6 +332,7 @@ async function loadSysInfo() {
       for (const key of ['devicename', 'manufacturer', 'model', 'version']) {
         $('#info_' + key).textContent = j.data[key] || '';
       }
+      $('#info_manufacturer_field').hidden = !(j.data.manufacturer || '').trim();
       $('#fw_ver').textContent = j.data.version || '';
       $('#s_devicename').value = j.data.devicename || '';
       $('#s_manufacturer').value = j.data.manufacturer || '';
@@ -503,14 +507,27 @@ async function pollIO() {
     if (!j.data) return;
     const d = j.data;
     const quality = d.diagnostics && d.diagnostics.io;
-    $('#di_quality').textContent = quality ? (quality.di_valid
+    const diQuality = $('#di_quality');
+    diQuality.className = 'io-quality';
+    diQuality.textContent = quality ? (quality.di_valid
       ? '采样有效 · ' + quality.di_age_ms + ' ms'
       : '采样失效：显示最后状态，请检查 IO 板与总线') : '';
+    if (quality && !quality.di_valid) diQuality.classList.add('is-warning');
+
     const queued = quality && quality.output_queue;
-    $('#do_quality').textContent = quality ? (!quality.do_readback_valid
-      ? '输出寄存器读回失效，请检查 IO 板与总线'
-      : queued && queued.depth > 0 ? '命令待执行：' + queued.depth
-      : '输出寄存器已读回（不代表触点/负载反馈）') : '';
+    const doQuality = $('#do_quality');
+    doQuality.className = 'io-quality';
+    if (!quality) {
+      doQuality.textContent = '';
+    } else if (!quality.do_readback_valid) {
+      doQuality.textContent = '输出寄存器读回失效，请检查 IO 板与总线';
+      doQuality.classList.add('is-error');
+    } else if (queued && queued.depth > 0) {
+      doQuality.textContent = '命令待执行：' + queued.depth;
+      doQuality.classList.add('is-warning');
+    } else {
+      doQuality.textContent = '输出寄存器已读回（不代表触点/负载反馈）';
+    }
 
     // 原 MAC 页面固定显示 8 个状态灯: PWR/RUN/BT/LAN/485_1/485_2/FIB1/FIB2。
     const stateNames = ['PWR', 'RUN', 'BT', 'LAN', '485_1', '485_2', 'FIB1', 'FIB2'];

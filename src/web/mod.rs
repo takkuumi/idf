@@ -90,11 +90,11 @@ const NVS_KEY_WEB_PWD_FLAG: &str = "web_pwd_f";
 const NVS_KEY_WEB_SYSTEM_INFO: &str = "web_sysinfo";
 const WEB_SYSTEM_INFO_FIELD_LEN: usize = 63;
 const WEB_SYSTEM_INFO_BLOB_LEN: usize = (WEB_SYSTEM_INFO_FIELD_LEN + 1) * 3;
-// 未保存系统信息时使用的展示默认值；旧固件从 /SystemInfo.txt 读取这些字段。
+// 未保存系统信息时使用的展示默认值；制造商留空，空值不在登录页占位。
 // 一旦用户通过 Web 保存系统信息，NVS 中的显式值优先于这些默认值。
 const DEFAULT_WEB_DEVICE_NAME: &str = "工业测控执行器";
-const DEFAULT_WEB_MANUFACTURER: &str = "深圳迈锐交通有限公司";
 const DEFAULT_WEB_MODEL: &str = "MZ-MCA-SFP";
+const LEGACY_DEFAULT_WEB_MANUFACTURER: &str = "深圳迈锐交通有限公司";
 #[cfg(feature = "f4")]
 const MCA_WEB_VERSION: &str = "F4";
 #[cfg(not(feature = "f4"))]
@@ -137,6 +137,13 @@ fn encode_web_system_info(info: &WebSystemInfo) -> Option<[u8; WEB_SYSTEM_INFO_B
     Some(blob)
 }
 
+fn normalize_web_system_info(mut info: WebSystemInfo) -> WebSystemInfo {
+    if info.manufacturer == LEGACY_DEFAULT_WEB_MANUFACTURER {
+        info.manufacturer.clear();
+    }
+    info
+}
+
 fn decode_web_system_info(blob: &[u8]) -> Option<WebSystemInfo> {
     if blob.len() != WEB_SYSTEM_INFO_BLOB_LEN {
         return None;
@@ -152,19 +159,23 @@ fn decode_web_system_info(blob: &[u8]) -> Option<WebSystemInfo> {
             .ok()?
             .to_string();
     }
-    Some(WebSystemInfo {
+    Some(normalize_web_system_info(WebSystemInfo {
         device_name: core::mem::take(&mut fields[0]),
         manufacturer: core::mem::take(&mut fields[1]),
         model: core::mem::take(&mut fields[2]),
-    })
+    }))
+}
+
+fn default_web_system_info() -> WebSystemInfo {
+    WebSystemInfo {
+        device_name: DEFAULT_WEB_DEVICE_NAME.to_string(),
+        manufacturer: String::new(),
+        model: DEFAULT_WEB_MODEL.to_string(),
+    }
 }
 
 fn load_web_system_info_from_nvs() -> WebSystemInfo {
-    let fallback = WebSystemInfo {
-        device_name: DEFAULT_WEB_DEVICE_NAME.to_string(),
-        manufacturer: DEFAULT_WEB_MANUFACTURER.to_string(),
-        model: DEFAULT_WEB_MODEL.to_string(),
-    };
+    let fallback = default_web_system_info();
     crate::device::try_with_nvs(|nvs| {
         let mut blob = [0u8; WEB_SYSTEM_INFO_BLOB_LEN];
         nvs.get_blob(NVS_KEY_WEB_SYSTEM_INFO, &mut blob)
@@ -2166,11 +2177,18 @@ fn escape_html_text(s: &str) -> String {
 }
 
 /// 构造登录页。仅注入制造商字段，不提供未认证的系统信息 API。
+fn render_login_page(manufacturer: &str) -> String {
+    let html = pages::LOGIN_HTML.replace("{{MANUFACTURER}}", &escape_html_text(manufacturer));
+    if manufacturer.is_empty() {
+        html.replace("<p class=\"sub\"></p>", "")
+    } else {
+        html
+    }
+}
+
 fn login_page_html() -> String {
-    pages::LOGIN_HTML.replace(
-        "{{MANUFACTURER}}",
-        &escape_html_text(&load_web_system_info().manufacturer),
-    )
+    let info = load_web_system_info();
+    render_login_page(&info.manufacturer)
 }
 
 // ============================================================================
@@ -2302,19 +2320,30 @@ mod tests {
     }
 
     #[test]
-    fn test_login_manufacturer_is_html_escaped() {
+    fn test_login_manufacturer_is_escaped_and_empty_value_is_hidden() {
         assert_eq!(
             escape_html_text("迈锐<&>\"'"),
             "迈锐&lt;&amp;&gt;&quot;&#39;"
         );
         assert!(pages::LOGIN_HTML.contains("工业测控执行器管理系统"));
         assert!(pages::LOGIN_HTML.contains("{{MANUFACTURER}}"));
-        let rendered = pages::LOGIN_HTML.replace(
-            "{{MANUFACTURER}}",
-            &escape_html_text("<script>alert(1)</script>"),
-        );
+        let empty = render_login_page("");
+        assert!(!empty.contains("class=\"sub\""));
+        assert!(!empty.contains(LEGACY_DEFAULT_WEB_MANUFACTURER));
+        let rendered = render_login_page("<script>alert(1)</script>");
         assert!(rendered.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!rendered.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn test_default_and_legacy_web_manufacturer_are_empty() {
+        assert_eq!(default_web_system_info().manufacturer, "");
+        let legacy = WebSystemInfo {
+            device_name: "IMC".to_string(),
+            manufacturer: LEGACY_DEFAULT_WEB_MANUFACTURER.to_string(),
+            model: "MZ-MCA-SFP".to_string(),
+        };
+        assert_eq!(normalize_web_system_info(legacy).manufacturer, "");
     }
 
     #[test]
@@ -2397,9 +2426,16 @@ mod tests {
     fn test_web_read_only_values_and_save_actions_are_distinct() {
         assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"s_version\""));
         assert!(pages::INDEX_HTML.contains("class=\"read-value\" id=\"n_mac\""));
+        assert!(pages::INDEX_HTML.contains("id=\"info_manufacturer_field\""));
+        assert!(
+            pages::INDEX_HTML
+                .contains(".io-quality{margin:12px 0 0;color:var(--dim);font-size:11px")
+        );
         assert!(pages::INDEX_HTML.contains("onclick=\"saveNetwork()\""));
         assert!(pages::INDEX_HTML.contains("onclick=\"saveIdentity()\""));
-        assert!(pages::INDEX_HTML.contains("归一化值 0–4095"));
+        assert!(!pages::INDEX_HTML.contains("归一化值 0–4095"));
+        assert!(pages::INDEX_HTML.contains("grid-template-columns:repeat(8,minmax(0,1fr))"));
+        assert!(pages::INDEX_HTML.contains("class=\"io-quality\""));
         assert!(pages::INDEX_HTML.contains("ai_data_min"));
         assert!(pages::INDEX_HTML.contains("网络参数已保存，重启设备后生效"));
         assert!(pages::INDEX_HTML.contains("设备基本信息已保存"));

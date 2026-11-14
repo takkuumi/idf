@@ -315,7 +315,7 @@ fn port_loop(index: usize, hb: &'static TaskHb) {
                 match opened.read(&mut frame, 250) {
                     Ok(0) => {}
                     Ok(length) => {
-                        if let Err(error) = crate::modbus::rtu_slave::handle_request(
+                        if let Err(error) = crate::modbus::rtu_slave::handle_request_stream(
                             opened,
                             &backend,
                             &frame[..length],

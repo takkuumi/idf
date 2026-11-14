@@ -382,7 +382,7 @@ async def main(args):
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--expected-version",default="3.2.0")
+    parser.add_argument("--expected-version",default="3.3.0")
     parser.add_argument("--mac",required=True,help="Target Ethernet MAC; verified before any mutation")
     parser.add_argument("--out",required=True)
     parser.add_argument("--seconds",type=int,default=180)

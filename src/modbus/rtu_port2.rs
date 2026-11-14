@@ -56,7 +56,7 @@ pub fn start(_hal: Arc<Hal>) -> AppResult<()> {
                 match port.read(&mut buf, 1000) {
                     Ok(0) => continue,
                     Ok(n) => {
-                        if let Err(e) = crate::modbus::rtu_slave::handle_request(
+                        if let Err(e) = crate::modbus::rtu_slave::handle_request_stream(
                             &mut port,
                             &backend,
                             &buf[..n],

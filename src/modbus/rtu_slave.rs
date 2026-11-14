@@ -137,6 +137,102 @@ pub(crate) fn handle_request(
     result
 }
 
+/// Dispatch complete Modbus request frames from a UART receive batch.
+///
+/// On F3 RS485-1, the physical link can return the slave's TX bytes to RX.
+/// Under back-to-back polling, an echoed response and the following request
+/// may be delivered as one UART batch. Passing the entire batch to
+/// `handle_request` fails CRC validation and drops the real request. Scan for
+/// bounded request candidates with a matching unit ID and CRC, while ignoring
+/// response frames (including echoed exception responses).
+pub(crate) fn handle_request_stream(
+    port: &mut Rs485Port,
+    backend: &BusBackend,
+    batch: &[u8],
+    addr: u8,
+    port_index: usize,
+) -> AppResult<()> {
+    let mut cursor = 0usize;
+    while let Some((start, length)) = find_valid_request(batch, cursor, addr) {
+        handle_request(
+            port,
+            backend,
+            &batch[start..start + length],
+            addr,
+            port_index,
+        )?;
+        cursor = start + length;
+    }
+    Ok(())
+}
+
+fn find_valid_request(batch: &[u8], from: usize, addr: u8) -> Option<(usize, usize)> {
+    if batch.len() < 4 || from > batch.len() - 4 {
+        return None;
+    }
+    let mut start = from;
+    while start <= batch.len() - 4 {
+        let slave = batch[start];
+        if slave != 0 && slave != addr {
+            start += 1;
+            continue;
+        }
+        let function = batch[start + 1];
+        if function & 0x80 != 0 {
+            // Exception responses have fixed length and are never requests.
+            let exception_len = 5;
+            if start + exception_len <= batch.len() {
+                let frame = &batch[start..start + exception_len];
+                let received = u16::from_le_bytes([frame[3], frame[4]]);
+                if modbus_crc16(&frame[..3]) == received {
+                    start += exception_len;
+                    continue;
+                }
+            }
+            start += 1;
+            continue;
+        }
+        // FC01..04 responses declare their byte length. Skip a valid echoed
+        // response before trying the same function's 8-byte request shape.
+        if (1..=4).contains(&function) && start + 3 <= batch.len() {
+            let response_len = 5usize.saturating_add(usize::from(batch[start + 2]));
+            if response_len <= 255 && start + response_len <= batch.len() {
+                let frame = &batch[start..start + response_len];
+                let received =
+                    u16::from_le_bytes([frame[response_len - 2], frame[response_len - 1]]);
+                if modbus_crc16(&frame[..response_len - 2]) == received {
+                    start += response_len;
+                    continue;
+                }
+            }
+        }
+        let length = match function {
+            1..=6 => 8,
+            15 | 16 => {
+                if start + 7 > batch.len() {
+                    start += 1;
+                    continue;
+                }
+                9usize.saturating_add(usize::from(batch[start + 6]))
+            }
+            // Preserve the previous illegal-function exception behavior for
+            // unknown, standalone RTU requests whose complete frame is here.
+            _ => batch.len() - start,
+        };
+        if length > 256 || start + length > batch.len() {
+            start += 1;
+            continue;
+        }
+        let frame = &batch[start..start + length];
+        let received = u16::from_le_bytes([frame[length - 2], frame[length - 1]]);
+        if modbus_crc16(&frame[..length - 2]) == received {
+            return Some((start, length));
+        }
+        start += 1;
+    }
+    None
+}
+
 fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> heapless::Vec<u8, 256> {
     let mut out: heapless::Vec<u8, 256> = heapless::Vec::new();
     let _ = out.push(slave);
@@ -167,6 +263,33 @@ mod tests {
             u16::from_le_bytes([response[n - 2], response[n - 1]]),
             modbus_crc16(&response[..n - 2])
         );
+    }
+
+    #[test]
+    fn test_stream_finds_request_after_echoed_205_byte_fc03_response() {
+        let request = [1, 3, 0x08, 0xFC, 0, 100, 0x86, 0x71];
+        let response = build_response(&BusBackend, 1, 3, &[0x08, 0xFC, 0, 100]);
+        assert_eq!(response.len(), 205);
+        let mut batch = heapless::Vec::<u8, 256>::new();
+        batch.extend_from_slice(&response).unwrap();
+        batch.extend_from_slice(&request).unwrap();
+        assert_eq!(find_valid_request(&batch, 0, 1), Some((205, 8)));
+    }
+
+    #[test]
+    fn test_stream_ignores_echoed_exception_response() {
+        let exception = [1, 0x83, 1, 0x80, 0xF0];
+        assert_eq!(modbus_crc16(&exception[..3]), 0xF080);
+        assert_eq!(find_valid_request(&exception, 0, 1), None);
+    }
+
+    #[test]
+    fn test_stream_requires_request_crc_and_honors_nonzero_offset() {
+        let mut batch = [0xAA; 17];
+        batch[5..13].copy_from_slice(&[1, 3, 0x08, 0xFC, 0, 100, 0x86, 0x71]);
+        assert_eq!(find_valid_request(&batch, 0, 1), Some((5, 8)));
+        batch[12] ^= 1;
+        assert_eq!(find_valid_request(&batch, 0, 1), None);
     }
 
     #[test]

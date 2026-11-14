@@ -125,6 +125,17 @@ curl --fail --show-error \
     http://<设备IP>/updateota
 ```
 
+### 6.1 v2.9.0 升级到 v3.3.0
+
+标准 v2.9.0 生产布局与 v3.3.0 相同，可以在同一硬件型号上直接 Web OTA。
+F3、F4、DEFAULT 必须严格匹配；上传对应的 `*-app.bin`，不要上传
+`*-ota-data-initial.bin`。OTA 只更新下一个 App 槽，不擦除 NVS、holding、
+组态或网络配置。设备重启后需等待稳定确认窗口完成，再检查版本和业务数据。
+
+如果设备是旧的单 factory 分区布局，则不具备上述 OTA 条件，必须先执行完整
+分区迁移和配置备份。详见
+`docs/testing/ota-v2.9.0-to-v3.3.0-2026-11-15.md`。
+
 成功响应：
 
 ```json

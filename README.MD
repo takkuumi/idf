@@ -1,11 +1,11 @@
 # 工业测控器 IMC 固件
 
 Rust + ESP-IDF v5.5.4，面向 W5500、BLE 手持机配置、Modbus RTU/TCP、IO 和模拟量。
-当前发布版本为 **3.2.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
+当前发布版本为 **3.3.0**，二进制目标为 `imc`，产品标识为 `imc-controller`。
 
-> 初版 3.2.0 实机定位 RTU 收帧微秒/毫秒混用（9600bps 等待约4秒），初版归档已移到 candidates 并暂停交付；修复及完整验收进行中。3.2.0 同时合入组态落盘/BLE 请求修复，并修复 Web 会话失效和 AI 单端标定问题。旧 3.1.0 初版归档暂停交付。验证范围以 [3.2.0 验收记录](docs/testing/v3.2.0-real-device-acceptance-2026-11-14.md) 为准。
+> 3.3.0 在 3.2.0 基础上修复 F3 RS485-1 应答回显/粘帧导致的交替超时；GPIO19 保持 `485_AD0` 地址输入。版本已在真实 F3 设备上完成 2300/100 连续 100 次验证。验证范围以 [3.3.0 RS485-1 验收记录](docs/testing/v3.3.0-rs485-1-acceptance-2026-11-14.md) 为准。
 出厂网络为 `192.168.1.200 / 255.255.255.0`，网关与 DNS 为 `192.168.1.1`；
-2.7.0 是首个生产数据基线；v3.2.0 沿用该版存储格式，可从 v2.7.0 保留配置升级。开发版本首次切换仍须全擦 Flash。
+2.7.0 是首个生产数据基线；v3.3.0 沿用该版存储格式，可从 v2.7.0 保留配置升级。开发版本首次切换仍须全擦 Flash。
 DEFAULT/F3 使用 PCA9555（16DI/16DO），F4 使用多片 PCA9555（48DI/48DO）。三者共用软件 I2C IO/LED 总线引脚。
 
 ## 开发与验证
@@ -25,7 +25,7 @@ cargo build --locked --release --bin imc
 - [文档索引](docs/index.md) · [项目与硬件概览](docs/README.md)
 - [架构](docs/architecture.md) · [寄存器/引脚](docs/pinmap.md)
 - [当前生产核查](docs/testing/production-audit-2026-10-30.md) · [验收清单](docs/verification.md)
-- [v3.2.0 发布说明](docs/releases/v3.2.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
+- [v3.3.0 发布说明](docs/releases/v3.3.0.md) · [当前待办与功能边界](docs/todo.md) · [正式构建与交付](docs/DELIVERY_BUILD.md)
 - [台架测试工具](tests/manual/README.md) · [主机核心测试](tests/host/run_production_core.py)
 
 `log/` 存现场记录；多数原始日志被 Git 忽略，重要结论必须同步到 `docs/`。

@@ -33,7 +33,8 @@
 
 ## 发布
 
-- [IMC v3.2.0 发布说明](releases/v3.2.0.md) · [实机验收](testing/v3.2.0-real-device-acceptance-2026-11-14.md)
+- [IMC v3.3.0 发布说明](releases/v3.3.0.md) · [实机验收](testing/v3.3.0-rs485-1-acceptance-2026-11-14.md)
+- [v2.9.0→v3.3.0 OTA 兼容性与封板记录](testing/ota-v2.9.0-to-v3.3.0-2026-11-15.md)
 
 - [IMC v3.1.0 生产发布说明](releases/v3.1.0.md)
 - [IMC v3.0.0 发布说明](releases/v3.0.0.md)
