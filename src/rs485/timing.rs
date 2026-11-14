@@ -20,10 +20,27 @@ pub fn silence_timeout_ms(baud: u32, tick_ms: u64) -> u64 {
 /// One blocking receive cannot exceed the remaining frame budget rounded to
 /// one scheduler tick. Zero remaining budget means no further blocking read.
 pub fn inter_byte_wait_ticks(baud: u32, remaining_us: u64, tick_ms: u64) -> u32 {
-    let wait_us = u64::from(silence_us(baud)).min(remaining_us);
-    wait_us
-        .div_ceil(tick_ms.max(1).saturating_mul(1_000))
-        .min(u64::from(u32::MAX)) as u32
+    if remaining_us == 0 {
+        return 0;
+    }
+    let tick_us = tick_ms.max(1).saturating_mul(1_000);
+    // A FreeRTOS N-tick block can start just before a tick and return after
+    // N-1 whole ticks. One extra tick guarantees the complete silence window.
+    let silence_ticks = u64::from(silence_us(baud))
+        .div_ceil(tick_us)
+        .saturating_add(1);
+    let remaining_ticks = remaining_us.div_ceil(tick_us);
+    silence_ticks.min(remaining_ticks).min(u64::from(u32::MAX)) as u32
+}
+
+/// Deliver hardware FIFO batches well before the software silence timer can
+/// expire. Default 120-byte batching hides an in-progress 9600-baud frame for
+/// 125ms. Adaptive batching stays below half t3.5 (at most 1ms), avoiding both
+/// false gaps and one-interrupt-per-byte overhead at high baud.
+pub fn rx_fifo_threshold(baud: u32, bits_per_char: u32) -> u32 {
+    let budget_us = (u64::from(silence_us(baud)) / 2).clamp(1, 1_000);
+    (u64::from(baud).saturating_mul(budget_us) / (u64::from(bits_per_char.max(1)) * 1_000_000))
+        .clamp(1, 120) as u32
 }
 
 /// Keep idle/first-byte policy separate. Once data has started, a legal slow
@@ -85,9 +102,9 @@ mod tests {
         assert_eq!(inter_byte_wait_ticks(9600, 0, 1), 0);
         assert_eq!(inter_byte_wait_ticks(9600, 100, 1), 1);
         assert_eq!(inter_byte_wait_ticks(9600, 2000, 1), 2);
-        assert_eq!(inter_byte_wait_ticks(9600, 250000, 1), 5);
+        assert_eq!(inter_byte_wait_ticks(9600, 250000, 1), 6);
         assert_eq!(inter_byte_wait_ticks(1200, 5000, 1), 5);
-        assert_eq!(inter_byte_wait_ticks(1200, 250000, 1), 33);
+        assert_eq!(inter_byte_wait_ticks(1200, 250000, 1), 34);
     }
     #[test]
     fn test_low_baud_long_frame_is_not_truncated_at_250ms_or_two_seconds() {
@@ -95,6 +112,33 @@ mod tests {
         assert!(budget >= 2693 && budget <= 3000, "budget={budget}");
         assert_eq!(frame_timeout_ms(9600, 10, 8, 5, 60000, 1), 2000);
         assert!(frame_timeout_ms(9600, 10, 0, 256, 250, 1) >= 302);
+    }
+    #[test]
+    fn test_fifo_batches_never_hide_in_progress_bytes_past_silence() {
+        for baud in [1200, 2400, 4800, 9600, 19200, 38400, 115200, 921600] {
+            for bits in [9, 10, 11, 12] {
+                let threshold = rx_fifo_threshold(baud, bits);
+                assert!((1..=120).contains(&threshold));
+                if threshold > 1 {
+                    assert!(
+                        u64::from(threshold) * u64::from(bits) * 1_000_000
+                            <= u64::from(baud) * 1_000
+                    );
+                    assert!(
+                        u64::from(threshold) * u64::from(bits) * 1_000_000
+                            < u64::from(baud) * u64::from(silence_us(baud))
+                    );
+                }
+            }
+        }
+        assert_eq!(rx_fifo_threshold(9600, 10), 1);
+        assert_eq!(rx_fifo_threshold(921600, 10), 80);
+    }
+    #[test]
+    fn test_tick_phase_margin_does_not_exceed_remaining_budget() {
+        assert_eq!(inter_byte_wait_ticks(115200, 50000, 1), 3);
+        assert_eq!(inter_byte_wait_ticks(9600, 50000, 1), 6);
+        assert_eq!(inter_byte_wait_ticks(1200, 5000, 1), 5);
     }
     #[test]
     fn test_invalid_inputs_saturate_without_overflow_or_infinite_wait() {

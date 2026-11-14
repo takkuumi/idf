@@ -2,7 +2,7 @@
 //! The writer never allocates or locks; HTTP readers make at most three attempts.
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const FIELDS: usize = 17;
+const FIELDS: usize = 19;
 struct Trace {
     sequence: AtomicU32,
     values: [AtomicU32; FIELDS],
@@ -79,12 +79,14 @@ static PORTS: [Trace; 3] = [const { Trace::new() }; 3];
 fn micros(value: std::time::Duration) -> u32 {
     value.as_micros().min(u128::from(u32::MAX)) as u32
 }
-pub(crate) fn opened(uart: u8, baud: u32) {
+pub(crate) fn opened(uart: u8, baud: u32, threshold: u32, tx_bytes: u32) {
     if let Some(t) = PORTS.get(usize::from(uart)) {
         t.update(|s| {
             s.set(12, baud);
             s.set(13, 1);
             s.increment(15);
+            s.set(17, threshold);
+            s.set(18, tx_bytes);
         });
     }
 }

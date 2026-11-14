@@ -14,6 +14,9 @@ use crate::error::{AppError, AppResult};
 use crate::rs485::config::Rs485Config;
 
 const RX_BUF_SIZE: i32 = 256;
+// One maximum 256-byte RTU frame plus driver item metadata fits without
+// waiting for the ISR to free the producer ring midway through a frame.
+const TX_BUF_SIZE: i32 = 512;
 const RX_TIMEOUT_MS: u32 = 200;
 #[allow(non_upper_case_globals)]
 const portTICK_PERIOD_MS: u32 = 1000 / configTICK_RATE_HZ;
@@ -101,7 +104,7 @@ impl Rs485Port {
             check(r, "uart_set_pin")?;
 
             // 3. 安装驱动
-            let r = uart_driver_install(port, RX_BUF_SIZE, RX_BUF_SIZE, 0, std::ptr::null_mut(), 0);
+            let r = uart_driver_install(port, RX_BUF_SIZE, TX_BUF_SIZE, 0, std::ptr::null_mut(), 0);
             check(r, "uart_driver_install")?;
 
             // 4. 当有 RTS/DE 引脚时, 切换为 RS485 半双工模式
@@ -112,6 +115,19 @@ impl Rs485Port {
                     let _ = uart_driver_delete(port);
                     return Err(e);
                 }
+            }
+
+            // Hardware FIFO delivery must not hide active bytes longer than
+            // the software inter-byte gap. Scale batching with baud rate.
+            let char_bits = 1
+                + u32::from(cfg.data_bits)
+                + u32::from(cfg.parity != 'N')
+                + u32::from(cfg.stop_bits);
+            let threshold = super::timing::rx_fifo_threshold(cfg.baud, char_bits);
+            let r = uart_set_rx_full_threshold(port, threshold as i32);
+            if let Err(e) = check(r, "uart_set_rx_full_threshold") {
+                let _ = uart_driver_delete(port);
+                return Err(e);
             }
 
             // 5. 启用硬件 RX 帧间隔检测 (Modbus RTU 3.5 字符时间)
@@ -133,7 +149,17 @@ impl Rs485Port {
             cfg.de_pin
         );
 
-        super::diagnostics::opened(cfg.uart_port, cfg.baud);
+        super::diagnostics::opened(
+            cfg.uart_port,
+            cfg.baud,
+            super::timing::rx_fifo_threshold(
+                cfg.baud,
+                1 + u32::from(cfg.data_bits)
+                    + u32::from(cfg.parity != 'N')
+                    + u32::from(cfg.stop_bits),
+            ),
+            TX_BUF_SIZE as u32,
+        );
         Ok(Self { cfg: *cfg })
     }
 
