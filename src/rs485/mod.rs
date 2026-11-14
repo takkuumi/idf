@@ -14,8 +14,10 @@ pub use config::Rs485Config;
 pub use port::Rs485Port;
 
 pub mod config;
+pub mod diagnostics;
 pub mod dip;
 pub mod port;
+pub(crate) mod timing;
 
 /// 创建一路 RS485 端口
 pub fn open(_cfg: &Rs485Config) -> AppResult<Rs485Port> {

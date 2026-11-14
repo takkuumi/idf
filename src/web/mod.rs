@@ -1523,7 +1523,7 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
     };
     let udp = crate::udp_multicast::is_receiving();
     let json = format!(
-        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"rs485_3_comerr":{},"rs485_3_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{}}}}}"#,
+        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"rs485_3_comerr":{},"rs485_3_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{},"firmware":{{"build_id":"{}","partition":"{}","next_partition":"{}","ota_state":{}}}}}}}"#,
         IO.sys.get_uptime(),
         eth,
         ble,
@@ -1552,6 +1552,10 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
         unsafe { esp_idf_sys::esp_get_free_heap_size() },
         IO.sys.get_reset_count(),
         IO.sys.get_reset_reason(),
+        env!("IMC_BUILD_ID"),
+        crate::ota::partition_info().0,
+        crate::ota::partition_info().1,
+        crate::ota::running_partition_state().map_or("null".to_string(), |state| state.to_string()),
     );
     send_json(stream, 200, &json)
 }
@@ -1703,10 +1707,11 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     #[cfg(not(any(feature = "f3", feature = "f4")))]
     let io_health = "null";
     let diagnostics = format!(
-        r#"{{"io":{},"calibration_status":{},"performance":{},"rcu_reclaim_max_us":{{"config":{},"storage":{}}}}}"#,
+        r#"{{"io":{},"calibration_status":{},"performance":{},"rtu":{},"rcu_reclaim_max_us":{{"config":{},"storage":{}}}}}"#,
         io_health,
         crate::channel::calib::status_code(),
         crate::telemetry::json(),
+        crate::rs485::diagnostics::json(),
         crate::bus::config_state::CONFIG.max_reclaim_wait_us(),
         crate::bus::storage_state::STORAGE.max_reclaim_wait_us()
     );

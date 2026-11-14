@@ -49,6 +49,10 @@ jobs:
         run: python3 tests/host/run_ble_advertising.py
       - name: Run BLE and NFC dispatch contention tests
         run: python3 tests/host/run_ble_dispatch.py
+      - name: Run UART timing and trace checks
+        run: |
+          python3 tests/host/run_uart_timing.py
+          python3 tests/host/run_uart_trace.py
       - name: Run AI conversion and moving average checks
         run: python3 tests/host/run_ai_transfer.py
       - name: Run function table runtime contract checks

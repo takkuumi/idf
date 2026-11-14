@@ -363,3 +363,15 @@ fn partition_label(partition: *const esp_idf_sys::esp_partition_t) -> &'static s
     let label = unsafe { std::ffi::CStr::from_ptr((*partition).label.as_ptr()) };
     label.to_str().unwrap_or("invalid")
 }
+
+/// Read-only confirmation state; factory has no OTA state and must not call
+/// esp_ota_get_state_partition (ESP_ERR_NOT_SUPPORTED).
+pub fn running_partition_state() -> Option<u32> {
+    let p = unsafe { esp_idf_sys::esp_ota_get_running_partition() };
+    if p.is_null() || !crate::is_ota_app_subtype(unsafe { (*p).subtype }) {
+        return None;
+    }
+    let mut state = 0;
+    (unsafe { esp_idf_sys::esp_ota_get_state_partition(p, &mut state) } == esp_idf_sys::ESP_OK)
+        .then_some(state)
+}

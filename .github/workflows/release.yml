@@ -72,6 +72,8 @@ jobs:
           python3 tests/host/run_legacy_table_stage.py
           python3 tests/host/run_ble_request_slots.py
           python3 tests/host/run_ai_transfer.py
+          python3 tests/host/run_uart_timing.py
+          python3 tests/host/run_uart_trace.py
           python3 tests/host/run_control_logic_parser.py
 
       - name: Build all production variants

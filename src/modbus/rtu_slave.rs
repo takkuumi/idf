@@ -115,6 +115,7 @@ pub(crate) fn handle_request(
 
     crate::modbus::shared::RS485_STATS.mark_port_ok(port_index);
 
+    let service_started = std::time::Instant::now();
     let func = req[1];
     let resp = build_response(backend, slave, func, &req[2..n - 2]);
     if resp
@@ -125,13 +126,15 @@ pub(crate) fn handle_request(
         crate::modbus::shared::RS485_STATS.set_port_apperr(port_index, code);
     }
 
+    let build_time = service_started.elapsed();
     // 广播不返回响应
     if slave == 0 {
         return Ok(());
     }
 
-    port.write(&resp)?;
-    Ok(())
+    let result = port.write(&resp);
+    crate::rs485::diagnostics::service(port.port(), build_time, service_started.elapsed());
+    result
 }
 
 fn build_response(backend: &BusBackend, slave: u8, func: u8, pdu: &[u8]) -> heapless::Vec<u8, 256> {

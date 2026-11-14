@@ -26,14 +26,12 @@ fn ms_to_ticks(ms: u64) -> u32 {
 
 #[inline]
 fn rtu_silence_us(baud: u32) -> u32 {
-    // 3.5 chars × 11 bits/char = 38.5 bit times。
-    38_500_000u32 / baud.max(1)
+    super::timing::silence_us(baud)
 }
 
 #[inline]
 fn rtu_silence_timeout_ms(baud: u32) -> u64 {
-    let tick_ms = u64::from(portTICK_PERIOD_MS.max(1));
-    u64::from(rtu_silence_us(baud)).div_ceil(tick_ms) * tick_ms
+    super::timing::silence_timeout_ms(baud, u64::from(portTICK_PERIOD_MS.max(1)))
 }
 
 /// TX_DONE 超时保护余量，不是固定发送延迟。
@@ -135,6 +133,7 @@ impl Rs485Port {
             cfg.de_pin
         );
 
+        super::diagnostics::opened(cfg.uart_port, cfg.baud);
         Ok(Self { cfg: *cfg })
     }
 
@@ -175,25 +174,31 @@ impl Rs485Port {
 
     /// 仅发送
     pub fn write(&mut self, data: &[u8]) -> AppResult<()> {
-        let port = self.cfg.uart_port as uart_port_t;
-        let n = unsafe { uart_write_bytes(port, data.as_ptr() as *const _, data.len()) };
-        if n != data.len() as i32 {
-            return Err(AppError::Rs485(format!("write short: {n}/{}", data.len())));
-        }
-        // 等待发送完成 (RS485 模式下 RTS 自动在完成后释放)
-        let parity_bits = u64::from(self.cfg.parity != 'N');
-        let bits_per_char = 1 + self.cfg.data_bits as u64 + parity_bits + self.cfg.stop_bits as u64;
-        let tx_ms = (data.len() as u64)
-            .saturating_mul(bits_per_char)
-            .saturating_mul(1000)
-            .div_ceil(self.cfg.baud.max(1) as u64)
-            .saturating_add(tx_guard_ms(self.cfg.baud))
-            .min(5000);
-        check(
-            unsafe { uart_wait_tx_done(port, ms_to_ticks(tx_ms)) },
-            "uart_wait_tx_done",
-        )?;
-        Ok(())
+        let started = std::time::Instant::now();
+        let result = (|| {
+            let port = self.cfg.uart_port as uart_port_t;
+            let n = unsafe { uart_write_bytes(port, data.as_ptr() as *const _, data.len()) };
+            if n != data.len() as i32 {
+                return Err(AppError::Rs485(format!("write short: {n}/{}", data.len())));
+            }
+            // 等待发送完成 (RS485 模式下 RTS 自动在完成后释放)
+            let parity_bits = u64::from(self.cfg.parity != 'N');
+            let bits_per_char =
+                1 + self.cfg.data_bits as u64 + parity_bits + self.cfg.stop_bits as u64;
+            let tx_ms = (data.len() as u64)
+                .saturating_mul(bits_per_char)
+                .saturating_mul(1000)
+                .div_ceil(self.cfg.baud.max(1) as u64)
+                .saturating_add(tx_guard_ms(self.cfg.baud))
+                .min(5000);
+            check(
+                unsafe { uart_wait_tx_done(port, ms_to_ticks(tx_ms)) },
+                "uart_wait_tx_done",
+            )?;
+            Ok(())
+        })();
+        super::diagnostics::tx(self.cfg.uart_port, data, started.elapsed(), result.is_ok());
+        result
     }
 
     /// 仅读取 (从站监听用)
@@ -207,7 +212,8 @@ impl Rs485Port {
     ///   - 19200bps:  ≈ 2.0ms
     ///   - 115200bps: ≈ 0.33ms (最小限制 1ms, 保证实际可行)
     pub fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> AppResult<usize> {
-        self.read_with_first_byte_timeout(buf, timeout_ms, timeout_ms)
+        let frame_ms = self.transaction_timeout_ms(0, buf.len(), timeout_ms);
+        self.read_with_first_byte_timeout(buf, timeout_ms, frame_ms)
     }
 
     /// 先快速等待首字节，收到后再开启完整帧超时预算。
@@ -260,8 +266,8 @@ impl Rs485Port {
 
         // 收到首字节后，重新开始完整帧预算。这样 1200/2400bps 的合法长响应
         // 不会被“首字节快速失败”策略截断。
-        let frame_deadline =
-            std::time::Instant::now() + Duration::from_millis(frame_timeout_ms.max(1));
+        let frame_started = std::time::Instant::now();
+        let frame_deadline = frame_started + Duration::from_millis(frame_timeout_ms.max(1));
 
         // 第二阶段: 帧间静默判断。不要用 sleep + get_buffered_data_len
         // 判断帧结束：UART 驱动按 FIFO/RX timeout 事件分段投递 ring buffer，
@@ -271,18 +277,18 @@ impl Rs485Port {
         // 真正静默后立即返回，不增加固定等待。
         // 3.5 字符时间 = 38.5 bits / 波特率。向上取整到 FreeRTOS tick，
         // 不能早于 RTU 帧间静默边界结束接收。
-        let silence_ms = rtu_silence_timeout_ms(self.cfg.baud);
-
-        while total < buf.len() && std::time::Instant::now() < frame_deadline {
+        while total < buf.len() {
+            let remaining = frame_deadline.saturating_duration_since(std::time::Instant::now());
+            let wait_ticks = super::timing::inter_byte_wait_ticks(
+                self.cfg.baud,
+                remaining.as_micros().min(u128::from(u64::MAX)) as u64,
+                u64::from(portTICK_PERIOD_MS.max(1)),
+            );
+            if wait_ticks == 0 {
+                break;
+            }
             let mut byte = [0u8; 1];
-            let n = unsafe {
-                uart_read_bytes(
-                    port,
-                    byte.as_mut_ptr() as *mut _,
-                    1,
-                    ms_to_ticks(silence_ms),
-                )
-            };
+            let n = unsafe { uart_read_bytes(port, byte.as_mut_ptr() as *mut _, 1, wait_ticks) };
             if n < 0 {
                 return Err(AppError::Rs485(format!("uart_read_bytes: {n}")));
             }
@@ -294,6 +300,7 @@ impl Rs485Port {
             total += 1;
         }
 
+        super::diagnostics::rx(self.cfg.uart_port, total, frame_started.elapsed());
         Ok(total)
     }
 
@@ -312,21 +319,23 @@ impl Rs485Port {
         response_len: usize,
         configured_timeout_ms: u64,
     ) -> u64 {
-        let parity_bits = u64::from(self.cfg.parity != 'N');
-        let bits_per_char = 1 + self.cfg.data_bits as u64 + parity_bits + self.cfg.stop_bits as u64;
-        let wire_bits = (request_len + response_len) as u64 * bits_per_char;
-        let wire_ms = wire_bits
-            .saturating_mul(1000)
-            .div_ceil(self.cfg.baud.max(1) as u64);
-        let silence_ms = u64::from((rtu_silence_us(self.cfg.baud) / 1000).max(1));
-        configured_timeout_ms
-            .max(wire_ms.saturating_add(silence_ms).saturating_add(30))
-            .clamp(20, 2000)
+        let parity_bits = u32::from(self.cfg.parity != 'N');
+        let bits_per_char =
+            1 + u32::from(self.cfg.data_bits) + parity_bits + u32::from(self.cfg.stop_bits);
+        super::timing::frame_timeout_ms(
+            self.cfg.baud,
+            bits_per_char,
+            request_len,
+            response_len,
+            configured_timeout_ms,
+            u64::from(portTICK_PERIOD_MS.max(1)),
+        )
     }
 }
 
 impl Drop for Rs485Port {
     fn drop(&mut self) {
+        super::diagnostics::closed(self.cfg.uart_port);
         let port = self.cfg.uart_port as uart_port_t;
         unsafe {
             uart_driver_delete(port);
@@ -348,9 +357,9 @@ mod tests {
 
     #[test]
     fn test_modbus_rtu_silence_uses_3_5_character_times() {
-        assert_eq!(rtu_silence_us(9600), 4010);
-        assert_eq!(rtu_silence_us(19200), 2005);
-        assert_eq!(rtu_silence_us(115200), 334);
+        assert_eq!(rtu_silence_us(9600), 4011);
+        assert_eq!(rtu_silence_us(19200), 2006);
+        assert_eq!(rtu_silence_us(115200), 1750);
     }
 
     #[test]
@@ -358,7 +367,7 @@ mod tests {
         let tick_ms = u64::from(portTICK_PERIOD_MS.max(1));
         for baud in [1200, 9600, 19200, 115200, 921_600] {
             let timeout_ms = rtu_silence_timeout_ms(baud);
-            assert!(timeout_ms >= u64::from(rtu_silence_us(baud)).div_ceil(tick_ms));
+            assert!(timeout_ms * 1000 >= u64::from(rtu_silence_us(baud)));
             assert_eq!(timeout_ms % tick_ms, 0);
         }
         assert_eq!(rtu_silence_timeout_ms(9600), 5);
