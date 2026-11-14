@@ -178,3 +178,7 @@ python3 tests/manual/test_ble_network_config.py --write-ip 192.168.51.220
 
 `lora_rtu_acceptance.py --port <外置USB-E22> --host <设备IP> --count 100 --out DIR`
 仅发送 FC01/02/03/04 只读帧，核对版本、MAC、组态及长文本与同设备 TCP 基线；保留失败、原始帧和首字节/完整帧时延。不能填板上下载串口后宣称无线通过。脚本不会修改无线模式、波特率、配置或 Q 点；连续三次无首字节将终止并报告失败。
+
+
+`uart0_route_acceptance.py --apply --peer <外置E22串口> --host HOST --out DIR`
+会主动控制板上下载串口 DTR/RTS 并复位 MCU，先确认 TCP 应用运行，再比较不同控制线状态下的 RF 应答；最后释放控制线并恢复应用。仅限独占台架，不能与持久化/压力验收并发运行，也不能把控制线可复位 MCU 推断为可切换外部 UART0 通路。
