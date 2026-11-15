@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::ai_transfer::{MovingAverage, effective_calibration, legacy_scaled_value};
+use super::ai_transfer::{MovingAverage, calibrated_scaled_value, calibration_is_usable};
 use crate::error::AppResult;
 use crate::hal::Hal;
 use crate::sync::MainLoopCell;
@@ -47,19 +47,18 @@ pub fn tick_ai_sample(hal: &crate::hal::Hal) {
     let _ = AI_STATE.with_mut(|state| {
         let raws: [u16; 8] = hal.adc.sample_all();
 
-        // 从 holding_buf 读取本通道校准值 (由 calib::run_auto_calibration 写入)。
-        // 已保存的单端标定也必须使用；缺失端点单独回退到默认值。
+        // 从 holding_buf 读取本通道校准值 (由启动采样或人工标定写入)。
+        // 已保存的单端标定仍使用有效端点；两端均为 0 表示未校准。
         let (sensor_min, sensor_max) = read_sensor_calibration();
 
         let averages = state.push(std::array::from_fn(|ch| raws[ch]));
         for ch in 0..CHANNEL_COUNT {
             let avg = averages[ch];
-            let (cal_min, cal_max) = effective_calibration(sensor_min[ch], sensor_max[ch]);
-            // 原 MCA: sensorValue = map(raw, max, min, 4095, 0),
-            // gucAnalogData = 4095 - sensorValue。因此 raw 越接近 max，输出越接近 0。
-            // 代数等价形式是直接把 [min,max] 映射到 [4095,0]。
-            let scaled = legacy_scaled_value(avg, cal_min, cal_max);
-            let status = if (cal_max as i32 - avg as i32) > 240 {
+            // 无标定时仅保留原始 ADC 诊断值，不用默认参考冒充有效输入。
+            let scaled = calibrated_scaled_value(avg, sensor_min[ch], sensor_max[ch]).unwrap_or(0);
+            let status = if !calibration_is_usable(sensor_min[ch], sensor_max[ch])
+                || (sensor_max[ch] as i32 - avg as i32) > 240
+            {
                 0
             } else {
                 1

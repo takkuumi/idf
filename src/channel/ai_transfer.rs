@@ -45,6 +45,34 @@ pub fn effective_calibration(min: u16, max: u16) -> (u16, u16) {
     }
 }
 
+/// Whether the stored endpoints contain enough information to publish an AI
+/// engineering value. A completely empty pair is deliberately invalid: the
+/// default reference span is only a conversion fallback for diagnostics, not
+/// evidence that an unconnected input carries a real signal.
+pub fn calibration_is_usable(min: u16, max: u16) -> bool {
+    // `max` is the raw zero-current endpoint in this inverted transfer. A
+    // span-only calibration cannot establish what zero input looks like and
+    // would turn ADC offset into a plausible nonzero process value.
+    if max == 0 {
+        return false;
+    }
+    let (effective_min, effective_max) = effective_calibration(min, max);
+    effective_min < effective_max
+        && effective_max <= ai_calib::ADC_MAX as u16
+        && (min == 0 || min == effective_min)
+        && (max == 0 || max == effective_max)
+}
+
+/// Return a converted ADC value only when at least one valid calibration
+/// endpoint exists. `None` means the raw ADC remains diagnostic-only.
+pub fn calibrated_scaled_value(raw: u16, min: u16, max: u16) -> Option<u16> {
+    if !calibration_is_usable(min, max) {
+        return None;
+    }
+    let (min, max) = effective_calibration(min, max);
+    Some(legacy_scaled_value(raw, min, max))
+}
+
 /// 对齐旧 MCA `Get_Analog()` 的最终输出：先把 ADC 值映射到 0..4095，
 /// 然后清除小于 20 的零点噪声。映射直接写成等价的正向表达式，
 /// 避免旧实现 `4095 - map(raw, max, min, 4095, 0)` 的双重反向造成误读。
@@ -104,6 +132,22 @@ mod tests {
                 "invalid pair {min}/{max}"
             );
         }
+    }
+
+    #[test]
+    fn test_empty_or_invalid_calibration_is_not_published_as_signal() {
+        assert!(!calibration_is_usable(0, 0));
+        assert!(calibration_is_usable(0, 2942));
+        assert!(!calibration_is_usable(605, 0));
+        assert!(calibration_is_usable(605, 3016));
+        assert!(!calibration_is_usable(3016, 605));
+        assert!(!calibration_is_usable(605, 605));
+        assert!(!calibration_is_usable(4095, 0));
+        assert_eq!(calibrated_scaled_value(2897, 0, 0), None);
+        assert_eq!(calibrated_scaled_value(2897, 605, 0), None);
+        // One stored endpoint remains usable and is preserved, as in the 3.2.0 fix.
+        assert_eq!(calibrated_scaled_value(2942, 0, 2942), Some(0));
+        assert!(calibrated_scaled_value(2897, 0, 2942).unwrap() > 0);
     }
 
     #[test]

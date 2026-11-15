@@ -11,6 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "src/modbus/tcp_server.rs").read_text()
+CONFIG = (ROOT / "src/config.rs").read_text()
+MAX_CONNECTIONS = int(re.search(
+    r"pub const MAX_CONNECTIONS: usize = (\d+);", CONFIG
+).group(1))
 
 
 def item(text: str, marker: str) -> str:
@@ -29,7 +33,7 @@ request_limit = re.search(r"^const MAX_REQUESTS_PER_TICK:.*;", SOURCE, re.M).gro
 admission_limit = re.search(r"^const FIRST_REQUEST_TIMEOUT:.*;", SOURCE, re.M).group(0)
 program = f"""
 #![allow(dead_code)]
-mod cfg {{ pub const MAX_CONNECTIONS: usize = 8; pub const IDLE_TIMEOUT_MS:u64=120000; pub const TX_TIMEOUT_MS:u64=5000; pub const PARTIAL_FRAME_TIMEOUT_MS:u64=30000; }}
+mod cfg {{ pub const MAX_CONNECTIONS: usize = {MAX_CONNECTIONS}; pub const IDLE_TIMEOUT_MS:u64=120000; pub const TX_TIMEOUT_MS:u64=5000; pub const PARTIAL_FRAME_TIMEOUT_MS:u64=30000; }}
 {request_limit}
 {admission_limit}
 {helper}
@@ -147,10 +151,12 @@ fn actual_scheduler_rotates_same_port_clients_without_starving_another() {
     poll_clients(&mut s,Instant::now());assert_eq!(*CALLS.lock().unwrap(),[1]);
 }
 #[test]
-fn actual_scheduler_services_all_eight_connections_fairly() {
-    let (mut s,_peers)=state(&[0,0,1,1,2,2,3,3]);
-    for _ in 0..8 {poll_clients(&mut s,Instant::now());}
-    let mut calls=CALLS.lock().unwrap().clone();calls.sort();assert_eq!(calls,(1..=8).collect::<Vec<_>>());
+fn actual_scheduler_services_all_configured_connections_fairly() {
+    let slots:Vec<usize>=(0..cfg::MAX_CONNECTIONS).map(|index|index%4).collect();
+    let (mut s,_peers)=state(&slots);
+    for _ in 0..cfg::MAX_CONNECTIONS {poll_clients(&mut s,Instant::now());}
+    let mut calls=CALLS.lock().unwrap().clone();calls.sort();
+    assert_eq!(calls,(1..=cfg::MAX_CONNECTIONS as u16).collect::<Vec<_>>());
 }
 #[test]
 fn admission_deadline_expires_only_unverified_sessions() {

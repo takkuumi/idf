@@ -44,7 +44,7 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=n
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
-CONFIG_APP_PROJECT_VER="3.3.0"
+CONFIG_APP_PROJECT_VER="3.4.0"
 CONFIG_SPI_FLASH_BROWNOUT_RESET=y
 # ESP-IDF v5.5.4 无 SPI_FLASH_USE_4BLOCK_ERASE，旧选项不会生效。
 # 显式固定现有有效值：保留块擦除能力，擦除期间让出 CPU，避免通信/喂狗饥饿。
@@ -119,8 +119,8 @@ CONFIG_FREERTOS_TASK_PRE_DELETE_CALLBACK=y
 # ---- LwIP / TCP/IP 协议栈 ----
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=8192
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY=y
-# 固定需求: 4 Modbus listeners + Web listener + UDP + 8 Modbus clients
-# + 1 Web active connection = 15. 保留 5 个重连/诊断余量；默认 10 会在
+# 固定需求: 4 Modbus listeners + Web listener + UDP + 9 Modbus clients
+# + 1 Web active connection = 16. 保留 4 个重连/诊断余量；默认 10 会在
 # 第 5 个并发客户端附近触发 ENFILE (errno 23) 等资源错误。
 CONFIG_LWIP_MAX_SOCKETS=20
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744

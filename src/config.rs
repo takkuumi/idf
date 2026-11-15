@@ -281,18 +281,18 @@ pub mod modbus {
         /// 默认 4 端口 (对齐参考固件 ext_tcp_port1..4 = {502,503,504,5002}).
         /// 运行时端口可由 Modbus 写 HOLD_TCP_COM_BASE..3 (2243-2246) 动态修改.
         pub const PORTS: &[u16] = &[502, 503, 504, 5002];
-        /// 全局 Modbus TCP 长连接上限。四个监听端口共享该上限。
+        /// 全局 Modbus TCP 长连接上限。为 8 个业务客户端预留 1 个管理/现场会话余量。
         ///
-        /// 四个监听端口合计的 Modbus TCP 客户端上限。
-        /// 20 个 LwIP socket 还要为四个 listener、Web、UDP 和系统 socket
-        /// 留出余量；不能只调高会话数而忽略 LwIP TCP 控制块上限。
+        /// 四个监听端口合计的 Modbus TCP 客户端上限。应用目标为 8 个并发业务客户端，
+        /// 第 9 个槽避免一个既有诊断/维护连接导致第 8 个业务客户端被拒绝。
+        /// 20 个 LwIP socket 和 16 个 TCP PCB 仍限制总资源；不能仅调高此值而忽略余量。
         /// 满载时只回收断开或首包超时的未验证连接，不抢占已验证会话。
-        pub const MAX_CONNECTIONS: usize = 8;
+        pub const MAX_CONNECTIONS: usize = 9;
         /// 已建立连接的空闲回收时间。原 2 秒“读超时”不能直接当连接空闲超时，
         /// 否则常见 PLC/SCADA 长连接在两次轮询间就被服务端主动断开。
         pub const IDLE_TIMEOUT_MS: u64 = 2 * 60 * 1000;
         /// 弱网下完整 MBAP 帧的接收上限。计时从首字节开始，后续零散字节不续期，
-        /// 防止 slowloris 客户端永久占用固定的 8 个连接槽。
+        /// 防止 slowloris 客户端永久占用固定的 9 个连接槽。
         pub const PARTIAL_FRAME_TIMEOUT_MS: u64 = 30_000;
         pub const TX_TIMEOUT_MS: u64 = 5000;
         /// TCP keepalive 用于回收拔线、客户端断电等未发送 FIN/RST 的半开连接。

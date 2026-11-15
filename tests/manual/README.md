@@ -5,6 +5,61 @@
 `--apply`，会暂改配置并恢复；禁止在生产控制回路运行。BLE IP 写入仍须 `--write-ip`
 并确认目标地址。
 
+## RS485 少量/批量读取的完整往返与吞吐
+
+```bash
+python3 tests/manual/rs485_read_benchmark.py \
+  --ip 192.168.51.226 --serial /dev/cu.usbserial-14140 \
+  --baud 9600 --unit 1 --address 2300 --expected-uart 2 \
+  --counts 1,2,4,8,16,32,64,100,125 --samples 100 \
+  --gaps-ms 4.2,0 --timeout-ms 1000 \
+  --out log/hardware/rs485-size-benchmark-unique
+```
+
+需要 pyserial，独占串口/RS485 总线和 Web 会话；holding 地址需为静态数据，
+以便与 TCP 基准比较。Web 凭据用 `IMC_WEB_USER` / `IMC_WEB_PASSWORD` 环境变量
+指定，默认使用固件默认凭据。脚本仅发 FC03 读取、获取只读身份/诊断并登录 Web。
+输出目录须不存在；逐次 JSONL、汇总 JSON/CSV 和运行前后快照均会留存。
+
+延迟从 `serial.write` 前开始，到完整应答结束，包含请求发送和 USB/OS 延迟。
+吞吐按整档实际墙钟计算，包含间隔和日志开销。`--gaps-ms 0` 表示完整应答后不
+额外软件等待，并非要求物理帧间静默为零；用于台架压力对照。脚本用 UART 收发/
+服务计数核实 `--expected-uart`，避免测错物理口。
+
+本次 9600 分档结果及旧脚本计时修正见
+`docs/testing/v3.3.0-rs485-read-size-throughput-2026-11-15.md`。
+
+## TCP + RS485 + BLE 并发只读压力
+
+```bash
+python3 tests/manual/full_link_stress.py \
+  --ip 192.168.51.226 --serial /dev/cu.usbserial-14140 \
+  --baud 9600 --out log/hardware/full-link-unique
+```
+
+默认运行单链路基线、4/8 客户端混合负载、bulk、10 分钟 soak、计划重连及恢复阶段。
+脚本只读 FC03，BLE 连接只读；不写 Q 点、配置、NVS，不主动复位/刷机。主机网络和
+串口需可同时到达设备；Web 会话由脚本占用。原始请求结果、健康采样和测试前后持久化
+哈希一并保留。必须使用新的输出目录。
+
+只做容量定位时可运行：
+
+```bash
+python3 tests/manual/full_link_stress.py \
+  --ip 192.168.51.226 --serial /dev/cu.usbserial-14140 \
+  --baud 9600 --capacity-compare --out log/hardware/full-link-compare-unique
+```
+
+该模式依次测 8 个 TCP 客户端（不启用 RS485/BLE）、8 个 TCP 客户端三链路并发、
+7 个 TCP 客户端三链路并发、6 个 TCP 客户端三链路并发。它用于区分 TCP 会话容量
+与链路竞争，仍然是只读台架测试。
+
+修复边界回归可用 `--boundary --expected-build-id <build-id>`，依次压测 8 TCP 单链路、
+8 TCP + RS485 + BLE 180 秒，以及降速恢复阶段。`/getsystemstatus` 中的
+`tcp_active_connections` 和 `tcp_rejected_connections` 用于核对常驻会话、活动峰值及拒绝。
+此模式会占用单 Web 登录会话，期间不要从浏览器/其它工具重新登录。
+v3.3.0 实测结论见 `docs/testing/v3.3.0-full-link-stress-2026-11-15.md`。
+
 ## DO 写入、读取和连续压测
 
 ```bash

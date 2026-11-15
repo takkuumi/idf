@@ -1533,8 +1533,15 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
         }
     };
     let udp = crate::udp_multicast::is_receiving();
+    #[cfg(feature = "modbus-tcp")]
+    let tcp_sessions = (
+        crate::modbus::tcp_server::active_connection_count(),
+        crate::modbus::tcp_server::rejected_connection_count(),
+    );
+    #[cfg(not(feature = "modbus-tcp"))]
+    let tcp_sessions = (0, 0);
     let json = format!(
-        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"rs485_3_comerr":{},"rs485_3_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{},"firmware":{{"build_id":"{}","partition":"{}","next_partition":"{}","ota_state":{}}}}}}}"#,
+        r#"{{"type":"getsystemstatus","code":"0","msg":"","data":{{"uptime":{},"ethernet_link":{},"ble_connected":{},"ble_notify":{},"udp_multicast":{},"udp_received_bytes":{},"tcp_active_connections":{},"tcp_rejected_connections":{},"rs485_1_comerr":{},"rs485_1_apperr":{},"rs485_2_comerr":{},"rs485_2_apperr":{},"rs485_3_comerr":{},"rs485_3_apperr":{},"recovery_mode":"{}","recoverable":{},"degradable":{},"severe":{},"free_heap":{},"reset_count":{},"reset_reason":{},"firmware":{{"build_id":"{}","partition":"{}","next_partition":"{}","ota_state":{}}}}}}}"#,
         IO.sys.get_uptime(),
         eth,
         ble,
@@ -1550,6 +1557,8 @@ fn handle_get_system_status(stream: &mut TcpStream, _req: &HttpRequest) -> std::
         },
         udp,
         crate::udp_multicast::received_len(),
+        tcp_sessions.0,
+        tcp_sessions.1,
         crate::modbus::shared::RS485_STATS.port_comerr(0),
         crate::modbus::shared::RS485_STATS.port_apperr(0),
         crate::modbus::shared::RS485_STATS.port_comerr(1),
@@ -1677,6 +1686,7 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
     let ai_count = crate::config::hw_version::AI_COUNT;
     let mut ai_data = String::new();
     let mut ai_raw = String::new();
+    let mut ai_status = String::new();
     let mut ai_effective = String::new();
     let mut ai_max = String::new();
     let mut ai_min = String::new();
@@ -1684,6 +1694,7 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         if i > 0 {
             ai_data.push(',');
             ai_raw.push(',');
+            ai_status.push(',');
             ai_effective.push(',');
             ai_max.push(',');
             ai_min.push(',');
@@ -1692,6 +1703,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         ai_data.push_str(&format!("\"ai_addr_{}\":{}", i, val));
         let raw = crate::bus::IO.ai.get_raw(usize::from(i));
         ai_raw.push_str(&format!("\"ai_addr_{}\":{}", i, raw));
+        let status = crate::bus::IO.ai.get_status(usize::from(i));
+        ai_status.push_str(&format!("\"ai_addr_{}\":{}", i, status));
         // C++ 在 getiodata 同时返回 ai_data_max / ai_data_min (校准值), 来自 holding_buf 2288+/2280+
         let max_v =
             crate::bus::backends::read_hold_reg(regs::HOLD_SENSOR_MAX_BASE + i).unwrap_or(0);
@@ -1701,6 +1714,7 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         ai_min.push_str(&format!("\"ai_addr_min_{}\":{}", i, min_v));
         let (effective_min, effective_max) =
             crate::channel::ai_transfer::effective_calibration(min_v, max_v);
+        let valid = crate::channel::ai_transfer::calibration_is_usable(min_v, max_v);
         let source = match (min_v == effective_min, max_v == effective_max) {
             (true, true) => "full",
             (false, true) if min_v == 0 => "zero",
@@ -1708,8 +1722,8 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
             _ => "default",
         };
         ai_effective.push_str(&format!(
-            "\"ai_addr_{}\":{{\"min\":{},\"max\":{},\"source\":\"{}\"}}",
-            i, effective_min, effective_max, source
+            "\"ai_addr_{}\":{{\"min\":{},\"max\":{},\"source\":\"{}\",\"valid\":{}}}",
+            i, effective_min, effective_max, source, valid
         ));
     }
 
@@ -1727,8 +1741,17 @@ fn handle_get_io_data(stream: &mut TcpStream, _req: &HttpRequest) -> std::io::Re
         crate::bus::storage_state::STORAGE.max_reclaim_wait_us()
     );
     let json = format!(
-        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_raw":{{{}}},"ai_effective":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}},"diagnostics":{}}}}}"#,
-        state_data, di_data, do_data, ai_data, ai_raw, ai_effective, ai_max, ai_min, diagnostics,
+        r#"{{"type":"getiodata","code":"0","msg":"","data":{{"state_data":{{{}}},"di_data":{{{}}},"do_data":{{{}}},"ai_data":{{{}}},"ai_raw":{{{}}},"ai_status":{{{}}},"ai_effective":{{{}}},"ai_data_max":{{{}}},"ai_data_min":{{{}}},"diagnostics":{}}}}}"#,
+        state_data,
+        di_data,
+        do_data,
+        ai_data,
+        ai_raw,
+        ai_status,
+        ai_effective,
+        ai_max,
+        ai_min,
+        diagnostics,
     );
     send_json(stream, 200, &json)
 }

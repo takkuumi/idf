@@ -49,15 +49,25 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False) + '\n'); f.flush(); rows.append(d)
             if a.verify:
                 assert set(d['ai_raw']) == set(d['ai_data']), d
+                assert set(d.get('ai_status', {})) == set(d['ai_data']), d
+                assert set(d.get('ai_effective', {})) == set(d['ai_data']), d
                 for k, raw in d['ai_raw'].items():
                     ch = k.removeprefix('ai_addr_')
-                    stored_min = d['ai_data_min'][f'ai_addr_min_{ch}']; stored_max = d['ai_data_max'][f'ai_addr_max_{ch}']
-                    lo = stored_min or 605; hi = stored_max or 3016
-                    if not 0 < lo < hi <= 4095: lo, hi = 605, 3016
+                    calibration = d['ai_effective'][k]
+                    actual = d['ai_data'][k]
+                    status = d['ai_status'][k]
+                    if not calibration.get('valid', False):
+                        if actual != 0 or status != 0:
+                            errors.append({'sample': n, 'channel': ch, 'raw': raw, 'actual': actual, 'status': status, 'expected': 0, 'reason': 'invalid calibration'})
+                        continue
+                    lo = calibration['min']; hi = calibration['max']
+                    if not 0 < lo < hi <= 4095:
+                        errors.append({'sample': n, 'channel': ch, 'raw': raw, 'effective_min': lo, 'effective_max': hi, 'reason': 'invalid effective calibration marked valid'})
+                        continue
                     scaled = max(0, min(4095, 4095 + int((raw - lo) * -4095 / (hi - lo))))
                     if scaled < 20: scaled = 0
-                    if abs(d['ai_data'][k] - scaled) > a.tolerance:
-                        errors.append({'sample': n, 'channel': ch, 'raw': raw, 'actual': d['ai_data'][k], 'expected': scaled})
+                    if abs(actual - scaled) > a.tolerance:
+                        errors.append({'sample': n, 'channel': ch, 'raw': raw, 'actual': actual, 'expected': scaled})
             if n + 1 < a.samples: time.sleep(a.interval)
     summary = {'samples': len(rows), 'verified': a.verify, 'errors': errors, 'channels': {k: {'scaled_min': min(d['ai_data'][k] for d in rows), 'scaled_max': max(d['ai_data'][k] for d in rows), 'raw_min': min(d.get('ai_raw', {}).get(k, 0) for d in rows), 'raw_max': max(d.get('ai_raw', {}).get(k, 0) for d in rows)} for k in rows[0]['ai_data']}, 'final_status': api('getsystemstatus')}
     (a.out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n'); print(json.dumps(summary, ensure_ascii=False))

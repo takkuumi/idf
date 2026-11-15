@@ -33,9 +33,13 @@
 
 ## 发布
 
+- [IMC v3.4.0 发布说明](releases/v3.4.0.md) · [AI 空载偏值实机验收](testing/v3.3.0-ai-no-input-2026-11-15.md)
+- [v3.4.0 TCP + RS485 + BLE 全链路压力验收](testing/v3.3.0-full-link-stress-2026-11-15.md)
 - [IMC v3.3.0 发布说明](releases/v3.3.0.md) · [实机验收](testing/v3.3.0-rs485-1-acceptance-2026-11-14.md)
 - [v2.9.0→v3.3.0 OTA 兼容性与封板记录](testing/ota-v2.9.0-to-v3.3.0-2026-11-15.md)
 - [v3.3.0 F3 最终封板系统审查](testing/v3.3.0-final-system-audit-2026-11-15.md)
+- [v3.3.0 TCP + RS485 + BLE 全链路压力验收](testing/v3.3.0-full-link-stress-2026-11-15.md)
+- [v3.3.0 RS485 9600 分档读取吞吐与计时修正](testing/v3.3.0-rs485-read-size-throughput-2026-11-15.md)
 
 - [IMC v3.1.0 生产发布说明](releases/v3.1.0.md)
 - [IMC v3.0.0 发布说明](releases/v3.0.0.md)

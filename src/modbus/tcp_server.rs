@@ -1,6 +1,6 @@
 //! Modbus TCP Server（四端口、主循环多连接状态机）。
 //!
-//! 所有监听 socket 和最多 8 个客户端都由 main_loop 的 5ms 非阻塞 tick 处理。
+//! 所有监听 socket 和最多 9 个客户端都由 main_loop 的 5ms 非阻塞 tick 处理。
 //! 模块不创建 pthread，因此不再申请 16KB internal SRAM 任务栈，连接建立也不会
 //! 增加任务数量。MBAP/PDU 格式和四个监听端口保持不变。
 
@@ -22,7 +22,7 @@ const MBAP_HEADER_LEN: usize = 7;
 const MAX_MBAP_LENGTH: usize = MODBUS_TCP_MAX_MBAP_LENGTH;
 const MAX_ADU_SIZE: usize = MODBUS_TCP_MAX_ADU_LEN;
 /// 同一连接在单次 5ms tick 内最多处理的流水请求数。
-/// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 8 客户端公平调度。
+/// 上限 4 可消除“每 tick 一帧”的吞吐瓶颈，同时保证 9 客户端公平调度。
 const MAX_REQUESTS_PER_POLL: usize = 4;
 /// 服务器每个 5ms tick 的总请求预算。单次只准入一个完整业务请求，
 /// 给 IO、BLE、AI 和看门狗保留确定的调度余量。
@@ -32,7 +32,7 @@ const MAX_REQUESTS_PER_TICK: usize = 1;
 const MAX_TCP_WORK_US: u64 = 1_500;
 /// 每轮最多接收两个新连接，并在四个监听端口间轮转，连接风暴不能占满主循环。
 const MAX_ACCEPTS_PER_TICK: usize = 2;
-/// 正常 PLC/Poll 重连保护。8 个固定会话槽位已限制资源，
+/// 正常 PLC/Poll 重连保护。9 个固定会话槽位已限制资源，
 /// 这里限制 accept 工作量，不把正常短时重连误判为攻击；它不是 SYN 防火墙。
 const MAX_CONN_PER_SECOND: u32 = 64;
 /// 新建连接必须在绝对期限内发出首个完整 Modbus 请求；零字节/滴流不能长期占槽。
@@ -44,7 +44,18 @@ const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const _: () = assert!(MAX_ADU_SIZE == MBAP_PREFIX_LEN + MAX_MBAP_LENGTH);
 
 static CONN_COUNT: AtomicU32 = AtomicU32::new(0);
+static REJECTED_CONN_TOTAL: AtomicU32 = AtomicU32::new(0);
 static NEXT_CONN_ID: AtomicU32 = AtomicU32::new(1);
+
+/// 当前 Modbus TCP 活动会话数，供 Web 健康状态读取。
+pub fn active_connection_count() -> u32 {
+    CONN_COUNT.load(Ordering::Relaxed)
+}
+
+/// 自启动以来因连接槽满而拒绝的连接总数。
+pub fn rejected_connection_count() -> u32 {
+    REJECTED_CONN_TOTAL.load(Ordering::Relaxed)
+}
 
 struct Client {
     id: u32,
@@ -725,11 +736,17 @@ fn accept_pending(state: &mut TcpServerState, now: Instant) -> bool {
                     state.conn_rate_count += 1;
                 } else {
                     state.rejected_connections = state.rejected_connections.saturating_add(1);
+                    let _ = REJECTED_CONN_TOTAL.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |count| Some(count.saturating_add(1)),
+                    );
                     if now >= state.next_reject_log {
                         log::warn!(
-                            "[mb-tcp] max connections reached; rejected={} active={} (no reclaimable sessions)",
+                            "[mb-tcp] max connections reached; rejected={} active={} total_rejected={} (no reclaimable sessions)",
                             state.rejected_connections,
-                            state.clients.len()
+                            state.clients.len(),
+                            REJECTED_CONN_TOTAL.load(Ordering::Relaxed)
                         );
                         state.rejected_connections = 0;
                         state.next_reject_log = now + REJECT_LOG_INTERVAL;
@@ -873,7 +890,7 @@ mod tests {
 
     #[test]
     fn test_tcp_uses_one_bounded_main_loop_state() {
-        assert_eq!(cfg::MAX_CONNECTIONS, 8);
+        assert_eq!(cfg::MAX_CONNECTIONS, 9);
         assert_eq!(MAX_REQUESTS_PER_POLL, 4);
         assert_eq!(MAX_REQUESTS_PER_TICK, 1);
         assert_eq!(MAX_TCP_WORK_US, 1_500);

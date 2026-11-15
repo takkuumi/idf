@@ -573,11 +573,13 @@ async function pollIO() {
         const n = k.replace('ai_addr_', '');
         const v = d.ai_data[k];
         const calibration = (d.ai_effective || {})[k] || {};
-        const calibrated = calibration.source && calibration.source !== 'default';
+        const calibrated = calibration.valid === true;
         const pct = Math.max(0, Math.min(100, (v / 4095) * 100));
-        const value = v;
+        const value = calibrated ? v : '—';
         const states = { full: '双端标定/4095', zero: '零点标定/4095', span: '满量程标定/4095' };
-        const state = states[calibration.source] || '默认参考/4095';
+        const state = calibrated
+          ? states[calibration.source]
+          : (calibration.source === 'span' ? '缺少零点标定' : '未标定');
         aiHtml += `<div class="ai-item"><span style="min-width:32px;font-size:12px;color:var(--dim)">AI${n}</span>
           <div class="ai-bar"><i style="width:${pct}%"></i></div>
           <span class="ai-val${calibrated ? '' : ' invalid'}">${value}</span>
